@@ -3,10 +3,10 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/status-Specification%20First%20Pass-0d9488?style=flat-square" alt="Project status: Specification First Pass">
-  <img src="https://img.shields.io/badge/language-Rust-dea584?style=flat-square" alt="Language: Rust">
-  <img src="https://img.shields.io/badge/repository-DOM%20Wallet%20V3-155e75?style=flat-square" alt="Repository: DOM Wallet V3">
-  <img src="https://img.shields.io/badge/security%20model-Specification%20Driven-0369a1?style=flat-square" alt="Security model: Specification Driven">
+  <img src="https://img.shields.io/badge/status-Specification%20First%20Pass-b87333?style=flat-square" alt="Project status: Specification First Pass">
+  <img src="https://img.shields.io/badge/language-Rust-7a4a22?style=flat-square" alt="Language: Rust">
+  <img src="https://img.shields.io/badge/repository-DOM%20Wallet%20V3-3d2f22?style=flat-square" alt="Repository: DOM Wallet V3">
+  <img src="https://img.shields.io/badge/security%20model-Specification%20Driven-8a6a3f?style=flat-square" alt="Security model: Specification Driven">
 </p>
 
 # DOM Wallet V3
