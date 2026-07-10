@@ -1,17 +1,23 @@
 # DOM Wallet V3 Specifications
 
-- `0000_DESIGN_PRINCIPLES.md`
-- `0001_THREAT_MODEL.md`
-- `0002_WALLET_STATE_MODEL.md`
-- `0003_TRANSACTION_LIFECYCLE.md`
-- `0004_STORAGE_ATOMICITY.md`
-- `0005_CHAIN_SOURCE_AND_SYNC.md`
-- `0006_REORG_AND_ROLLBACK.md`
-- `0007_KEY_DERIVATION_AND_SECRETS.md`
-- `0008_BACKUP_AND_RECOVERY.md`
-- `0009_ECONOMIC_RULES.md`
-- `0010_API_AND_TRANSPORT_SECURITY.md`
-- `0011_MIGRATION_FROM_V2.md`
-- `0012_TESTING_AND_ASSURANCE.md`
+**Owner:** Soren Planck
 
-All specifications begin as DRAFT and must be reviewed before implementation.
+| Specification | Status |
+|---|---|
+| 0000 Design Principles | DRAFT |
+| 0001 Threat Model | DRAFT |
+| 0002 Wallet State Model | DRAFT |
+| 0003 Transaction Lifecycle | PENDING FIRST PASS |
+| 0004 Storage Atomicity | DRAFT |
+| 0005 Chain Source and Sync | DRAFT |
+| 0006 Reorg and Rollback | DRAFT |
+| 0007 Key Derivation and Secrets | PENDING FIRST PASS |
+| 0008 Backup and Recovery | PENDING FIRST PASS |
+| 0009 Economic Rules | PENDING FIRST PASS |
+| 0010 API and Transport Security | PENDING FIRST PASS |
+| 0011 Migration from V2 | PENDING FIRST PASS |
+| 0012 Testing and Assurance | PENDING FIRST PASS |
+
+Required dependency order: threat model → state model → storage atomicity → chain source and sync → reorg and rollback → transaction lifecycle → secrets → backup → economics → APIs → migration → assurance.
+
+All specifications require review before implementation. DOM semantics are sovereign; external references may supply protected properties and engineering strategies only.
