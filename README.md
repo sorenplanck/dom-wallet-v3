@@ -1,712 +1,251 @@
-<div align="center">
+<p align="center">
+  <img src="assets/dom-wallet-v3-banner.svg" alt="DOM Wallet V3 — Secure state. Deterministic recovery. Native DOM sovereignty." width="760">
+</p>
 
-<img src="assets/dom-wallet-v3-banner.svg" alt="DOM Wallet V3" width="760">
-
-<br>
-
-[![Project Status](https://img.shields.io/badge/status-specification%20%26%20architecture-008c95)](#project-status)
-[![Language](https://img.shields.io/badge/language-Rust-186faf)](https://www.rust-lang.org/)
-[![Foundation Checks](https://github.com/sorenplanck/dom-wallet-v3/actions/workflows/foundation.yml/badge.svg)](https://github.com/sorenplanck/dom-wallet-v3/actions/workflows/foundation.yml)
-[![Security Policy](https://img.shields.io/badge/security-policy-102a43)](SECURITY.md)
-[![Repository](https://img.shields.io/badge/repository-DOM%20Wallet%20V3-334e68)](https://github.com/sorenplanck/dom-wallet-v3)
+<p align="center">
+  <img src="https://img.shields.io/badge/status-Specification%20First%20Pass-0d9488?style=flat-square" alt="Project status: Specification First Pass">
+  <img src="https://img.shields.io/badge/language-Rust-dea584?style=flat-square" alt="Language: Rust">
+  <img src="https://img.shields.io/badge/repository-DOM%20Wallet%20V3-155e75?style=flat-square" alt="Repository: DOM Wallet V3">
+  <img src="https://img.shields.io/badge/security%20model-Specification%20Driven-0369a1?style=flat-square" alt="Security model: Specification Driven">
+</p>
 
 # DOM Wallet V3
 
-### A secure, recoverable, and DOM-native wallet architecture.
+> A secure, recoverable, and DOM-native wallet architecture.
 
-</div>
+> **Current phase: Foundation and Specification.** Five foundational specifications have completed their first design pass and remain **DRAFT**. No functional production wallet exists yet, and no real-fund use is authorized.
 
----
+DOM Wallet V3 is a new, independent wallet architecture for the DOM protocol. It is being specified before implementation so that wallet correctness includes failure, recovery, and adversarial behavior—not only a successful transaction path.
 
-DOM Wallet V3 is a new, independently designed wallet implementation for the DOM Protocol.
+V3 preserves validated DOM Wallet V1 and V2 properties while establishing one DOM-native model for state, persistence, synchronization, recovery, and verification. It is neither a port nor a fork of another wallet project, and it is not a cosmetic refactor of DOM Wallet V2.
 
-The project combines:
+The repository is intentionally not a functional wallet yet. Its present deliverable is an engineering foundation that can be reviewed before wallet crates, network operations, seed handling, or user-facing payment flows are introduced.
 
-* validated protocol knowledge and working properties from DOM Wallet V1 and V2;
-* mature wallet-engineering strategies studied from Epic Wallet;
-* a new DOM-native architecture;
-* explicit state machines and invariants;
-* atomic persistence and crash recovery;
-* canonical synchronization using block height and block hash;
-* complete backup, restore, and migration contracts;
-* adversarial, property-based, restart, reorganization, and end-to-end testing.
+## Why V3 Exists
 
-DOM Wallet V3 is not a port of Epic Wallet and is not a cosmetic refactor of DOM Wallet V2.
+A wallet can appear correct on a happy path and still be unsafe when a write stops halfway, a node becomes unavailable, a request is replayed, or two callers reserve the same output. Wallet correctness must survive the operational conditions users actually encounter.
 
-Every implementation in this repository must be independently designed and written for the DOM Protocol.
+V3 is being designed to account for partial writes, node outage, replay, concurrent reservations, stale chain state, and a same-height reorganization. It also treats backup corruption, incomplete restore, migration risk, and exact transaction resubmission as first-class engineering problems.
 
-> **Governing rule:** `DOM semantics > Epic strategy`
+The goal is a wallet whose state remains explainable and recoverable after interruption. That requires explicit invariants, durable intent before external effects, deterministic reconciliation, and verification that includes hostile or incomplete inputs.
 
----
+## DOM Sovereignty
 
-## Why DOM Wallet V3?
+DOM Wallet V3 follows only:
 
-A wallet is more than a user interface for sending transactions.
+* DOM consensus.
+* DOM cryptographic primitives.
+* DOM chain ID.
+* DOM transaction and slate formats.
+* DOM fees and weights.
+* DOM coinbase and maturity rules.
+* DOM privacy requirements.
+* DOM backup and recovery contracts.
 
-It is responsible for protecting:
+**DOM semantics > Epic strategy.**
 
-* ownership keys;
-* private transaction contexts;
-* outputs and balances;
-* derivation positions;
-* transaction history;
-* backup integrity;
-* synchronization state;
-* recovery evidence;
-* non-reuse guarantees.
+DOM Wallet V1 and V2 are sources of DOM-specific experience and validated properties. A comparative wallet study may inform protected properties, architectural boundaries, failure handling, recovery methods, and test categories; it does not define protocol behavior, data formats, economics, cryptography, transport, or compatibility for DOM Wallet V3.
 
-A wallet can appear functional while still failing under:
+## Current Project Status
 
-* interrupted writes;
-* node outages;
-* duplicated requests;
-* concurrent transactions;
-* stale chain data;
-* same-height reorganizations;
-* corrupted backups;
-* incomplete restores;
-* migration errors;
-* transaction resubmission;
-* malicious or inconsistent node responses.
+The repository foundation and engineering baseline are complete. The first design pass is complete for the Threat Model, Wallet State Model, Storage and Atomicity, ChainSource and Synchronization, and Reorganization and Rollback specifications. Each remains DRAFT and requires review before implementation.
 
-DOM Wallet V3 is being designed from the beginning to make these behaviors explicit, deterministic, recoverable, and testable.
+Remaining foundational specifications still require a first pass and later review. No wallet crates or functional wallet implementation exist in this repository. Production use, mainnet use, and real-fund use are not authorized.
 
----
+| Specification | Status |
+|---|---|
+| 0000 Design Principles | DRAFT |
+| 0001 Threat Model | DRAFT |
+| 0002 Wallet State Model | DRAFT |
+| 0003 Transaction Lifecycle | PENDING FIRST PASS |
+| 0004 Storage Atomicity | DRAFT |
+| 0005 Chain Source and Sync | DRAFT |
+| 0006 Reorg and Rollback | DRAFT |
+| 0007 Key Derivation and Secrets | PENDING FIRST PASS |
+| 0008 Backup and Recovery | PENDING FIRST PASS |
+| 0009 Economic Rules | PENDING FIRST PASS |
+| 0010 API and Transport Security | PENDING FIRST PASS |
+| 0011 Migration from V2 | PENDING FIRST PASS |
+| 0012 Testing and Assurance | PENDING FIRST PASS |
 
-# DOM Protocol Philosophy
+The authoritative status table is maintained in [Specifications](specs/README.md).
 
-DOM Wallet V3 preserves the philosophy and technical sovereignty of the DOM Protocol.
+## Core Design Principles
 
-The wallet must follow exclusively:
+* **One canonical wallet state.** Identity, accounts, outputs, reservations, transaction records, private contexts, cursor, and recovery evidence share one versioned model.
+* **Explicit state machines.** Valid and invalid transitions are part of the design, not implied by UI flow or database fields.
+* **Atomic durable operations.** A logical action commits as one durable unit of work or remains recoverable as the previous generation.
+* **Crash recovery by design.** Every persistent operation has defined reopen and restart behavior.
+* **Idempotent replay.** Retried requests, scans, restores, and recovery plans cannot create duplicate logical actions.
+* **Height-and-hash chain identity.** A canonical cursor identifies a height and its block hash; a height alone is insufficient.
+* **Reorganization as normal behavior.** Removed receives, spends, maturity, cursor movement, and local intent are reconciled deliberately.
+* **No silent secret reuse.** Allocation and transaction-secret evidence must survive restart, restore, and migration.
+* **Recovery as an architectural requirement.** Backup, full recovery, seed-only limits, and interrupted recovery are designed before implementation.
+* **Least privilege.** Unlock, spending, receiving, backup, administration, and observation have separate capability boundaries.
+* **Deterministic testability.** Time, randomness, source behavior, storage faults, crashes, and reorganizations must be controllable in tests.
 
-* DOM consensus rules;
-* DOM cryptographic primitives;
-* DOM transaction and slate formats;
-* DOM chain identity;
-* DOM fee and weight rules;
-* DOM coinbase and maturity rules;
-* DOM privacy requirements;
-* DOM backup and recovery guarantees.
+## Confirmed V3 Requirement: DOM-W2-SYNC-001
 
-Reference implementations may teach engineering strategies, but they do not define DOM behavior.
+`DOM-W2-SYNC-001` is a confirmed V3 design requirement. Height alone is insufficient to decide whether a wallet is current. The canonical cursor includes both `height` and `block_hash`.
 
-The project does not inherit Epic-specific:
+* A same-height reorganization forces reconciliation.
+* A lower-height canonical view forces reconciliation.
+* A missing, changed, or unverifiable hash forces reconciliation.
+* The cursor and every corresponding wallet-state change commit atomically.
 
-* slate formats;
-* transaction formats;
-* derivation paths;
-* fee formulas;
-* weight formulas;
-* kernel rules;
-* commitment rules;
-* proof-rewind mechanisms;
-* KDF parameters;
-* Tor, Epicbox, or Keybase transports;
-* historical compatibility behavior.
+This rule prevents a height-only shortcut from presenting an outdated canonical view as current. The detailed contract is in [Chain Source and Sync](specs/0005_CHAIN_SOURCE_AND_SYNC.md) and [Reorg and Rollback](specs/0006_REORG_AND_ROLLBACK.md).
 
----
-
-# Core Design Principles
-
-## One canonical wallet state
-
-Outputs, reservations, transactions, private contexts, derivation positions, chain cursors, and recovery events must belong to one coherent, versioned state model.
-
-## Explicit state machines
-
-Every transition must define:
-
-* preconditions;
-* postconditions;
-* invalid transitions;
-* persistent effects;
-* crash behavior;
-* restart behavior;
-* reorganization behavior;
-* required tests.
-
-## Atomic durable operations
-
-A logical operation must not leave only part of its state committed.
-
-For example, send preparation may require a single durable operation covering:
-
-* input reservations;
-* change derivation;
-* transaction record;
-* private transaction context;
-* derivation counters;
-* recovery metadata.
-
-Either the complete operation commits, or none of it becomes active.
-
-## Crash recovery by design
-
-Every persistent operation must define what happens if the process stops:
-
-* before the operation;
-* during the operation;
-* after the local commit;
-* after an external message is sent;
-* after node submission;
-* before the result is recorded.
-
-## Canonical chain identity
-
-Height alone is not sufficient to prove wallet freshness.
-
-DOM Wallet V3 identifies its canonical synchronization position using at least:
-
-```text
-(height, block_hash)
-```
-
-A same-height reorganization, lower-height canonical tip, missing hash, changed hash, or unverifiable hash must force reconciliation.
-
-## Reorganization as normal behavior
-
-Chain reorganizations are expected protocol events, not manual-repair exceptions.
-
-The wallet must support:
-
-* common-ancestor discovery;
-* durable rollback planning;
-* output reclassification;
-* removed receive handling;
-* removed spend handling;
-* transaction reclassification;
-* coinbase maturity recalculation;
-* cursor rewind;
-* canonical replay;
-* restart during reorganization;
-* deterministic convergence.
-
-## No silent secret reuse
-
-Restore, rollback, retry, cancellation, migration, and crash recovery must not cause reuse of:
-
-* nonces;
-* blindings;
-* derivation positions;
-* private transaction contexts;
-* equivalent secret material.
-
-## Recovery is an architectural requirement
-
-Seed-only recovery and full-backup recovery are different products with different guarantees.
-
-The project must explicitly define:
-
-* what a seed can recover;
-* what requires a full backup;
-* what cannot be reconstructed;
-* how derivation positions are preserved;
-* how restores are validated;
-* how cross-chain imports are rejected;
-* how secret reuse is prevented.
-
----
-
-# Project Status
-
-> **Current phase: Foundation and Specification**
-
-DOM Wallet V3 is not currently a production wallet.
-
-The repository does not yet authorize:
-
-* production wallet use;
-* real funds;
-* production seeds;
-* mainnet wallet operation;
-* replacement of DOM Wallet V1 or V2.
-
-Mainnet-capable code paths may be implemented during development, but use with real funds requires:
-
-1. complete specifications;
-2. complete implementation gates;
-3. adversarial and end-to-end verification;
-4. testnet validation;
-5. independent security review;
-6. remediation of applicable findings;
-7. reproducible release artifacts;
-8. explicit project authorization.
-
----
-
-# Target Architecture
+## Target Architecture
 
 ```text
 User interfaces and automation
-              │
-              ▼
-Capability APIs and application services
-              │
-              ▼
-Lifecycle, synchronization and recovery orchestration
-              │
-              ▼
-Canonical DOM Wallet domain model
-              │
-      ┌───────┼────────┬──────────────┐
-      ▼       ▼        ▼              ▼
-   Crypto   Storage  ChainSource   Transport ports
-      │       │        │              │
-      └───────┴────────┴──────────────┘
-              │
-              ▼
-        DOM Protocol adapters
+            ↓
+      Capability APIs
+            ↓
+Lifecycle, synchronization, and recovery
+            ↓
+      Canonical domain model
+            ↓
+Crypto, storage, ChainSource, and transport ports
+            ↓
+       DOM Protocol adapters
 ```
 
-Higher-level interfaces may depend on domain contracts.
+Dependencies point inward. User interfaces, automation, concrete storage, nodes, and transports adapt to domain contracts; the canonical domain model does not depend on a CLI, UI, HTTP service, or a concrete node implementation. DOM protocol adapters provide the selected consensus and cryptographic behavior at the boundary without allowing external infrastructure to redefine wallet rules.
 
-Domain rules must not depend on:
+## Planned Workspace
 
-* CLI;
-* HTTP;
-* GUI;
-* database brands;
-* concrete node clients;
-* transport implementations;
-* runtime frameworks.
+The following crates are planned, but none has been introduced. A crate may be added only after its governing specifications are accepted.
 
----
+| Planned crate | Intended responsibility |
+|---|---|
+| `dom-wallet-domain` | Canonical state, invariants, and domain transitions. |
+| `dom-wallet-crypto` | DOM-native wallet cryptographic boundaries. |
+| `dom-wallet-storage` | Encrypted durable units of work and recovery. |
+| `dom-wallet-chain-source` | Transport-independent canonical-chain evidence. |
+| `dom-wallet-sync` | Initial, incremental, and full reconciliation. |
+| `dom-wallet-reorg` | Evidence-based rollback and replay. |
+| `dom-wallet-lifecycle` | Send, receive, finalize, submit, and cancellation contracts. |
+| `dom-wallet-backup` | Backup and recovery orchestration. |
+| `dom-wallet-node` | DOM Protocol node adapters. |
+| `dom-wallet-api` | Capability-oriented interfaces. |
+| `dom-wallet-cli` | Command-line interaction and diagnostics. |
+| `dom-wallet-testkit` | Deterministic test controls and integration support. |
 
-# Planned Workspace
+## Target Capabilities
 
-```text
-dom-wallet-v3/
-├── crates/
-│   ├── dom-wallet-domain/
-│   ├── dom-wallet-crypto/
-│   ├── dom-wallet-storage/
-│   ├── dom-wallet-chain-source/
-│   ├── dom-wallet-sync/
-│   ├── dom-wallet-reorg/
-│   ├── dom-wallet-lifecycle/
-│   ├── dom-wallet-backup/
-│   ├── dom-wallet-node/
-│   ├── dom-wallet-api/
-│   ├── dom-wallet-cli/
-│   └── dom-wallet-testkit/
-├── specs/
-├── docs/
-├── tests/
-│   ├── integration/
-│   ├── e2e/
-│   ├── restart/
-│   ├── reorg/
-│   ├── migration/
-│   └── adversarial/
-├── fuzz/
-├── scripts/
-├── examples/
-├── reports/
-└── .github/workflows/
-```
+When governing specifications are accepted and implementation gates permit it, the architecture is intended to support:
 
-Crates will be introduced only after their contracts and dependency directions are approved.
-
----
-
-# Planned Capabilities
-
-## Wallet lifecycle
-
-* wallet creation;
-* safe open and close;
-* lock and unlock;
-* credential rotation;
-* integrity validation;
-* restart recovery.
-
-## Accounts and derivation
-
-* versioned accounts;
-* domain-separated derivation;
-* independent coinbase, receive, and change domains;
-* monotonic derivation positions;
-* non-reuse evidence;
-* migration-safe counters.
-
-## Outputs and balances
-
-* canonical output detection;
-* confirmation;
-* maturity;
-* reservation;
-* spending;
-* rollback;
-* historical retention;
-* derived balance views.
-
-Planned balance views include:
-
-* total;
-* confirmed;
-* spendable;
-* locked;
-* immature;
-* pending incoming;
-* pending outgoing;
-* reorganization-provisional.
-
-## Transactions
-
-* draft;
-* preparation;
-* input reservation;
-* participant exchange;
-* finalization;
-* durable submission intent;
-* node submission;
-* mempool observation;
-* canonical confirmation;
-* cancellation;
-* expiration;
-* repost;
-* rollback;
-* reorganization reclassification.
-
-## Synchronization
-
-* initial scan;
-* incremental synchronization;
-* bounded pagination;
-* stable chain views;
-* source switching;
-* interrupted-scan recovery;
-* canonical reconciliation;
-* same-height reorganization detection;
-* lower-height rollback;
-* full rescan.
-
-## Backup and recovery
-
-* versioned full backups;
-* authenticated encryption;
-* chain-bound metadata;
-* consistent-generation snapshots;
-* staged restore;
-* seed-only recovery;
+* wallet lifecycle and account management;
+* outputs and derived balance views;
+* send and receive lifecycle handling;
+* canonical synchronization and reconciliation;
+* reorganization detection, rollback, and replay;
+* chain-bound backup;
+* seed-only recovery with explicitly limited guarantees;
 * full-backup recovery;
-* post-restore validation;
-* cross-chain rejection;
-* derivation non-reuse verification.
+* DOM Wallet V2 migration;
+* capability-oriented APIs;
+* CLI workflows and redacted diagnostics.
 
-## Migration
+This list is a design target, not a statement of currently available functionality.
 
-* DOM Wallet V2 dry-run;
-* source validation;
-* staged conversion;
-* canonical chain reconciliation;
-* derivation-floor calculation;
-* difference report;
-* activation or rollback;
-* post-migration backup and restore.
-
----
+## Security Model
 
-# Security Model
+The security model protects critical secrets, integrity-critical wallet state, availability-critical recovery state, and privacy assets such as output ownership, balances, transaction links, derivation positions, and source-query metadata. It considers remote callers, narrower-capability callers, malicious or stale sources, replaying peers, concurrent local processes, storage corruption or rollback, backup theft, and resource exhaustion.
 
-DOM Wallet V3 must protect:
+The design requires chain binding, authenticated encrypted state, non-reuse evidence, least privilege, bounded source work, redacted diagnostics, and fail-closed recovery where evidence is incomplete. Authentication of a source does not itself prove the validity of its data.
 
-* root seed;
-* private keys;
-* blindings;
-* nonces;
-* private transaction contexts;
-* passwords;
-* authentication credentials;
-* output ownership;
-* balances;
-* transaction metadata;
-* derivation state;
-* backups;
-* canonical synchronization state.
-
-The project is designed to resist or safely handle:
-
-* malformed input;
-* replay;
-* duplicate requests;
-* concurrent reservations;
-* malicious or stale nodes;
-* same-height reorganizations;
-* partial storage writes;
-* database corruption;
-* backup theft;
-* cross-chain substitution;
-* resource exhaustion;
-* credential misuse;
-* secret leakage;
-* migration inconsistencies;
-* dependency and build-system compromise.
-
-See [SECURITY.md](SECURITY.md) for the vulnerability-reporting policy.
-
----
-
-# Verification Strategy
-
-A feature is not complete because its happy path works.
-
-DOM Wallet V3 requires multiple verification layers.
-
-## Unit tests
-
-For:
-
-* predicates;
-* state transitions;
-* canonical encoding;
-* parsers;
-* economics;
-* error mapping.
-
-## Property tests
-
-For:
-
-* balance decomposition;
-* reservation uniqueness;
-* serialization round trips;
-* synchronization idempotency;
-* derivation monotonicity;
-* secret non-reuse;
-* rollback and replay convergence.
-
-## Model-based tests
-
-Generated command sequences will be compared against a simpler executable reference model.
-
-## Restart tests
-
-Every durable operation must be interrupted:
-
-* before commit;
-* during commit;
-* after commit;
-* before an external action;
-* after an external action;
-* before result persistence.
+See the [Threat Model](specs/0001_THREAT_MODEL.md), [Wallet State Model](specs/0002_WALLET_STATE_MODEL.md), and [Storage and Atomicity](specs/0004_STORAGE_ATOMICITY.md).
 
-## Reorganization tests
+## Verification Strategy
 
-Including:
+V3 verification is planned as a layered program rather than a single happy-path test suite:
 
-* same-height reorganization;
-* lower-height canonical tip;
-* repeated reorganization;
-* deep bounded reorganization;
-* reorganization during rollback;
-* source switching;
-* no-common-ancestor fallback.
-
-## End-to-end tests
-
-Including:
+* unit tests for transitions, boundaries, and invalid inputs;
+* property tests for state invariants, allocation non-reuse, idempotency, and reconciliation equivalence;
+* an executable state model used to compare implementation behavior with the specified model;
+* restart tests for every durable operation and recovery phase;
+* reorganization tests, including same-height and lower-height cases;
+* concurrency tests for expected-generation conflicts and reservation uniqueness;
+* corruption and truncation tests for persisted and backup data;
+* fuzzing of framing, canonical records, source replies, and recovery plans;
+* integration tests for storage, source switching, restore, and lifecycle boundaries;
+* multi-node and multi-wallet end-to-end tests after implementation exists.
 
-* multiple wallets;
-* multiple DOM nodes;
-* complete send and receive flow;
-* node restart;
-* wallet restart;
-* synchronization;
-* reorganization;
-* backup;
-* restore;
-* V2 migration.
+The required test categories for the completed specifications are recorded in the corresponding specification documents.
 
-## Fuzzing
-
-Planned fuzz targets include:
-
-* API payloads;
-* transaction messages;
-* backup containers;
-* storage records;
-* migration parsers;
-* ChainSource responses;
-* canonical decoders;
-* state-machine command sequences.
+## Implementation Gates
 
----
+| Gate | Status | Evidence |
+|---|---|---|
+| Gate 0 — Foundation baseline | COMPLETE | Engineering baseline and repository foundation are recorded. |
+| Gate 1 — Foundational specifications | IN PROGRESS | Five first-pass specifications are DRAFT; remaining first passes and reviews are required. |
+| Gate 2 — State-model acceptance | NOT STARTED | Requires accepted governing specifications. |
+| Gate 3 — Storage and crash-recovery acceptance | NOT STARTED | Requires accepted persistence and recovery design. |
+| Gate 4 — Chain-source and sync acceptance | NOT STARTED | Requires accepted canonical-view contract. |
+| Gate 5 — Reorg and rollback acceptance | NOT STARTED | Requires accepted rollback and convergence design. |
+| Gate 6 — Secrets and backup acceptance | NOT STARTED | Requires accepted secret and recovery specifications. |
+| Gate 7 — Economics and lifecycle acceptance | NOT STARTED | Requires accepted DOM economics and lifecycle specifications. |
+| Gate 8 — Interface and transport acceptance | NOT STARTED | Requires accepted capability and transport specifications. |
+| Gate 9 — Migration acceptance | NOT STARTED | Requires accepted DOM Wallet V2 migration specification. |
+| Gate 10 — Implementation introduction | NOT STARTED | Requires prior accepted gates and approved crate boundaries. |
+| Gate 11 — Verification completion | NOT STARTED | Requires implementation and required test evidence. |
+| Gate 12 — Independent review | NOT STARTED | Requires completed implementation and review scope. |
+| Gate 13 — Operational authorization | NOT STARTED | Requires all applicable safety and release gates. |
 
-# Implementation Gates
+## Specifications and Documentation
 
-DOM Wallet V3 follows dependency-ordered gates rather than calendar estimates.
+* [Specification index](specs/README.md)
+* [Architecture foundation](docs/ARCHITECTURE.md)
+* [Engineering sources](docs/ENGINEERING_SOURCES.md)
+* [Reference baseline](docs/REFERENCE_BASELINE.md)
+* [Adoption matrix](docs/EPIC_DOM_ADOPTION_MATRIX.md)
+* [Confirmed design inputs](docs/CONFIRMED_DESIGN_INPUTS.md)
+* [Specification gate](docs/SPECIFICATION_GATE.md)
+* [Foundational specifications pass 1](reports/FOUNDATIONAL_SPECIFICATIONS_PASS1.md)
 
-| Gate    | Scope                                           |
-| ------- | ----------------------------------------------- |
-| Gate 0  | Repository foundation and engineering baselines |
-| Gate 1  | Accepted foundational specifications            |
-| Gate 2  | Domain model and deterministic testkit          |
-| Gate 3  | Cryptography and durable storage                |
-| Gate 4  | ChainSource and synchronization                 |
-| Gate 5  | Reorganization and rollback                     |
-| Gate 6  | Transaction lifecycle                           |
-| Gate 7  | Backup and recovery                             |
-| Gate 8  | APIs, CLI, and transports                       |
-| Gate 9  | DOM Wallet V2 migration                         |
-| Gate 10 | Local/regtest DOM integration                   |
-| Gate 11 | Testnet preview                                 |
-| Gate 12 | Independent security review                     |
-| Gate 13 | Audited operational release                     |
+## Engineering References
 
-Each gate must produce reproducible evidence tied to an exact commit.
+DOM Wallet V1 and V2 provide DOM-specific experience, validated behavior, chain-ID protections, backup mechanisms, transaction-format knowledge, and known failure cases. Existing DOM components are retained only after validation for V3.
 
----
+Epic Wallet contributes protected properties and engineering lessons concerning architecture, failure handling, recovery, and verification categories. No Epic implementation is copied, and no Epic protocol behavior becomes authoritative for DOM.
 
-# Specifications
+The source hierarchy and adoption constraints are documented in [Engineering Sources](docs/ENGINEERING_SOURCES.md), [Reference Baseline](docs/REFERENCE_BASELINE.md), and the [Adoption Matrix](docs/EPIC_DOM_ADOPTION_MATRIX.md).
 
-The normative project specifications live in [`specs/`](specs/).
+## Building
 
-Planned specifications include:
+No functional wallet implementation exists yet. The current workspace is a specification foundation and declares no member crates, so there is no wallet binary, library, or test suite to run.
 
-* Design Principles
-* Threat Model
-* Wallet State Model
-* Transaction Lifecycle
-* Storage and Atomicity
-* ChainSource and Synchronization
-* Reorganization and Rollback
-* Key Derivation and Secret Handling
-* Backup and Recovery
-* Economic Rules
-* API and Transport Security
-* Migration from DOM Wallet V2
-* Testing and Assurance
+The currently valid repository manifest check is:
 
-Implementation must not silently replace unresolved specification decisions.
+```bash
+cargo metadata --no-deps
+```
 
----
-
-# Engineering References
-
-DOM Wallet V3 uses two primary sources of engineering knowledge.
-
-## DOM Wallet V1 and V2
-
-They provide DOM-specific experience involving:
-
-* consensus integration;
-* cryptographic primitives;
-* chain ID;
-* transaction and slate formats;
-* fee and weight rules;
-* coinbase behavior;
-* backups;
-* node integration;
-* known failures;
-* validated tests.
-
-Existing DOM behavior is not migrated automatically.
-
-Each component must be classified as:
-
-* retained;
-* adapted;
-* independently reimplemented;
-* rejected.
-
-## Epic Wallet
-
-Epic Wallet is studied as a mature reference for:
-
-* architectural separation;
-* storage and lifecycle contracts;
-* transaction-context persistence;
-* output reconciliation;
-* API privilege separation;
-* failure handling;
-* recovery;
-* test organization.
-
-Epic Wallet is not the source-code base, protocol specification, or compatibility target for DOM Wallet V3.
-
-See:
-
-* [`docs/REFERENCE_BASELINE.md`](docs/REFERENCE_BASELINE.md)
-* [`docs/ENGINEERING_SOURCES.md`](docs/ENGINEERING_SOURCES.md)
-* [`docs/EPIC_DOM_ADOPTION_MATRIX.md`](docs/EPIC_DOM_ADOPTION_MATRIX.md)
-* [`docs/CONFIRMED_DESIGN_INPUTS.md`](docs/CONFIRMED_DESIGN_INPUTS.md)
-
----
-
-# Building
-
-There is currently no functional wallet implementation to build.
-
-The repository is in the specification and architecture phase.
-
-When the first crates are introduced, the expected development workflow will include:
+`cargo metadata --no-deps` verifies the declared workspace manifest. The workspace has no Rust targets yet, so `cargo fmt --check` currently reports that it cannot find targets. The command is retained below as the formatting check that will become applicable when Rust source is introduced; it is not evidence of a built wallet or executed wallet tests.
 
 ```bash
 cargo fmt --check
-cargo check --workspace --all-targets
-cargo clippy --workspace --all-targets
-cargo test --workspace
 ```
 
-Additional security and verification commands will be documented as their corresponding gates are introduced.
+## Contributing
 
----
+Contributions follow a specification-first process: identify the governing specification, preserve DOM sovereignty, make invariants and failure behavior explicit, and define reproducible verification before implementation work begins.
 
-# Contributing
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before proposing or making changes.
 
-The project follows a specification-first process.
+## Authorship
 
-Before implementing a feature:
-
-1. identify the protected property;
-2. define the invariant;
-3. update or create the specification;
-4. define acceptance criteria;
-5. define tests;
-6. implement the smallest DOM-native solution;
-7. run the required gates;
-8. review the evidence.
-
-All repository artifacts must be written in English.
-
-See [CONTRIBUTING.md](CONTRIBUTING.md).
-
----
-
-# Authorship
-
-All commits and repository artifacts identify:
-
-```text
 Soren Planck <sorenplanck@tutamail.com>
-```
 
-`Co-authored-by` trailers and automated-tool attribution are prohibited.
+Commit trailers naming a second author and automated-tool attribution are prohibited.
 
----
+## License
 
-# License
+No license has been selected yet. No reuse rights are implied until a LICENSE file exists.
 
-A project license has not yet been selected.
-
-The license decision must consider:
-
-* compatibility with the DOM Protocol;
-* dependency licenses;
-* patent provisions;
-* contribution policy;
-* redistribution objectives;
-* attribution requirements.
-
-See [`docs/LICENSE_DECISION.md`](docs/LICENSE_DECISION.md).
-
----
-
-<div align="center">
-
-## DOM Wallet V3
-
-**Secure state. Deterministic recovery. Native DOM sovereignty.**
-
-</div>
+<p align="center">
+  <strong>DOM Wallet V3</strong><br>
+  Secure state. Deterministic recovery. Native DOM sovereignty.
+</p>

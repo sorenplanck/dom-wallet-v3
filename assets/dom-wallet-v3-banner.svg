@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="480" viewBox="0 0 1600 480" role="img" aria-labelledby="title description">
+  <title id="title">DOM Wallet V3</title>
+  <desc id="description">A dark technical banner with an abstract protected-state motif, canonical chain continuity, and synchronization lines.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#050a14"/>
+      <stop offset="0.5" stop-color="#081827"/>
+      <stop offset="1" stop-color="#07111f"/>
+    </linearGradient>
+    <linearGradient id="spectrum" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#25d366"/>
+      <stop offset="0.36" stop-color="#14b8a6"/>
+      <stop offset="0.7" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#3b82f6"/>
+    </linearGradient>
+    <linearGradient id="motif" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#34d399"/>
+      <stop offset="0.5" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#2563eb"/>
+    </linearGradient>
+    <radialGradient id="halo" cx="50%" cy="50%" r="50%">
+      <stop offset="0" stop-color="#14b8a6" stop-opacity="0.24"/>
+      <stop offset="1" stop-color="#14b8a6" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0V40" fill="none" stroke="#89a8c9" stroke-opacity="0.065" stroke-width="1"/>
+    </pattern>
+    <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="8" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="softGlow" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="18"/>
+    </filter>
+  </defs>
+
+  <rect width="1600" height="480" fill="url(#background)"/>
+  <rect width="1600" height="480" fill="url(#grid)"/>
+  <ellipse cx="280" cy="244" rx="285" ry="265" fill="url(#halo)"/>
+  <ellipse cx="1230" cy="36" rx="420" ry="150" fill="#0ea5e9" fill-opacity="0.055" filter="url(#softGlow)"/>
+
+  <g fill="none" stroke="url(#spectrum)" stroke-linecap="round">
+    <path d="M64 328H166L216 278H338L392 224H494" stroke-opacity="0.22" stroke-width="2"/>
+    <path d="M70 370H188L238 320H350L400 270H504" stroke-opacity="0.12" stroke-width="1.5"/>
+    <path d="M1076 128H1188L1232 172H1344L1400 228H1536" stroke-opacity="0.20" stroke-width="2"/>
+    <path d="M1080 176H1172L1218 222H1326L1382 278H1528" stroke-opacity="0.11" stroke-width="1.5"/>
+    <path d="M964 372H1088L1130 330H1242L1288 284H1530" stroke-opacity="0.16" stroke-width="2"/>
+  </g>
+
+  <g fill="#22d3ee">
+    <circle cx="166" cy="328" r="4"/>
+    <circle cx="392" cy="224" r="4"/>
+    <circle cx="1188" cy="128" r="4"/>
+    <circle cx="1400" cy="228" r="4"/>
+    <circle cx="1130" cy="330" r="4"/>
+    <circle cx="1288" cy="284" r="4"/>
+  </g>
+
+  <g transform="translate(112 88)">
+    <circle cx="160" cy="152" r="145" fill="#071827" fill-opacity="0.74" stroke="#1f4967" stroke-width="1.5"/>
+    <circle cx="160" cy="152" r="121" fill="none" stroke="url(#spectrum)" stroke-opacity="0.4" stroke-width="1.5" stroke-dasharray="2 9"/>
+    <circle cx="160" cy="152" r="97" fill="url(#halo)"/>
+    <path d="M160 42L252 94V202L160 256L68 202V94Z" fill="#061523" stroke="url(#motif)" stroke-width="4" filter="url(#glow)"/>
+    <path d="M160 69L229 108V188L160 229L91 188V108Z" fill="none" stroke="#75f5d0" stroke-opacity="0.65" stroke-width="1.5"/>
+    <path d="M160 84V213M111 123L209 180M209 123L111 180" stroke="url(#motif)" stroke-width="3" stroke-linecap="round"/>
+    <circle cx="160" cy="152" r="23" fill="#071827" stroke="#bbf7d0" stroke-width="2"/>
+    <path d="M151 152L158 159L172 143" fill="none" stroke="#bbf7d0" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+    <g fill="#bcfdf1" filter="url(#glow)">
+      <circle cx="160" cy="84" r="5"/>
+      <circle cx="209" cy="123" r="5"/>
+      <circle cx="209" cy="180" r="5"/>
+      <circle cx="160" cy="213" r="5"/>
+      <circle cx="111" cy="180" r="5"/>
+      <circle cx="111" cy="123" r="5"/>
+    </g>
+  </g>
+
+  <g transform="translate(530 128)">
+    <rect x="0" y="0" width="820" height="2" rx="1" fill="url(#spectrum)"/>
+    <text x="0" y="96" fill="#f1f8ff" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="66" font-weight="700" letter-spacing="7">DOM WALLET V3</text>
+    <text x="3" y="144" fill="#a9c5d9" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="23" font-weight="500" letter-spacing="0.45">Secure state. Deterministic recovery. Native DOM sovereignty.</text>
+    <g transform="translate(2 187)" fill="none" stroke-linecap="round">
+      <path d="M0 0H62L86 24H148L172 0H244L268 24H330" stroke="#2dd4bf" stroke-opacity="0.8" stroke-width="2"/>
+      <path d="M350 24H416L440 0H502L526 24H590L614 0H690" stroke="#38bdf8" stroke-opacity="0.7" stroke-width="2"/>
+      <circle cx="86" cy="24" r="4" fill="#5eead4"/>
+      <circle cx="268" cy="24" r="4" fill="#5eead4"/>
+      <circle cx="440" cy="0" r="4" fill="#7dd3fc"/>
+      <circle cx="614" cy="0" r="4" fill="#7dd3fc"/>
+    </g>
+    <text x="2" y="249" fill="#5d8199" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="14" font-weight="600" letter-spacing="3">SPECIFICATION-FIRST  /  DOM-NATIVE  /  RECOVERY-ORIENTED</text>
+  </g>
+
+  <path d="M0 478H1600" stroke="url(#spectrum)" stroke-opacity="0.55" stroke-width="2"/>
+</svg>
