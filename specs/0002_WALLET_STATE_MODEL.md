@@ -1,6 +1,6 @@
 # DOM Wallet V3 Canonical Wallet State Model
 
-**Status:** DRAFT
+**Status:** REVIEW
 **Owner:** Soren Planck
 
 ## Purpose and scope

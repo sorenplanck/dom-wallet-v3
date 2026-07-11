@@ -48,27 +48,27 @@ DOM Wallet V1 and V2 are sources of DOM-specific experience and validated proper
 
 ## Current Project Status
 
-The repository foundation and engineering baseline are complete. The first design pass and adversarial cross-review are complete for specifications 0001 through 0012. All thirteen foundational specifications remain DRAFT because 23 BLOCKING decisions, including high-severity envelope, stable-view, rollback, and economic-authority decisions, require approved DOM or project evidence before REVIEW promotion.
+The repository foundation and engineering baseline are complete. The first design pass, adversarial cross-review, and Blocker Closure Pass 1 are complete. Six foundational specifications are in REVIEW and seven remain DRAFT because three BLOCKING decisions require DOM protocol, cryptographic, or implementation proof.
 
 No wallet crates or functional wallet implementation exist in this repository. Production use, mainnet use, and real-fund use are not authorized.
 
 | Specification | Status |
 |---|---|
-| 0000 Design Principles | DRAFT |
-| 0001 Threat Model | DRAFT |
-| 0002 Wallet State Model | DRAFT |
+| 0000 Design Principles | REVIEW |
+| 0001 Threat Model | REVIEW |
+| 0002 Wallet State Model | REVIEW |
 | 0003 Transaction Lifecycle | DRAFT |
-| 0004 Storage Atomicity | DRAFT |
+| 0004 Storage Atomicity | REVIEW |
 | 0005 Chain Source and Sync | DRAFT |
 | 0006 Reorg and Rollback | DRAFT |
 | 0007 Key Derivation and Secrets | DRAFT |
 | 0008 Backup and Recovery | DRAFT |
-| 0009 Economic Rules | DRAFT |
+| 0009 Economic Rules | REVIEW |
 | 0010 API and Transport Security | DRAFT |
 | 0011 Migration from V2 | DRAFT |
-| 0012 Testing and Assurance | DRAFT |
+| 0012 Testing and Assurance | REVIEW |
 
-The authoritative status table is maintained in [Specifications](specs/README.md). The review evidence is recorded in the [Consistency Matrix](docs/SPECIFICATION_CONSISTENCY_MATRIX.md), [Decision Register](docs/FOUNDATIONAL_DECISION_REGISTER.md), and [Cross Review Report](reports/FOUNDATIONAL_SPECIFICATIONS_CROSS_REVIEW.md).
+The authoritative status table is maintained in [Specifications](specs/README.md). The review evidence is recorded in the [Consistency Matrix](docs/SPECIFICATION_CONSISTENCY_MATRIX.md), [Decision Register](docs/FOUNDATIONAL_DECISION_REGISTER.md), [Cross Review Report](reports/FOUNDATIONAL_SPECIFICATIONS_CROSS_REVIEW.md), and [Blocker Closure Pass 1](reports/FOUNDATIONAL_BLOCKER_CLOSURE_PASS1.md).
 
 ## Core Design Principles
 
@@ -180,7 +180,7 @@ The required test categories for the completed specifications are recorded in th
 | Gate | Status | Evidence |
 |---|---|---|
 | Gate 0 — Foundation baseline | COMPLETE | Engineering baseline and repository foundation are recorded. |
-| Gate 1 — Foundational specifications | IN PROGRESS | All first passes and the adversarial cross-review are complete; 23 BLOCKING decisions keep all specifications DRAFT pending approved evidence, REVIEW promotion, and ACCEPTED status. |
+| Gate 1 — Foundational specifications | IN PROGRESS | First passes, cross-review, and Blocker Closure Pass 1 are complete; 3 BLOCKING decisions keep 7 specifications DRAFT pending approved evidence, REVIEW promotion, and ACCEPTED status. |
 | Gate 2 — State-model acceptance | NOT STARTED | Requires accepted governing specifications. |
 | Gate 3 — Storage and crash-recovery acceptance | NOT STARTED | Requires accepted persistence and recovery design. |
 | Gate 4 — Chain-source and sync acceptance | NOT STARTED | Requires accepted canonical-view contract. |
@@ -208,6 +208,7 @@ The required test categories for the completed specifications are recorded in th
 * [Specification consistency matrix](docs/SPECIFICATION_CONSISTENCY_MATRIX.md)
 * [Foundational decision register](docs/FOUNDATIONAL_DECISION_REGISTER.md)
 * [Foundational cross review](reports/FOUNDATIONAL_SPECIFICATIONS_CROSS_REVIEW.md)
+* [Foundational blocker closure pass 1](reports/FOUNDATIONAL_BLOCKER_CLOSURE_PASS1.md)
 
 ## Engineering References
 

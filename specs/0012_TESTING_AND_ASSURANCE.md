@@ -1,6 +1,6 @@
 # DOM Wallet V3 Testing and Assurance
 
-**Status:** DRAFT
+**Status:** REVIEW
 **Owner:** Soren Planck
 
 ## Purpose and scope

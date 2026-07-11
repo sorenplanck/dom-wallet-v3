@@ -3,6 +3,8 @@
 **Owner:** Soren Planck
 **Review date:** 2026-07-11
 
+**Closure Pass 1:** DEC-ECON-BLOCK-WEIGHT is resolved from current DOM consensus code and tests; remaining blocker references are DEC-ROLLBACK-PROTECTION, DEC-STABLE-VIEW, and DEC-V3-SECRET-DOMAINS.
+
 | Subject | Authority | Dependents and records | Atomicity, restart, reorg, migration, and security rule | Evidence and decisions | Verdict |
 |---|---|---|---|---|---|
 | Identity, account, generation | 0002 | All specifications; WalletIdentity, AccountId, Generation | Chain-bound immutable identity; one expected-generation DUW; restore and migration validate before activation. | State invariant tests; DEC-ACCOUNT-POLICY | CONFIRMED_CONSISTENT |

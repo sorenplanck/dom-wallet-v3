@@ -1,6 +1,6 @@
 # DOM Wallet V3 Storage and Atomicity
 
-**Status:** DRAFT
+**Status:** REVIEW
 **Owner:** Soren Planck
 
 ## Purpose and scope

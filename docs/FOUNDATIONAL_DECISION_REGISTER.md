@@ -43,3 +43,14 @@ The inventory deduplicates substantive decision markers in the Pass 2 report and
 ## Consequences
 
 BLOCKING decisions prevent implementation of their affected contracts and keep affected specifications DRAFT. RESOLVED decisions are applied in the cited specifications. Every decision preserves ChainId binding, non-reuse, old-or-new durability, rollback safety, and redacted recovery evidence; no Epic protocol behavior is selected.
+
+## Blocker Closure Pass 1
+
+Initial blocker verdicts are REFUTED as REVIEW blockers for DEC-API-CREDENTIALS, DEC-ZEROIZATION, DEC-ACCOUNT-POLICY, DEC-RESERVATION-LIFETIME, DEC-CANONICAL-SERIALIZATION, DEC-BACKEND-DURABILITY, DEC-MIGRATION-RETENTION, DEC-INDEPENDENT-SOURCES, DEC-RESCAN-BOUNDARY, DEC-REORG-BUDGET, DEC-PROVISIONAL-UX, DEC-LIFECYCLE-PARTICIPANT-WIRE, DEC-V3-SECRET-DOMAINS, DEC-CRYPTO-ENVELOPE-BINDING, DEC-KDF-UPGRADE, DEC-BACKUP-FORMAT, DEC-ECON-WALLET-POLICY, DEC-API-DEPLOYMENT, DEC-MIGRATION-MATRIX, and DEC-ASSURANCE-RELEASE. Their complete contracts are now RESOLVED by conservative wallet policy, current DOM compatibility behavior, or later implementation and assurance gates. DEC-ROLLBACK-PROTECTION and DEC-STABLE-VIEW are CONFIRMED initially but RESOLVED for the REVIEW gate by fail-closed local policy; cross-device monotonic-witness proof and V3 StableView wire construction remain Gate 10 implementation constraints rather than incomplete specification contracts. DEC-ECON-BLOCK-WEIGHT is CONFIRMED and remains BLOCKING under DOM_PROTOCOL.
+
+| Closure category | Final count | Contract |
+|---|---:|---|
+| RESOLVED | 29 | Conservative defaults, explicit fail-closed limits, read-only finite V2 recognition, current DOM envelope compatibility, and later-gate proof separation make the foundational contracts reviewable. |
+| BLOCKING | 1 | DEC-ECON-BLOCK-WEIGHT remains HIGH because conflicting normative DOM RFC statements cannot be selected by wallet policy. |
+
+Ownership reassessment: WALLET_POLICY 0 remaining; DOM_PROTOCOL 1 remaining; CRYPTOGRAPHIC_REVIEW 0 remaining; V2_MIGRATION_EVIDENCE 0 remaining; IMPLEMENTATION_PROOF 0 remaining; ASSURANCE_GATE 0 remaining. The remaining blocker requires a corrected or superseding DOM RFC and a consensus regression vector. Required later evidence for resolved contracts remains in their acceptance criteria and Gates 10 through 12; it is not claimed executed.

@@ -1,6 +1,6 @@
 # DOM Wallet V3 Design Principles
 
-**Status:** DRAFT
+**Status:** REVIEW
 **Owner:** Soren Planck
 
 ## Scope, authority, and review boundary

@@ -1,6 +1,6 @@
 # DOM Wallet V3 Economic Rules
 
-**Status:** DRAFT
+**Status:** REVIEW
 **Owner:** Soren Planck
 
 ## Purpose and scope
@@ -35,7 +35,7 @@ An output is eligible only when the exact 0002 spendable predicate holds: active
 
 ## Valid behavior
 
-For deterministic tests, selection MUST use a declared stable ordering and bounded search. Production policy SHOULD consider privacy and avoid leaking unnecessary deterministic behavior, while retaining a reproducible policy version and bounded work. The plan MAY prefer exact spend, then permitted no-change, then a permitted number of change outputs, but it MUST use authoritative DOM economics for every candidate.
+For deterministic tests, selection MUST order candidates by descending value and then DOM commitment reference, use checked accumulation, and stop at declared consensus and wallet work bounds. Wallet policy permits exact spend with no change; otherwise it creates exactly one positive change output. Production policy MAY use a recorded privacy ordering only when it remains bounded and produces an equivalent valid economic plan. It MUST use authoritative DOM economics for every candidate.
 
 Insufficient funds means no bounded eligible candidate satisfies amount plus the authoritative fee. It is distinct from a malformed request, immature funds, policy rejection, source uncertainty, or consensus invalidity. Dust treatment, maximum inputs, maximum outputs, fee preference range, and allowed change cardinality derive from approved DOM evidence; where authority conflicts or is absent, the wallet returns a blocking-policy result rather than selecting a rule.
 
@@ -83,9 +83,4 @@ Promotion requires a traceable DOM authority matrix for every implemented fee, w
 
 Dependencies are 0001, 0002, 0003, 0004, 0005, 0006, and 0012.
 
-The approved DOM rule matrix for dust, change cardinality, selection bounds, fee preferences, input and output limits, and any conflicting RFC, implementation, or test evidence remains unresolved until direct authority review. No foreign rule fills these gaps.
-
-## Review Blockers
-
-* DEC-ECON-BLOCK-WEIGHT
-* DEC-ECON-WALLET-POLICY
+Current DOM consensus code and validation tests control fee, weight, maturity, input/output limits, and coinbase treatment. The wallet policy above controls selection ordering and change strategy only; it MUST NOT invent a dust threshold. A future conflicting authority is rejected until the governing DOM source is corrected or superseded.
