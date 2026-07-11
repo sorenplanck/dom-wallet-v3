@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>DOM Wallet V3</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <main class="shell">
+      <header class="masthead">
+        <div><span class="symbol">DOM</span><h1>DOM Wallet V3</h1></div>
+        <p id="network-identity" class="identity">No wallet open</p>
+      </header>
+      <p class="notice">Experimental foundation. Community review is open; this status never disables wallet or network functionality.</p>
+      <nav aria-label="Wallet navigation">
+        <button data-screen="onboarding">Wallet</button><button data-screen="dashboard">Dashboard</button>
+        <button data-screen="node">Node</button><button data-screen="diagnostics">Diagnostics</button>
+      </nav>
+      <section id="status" class="status" aria-live="polite">Starting desktop shell…</section>
+      <section id="onboarding" class="screen">
+        <h2>Open or create a wallet</h2>
+        <form id="create-form"><label>Wallet directory <input name="path" autocomplete="off" required></label><label>Network <select name="network"><option>PRIVATE_TESTNET</option><option>PUBLIC_TESTNET</option><option>MAINNET</option></select></label><label>Chain ID <input name="chain_id" pattern="[0-9a-f]{64}" required></label><label>Genesis hash <input name="genesis_id" pattern="[0-9a-f]{64}" required></label><label>Password <input name="password" type="password" autocomplete="new-password" required></label><button>Create wallet</button></form>
+        <form id="open-form"><label>Wallet directory <input name="path" autocomplete="off" required></label><button>Open wallet</button></form>
+        <form id="unlock-form"><label>Password <input name="password" type="password" autocomplete="current-password" required></label><button>Unlock</button></form>
+      </section>
+      <section id="dashboard" class="screen" hidden>
+        <h2>Account overview</h2><div id="balance-cards" class="cards"></div><p id="sync-status">Synchronization is not started.</p>
+        <button id="sync">Synchronize</button><button id="lock">Lock wallet</button>
+      </section>
+      <section id="node" class="screen" hidden>
+        <h2>Node configuration</h2><p id="node-status">No node configuration is exposed to the interface.</p>
+        <button id="probe">Probe configured node</button>
+      </section>
+      <section id="diagnostics" class="screen" hidden><h2>Diagnostics</h2><pre id="diagnostics-output">Redacted diagnostics only.</pre></section>
+    </main>
+    <script type="module" src="main.js"></script>
+  </body>
+</html>

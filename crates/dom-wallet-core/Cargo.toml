@@ -1,0 +1,19 @@
+[package]
+name = "dom-wallet-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+dom-wallet-chain = { path = "../dom-wallet-chain" }
+dom-wallet-crypto = { path = "../dom-wallet-crypto" }
+dom-wallet-domain = { path = "../dom-wallet-domain" }
+dom-wallet-storage = { path = "../dom-wallet-storage" }
+rand.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

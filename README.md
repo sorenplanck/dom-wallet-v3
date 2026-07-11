@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/status-Specification%20First%20Pass-b87333?style=flat-square" alt="Project status: Specification First Pass">
+  <img src="https://img.shields.io/badge/status-Executable%20Foundation%201A-b87333?style=flat-square" alt="Project status: Executable Foundation 1A">
   <img src="https://img.shields.io/badge/language-Rust-7a4a22?style=flat-square" alt="Language: Rust">
   <img src="https://img.shields.io/badge/repository-DOM%20Wallet%20V3-3d2f22?style=flat-square" alt="Repository: DOM Wallet V3">
   <img src="https://img.shields.io/badge/security%20model-Specification%20Driven-8a6a3f?style=flat-square" alt="Security model: Specification Driven">
@@ -13,13 +13,13 @@
 
 > A secure, recoverable, and DOM-native wallet architecture.
 
-> **Current phase: Foundation and Specification.** All foundational specifications have completed their first design pass; eight are in **REVIEW** and five remain **DRAFT**. No functional wallet exists yet. Implementation and launch are authorized under the open community-review policy, while the project remains experimental and unaudited until evidence changes.
+> **Current phase: Executable Foundation 1A.** All foundational specifications have completed their first design pass; eight are in **REVIEW** and five remain **DRAFT**. The repository now contains an experimental, unaudited desktop-wallet foundation for local wallet lifecycle and deterministic mock synchronization. Implementation and launch are authorized under the open community-review policy.
 
 DOM Wallet V3 is a new, independent wallet architecture for the DOM protocol. It is being specified before implementation so that wallet correctness includes failure, recovery, and adversarial behavior—not only a successful transaction path.
 
 V3 preserves validated DOM Wallet V1 and V2 properties while establishing one DOM-native model for state, persistence, synchronization, recovery, and verification. It is neither a port nor a fork of another wallet project, and it is not a cosmetic refactor of DOM Wallet V2.
 
-The repository is intentionally not a functional wallet yet. Its present deliverable is an engineering foundation that can be reviewed before wallet crates, network operations, seed handling, or user-facing payment flows are introduced.
+The repository now contains the first executable engineering foundation. It can create, reopen, unlock, lock, and persist a local wallet; bind a wallet to an exact network, chain ID, and genesis ID; project redacted account state; and synchronize deterministic mock-chain state under the approved ScanTarget policy. It does not yet implement payment, slate, broadcast, backup/restore, migration, or a negotiated production DOM-node scan adapter.
 
 ## Why V3 Exists
 
@@ -50,7 +50,7 @@ DOM Wallet V1 and V2 are sources of DOM-specific experience and validated proper
 
 The repository foundation and engineering baseline are complete. The first design pass, adversarial cross-review, and blocker-closure work are complete through the owner-approved StableView policy. DEC-STABLE-VIEW is resolved through a limited ChainSource wallet policy strengthened by DOM height-and-hash binding and fail-closed validation. The project owner has selected Option A — Hardened DOM Wallet Continuity for DEC-V3-SECRET-DOMAINS. There are 30 effective RESOLVED decisions, 0 effective BLOCKING decisions, and 0 effective HIGH blockers. Eight foundational specifications are in REVIEW and five remain DRAFT as incomplete engineering documents.
 
-No wallet crates or functional wallet implementation exist in this repository. Implementation, private testnet, public testnet, and mainnet launch are not conditioned on an external audit or independent review. The project follows open community review; external audits are welcome but optional. Market value is external to protocol enforcement, and the software has no audit-status or asset-value runtime classification. Incomplete security work remains publicly tracked; this is not an audit, safety, or risk-free claim.
+The repository contains an executable Rust workspace and a Tauri-ready desktop shell. Phase 1A local lifecycle and deterministic mock synchronization are implemented and tested; the application remains experimental and unaudited. Implementation, private testnet, public testnet, and mainnet launch are not conditioned on an external audit or independent review. The project follows open community review; external audits are welcome but optional. Market value is external to protocol enforcement, and the software has no audit-status or asset-value runtime classification. Incomplete security work remains publicly tracked; this is not an audit, safety, or risk-free claim.
 
 | Specification | Status |
 |---|---|
@@ -113,24 +113,19 @@ Crypto, storage, ChainSource, and transport ports
 
 Dependencies point inward. User interfaces, automation, concrete storage, nodes, and transports adapt to domain contracts; the canonical domain model does not depend on a CLI, UI, HTTP service, or a concrete node implementation. DOM protocol adapters provide the selected consensus and cryptographic behavior at the boundary without allowing external infrastructure to redefine wallet rules.
 
-## Planned Workspace
+## Executable Foundation Workspace
 
-The following crates are planned, but none has been introduced. A crate may be added only after its governing specifications are accepted.
+Phase 1A introduces the following implementation boundaries. Their existence does not claim that later wallet functions are complete.
 
 | Planned crate | Intended responsibility |
 |---|---|
 | `dom-wallet-domain` | Canonical state, invariants, and domain transitions. |
 | `dom-wallet-crypto` | DOM-native wallet cryptographic boundaries. |
 | `dom-wallet-storage` | Encrypted durable units of work and recovery. |
-| `dom-wallet-chain-source` | Transport-independent canonical-chain evidence. |
-| `dom-wallet-sync` | Initial, incremental, and full reconciliation. |
-| `dom-wallet-reorg` | Evidence-based rollback and replay. |
-| `dom-wallet-lifecycle` | Send, receive, finalize, submit, and cancellation contracts. |
-| `dom-wallet-backup` | Backup and recovery orchestration. |
-| `dom-wallet-node` | DOM Protocol node adapters. |
-| `dom-wallet-api` | Capability-oriented interfaces. |
-| `dom-wallet-cli` | Command-line interaction and diagnostics. |
-| `dom-wallet-testkit` | Deterministic test controls and integration support. |
+| `dom-wallet-chain` | Transport-independent ChainSource boundary, ScanTarget policy, mock source, and reconnect logic. |
+| `dom-wallet-core` | Wallet lifecycle, projections, synchronization orchestration, diagnostics, and capability boundary. |
+| `src-tauri` | Tauri-ready desktop command boundary with redacted DTOs. |
+| `frontend` | DOM dark-bronze-paper desktop presentation. |
 
 ## Target Capabilities
 
@@ -223,19 +218,18 @@ The source hierarchy and adoption constraints are documented in [Engineering Sou
 
 ## Building
 
-No functional wallet implementation exists yet. The current workspace is a specification foundation and declares no member crates, so there is no wallet binary, library, or test suite to run.
-
-The currently valid repository manifest check is:
+Phase 1A provides a Rust workspace, headless-checkable Tauri command shell, and static desktop frontend. It is intentionally incomplete: send, receive, transaction finalization, broadcast, backup export, restore, migration, full reorganization execution, and a negotiated live DOM-node scan adapter are not implemented.
 
 ```bash
-cargo metadata --no-deps
+cargo fmt --all --check
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-targets
+(cd frontend && npm run typecheck && npm test && npm run build)
+cargo run -p dom-wallet-tauri-shell
 ```
 
-`cargo metadata --no-deps` verifies the declared workspace manifest. The workspace has no Rust targets yet, so `cargo fmt --check` currently reports that it cannot find targets. The command is retained below as the formatting check that will become applicable when Rust source is introduced; it is not evidence of a built wallet or executed wallet tests.
-
-```bash
-cargo fmt --check
-```
+See [Implementation Phase 1A Architecture](docs/IMPLEMENTATION_PHASE1A_ARCHITECTURE.md), [Node Configuration](docs/NODE_CONFIGURATION.md), [Build and Run](docs/BUILD_AND_RUN.md), and the [Phase 1A foundation report](reports/IMPLEMENTATION_PHASE1A_FOUNDATION.md). The node configuration placeholder is deliberately invalid; real configurations require exact authoritative network, chain ID, and genesis identity and never bypass validation.
 
 ## Contributing
 
