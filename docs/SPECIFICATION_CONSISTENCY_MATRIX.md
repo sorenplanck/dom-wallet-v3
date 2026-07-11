@@ -5,6 +5,8 @@
 
 **Closure Pass 1:** DEC-ECON-BLOCK-WEIGHT is resolved from current DOM consensus code and tests. The reconciled effective blocker references are DEC-ROLLBACK-PROTECTION, DEC-STABLE-VIEW, and DEC-V3-SECRET-DOMAINS; see [Blocker Status Reconciliation](../reports/FOUNDATIONAL_BLOCKER_STATUS_RECONCILIATION.md).
 
+**Closure Pass 2:** DEC-ROLLBACK-PROTECTION is resolved for REVIEW with later implementation proof retained. DEC-STABLE-VIEW and DEC-V3-SECRET-DOMAINS remain authority blockers; see the [Pass 2 report](../reports/FOUNDATIONAL_BLOCKER_CLOSURE_PASS2.md).
+
 | Subject | Authority | Dependents and records | Atomicity, restart, reorg, migration, and security rule | Evidence and decisions | Verdict |
 |---|---|---|---|---|---|
 | Identity, account, generation | 0002 | All specifications; WalletIdentity, AccountId, Generation | Chain-bound immutable identity; one expected-generation DUW; restore and migration validate before activation. | State invariant tests; DEC-ACCOUNT-POLICY | CONFIRMED_CONSISTENT |

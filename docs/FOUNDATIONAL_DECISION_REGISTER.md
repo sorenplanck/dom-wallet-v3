@@ -70,3 +70,13 @@ The newest explicit reconciliation or closure final-status subsection for a stab
 | DEC-V3-SECRET-DOMAINS | Pass 1 diff; 0003, 0007, 0008, 0010, 0011 metadata; Pass 1 report remaining-blocker table; matrix; index and README | BLOCKING | REGISTER_STATUS_INCORRECT, MULTIPLE_ARTIFACTS_INCORRECT | Approved private-context, backup, and authentication domain construction, vectors, and cryptographic review remain absent. |
 
 This reconciliation supersedes the contradictory Pass 1 register narrative only for current effective status. The immutable Pass 1 report is retained as historical evidence and its remaining-blocker table is the supported Pass 1 outcome. Current effective inventory: 27 RESOLVED and 3 BLOCKING; ownership is one DOM_PROTOCOL, one CRYPTOGRAPHIC_REVIEW, and one IMPLEMENTATION_PROOF decision; severity is 0 CRITICAL, 2 HIGH, and 1 MEDIUM.
+
+## Foundational Blocker Closure Pass 2
+
+DEC-ROLLBACK-PROTECTION start verdict: REFUTED. Final status: RESOLVED. Ownership: IMPLEMENTATION_PROOF. The complete wallet contract already requires monotonic known Generation and non-reuse floors, typed recovery, staged activation, and later fault evidence; cross-device witness execution belongs to later gates.
+
+DEC-STABLE-VIEW start verdict: CONFIRMED. Final status: BLOCKING. Ownership: DOM_PROTOCOL. Severity remains HIGH. Required authority is in [Protocol Decision Request](FOUNDATIONAL_PROTOCOL_DECISION_REQUEST.md).
+
+DEC-V3-SECRET-DOMAINS start verdict: CONFIRMED. Final status: BLOCKING. Ownership: CRYPTOGRAPHIC_REVIEW. Severity remains HIGH. Required authority is in [Cryptographic Review Request](FOUNDATIONAL_CRYPTOGRAPHIC_REVIEW_REQUEST.md).
+
+Effective summary: 28 RESOLVED and 2 BLOCKING decisions. Historical BLOCKING rows are not active status.

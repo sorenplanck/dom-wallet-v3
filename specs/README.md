@@ -20,4 +20,4 @@
 
 Required dependency order: Threat Model -> Wallet State Model -> Storage and Atomicity -> ChainSource and Synchronization -> Reorganization and Rollback -> Transaction Lifecycle -> Key Derivation and Secrets -> Backup and Recovery -> Economic Rules -> API and Transport Security -> Migration from V2 -> Testing and Assurance.
 
-Closure Pass 1 result: 6 specifications in REVIEW, 7 specifications remaining DRAFT, 27 RESOLVED decisions, and 3 BLOCKING decisions. Gate 1 is IN PROGRESS until every foundational specification is ACCEPTED and required gate evidence is complete.
+Closure Pass 2 result: 6 specifications in REVIEW, 7 specifications remaining DRAFT, 28 RESOLVED decisions, and 2 BLOCKING decisions. Gate 1 is IN PROGRESS until every foundational specification is ACCEPTED and required gate evidence is complete.
