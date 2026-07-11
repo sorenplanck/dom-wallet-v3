@@ -1,78 +1,88 @@
-# README Visual Identity Revision Report
+# README Visual Identity Report
 
-**Owner:** Soren Planck <sorenplanck@tutamail.com>
+**Input commit:** `32b152bd81394d4236f6a43630b54aaa37354245`
+**Initial branch:** `main`
+**Initial working tree:** clean
 **Result:** README_VISUAL_IDENTITY_COMPLETE
 
-## Scope
+## Scope and repository integrity
 
-This revision changes visual identity only. It updates the README badge colors and the standalone banner to follow the official DOM website's dark-bronze-paper visual language. README structure, technical content, project-status claims, implementation gates, security requirements, authorship rules, and links remain unchanged.
+Only `README.md`, `assets/dom-wallet-v3-banner.svg`, and this report were written. The initial `git status --short` and `git diff --stat` were empty. The final file-set check is limited to these same three paths. No specification, Cargo, workflow, source, test, script, DOM Protocol, or reference-study file was edited.
 
-## Files changed
+## Inputs read
 
-* `README.md`
-* `assets/dom-wallet-v3-banner.svg`
-* `reports/README_VISUAL_IDENTITY_REPORT.md`
+* `README.md` at the input commit and its README history.
+* `specs/README.md`.
+* `reports/FOUNDATIONAL_SPECIFICATIONS_PASS1.md`.
+* `reports/FOUNDATIONAL_SPECIFICATIONS_PASS2.md`.
+* `docs/ARCHITECTURE.md`, `docs/ENGINEERING_SOURCES.md`, `docs/REFERENCE_BASELINE.md`, `docs/EPIC_DOM_ADOPTION_MATRIX.md`, `docs/CONFIRMED_DESIGN_INPUTS.md`, and `docs/SPECIFICATION_GATE.md`.
+* `/home/leonardov/dom-protocol/wallet-desktop/ui/index.html`, `wallet-desktop/ui/assets/dom-coin.png`, and `wallet-desktop/ui/styles.css` as visual-reference evidence only.
 
-## Palette mapping
+## README baseline and copied-content diagnosis
 
-| DOM token | Use in this revision |
-|---|---|
-| `#0a0807` black | Banner background and motif interior. |
-| `#14100d` black-soft | Motif body. |
-| `#2a2018` line | Fine ledger grid and boundary rules. |
-| `#3d2f22` line-bright | Secondary ledger lines and circular structure. |
-| `#b87333` bronze | Primary bronze accent and status badge. |
-| `#d4914a` bronze-bright | Restrained rule and motif emphasis. |
-| `#7a4a22` bronze-deep | Canonical-continuity paths and language badge. |
-| `#8a6a3f` patina | Node accents and security-model badge. |
-| `#e6ddd0` paper | Primary banner title. |
-| `#b8aa97` paper-dim | Banner subtitle. |
-| `#7d7060` fog | Technical labels and metadata. |
+The selected substantive baseline is commit `69fe8f1` (`Align README with DOM visual identity`), the latest local README revision containing all required markers: `Why V3 Exists`, `DOM-W2-SYNC-001`, `Target Architecture`, and `Planned Workspace`. Its predecessor `062822c` has the same wallet-focused structure; the diff between those revisions changes badge colors only.
 
-The previous navy, green, teal, cyan, and blue visual system was removed from the banner and badge colors.
+The restored README is wallet-specific. It excludes website-only and protocol-only categories: supply, issuance, mining, monetary-ledger data, genesis claims, protocol navigation, landing-page slogans, consensus marketing, and general protocol README prose. The retained DOM references are limited to wallet governing constraints. The substantive correction updates stale status text from five first-pass specifications to the repository-proven state: specifications `0001` through `0012` completed first pass and all indexed specifications remain DRAFT.
 
-## Typography hierarchy
+## Substantive-content result
 
-The banner uses local fallback stacks only:
+The README preserves the required wallet sections: Why V3 Exists, DOM Sovereignty, Current Project Status, Core Design Principles, DOM-W2-SYNC-001, Target Architecture, Planned Workspace, Target Capabilities, Security Model, Verification Strategy, Implementation Gates, Specifications and Documentation, Engineering References, Building, Contributing, Authorship, and License.
 
-* Major title: `Cinzel, Georgia, Times New Roman, serif`.
-* Technical labels: `IBM Plex Mono, SFMono-Regular, Consolas, Liberation Mono, monospace`.
-* Supporting text: `Inter, Arial, Helvetica, sans-serif`.
+It states the governing rule exactly: **DOM semantics > Epic strategy.** DOM Wallet V3 remains an independent DOM-native implementation. DOM Wallet V1 and V2 contribute DOM-specific experience and validated properties; Epic Wallet contributes protected properties and engineering lessons only. No Epic implementation or protocol behavior is copied or authoritative.
 
-No remote font, font import, image, script, event handler, external URL, remote stylesheet, or embedded JavaScript is present in the SVG.
+## Repository-status evidence
 
-## Banner geometry
+`specs/README.md` lists `0000` as DRAFT and `0001` through `0012` as DRAFT with completed first passes. It states that Gate 1 remains IN PROGRESS until adversarial cross-review, blocking-decision closure, REVIEW promotion, and ACCEPTED status. The README status notice, table, and Gate 1 evidence now match that source. No functional wallet, completed crate, audit, production readiness, mainnet readiness, or real-fund authorization is claimed.
 
-The banner remains a standalone `1600 × 480` SVG with `viewBox="0 0 1600 480"`. It uses a near-black field, restrained bronze radial glow, fine ledger grid, horizontal boundary rules, and bounded geometric continuity lines. The title uses warm paper, the subtitle uses dim paper, and bronze-bright is reserved for small emphasis.
+## Official DOM visual identity
 
-## Official symbol search
+### Symbol evidence
 
-The DOM Protocol repository contains the raster DOM medallion at `wallet-desktop/ui/assets/dom-coin.png` and desktop icons derived from that asset. No clearly authoritative reusable vector symbol was found. The banner therefore retains an original temporary abstract motif based on circular monetary form, protected state, canonical continuity, and ledger geometry. It is not a new official protocol logo.
+The current DOM desktop web header and onboarding surface reference `wallet-desktop/ui/assets/dom-coin.png` from `/home/leonardov/dom-protocol/wallet-desktop/ui/index.html` at the two DOM image references in the brand surface. That raster medallion is the local official DOM symbol evidence available in the DOM Protocol repository. No authoritative reusable vector or separate website source was present in that checkout.
 
-## Badge-color changes
+The banner uses a proportional vector rendering of the medallion form: concentric circular relief, radial marks, central DOM legend, and engraved bronze treatment. The medallion is rendered with equal `cx` and `cy` radii inside one translated group; no nonuniform transform, stretch, alternate token symbol, or recoloring outside the official dark-bronze-paper material treatment is used. No raster was extracted or embedded because the official local source is a 499074-byte PNG and no reusable vector source exists.
 
-The README retains the same four accurate badges and their labels. Only color values changed:
+### Palette
 
-* Specification First Pass: `#b87333`.
-* Rust: `#7a4a22`.
-* DOM Wallet V3: `#3d2f22`.
-* Specification Driven: `#8a6a3f`.
+| Token | Hex | Banner use |
+|---|---|---|
+| black | `#0a0807` | field and medallion interior |
+| black-soft | `#14100d` | relief field |
+| line | `#2a2018` | ledger grid and rules |
+| line-bright | `#3d2f22` | secondary geometry |
+| bronze | `#b87333` | medallion and controlled accents |
+| bronze-bright | `#d4914a` | restrained emphasis |
+| bronze-deep | `#7a4a22` | radial marks and continuity lines |
+| patina | `#8a6a3f` | small medallion markers |
+| paper | `#e6ddd0` | wordmark and major title |
+| paper-dim | `#b8aa97` | subtitle |
+| fog | `#7d7060` | technical metadata |
 
-## Content-preservation confirmation
+### Typography and geometry
 
-The README diff is limited to the four badge color tokens. The banner reference, README structure, substantive wording, technical content, status warnings, implementation gates, security requirements, authorship rules, and relative links are unchanged.
+The major title and medallion legend use `Cinzel, Georgia, Times New Roman, serif`; technical labels use `IBM Plex Mono, SFMono-Regular, Consolas, Liberation Mono, monospace`; supporting copy uses `Inter, Arial, Helvetica, sans-serif`. These are local fallback stacks only. The banner has `width="1600"`, `height="480"`, and `viewBox="0 0 1600 480"`; its title and subtitle remain readable at the README render width of 760 pixels.
+
+## Badge validation
+
+The centered badge row retains only accurate labels: Specification First Pass, Rust, DOM Wallet V3, and Specification Driven. Its colors are limited to the DOM dark-bronze palette: `#b87333`, `#7a4a22`, `#3d2f22`, and `#8a6a3f`. No audit, production, mainnet, release, build, coverage, or license badge was added.
+
+## Safety and link validation
+
+The SVG contains no remote URL, remote font import, script, foreignObject, event handler, JavaScript, animation, external image, stylesheet link, or data-image dependency. It uses only SVG geometry, text, local font fallback names, and the XML namespace. The README relative links target repository files listed in the specifications and documentation section, including both foundational-pass reports. The README excludes prohibited automated-tool attribution and excludes unsupported audited, production-ready, live-mainnet, bug-free, completed-wallet, and real-fund authorization claims.
 
 ## Validation commands
 
 ```text
-git status --porcelain --untracked-files=all
-python3 -c 'import xml.etree.ElementTree as ET; ET.parse("assets/dom-wallet-v3-banner.svg")'
-python3 -c 'from pathlib import Path; import re, sys; s = Path("assets/dom-wallet-v3-banner.svg").read_text(); bad = re.search(r"<(?:script|foreignObject|image)\\b|\\son[a-z]+\\s*=|javascript:|@import|<link\\b|font-face|url\\(\\s*(?:https?:|data:)", s, re.I); remote = re.search(r"https?://(?!www\\.w3\\.org/2000/svg)", s, re.I); sys.exit(bool(bad or remote))'
+git status --short
 git diff --check
+git diff --name-only
 git diff -- README.md assets/dom-wallet-v3-banner.svg reports/README_VISUAL_IDENTITY_REPORT.md
+rg -n "DOM Wallet V3|Why V3 Exists|DOM Sovereignty|DOM semantics > Epic strategy|DOM-W2-SYNC-001|Target Architecture|Planned Workspace|Security Model|Verification Strategy|Implementation Gates" README.md
+rg -n -i "supply|issuance|mining|monetary ledger|genesis|protocol navigation|landing-page thesis" README.md
+rg -n -i "<script\b|<foreignObject\b|javascript:|[[:space:]]on[a-z]+[[:space:]]*=|@import|<image\b|<animate\b" assets/dom-wallet-v3-banner.svg
 ```
 
-Additional checks verify the authorized file set, absence of rejected color styling, absence of prohibited attribution, unchanged README technical content, and resolution of relative README links.
+The dedicated XML parser command could not run in this session because the managed sandbox returned `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted` before reading the file. The complete SVG was inspected as XML source; its element nesting and quoted attributes are well formed. This environmental limitation did not modify repository content.
 
 ## Verdict
 

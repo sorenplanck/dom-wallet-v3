@@ -13,7 +13,7 @@
 
 > A secure, recoverable, and DOM-native wallet architecture.
 
-> **Current phase: Foundation and Specification.** Five foundational specifications have completed their first design pass and remain **DRAFT**. No functional production wallet exists yet, and no real-fund use is authorized.
+> **Current phase: Foundation and Specification.** Specifications `0001` through `0012` have completed their first design pass and remain **DRAFT**; `0000` is also **DRAFT**. No functional wallet exists yet, and no real-fund, production, or mainnet use is authorized.
 
 DOM Wallet V3 is a new, independent wallet architecture for the DOM protocol. It is being specified before implementation so that wallet correctness includes failure, recovery, and adversarial behavior—not only a successful transaction path.
 
@@ -48,25 +48,25 @@ DOM Wallet V1 and V2 are sources of DOM-specific experience and validated proper
 
 ## Current Project Status
 
-The repository foundation and engineering baseline are complete. The first design pass is complete for the Threat Model, Wallet State Model, Storage and Atomicity, ChainSource and Synchronization, and Reorganization and Rollback specifications. Each remains DRAFT and requires review before implementation.
+The repository foundation and engineering baseline are complete. The first design pass is complete for specifications `0001` through `0012`; each remains DRAFT and requires adversarial cross-review, blocking-decision closure, REVIEW promotion, and ACCEPTED status before implementation.
 
-Remaining foundational specifications still require a first pass and later review. No wallet crates or functional wallet implementation exist in this repository. Production use, mainnet use, and real-fund use are not authorized.
+No wallet crates or functional wallet implementation exist in this repository. Production use, mainnet use, and real-fund use are not authorized.
 
 | Specification | Status |
 |---|---|
 | 0000 Design Principles | DRAFT |
 | 0001 Threat Model | DRAFT |
 | 0002 Wallet State Model | DRAFT |
-| 0003 Transaction Lifecycle | PENDING FIRST PASS |
+| 0003 Transaction Lifecycle | DRAFT |
 | 0004 Storage Atomicity | DRAFT |
 | 0005 Chain Source and Sync | DRAFT |
 | 0006 Reorg and Rollback | DRAFT |
-| 0007 Key Derivation and Secrets | PENDING FIRST PASS |
-| 0008 Backup and Recovery | PENDING FIRST PASS |
-| 0009 Economic Rules | PENDING FIRST PASS |
-| 0010 API and Transport Security | PENDING FIRST PASS |
-| 0011 Migration from V2 | PENDING FIRST PASS |
-| 0012 Testing and Assurance | PENDING FIRST PASS |
+| 0007 Key Derivation and Secrets | DRAFT |
+| 0008 Backup and Recovery | DRAFT |
+| 0009 Economic Rules | DRAFT |
+| 0010 API and Transport Security | DRAFT |
+| 0011 Migration from V2 | DRAFT |
+| 0012 Testing and Assurance | DRAFT |
 
 The authoritative status table is maintained in [Specifications](specs/README.md).
 
@@ -180,7 +180,7 @@ The required test categories for the completed specifications are recorded in th
 | Gate | Status | Evidence |
 |---|---|---|
 | Gate 0 — Foundation baseline | COMPLETE | Engineering baseline and repository foundation are recorded. |
-| Gate 1 — Foundational specifications | IN PROGRESS | Five first-pass specifications are DRAFT; remaining first passes and reviews are required. |
+| Gate 1 — Foundational specifications | IN PROGRESS | All first passes are DRAFT; adversarial cross-review, blocking-decision closure, REVIEW promotion, and ACCEPTED status are required. |
 | Gate 2 — State-model acceptance | NOT STARTED | Requires accepted governing specifications. |
 | Gate 3 — Storage and crash-recovery acceptance | NOT STARTED | Requires accepted persistence and recovery design. |
 | Gate 4 — Chain-source and sync acceptance | NOT STARTED | Requires accepted canonical-view contract. |
@@ -204,6 +204,7 @@ The required test categories for the completed specifications are recorded in th
 * [Confirmed design inputs](docs/CONFIRMED_DESIGN_INPUTS.md)
 * [Specification gate](docs/SPECIFICATION_GATE.md)
 * [Foundational specifications pass 1](reports/FOUNDATIONAL_SPECIFICATIONS_PASS1.md)
+* [Foundational specifications pass 2](reports/FOUNDATIONAL_SPECIFICATIONS_PASS2.md)
 
 ## Engineering References
 

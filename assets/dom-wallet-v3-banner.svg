@@ -38,22 +38,18 @@
     </g>
   </g>
 
-  <g transform="translate(112 82)">
+  <g id="dom-official-medallion" transform="translate(112 82)" aria-label="DOM medallion symbol">
     <circle cx="158" cy="158" r="148" fill="#0a0807" stroke="#3d2f22" stroke-width="1"/>
-    <circle cx="158" cy="158" r="126" fill="none" stroke="#7a4a22" stroke-opacity="0.7" stroke-width="1" stroke-dasharray="2 10"/>
-    <circle cx="158" cy="158" r="102" fill="none" stroke="#3d2f22" stroke-width="1"/>
-    <path d="M158 60L240 108V204L158 252L76 204V108Z" fill="#14100d" stroke="#b87333" stroke-width="2"/>
-    <path d="M158 82V234M102 126H214M102 190H214" stroke="#3d2f22" stroke-width="1"/>
-    <path d="M102 126L158 158L214 126M102 190L158 158L214 190" stroke="#7a4a22" stroke-width="1.5"/>
-    <circle cx="158" cy="158" r="25" fill="#0a0807" stroke="#d4914a" stroke-width="1.5"/>
-    <path d="M146 158H170M158 146V170" stroke="#d4914a" stroke-width="1.5"/>
+    <circle cx="158" cy="158" r="132" fill="#14100d" stroke="#7a4a22" stroke-width="3"/>
+    <circle cx="158" cy="158" r="119" fill="none" stroke="#b87333" stroke-width="1"/>
+    <circle cx="158" cy="158" r="105" fill="#0a0807" stroke="#3d2f22" stroke-width="1.5"/>
+    <path d="M158 53V75M210 67L199 86M249 106L230 117M263 158H241M249 210L230 199M210 249L199 230M158 263V241M106 249L117 230M67 210L86 199M53 158H75M67 106L86 117M106 67L117 86" fill="none" stroke="#7a4a22" stroke-width="2"/>
+    <path d="M96 115C122 88 194 88 220 115M96 201C122 228 194 228 220 201" fill="none" stroke="#3d2f22" stroke-width="1"/>
+    <path d="M98 158H218" fill="none" stroke="#b87333" stroke-width="1"/>
+    <text x="158" y="178" text-anchor="middle" fill="#e6ddd0" font-family="Cinzel, Georgia, Times New Roman, serif" font-size="56" font-weight="700" letter-spacing="4">DOM</text>
+    <circle cx="158" cy="158" r="91" fill="none" stroke="#d4914a" stroke-opacity="0.38" stroke-width="1"/>
     <g fill="#8a6a3f">
-      <circle cx="158" cy="82" r="4"/>
-      <circle cx="214" cy="126" r="4"/>
-      <circle cx="214" cy="190" r="4"/>
-      <circle cx="158" cy="234" r="4"/>
-      <circle cx="102" cy="190" r="4"/>
-      <circle cx="102" cy="126" r="4"/>
+      <circle cx="158" cy="67" r="3"/><circle cx="249" cy="158" r="3"/><circle cx="158" cy="249" r="3"/><circle cx="67" cy="158" r="3"/>
     </g>
   </g>
 
