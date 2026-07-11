@@ -27,6 +27,12 @@ The evidence program MUST prove or expose failure for: reservation uniqueness; n
 
 DOM-W2-SYNC-001 requires directed evidence for same-height hash divergence, lower canonical height, missing hash, changed hash, unverifiable hash, restart between cursor and state publication, selection after every case, and repeated reconciliation.
 
+## Approved ScanTarget assurance evidence
+
+The following are required future implementation and verification evidence for the owner-approved ScanTarget WALLET POLICY in 0005 and its reorganization consequences in 0006. This list does not claim that any test exists, executes, or passes. Deterministic evidence MUST cover target creation from height and block hash; rejection of height-only targets; same-height hash divergence; lower canonical tip; missing target hash; changed target hash; unverifiable hash-at-height; source identity change; source disagreement; inconsistent page contents; repeated pages with conflicting data; missing pages; reordered pages; changed scan bounds; unexpected PMMR range expansion; a higher tip with bounded proof that the target remains canonical; a higher tip without ancestry proof; bounded ancestry exhaustion; timeout and retry-budget exhaustion; interrupted provisional scan; restart with a still-valid ScanTarget; restart with an invalidated ScanTarget; crash before activation; crash during atomic generation publication; rejection of partial-page activation; proof that the canonical cursor and every scan-derived mutation commit together; no cursor advancement after failed final validation; quarantine or deletion of invalid provisional state; full-rescan fallback; source switching with independent target revalidation; reorganization during a scan; reorganization during durable reorg replay; rollback-plus-replay equivalence with deterministic fresh reconciliation; and resource-bound enforcement under adversarial source behavior.
+
+The harness MUST represent each target as height, block hash, source identity, bounded range, and evidence version. It MUST distinguish provisional staged state from canonical state and assert that no test double supplies a DOM Protocol StableView guarantee, snapshot witness, finality guarantee, or new node endpoint. DOM-W2-SYNC-001 remains mandatory and unchanged: height alone never establishes freshness or scan coherence.
+
 ## Required verification portfolio
 
 | Evidence class | Required scope |

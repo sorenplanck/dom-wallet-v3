@@ -80,3 +80,19 @@ DEC-STABLE-VIEW start verdict: CONFIRMED. Final status: BLOCKING. Ownership: DOM
 DEC-V3-SECRET-DOMAINS start verdict: CONFIRMED. Final status: BLOCKING. Ownership: CRYPTOGRAPHIC_REVIEW. Severity remains HIGH. Required authority is in [Cryptographic Review Request](FOUNDATIONAL_CRYPTOGRAPHIC_REVIEW_REQUEST.md).
 
 Effective summary: 28 RESOLVED and 2 BLOCKING decisions. Historical BLOCKING rows are not active status.
+
+## Post-Escalation Owner Approval: DEC-STABLE-VIEW
+
+**Prior status:** BLOCKING
+**Prior ownership:** DOM_PROTOCOL
+**Approval date:** 2026-07-11
+**Approved option:** C
+**Final ownership:** OWNER_APPROVED_WALLET_POLICY_WITH_DOM_PROTOCOL_BOUNDARY
+**Final status:** RESOLVED
+**Severity disposition:** HIGH authority uncertainty is closed by the project-owner wallet-policy decision; no DOM Protocol authority is asserted.
+
+> APPROVED OPTION C — Adopt the Epic-style limited ChainSource and bounded PMMR scan strategy, strengthened for DOM with mandatory target-tip height-and-hash binding, post-scan tip revalidation, atomic cursor activation, provisional results until validation, and fail-closed reconciliation or full-rescan fallback whenever coherent-view evidence cannot be established.
+
+The selected contract is the ScanTarget policy in 0005: target height and block hash, source identity, finite bounds, and evidence version bind all provisional scan work; final hash-at-height or bounded-ancestry validation is required before atomic canonical activation. Height alone, a native DOM StableView guarantee, finality, a protocol witness, a new endpoint, mixed source evidence, or partial activation are rejected assumptions. Persistence keeps staged ScanTarget work non-canonical; a crash reopens the complete prior or complete new generation only, and resume revalidates its target. Reorganization preserves target and ancestor evidence in ReorgPlan, invalidates incompatible staged work, and falls back to full rescan when bounded ancestry cannot establish safety. Affected specifications are 0005 and 0006, with dependent references in 0003, 0008, 0011, and 0012. Required future tests are recorded in 0005, 0006, and [the closed protocol request](FOUNDATIONAL_PROTOCOL_DECISION_REQUEST.md).
+
+**Effective current summary:** 29 RESOLVED and 1 BLOCKING decision. Historical BLOCKING rows remain historical; DEC-V3-SECRET-DOMAINS remains the sole effective BLOCKING decision, with ownership CRYPTOGRAPHIC_REVIEW and severity HIGH.

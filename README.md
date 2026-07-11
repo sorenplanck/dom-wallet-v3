@@ -13,7 +13,7 @@
 
 > A secure, recoverable, and DOM-native wallet architecture.
 
-> **Current phase: Foundation and Specification.** Specifications `0001` through `0012` have completed their first design pass and remain **DRAFT**; `0000` is also **DRAFT**. No functional wallet exists yet, and no real-fund, production, or mainnet use is authorized.
+> **Current phase: Foundation and Specification.** All foundational specifications have completed their first design pass; eight are in **REVIEW** and five remain **DRAFT**. No functional wallet exists yet, and no real-fund, production, or mainnet use is authorized.
 
 DOM Wallet V3 is a new, independent wallet architecture for the DOM protocol. It is being specified before implementation so that wallet correctness includes failure, recovery, and adversarial behavior—not only a successful transaction path.
 
@@ -48,7 +48,7 @@ DOM Wallet V1 and V2 are sources of DOM-specific experience and validated proper
 
 ## Current Project Status
 
-The repository foundation and engineering baseline are complete. The first design pass, adversarial cross-review, and Blocker Closure Pass 1 are complete. Six foundational specifications are in REVIEW and seven remain DRAFT because three BLOCKING decisions require DOM protocol, cryptographic, or implementation proof.
+The repository foundation and engineering baseline are complete. The first design pass, adversarial cross-review, and blocker-closure work are complete through the owner-approved StableView policy. DEC-STABLE-VIEW is resolved through a limited ChainSource wallet policy strengthened by DOM height-and-hash binding and fail-closed validation. There are 29 effective RESOLVED decisions and 1 effective BLOCKING decision; DEC-V3-SECRET-DOMAINS is the only effective HIGH blocker and requires independent cryptographic review. Eight foundational specifications are in REVIEW and five remain DRAFT.
 
 No wallet crates or functional wallet implementation exist in this repository. Production use, mainnet use, and real-fund use are not authorized.
 
@@ -59,8 +59,8 @@ No wallet crates or functional wallet implementation exist in this repository. P
 | 0002 Wallet State Model | REVIEW |
 | 0003 Transaction Lifecycle | DRAFT |
 | 0004 Storage Atomicity | REVIEW |
-| 0005 Chain Source and Sync | DRAFT |
-| 0006 Reorg and Rollback | DRAFT |
+| 0005 Chain Source and Sync | REVIEW |
+| 0006 Reorg and Rollback | REVIEW |
 | 0007 Key Derivation and Secrets | DRAFT |
 | 0008 Backup and Recovery | DRAFT |
 | 0009 Economic Rules | REVIEW |
@@ -68,7 +68,7 @@ No wallet crates or functional wallet implementation exist in this repository. P
 | 0011 Migration from V2 | DRAFT |
 | 0012 Testing and Assurance | REVIEW |
 
-The authoritative status table is maintained in [Specifications](specs/README.md). The review evidence is recorded in the [Consistency Matrix](docs/SPECIFICATION_CONSISTENCY_MATRIX.md), [Decision Register](docs/FOUNDATIONAL_DECISION_REGISTER.md), [Cross Review Report](reports/FOUNDATIONAL_SPECIFICATIONS_CROSS_REVIEW.md), [Blocker Closure Pass 1](reports/FOUNDATIONAL_BLOCKER_CLOSURE_PASS1.md), and [Blocker Status Reconciliation](reports/FOUNDATIONAL_BLOCKER_STATUS_RECONCILIATION.md).
+The authoritative status table is maintained in [Specifications](specs/README.md). The review evidence is recorded in the [Consistency Matrix](docs/SPECIFICATION_CONSISTENCY_MATRIX.md), [Decision Register](docs/FOUNDATIONAL_DECISION_REGISTER.md), [StableView protocol request](docs/FOUNDATIONAL_PROTOCOL_DECISION_REQUEST.md), [StableView approval report](reports/FOUNDATIONAL_STABLE_VIEW_APPROVAL.md), [Cryptographic review request](docs/FOUNDATIONAL_CRYPTOGRAPHIC_REVIEW_REQUEST.md), [Cross Review Report](reports/FOUNDATIONAL_SPECIFICATIONS_CROSS_REVIEW.md), [Blocker Closure Pass 1](reports/FOUNDATIONAL_BLOCKER_CLOSURE_PASS1.md), and [Blocker Status Reconciliation](reports/FOUNDATIONAL_BLOCKER_STATUS_RECONCILIATION.md).
 
 ## Core Design Principles
 
@@ -180,7 +180,7 @@ The required test categories for the completed specifications are recorded in th
 | Gate | Status | Evidence |
 |---|---|---|
 | Gate 0 — Foundation baseline | COMPLETE | Engineering baseline and repository foundation are recorded. |
-| Gate 1 — Foundational specifications | IN PROGRESS | First passes, cross-review, and Blocker Closure Pass 1 are complete; 3 BLOCKING decisions keep 7 specifications DRAFT pending approved evidence, REVIEW promotion, and ACCEPTED status. |
+| Gate 1 — Foundational specifications | IN PROGRESS | First passes, cross-review, and owner-approved StableView closure are complete; 1 effective HIGH cryptographic blocker keeps 5 specifications DRAFT pending independent review, REVIEW promotion, and ACCEPTED evidence. |
 | Gate 2 — State-model acceptance | NOT STARTED | Requires accepted governing specifications. |
 | Gate 3 — Storage and crash-recovery acceptance | NOT STARTED | Requires accepted persistence and recovery design. |
 | Gate 4 — Chain-source and sync acceptance | NOT STARTED | Requires accepted canonical-view contract. |

@@ -1,6 +1,6 @@
 # DOM Wallet V3 Reorganization and Rollback
 
-**Status:** DRAFT
+**Status:** REVIEW
 **Owner:** Soren Planck
 
 ## Purpose and scope
@@ -9,32 +9,32 @@ This specification defines deterministic recovery when canonical DOM chain obser
 
 ## Authoritative sources and terminology
 
-Sources are 0000 through 0005, the confirmed DOM-W2-SYNC-001 finding, and DOM Wallet V1/V2 retained-output and canonical-reconciliation experience. A **reorg plan** is the encrypted durable recovery event that records a bounded rollback/replay operation. A **common ancestor** is the highest verified height/hash shared by the committed cursor view and the new stable canonical view. A **provisional state** is a user-visible state in which chain-derived balances and selection are restricted until reconciliation completes.
+Sources are 0000 through 0005, the confirmed DOM-W2-SYNC-001 finding, and DOM Wallet V1/V2 retained-output and canonical-reconciliation experience. A **reorg plan** is the encrypted durable recovery event that records a bounded rollback/replay operation. A **common ancestor** is the highest verified height/hash shared by the committed cursor and the ScanTarget being reconciled. A **provisional state** is a user-visible state in which chain-derived balances and selection are restricted until reconciliation completes.
 
 ## Entry conditions and protected properties
 
-Rollback MUST begin when the mandatory freshness comparison in 0005 finds a same-height hash divergence, a lower-height canonical tip, a changed or missing cursor hash, a verified non-ancestor cursor, or a scan/view inconsistency that may invalidate observations. It MAY begin after a later higher tip reveals prior divergence. It MUST NOT begin solely because an unauthenticated or malformed source makes an unsupported claim.
+Rollback MUST begin when the mandatory freshness comparison in 0005 finds a same-height hash divergence, a lower-height canonical tip, a changed or missing cursor hash, a verified non-ancestor cursor, ScanTarget invalidation, source change, source disagreement, incompatible ancestry, or inconsistent staged scan evidence. It MAY begin after a later higher tip reveals prior divergence. It MUST NOT begin solely because an unauthenticated or malformed source makes an unsupported claim.
 
 The protected properties are: no use of stale chain observation for spending; no loss of local intent, allocation evidence, private contexts, or retained historical records; DOM-native recalculation of coinbase maturity; bounded and evidence-based ancestry discovery; resumable atomic recovery; and convergence with fresh reconciliation.
 
 ## Bounded common-ancestor discovery
 
-The wallet MUST compare the current cursor and new source view using hash-at-height and ancestry evidence under one stable view. It MUST search backward only within configured depth, response, time, and retry limits. It MAY use a bounded efficient search strategy, but every selected ancestor MUST be verified by height and hash; it MUST NOT guess an ancestor from height, timestamp, or a source assertion alone.
+The wallet MUST compare the current cursor and new ScanTarget using hash-at-height and ancestry evidence under the one ScanTarget defined by 0005. It MUST search backward only within configured depth, response, time, and retry limits. It MAY use a bounded efficient search strategy, but every selected ancestor MUST be verified by height and hash; it MUST NOT guess an ancestor from height, timestamp, or a source assertion alone.
 
-If no common ancestor can be proven within limits, if the source cannot produce required evidence, or if the view changes during discovery, the wallet MUST enter a recovery-required provisional state and use the safe full-rescan fallback. The fallback retains local intent, derivation allocation evidence, reservations, private contexts, transaction records, audit history, and tombstones; it rebuilds only chain-derived observations and indexes from an approved boundary.
+If no common ancestor can be proven within limits, if the source cannot produce required evidence, or if ScanTarget evidence changes during discovery, the wallet MUST enter a recovery-required provisional state and use the safe full-rescan fallback. The fallback retains local intent, derivation allocation evidence, reservations, private contexts, transaction records, audit history, and tombstones; it rebuilds only chain-derived observations and indexes from an approved boundary.
 
 ## Durable reorg plan and atomic phase order
 
-A reorg plan has a stable `plan_id`, expected generation, old cursor, target stable-view identity, verified ancestor or full-rescan reason, bounded range, phase, idempotency key, and recovery status. It is created in a DUW before rollback effects become externally visible. Its phases are:
+A reorg plan has a stable `plan_id`, expected generation, old cursor, target ScanTarget evidence, verified ancestor evidence or full-rescan reason, affected range, durable phase, idempotency key, and recovery status. It is created in a DUW before rollback effects become externally visible. Its phases are:
 
 1. **Planned:** persist entry evidence and set provisional state; selection from affected chain observations is blocked.
 2. **Ancestor verified:** persist the bounded common ancestor or full-rescan decision.
 3. **Rollback applied:** in one or more resumable DUWs, reclassify observations above the ancestor, recalculate maturity inputs, retain removed evidence, and atomically checkpoint the rewound cursor with each completed range.
-4. **Replay applied:** scan and reconcile the target stable view in ordered bounded ranges, atomically checkpointing observations and cursor.
-5. **Validated:** verify invariants, stable target tip, and convergence checks; clear provisional restrictions only in this DUW.
+4. **Replay applied:** scan and reconcile the target ScanTarget in ordered bounded ranges, keeping effects provisional until validation.
+5. **Validated:** revalidate target hash, bounds, and required ancestry; verify invariants and convergence checks; atomically activate or clear provisional restrictions only in this DUW.
 6. **Completed:** retain a redacted completion event and plan tombstone.
 
-Each phase transition MUST validate expected generation. A crash leaves the last acknowledged phase authoritative. Repeating an acknowledged or incomplete phase MUST be idempotent. A reorg discovered during an active plan MUST create a successor plan referencing the prior plan, or invalidate the target view and restart from the last committed safe checkpoint; it MUST NOT merge incompatible views or clear provisional restrictions prematurely.
+Each phase transition MUST validate expected generation. A crash leaves the last acknowledged phase authoritative. Restart during freeze, rewind, replay, validation, or activation MUST resume deterministically from that phase or fail closed. Repeating an acknowledged or incomplete phase MUST be idempotent. A reorganization during staged scan work MUST invalidate the ScanTarget and create a successor plan referencing the prior plan, or restart from the last committed safe checkpoint; it MUST NOT merge incompatible targets or clear provisional restrictions prematurely.
 
 ## Reclassification rules
 
@@ -56,7 +56,7 @@ On restart, open validation MUST locate the active plan, validate its old cursor
 
 ## Valid and invalid behavior
 
-Valid rollback is bounded, evidence-based, atomic by phase, idempotent, and visibly provisional. Valid replay uses one stable target view and fresh cursor checkpoints. Invalid behavior includes height-only freshness, guessed ancestry, cursor rewind without record changes, deletion of removed observations, automatic release of unrelated reservations, use of an immature coinbase, use of a mixed source view, unbounded ancestor search, or treating a partial plan as final.
+Valid rollback is bounded, evidence-based, atomic by phase, idempotent, and visibly provisional. Valid replay uses one ScanTarget and fresh cursor checkpoints. Invalid behavior includes height-only freshness, guessed ancestry, cursor rewind without record changes, deletion of removed observations, automatic release of unrelated reservations, use of an immature coinbase, use of mixed target evidence, unbounded ancestor search, or treating a partial plan as final.
 
 ## Convergence requirement
 
@@ -72,23 +72,22 @@ Reorganizations are normal protocol behavior, not evidence of corruption by them
 |---|---|
 | Unit tests | Entry-condition classification, ancestor evidence validation, every output reclassification, coinbase maturity recalculation, cursor phase rules, and invalid non-mutation. |
 | Property tests | Rollback plus replay equals fresh reconciliation for generated forks and local intent; retained identity and reservation uniqueness survive arbitrary repeated plans. |
-| Integration tests | same-height reorg, lower-height tip, longer reorg, removed receive, removed spend, remine, active reservation, pending spend, source switching, and full-rescan fallback. |
-| Fault-injection tests | Crash before and after every plan phase DUW, corrupt plan, source change during discovery/replay, reorg during reorg, exhausted depth/response limits, and restart at each phase. |
+| Integration tests | same-height hash divergence, lower canonical tip, target invalidation, incompatible ancestry, source change, source disagreement, longer reorg, removed receive, removed spend, remine, active reservation, pending spend, source switching, and full-rescan fallback. |
+| Fault-injection tests | Crash before and after every plan phase DUW, corrupt plan, source change during discovery/replay, reorg during staged scan or reorg, exhausted depth/response limits, and restart during freeze, rewind, replay, validation, and activation. |
 | Fuzz targets | Ancestor evidence, plan records, cursor records, scan-range boundaries, and malformed chain observations; no panic, guessed ancestry, or unbounded work. |
 
-## Acceptance criteria for REVIEW
+## Acceptance criteria for ACCEPTED
 
-Move to REVIEW only when the convergence property has a complete test oracle; same-height and lower-height cases are covered; 0004 demonstrates phase atomicity; 0005 demonstrates source/view validation; and 0003 supplies compatible transaction reclassification and reservation outcomes.
+The required future evidence includes a complete convergence oracle, same-height and lower-tip cases, ScanTarget invalidation, phase atomicity from 0004, target validation from 0005, and compatible lifecycle reclassification and reservation outcomes from 0003. REVIEW records the complete policy contract; it does not claim execution of that evidence.
 
 ## Dependencies and unresolved decisions
 
 Dependencies are 0001, 0002, 0003, 0004, and 0005. Specifications 0007 through 0009 contribute secret recovery, backup boundary, and DOM economic/maturity validation.
 
-* **Maximum automatic ancestor depth and rescan resource budget:** affects availability and recovery latency. Evidence required: deployment capacity and adversarial-source analysis. Gate: 0012 assurance review.
+* **Maximum automatic ancestor depth and rescan resource budget:** a conservative bounded policy is required by 0005; deployment calibration is later assurance evidence at 0012.
 * **User policy for prolonged provisional state:** affects user experience without changing safety. Evidence required: approved interface policy. Gate: 0010 review.
 * **Final lifecycle reclassification vocabulary:** affects transaction display and cancellation. Evidence required: 0003 lifecycle state machine. Gate: 0003 review.
 
 ## Review Blockers
 
-* DEC-STABLE-VIEW
-* DEC-REORG-BUDGET
+None. DEC-STABLE-VIEW is resolved by the Owner-approved ScanTarget WALLET POLICY. DEC-REORG-BUDGET is later-gate assurance evidence, not a REVIEW blocker.
