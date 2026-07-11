@@ -1,17 +1,17 @@
 # Foundational Secret-Domain Design Options
 
-**Status:** PROPOSED_FOR_INDEPENDENT_REVIEW
+**Status:** OWNER_SELECTED_IMPLEMENTATION_FAMILY
 **Decision:** DEC-V3-SECRET-DOMAINS
 **Wallet input commit:** `d1b53d552397c6da8f9b0e03f0bfefd4d8855d6a`
 **Input evidence:** DOM Git commit `aa7f389a157af1b1a486dcb7e27cb80e7b543de3`; [DOM reference study](../reports/DOM_WALLET_SECRET_DOMAIN_REFERENCE_STUDY.md); [Tauri continuity](DOM_TAURI_PRODUCT_CONTINUITY.md); [Epic secondary study](../reports/EPIC_SECRET_DOMAIN_REFERENCE_STUDY.md).
-**Selected option:** UNSELECTED
-**Construction status:** NOT_SPECIFIED
-**Vectors:** NOT_PROVIDED
-**Independent review:** NOT_COMPLETED
+**Selected option:** OPTION_A_HARDENED_DOM_WALLET_CONTINUITY
+**Construction status:** VERSIONED_IMPLEMENTATION_REQUIREMENT
+**Vectors:** IMPLEMENTATION_AND_COMMUNITY_REVIEW_REQUIREMENT
+**Independent review:** OPTIONAL_OPEN_COMMUNITY_REVIEW
 
 ## Authority and scope
 
-This is a design-options package, not cryptographic approval. DOM consensus, current DOM cryptographic primitives, transaction/slate formats, chain identity, and approved protocol rules are authoritative. Validated DOM Wallet V1/V2 behavior is primary evidence for product continuity, funds compatibility, storage, backup, and recovery. Epic is secondary and may supply only verified gap-solving properties. Tauri and the DOM product identity remain the desktop baseline; no option replaces them.
+This document records the project-owner selection of an implementation architecture family. DOM consensus, current DOM cryptographic primitives, transaction/slate formats, chain identity, and approved protocol rules are authoritative. Validated DOM Wallet V1/V2 behavior is primary evidence for product continuity, funds compatibility, storage, backup, and recovery. Epic is secondary and may supply only verified gap-solving properties. Tauri and the DOM product identity remain the desktop baseline; no option replaces them.
 
 No option supplies a new label, byte string, salt policy, KDF profile, expansion formula, scalar mapping, nonce algorithm, AEAD profile, associated-data layout, or vector output. Those are reviewer-owned values: `APPROVED_DOMAIN_LABEL`, `APPROVED_KDF_PROFILE`, `APPROVED_CANONICAL_ENCODING`, `APPROVED_SCALAR_MAPPING`, and `APPROVED_AEAD_PROFILE`.
 
@@ -56,7 +56,7 @@ Option A keeps verified DOM Wallet V2 properties as the primary baseline: author
 
 Epic can only fill verified DOM gaps in context lifecycle, retry durability, recovery state, and assurance. Option A is DOM-first and is not Epic-like, Epic-derived, or an authorization to copy V2 code.
 
-Advantages: highest compatibility continuity and clearest migration path. Risks requiring review: hidden legacy coupling, reuse of a construction outside its demonstrated envelope scope, insufficient domain separation, and backup rollback behavior.
+Advantages: highest compatibility continuity and clearest migration path. Engineering obligations are versioned construction definitions, vectors, fail-closed parsing, non-reuse evidence, compatible migrations, and open community findings. These obligations are not an external-review, audit, implementation, or launch gate.
 
 ### Option B — DOM-Native Labeled Subkey Hierarchy
 
@@ -98,29 +98,40 @@ All families must be evaluated against cross-chain, cross-network, cross-wallet,
 
 Recovery must distinguish deterministic DOM fund material from random/local material. Full backup must carry the approved non-reuse and lifecycle state; seed-only recovery must not manufacture contexts or credentials. Migration must import proven V2 provenance or enter typed recovery, never infer it. Tauri surfaces show those boundaries without receiving the underlying secret records.
 
-## Independent reviewer decision table
+## Implementation and community-review decision table
 
-| Required decision | DOM evidence | Protected property | Required reviewer output | Affected specifications |
+| Required implementation decision | DOM evidence | Protected property | Required versioned output and open community review focus | Affected specifications |
 | --- | --- | --- | --- | --- |
-| Architecture family | V1/V2 continuity and V2 context lifecycle | DOM compatibility | OPTION A, B, C, or rejection | 0003, 0007, 0008, 0010, 0011 |
+| Architecture family | V1/V2 continuity and V2 context lifecycle | DOM compatibility | Option A selected by project owner; B and C retained for future community-proposed upgrades | 0003, 0007, 0008, 0010, 0011 |
 | Reusable DOM construction versus replacement | `dom-wallet-crypto`, `dom-wallet-keys`, V2 backup/state | Preserve properties without accidental scope extension | Exact reusable scope and replacement boundaries | 0007, 0008, 0011 |
-| Root ownership, KDF/expansion, domain identifiers, canonical encoding | Existing construction is limited to legacy wallet envelope | Purpose separation | Approved profiles and encoding | 0007, 0010 |
-| Chain/wallet/account/transaction/slate/participant binding | V2 chain-aware slate and backup records | Cross-context rejection | Exact binding model | 0003, 0007, 0008, 0010 |
-| Nonce generation and scalar mapping | Existing DOM slate/fund behavior | Non-reuse | Approved construction and misuse limits | 0003, 0007 |
-| AEAD, password KDF, salt, IV/nonce, AAD, envelope versioning | V1/V2 envelope evidence | Confidentiality, integrity, typed rejection | Exact V3 profile or rejection | 0007, 0008, 0010 |
-| Rotation, backup inclusion, restore, migration, rollback protection | V2 full backup and legacy limitations | Continuity and recovery safety | Record ownership and activation rules | 0008, 0011 |
-| Vectors, negative tests, interoperability, Tauri boundary | Current evidence and V3 assurance requirements | Verifiable, secret-free interface | Approved vector suite and test plan | 0003, 0007, 0008, 0010, 0011, 0012 |
+| Root ownership, KDF/expansion, domain identifiers, canonical encoding | Existing construction is limited to legacy wallet envelope | Purpose separation | Versioned profiles and encoding, published for continuous review | 0007, 0010 |
+| Chain/wallet/account/transaction/slate/participant binding | V2 chain-aware slate and backup records | Cross-context rejection | Exact binding model and negative vectors | 0003, 0007, 0008, 0010 |
+| Nonce generation and scalar mapping | Existing DOM slate/fund behavior | Non-reuse | Versioned construction and misuse limits | 0003, 0007 |
+| AEAD, password KDF, salt, IV/nonce, AAD, envelope versioning | V1/V2 envelope evidence | Confidentiality, integrity, typed rejection | Exact V3 profile, migration behavior, and vectors | 0007, 0008, 0010 |
+| Rotation, backup inclusion, restore, migration, rollback protection | V2 full backup and legacy limitations | Continuity and recovery safety | Record ownership, activation rules, and compatible migration | 0008, 0011 |
+| Vectors, negative tests, interoperability, Tauri boundary | Current evidence and V3 assurance requirements | Verifiable, secret-free interface | Published vector suite and test plan; community review welcome | 0003, 0007, 0008, 0010, 0011, 0012 |
 
 ## Vector schema and selection rules
 
 Vectors contain: vector version; chain ID; network ID; wallet identity; purpose; construction version; object identity; encoded context; expected representation; cross-domain, cross-chain, and cross-wallet inequality; malformed encoding; unknown version; retry stability; non-reuse; backup/restore continuity; migration; password change; authentication rotation; and interoperability identifiers. Every missing output is `TO_BE_PROVIDED_BY_APPROVED_REVIEWED_CONSTRUCTION`.
 
-Selection must preserve DOM consensus and wallet-format compatibility, satisfy every mandatory invariant, provide typed failure behavior, include negative/property/interoperability vectors, and keep all secret material outside Tauri presentation. The reviewer may select or reject a family only with an approved construction and test-vector plan.
+The owner selected Option A because it preserves DOM consensus and wallet-format compatibility, validated V1/V2 properties, Tauri continuity, and DOM visual identity while rejecting the eight documented weaknesses and limiting Epic to verified gap-solving strategy. Options B and C remain available as future community-proposed upgrades. Implementation must satisfy every mandatory invariant, provide typed failure behavior, include negative/property/interoperability vectors, and keep all secret material outside Tauri presentation.
 
 ## Prohibited shortcuts and gate
 
-Prohibited: copying Epic code, UI, APIs, transport, labels, formats, or cryptographic parameters; treating a legacy DOM construction as automatically approved; sending secrets through Tauri IPC; adding a domain label or formula without review; reducing non-reuse floors on restore/migration; or claiming seed-only recovery restores random/local material.
+Prohibited: copying Epic code, UI, APIs, transport, labels, formats, or cryptographic parameters; treating a legacy DOM construction as automatically approved; sending secrets through Tauri IPC; adding an undocumented or unversioned domain label or formula; reducing non-reuse floors on restore/migration; or claiming seed-only recovery restores random/local material.
 
-`DESIGN_OPTIONS_DOCUMENTED -> INDEPENDENT_CRYPTOGRAPHIC_REVIEW -> OPTION_SELECTED_OR_REJECTED -> CONSTRUCTION_SPECIFIED -> TEST_VECTORS_APPROVED -> SPECIFICATIONS_UPDATED -> IMPLEMENTATION_AUTHORIZED`
+`OWNER_POLICY_DOCUMENTED -> OPTION_A_SELECTED -> CONSTRUCTION_VERSIONED -> TEST_VECTORS_PUBLISHED -> COMMUNITY_REVIEW_CONTINUES -> SPECIFICATIONS_UPDATED -> IMPLEMENTATION_AUTHORIZED`
 
-DEC-V3-SECRET-DOMAINS remains BLOCKING until this gate completes through independent cryptographic review.
+DEC-V3-SECRET-DOMAINS is RESOLVED at architecture-policy level. Exact versioned construction details, vectors, negative tests, property tests, interoperability evidence, compatible migration, and community review remain visible implementation obligations. They are not external-audit or independent-review blockers for implementation or launch.
+
+## Owner Selection
+
+**Project-owner selection:** OPTION_A_HARDENED_DOM_WALLET_CONTINUITY
+**Architecture-policy status:** RESOLVED_BY_OWNER_POLICY
+**Implementation authorized:** YES
+**External audit required:** NO
+**Community-review model:** OPEN_AND_CONTINUOUS
+**Effective decision counts:** 30 RESOLVED; 0 BLOCKING; 0 HIGH blockers
+
+Option A is selected as the DOM-first implementation family. It preserves validated DOM-native transaction, slate, derivation, persistence, backup, recovery, and Tauri product behavior; rejects the eight confirmed DOM weaknesses; and uses Epic only for verified robustness gaps in private-context durability, retry, deletion, reconciliation, recovery, state-machine clarity, abstraction, hostile-input handling, and assurance. Exact cryptographic construction details remain versioned engineering work, publicly reviewable and replaceable through compatible migrations. The [Mainnet and Community Review Policy](MAINNET_AND_COMMUNITY_REVIEW_POLICY.md) governs launch authorization and review status.

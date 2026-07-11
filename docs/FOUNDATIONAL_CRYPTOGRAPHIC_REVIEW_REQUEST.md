@@ -49,3 +49,24 @@ Three non-selecting candidate architecture families are documented: Option A, Ha
 **Severity:** HIGH
 
 DEC-V3-SECRET-DOMAINS remains BLOCKING. An internal design-options package is not independent approval. The existing reviewer outcome field remains intentionally unpopulated: **APPROVED / APPROVED WITH REQUIRED CHANGES / REJECTED**.
+
+## Project Owner Resolution
+
+**Owner:** Soren Planck
+**Selected option:** OPTION_A_HARDENED_DOM_WALLET_CONTINUITY
+**Architecture-policy status:** RESOLVED_BY_OWNER_POLICY
+**Effective decision status:** RESOLVED
+**Final ownership:** PROJECT_OWNER_AND_OPEN_COMMUNITY_REVIEW
+**Implementation authorized:** YES
+**External audit required:** NO
+**Independent review required for launch:** NO
+**Community-review model:** OPEN_AND_CONTINUOUS
+**Effective decision counts:** 30 RESOLVED; 0 BLOCKING; 0 HIGH blockers
+
+The former mandatory independent-review path is superseded for implementation and launch by the project-owner open community-review policy. Option A preserves validated DOM Wallet V1/V2 properties, DOM-native transaction and slate compatibility, the existing Tauri desktop direction, and DOM visual identity while rejecting the eight documented weaknesses. Epic remains limited to verified gap-solving properties for private-context durability, retry, lifecycle deletion, reconciliation, recovery, state-machine clarity, abstraction boundaries, hostile-input handling, and assurance.
+
+The prior request language, including the earlier `UNSELECTED`, `NOT_SPECIFIED`, `NOT_PROVIDED`, and `NOT_COMPLETED` fields and reviewer wording, is retained as historical evidence only. It is not a current implementation or launch requirement.
+
+Implementation must still explicitly document, version, test, reproduce, and fail closed on invalid cryptographic input. Required engineering deliverables are exact construction identifiers and canonical contexts; parameters and encodings; nonce/blinding lifecycle and non-reuse evidence; envelope and migration versions; vectors; negative/property/interoperability tests; backup/restore and rollback behavior; redaction; and compatible replacement/migration paths. Community findings are accepted continuously and may lead to compatible security upgrades.
+
+The historical external reviewer form and outcome choices—**APPROVED / APPROVED WITH REQUIRED CHANGES / REJECTED**—remain available as optional future artifacts and are **NON-MANDATORY_FOR_IMPLEMENTATION_OR_LAUNCH**. No external reviewer outcome is populated. See the [Mainnet and Community Review Policy](MAINNET_AND_COMMUNITY_REVIEW_POLICY.md) and [Policy Update Report](../reports/MAINNET_AND_COMMUNITY_REVIEW_POLICY_UPDATE.md).

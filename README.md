@@ -13,7 +13,7 @@
 
 > A secure, recoverable, and DOM-native wallet architecture.
 
-> **Current phase: Foundation and Specification.** All foundational specifications have completed their first design pass; eight are in **REVIEW** and five remain **DRAFT**. No functional wallet exists yet, and no real-fund, production, or mainnet use is authorized.
+> **Current phase: Foundation and Specification.** All foundational specifications have completed their first design pass; eight are in **REVIEW** and five remain **DRAFT**. No functional wallet exists yet. Implementation and launch are authorized under the open community-review policy, while the project remains experimental and unaudited until evidence changes.
 
 DOM Wallet V3 is a new, independent wallet architecture for the DOM protocol. It is being specified before implementation so that wallet correctness includes failure, recovery, and adversarial behavior—not only a successful transaction path.
 
@@ -48,9 +48,9 @@ DOM Wallet V1 and V2 are sources of DOM-specific experience and validated proper
 
 ## Current Project Status
 
-The repository foundation and engineering baseline are complete. The first design pass, adversarial cross-review, and blocker-closure work are complete through the owner-approved StableView policy. DEC-STABLE-VIEW is resolved through a limited ChainSource wallet policy strengthened by DOM height-and-hash binding and fail-closed validation. There are 29 effective RESOLVED decisions and 1 effective BLOCKING decision; DEC-V3-SECRET-DOMAINS is the only effective HIGH blocker and requires independent cryptographic review. Eight foundational specifications are in REVIEW and five remain DRAFT.
+The repository foundation and engineering baseline are complete. The first design pass, adversarial cross-review, and blocker-closure work are complete through the owner-approved StableView policy. DEC-STABLE-VIEW is resolved through a limited ChainSource wallet policy strengthened by DOM height-and-hash binding and fail-closed validation. The project owner has selected Option A — Hardened DOM Wallet Continuity for DEC-V3-SECRET-DOMAINS. There are 30 effective RESOLVED decisions, 0 effective BLOCKING decisions, and 0 effective HIGH blockers. Eight foundational specifications are in REVIEW and five remain DRAFT as incomplete engineering documents.
 
-No wallet crates or functional wallet implementation exist in this repository. Production use, mainnet use, and real-fund use are not authorized.
+No wallet crates or functional wallet implementation exist in this repository. Implementation, private testnet, public testnet, and mainnet launch are not conditioned on an external audit or independent review. The project follows open community review; external audits are welcome but optional. Market value is external to protocol enforcement, and the software has no audit-status or asset-value runtime classification. Incomplete security work remains publicly tracked; this is not an audit, safety, or risk-free claim.
 
 | Specification | Status |
 |---|---|
@@ -68,7 +68,7 @@ No wallet crates or functional wallet implementation exist in this repository. P
 | 0011 Migration from V2 | DRAFT |
 | 0012 Testing and Assurance | REVIEW |
 
-The authoritative status table is maintained in [Specifications](specs/README.md). The review evidence is recorded in the [Consistency Matrix](docs/SPECIFICATION_CONSISTENCY_MATRIX.md), [Decision Register](docs/FOUNDATIONAL_DECISION_REGISTER.md), [StableView protocol request](docs/FOUNDATIONAL_PROTOCOL_DECISION_REQUEST.md), [StableView approval report](reports/FOUNDATIONAL_STABLE_VIEW_APPROVAL.md), [Cryptographic review request](docs/FOUNDATIONAL_CRYPTOGRAPHIC_REVIEW_REQUEST.md), [Cross Review Report](reports/FOUNDATIONAL_SPECIFICATIONS_CROSS_REVIEW.md), [Blocker Closure Pass 1](reports/FOUNDATIONAL_BLOCKER_CLOSURE_PASS1.md), and [Blocker Status Reconciliation](reports/FOUNDATIONAL_BLOCKER_STATUS_RECONCILIATION.md).
+The authoritative status table is maintained in [Specifications](specs/README.md). The owner-approved [Mainnet and Community Review Policy](docs/MAINNET_AND_COMMUNITY_REVIEW_POLICY.md) records the launch model and continuing security obligations. The review evidence is recorded in the [Consistency Matrix](docs/SPECIFICATION_CONSISTENCY_MATRIX.md), [Decision Register](docs/FOUNDATIONAL_DECISION_REGISTER.md), [Cryptographic review request](docs/FOUNDATIONAL_CRYPTOGRAPHIC_REVIEW_REQUEST.md), [Secret-domain design options](docs/FOUNDATIONAL_SECRET_DOMAIN_DESIGN_OPTIONS.md), [StableView approval report](reports/FOUNDATIONAL_STABLE_VIEW_APPROVAL.md), [Cross Review Report](reports/FOUNDATIONAL_SPECIFICATIONS_CROSS_REVIEW.md), and [Community Review Policy Update](reports/MAINNET_AND_COMMUNITY_REVIEW_POLICY_UPDATE.md).
 
 ## Core Design Principles
 
@@ -134,7 +134,7 @@ The following crates are planned, but none has been introduced. A crate may be a
 
 ## Target Capabilities
 
-When governing specifications are accepted and implementation gates permit it, the architecture is intended to support:
+When implementation is introduced, the architecture is intended to support:
 
 * wallet lifecycle and account management;
 * outputs and derived balance views;
@@ -180,7 +180,7 @@ The required test categories for the completed specifications are recorded in th
 | Gate | Status | Evidence |
 |---|---|---|
 | Gate 0 — Foundation baseline | COMPLETE | Engineering baseline and repository foundation are recorded. |
-| Gate 1 — Foundational specifications | IN PROGRESS | First passes, cross-review, and owner-approved StableView closure are complete; 1 effective HIGH cryptographic blocker keeps 5 specifications DRAFT pending independent review, REVIEW promotion, and ACCEPTED evidence. |
+| Gate 1 — Foundational specifications | IN PROGRESS | First passes, cross-review, StableView closure, and Option A policy selection are complete. Five DRAFT specifications remain an engineering-completion tracker; Gate 1 is not a runtime, implementation, testnet, mainnet, mining, transaction, or fund-usage prohibition. |
 | Gate 2 — State-model acceptance | NOT STARTED | Requires accepted governing specifications. |
 | Gate 3 — Storage and crash-recovery acceptance | NOT STARTED | Requires accepted persistence and recovery design. |
 | Gate 4 — Chain-source and sync acceptance | NOT STARTED | Requires accepted canonical-view contract. |
@@ -189,10 +189,10 @@ The required test categories for the completed specifications are recorded in th
 | Gate 7 — Economics and lifecycle acceptance | NOT STARTED | Requires accepted DOM economics and lifecycle specifications. |
 | Gate 8 — Interface and transport acceptance | NOT STARTED | Requires accepted capability and transport specifications. |
 | Gate 9 — Migration acceptance | NOT STARTED | Requires accepted DOM Wallet V2 migration specification. |
-| Gate 10 — Implementation introduction | NOT STARTED | Requires prior accepted gates and approved crate boundaries. |
+| Gate 10 — Implementation introduction | AUTHORIZED | Implementation is authorized under the owner policy; versioned constructions, vectors, tests, migrations, and fail-closed behavior remain engineering deliverables. |
 | Gate 11 — Verification completion | NOT STARTED | Requires implementation and required test evidence. |
-| Gate 12 — Independent review | NOT STARTED | Requires completed implementation and review scope. |
-| Gate 13 — Operational authorization | NOT STARTED | Requires all applicable safety and release gates. |
+| Gate 12 — Community and optional external review | CONTINUOUS | Community findings and optional external reviews are welcome evidence; they are not implementation, release, runtime, testnet, mainnet, mining, transaction, or fund-usage gates. |
+| Gate 13 — Operational evidence tracking | CONTINUOUS | Tracks disclosed risks, compatible security upgrades, and operational evidence. It is not an audit-status or asset-value enforcement mechanism. |
 
 ## Specifications and Documentation
 
@@ -207,6 +207,8 @@ The required test categories for the completed specifications are recorded in th
 * [Foundational specifications pass 2](reports/FOUNDATIONAL_SPECIFICATIONS_PASS2.md)
 * [Specification consistency matrix](docs/SPECIFICATION_CONSISTENCY_MATRIX.md)
 * [Foundational decision register](docs/FOUNDATIONAL_DECISION_REGISTER.md)
+* [Mainnet and community review policy](docs/MAINNET_AND_COMMUNITY_REVIEW_POLICY.md)
+* [Mainnet and community review policy update](reports/MAINNET_AND_COMMUNITY_REVIEW_POLICY_UPDATE.md)
 * [Foundational cross review](reports/FOUNDATIONAL_SPECIFICATIONS_CROSS_REVIEW.md)
 * [Foundational blocker closure pass 1](reports/FOUNDATIONAL_BLOCKER_CLOSURE_PASS1.md)
 * [Foundational blocker status reconciliation](reports/FOUNDATIONAL_BLOCKER_STATUS_RECONCILIATION.md)
