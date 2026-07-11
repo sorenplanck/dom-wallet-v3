@@ -21,7 +21,7 @@ Secrets include seeds, derived keys, chain codes, scalar material, blindings, no
 
 ## State and data model
 
-Semantic domains are Root, Account, Coinbase, Receive, Change, PrivateTransactionContext, BackupEnvelope, and Authentication. The literals, path layout, and subkey registry for V3 domains are not invented here. Existing DOM coinbase and spend derivation may be recognized for V2 migration only after 0011 validates its provenance.
+Semantic domains are Root, Account, Coinbase, Receive, Change, PrivateTransactionContext, BackupEnvelope, and Authentication. Existing DOM BIP-39/BIP-32/BIP-44 compatibility behavior, deterministic coinbase-by-height material, and deterministic receive-request material are authoritative for supported V1/V2 recovery and migration when their DOM validation inputs are present. Change and receive-slate blindings remain random, non-derivable material. New V3 private-context, backup-envelope, and authentication subkeys are controlled by DEC-V3-SECRET-DOMAINS and are not invented here.
 
 An unlock session carries WalletIdentity, ChainId, capability scope, issuance and expiry evidence, work or inactivity bound, and explicit lock state. It never contains a serializable RootSecret. A secret provenance record records the approved construction version, purpose, allocation, exposure, disposal, and recovery linkage.
 
@@ -84,3 +84,8 @@ Promotion requires reviewed vectors for every implemented DOM domain, a reviewed
 Dependencies are 0001, 0002, 0003, 0004, 0008, 0011, and 0012.
 
 The V3 literal domain-label registry, private-context and authentication subkey construction, authenticated-context encoding, KDF upgrade and bound policy, canonical point and scalar representation policy, and platform-specific zeroization guarantees remain unresolved. They require direct DOM cryptographic authority, vectors, and review before implementation.
+
+## Review Blockers
+
+* DEC-CRYPTO-ENVELOPE-BINDING
+* DEC-V3-SECRET-DOMAINS

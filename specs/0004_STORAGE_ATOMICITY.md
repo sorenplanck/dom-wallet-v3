@@ -21,7 +21,7 @@ Every DUW MUST:
 
 1. require an expected generation and fail with a conflict if it differs from the current generation;
 2. validate the full resulting state and canonical serialization before publication;
-3. bind encryption associated data to magic, model version, wallet identity, and DOM chain ID;
+3. authenticate magic, model version, wallet identity, and DOM chain ID before records are used; the V3 authenticated-context encoding is controlled by DEC-CRYPTO-ENVELOPE-BINDING and MUST NOT be inferred from the current V2 envelope;
 4. include all canonical records, indexes needed for recovery, recovery events, and audit event for the logical action;
 5. write authenticated bytes through one atomic publication protocol and acknowledge only after its required synchronization point;
 6. leave either the old valid generation or the complete new valid generation after a crash; and
@@ -33,7 +33,7 @@ Every DUW MUST:
 |---|---|
 | Send preparation | Validated local intent, idempotency key, input reservations, derivation allocations, change/output records, transaction record, encrypted private context, recovery event, and audit event. |
 | Receive | Replay check, received record/output observation, allocation evidence, transaction linkage, encrypted context if required, and audit event. |
-| Finalize | Finalized DOM-native canonical transaction bytes or reference inside canonical state, context transition, allocations, recovery event, and audit event. |
+| Finalize | Finalized DOM-native canonical transaction bytes or reference inside canonical state, context transition, allocations, retained reservation evidence, selected-input local-control transition to locally_finalized_spend(TransactionId), recovery event, and audit event. |
 | Submit intent | Durable intent, idempotency key, canonical transaction reference, attempt state, and audit event before transport invocation. |
 | Confirmation | Validated chain observation, output and transaction reclassification, maturity input, cursor, recovery completion, and audit event. |
 | Cancellation | Authorized lifecycle update, reservation release or retention evidence, context disposition, recovery event, and audit event. |
@@ -103,3 +103,8 @@ Dependencies are 0001, 0002, 0005, and 0006; 0003 supplies lifecycle transition 
 * **Anti-rollback primitive:** affects valid authenticated old-generation replay. Evidence required: supported-storage and platform design review. Gate: 0012 acceptance.
 * **Backend durability profile:** affects the precise synchronization primitive behind acknowledgement. Evidence required: adapter design and fault model. Gate: implementation-design review after this specification.
 * **Migration retention period for source bytes:** affects recoverability and privacy. Evidence required: 0011 migration plan. Gate: 0011 review.
+
+## Review Blockers
+
+* DEC-CRYPTO-ENVELOPE-BINDING
+* DEC-ROLLBACK-PROTECTION

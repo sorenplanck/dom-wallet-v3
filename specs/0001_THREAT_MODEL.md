@@ -98,3 +98,8 @@ This specification depends on 0000 and contracts from 0002 through 0006. Specifi
 * **Anti-rollback mechanism:** affects detection of a valid but older authenticated generation. Evidence required: platform threat analysis and a DOM-compatible durable monotonicity design. Gate: 0012 assurance acceptance.
 * **Capability credential form and revocation:** affects least privilege at UI and transport boundaries. Evidence required: API threat analysis and DOM wire constraints. Gate: 0010 acceptance.
 * **Secret zeroization guarantees by platform:** affects residual-memory exposure. Evidence required: supported-platform audit. Gate: 0007 acceptance.
+
+## Review Blockers
+
+* DEC-ROLLBACK-PROTECTION
+* DEC-API-DEPLOYMENT

@@ -1,5 +1,12 @@
 # DOM Wallet V3 Design Principles
 
+**Status:** DRAFT
+**Owner:** Soren Planck
+
+## Scope, authority, and review boundary
+
+These principles govern every foundational specification. DOM consensus and DOM cryptography are authoritative; external wallet material supplies engineering strategies only. Canonical state, durable operations, ChainId binding, non-reuse, least privilege, and deterministic evidence are required across the specification set.
+
 1. DOM protocol rules are sovereign.
 2. Correct and useful DOM V1/V2 properties must be preserved.
 3. Epic may provide engineering strategies, never copied implementation.
@@ -17,3 +24,8 @@
 15. Time, randomness, node responses, storage faults, crashes, and reorganizations must be controllable in tests.
 16. No feature is complete without failure-path and adversarial validation.
 17. Real funds require completed internal gates and independent security review.
+
+## Review Blockers
+
+* DEC-CRYPTO-ENVELOPE-BINDING
+* DEC-ECON-BLOCK-WEIGHT

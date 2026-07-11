@@ -81,3 +81,8 @@ Dependencies are 0001, 0002, 0004, and 0006. Specification 0003 supplies transac
 * **Stable-view evidence format:** affects detection of moving-source responses. Evidence required: DOM node capability and consensus-interface analysis. Gate: chain-source design review.
 * **Minimum independent-source policy:** affects detection of a consistently malicious but internally coherent source. Evidence required: privacy, availability, and deployment threat analysis. Gate: 0010 and 0012 review.
 * **Full-rescan recovery boundary:** affects scan cost and recoverability. Evidence required: approved 0007/0008 recovery guarantees. Gate: 0008 review.
+
+## Review Blockers
+
+* DEC-STABLE-VIEW
+* DEC-RESCAN-BOUNDARY

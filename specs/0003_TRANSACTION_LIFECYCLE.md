@@ -44,7 +44,7 @@ The lifecycle projection is: Created, Prepared, ParticipantExchange, Finalized, 
 | Send or self-transfer preparation | Spending authority, active ChainId, expected Generation, unique TransactionIntentId, spendable inputs, and valid 0009 policy | Prepared record and all preparation records in one durable unit |
 | Receive | Receiving authority, active ChainId, valid DOM-native input, unused ReplayId or identical replay | Replay-stable receive result, context and any local output evidence in one durable unit |
 | Participant exchange | Prepared record and durable ExposureRecord before external delivery | Exchange transcript reference or typed recovery state |
-| Finalization | Valid context, authorized participant material, current Generation, and renewed 0009 validation | Finalized immutable bytes, content hash, context disposition, and audit record |
+| Finalization | Valid context, authorized participant material, current Generation, and renewed 0009 validation | Finalized immutable bytes, content hash, context disposition, input local control set to locally_finalized_spend(TransactionId), and audit record |
 | Submission | Finalized bytes, node-adapter authority, and no incompatible DurableIntent | SubmissionIntended DurableIntent before adapter invocation |
 | Mempool observation | Bounded node evidence associated with exact bytes or DOM reference | Non-canonical observation only |
 | Confirmation | Valid 0005 evidence and cursor in a synchronization unit | Canonical observations and CanonicallyConfirmed projection |
@@ -53,7 +53,7 @@ The lifecycle projection is: Created, Prepared, ParticipantExchange, Finalized, 
 
 Preparation MUST validate expected Generation, capability, ChainId, intent fingerprint, input uniqueness, spendability, input and change cardinality, and all 0009 selection results before allocating or reserving. Receive MUST bind the request to ChainId and WalletIdentity before accepting participant material. A self-transfer MUST run both send and receive contracts without creating a second logical intent.
 
-Finalization MUST revalidate context integrity, participant material, reservation ownership, Generation, and economics. Submission MUST call the adapter with the exact durable bytes; a duplicate node submission is an admissible uncertain external effect, not a second transaction. Node outcomes are Accepted, DuplicateOrAlreadyKnown, Rejected, TemporarilyUnavailable, TimeoutOrUnknown, or MalformedResponse. Only Accepted and DuplicateOrAlreadyKnown permit later mempool observation; none proves confirmation.
+Finalization MUST revalidate context integrity, participant material, reservation ownership, Generation, and economics. In the finalization DUW, every selected input MUST retain its reservation evidence and change local control to locally_finalized_spend(TransactionId); this is not chain-spent evidence. Submission MUST call the adapter with the exact durable bytes; a duplicate node submission is an admissible uncertain external effect, not a second transaction. Node outcomes are Accepted, DuplicateOrAlreadyKnown, Rejected, TemporarilyUnavailable, TimeoutOrUnknown, or MalformedResponse. A later MempoolObserved or canonical observation is admissible only through validated ChainSource evidence matching immutable bytes or the DOM reference, regardless of an earlier adapter result; none of these outcomes alone proves confirmation.
 
 ## Invalid behavior
 
@@ -112,3 +112,8 @@ Promotion requires a reviewed DOM participant-wire and expiry contract, a transi
 Dependencies are 0001, 0002, 0004, 0005, 0006, 0007, 0009, and 0012.
 
 The authoritative DOM participant-wire version, expiry semantics, post-exposure cancellation policy, payment-proof or invoice semantics, and durable retention periods are unresolved. Each requires DOM format, consensus, or approved product-policy evidence before implementation; no foreign behavior selects an answer.
+
+## Review Blockers
+
+* DEC-LIFECYCLE-PARTICIPANT-WIRE
+* DEC-RESERVATION-LIFETIME

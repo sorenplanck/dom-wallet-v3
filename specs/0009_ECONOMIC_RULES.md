@@ -30,7 +30,7 @@ An output is eligible only when the exact 0002 spendable predicate holds: active
 3. A selection is bounded by approved search, input, output, work, and time limits; exhaustion returns a typed policy result without mutation.
 4. Input sum, output sum, fee, and all checked arithmetic are revalidated at finalization and immediately before submission.
 5. A candidate reserves outputs only in the 0003 preparation unit after a complete EconomicPlan validates.
-6. No-change is permitted only when the authoritative DOM balance and fee validation succeeds. Change count is validated as a nonzero permitted value before any division, modulus, allocation, or reservation.
+6. No-change has effective change cardinality zero and is permitted only when authoritative DOM balance and fee validation succeeds. A caller-requested positive change plan MUST use a nonzero permitted cardinality before any division, modulus, allocation, or reservation.
 7. A reorganization or maturity change invalidates prior eligibility and requires revalidation before finalization, repost, or submission.
 
 ## Valid behavior
@@ -43,7 +43,7 @@ Finalization and pre-submission revalidation MUST check that inputs remain canon
 
 ## Invalid behavior
 
-The wallet MUST reject without reservation a negative or overflowing amount representation, invalid change cardinality, foreign-chain or provisional output, non-spendable input, unchecked arithmetic, unbounded search request, stale plan, insufficient candidate, or fee/weight rule derived from another protocol. It MUST NOT divide by a caller-supplied count before validating it, reserve before validation, treat a policy preference as a consensus rule, or use an old canonical cursor to authorize spending.
+The wallet MUST reject without reservation a negative or overflowing amount representation, invalid positive change cardinality, foreign-chain or provisional output, non-spendable input, unchecked arithmetic, unbounded search request, stale plan, insufficient candidate, or fee/weight rule derived from another protocol. It MUST NOT divide by a caller-supplied count before validating it, reserve before validation, treat a policy preference as a consensus rule, or use an old canonical cursor to authorize spending.
 
 ## Persistence and atomicity
 
@@ -84,3 +84,8 @@ Promotion requires a traceable DOM authority matrix for every implemented fee, w
 Dependencies are 0001, 0002, 0003, 0004, 0005, 0006, and 0012.
 
 The approved DOM rule matrix for dust, change cardinality, selection bounds, fee preferences, input and output limits, and any conflicting RFC, implementation, or test evidence remains unresolved until direct authority review. No foreign rule fills these gaps.
+
+## Review Blockers
+
+* DEC-ECON-BLOCK-WEIGHT
+* DEC-ECON-WALLET-POLICY

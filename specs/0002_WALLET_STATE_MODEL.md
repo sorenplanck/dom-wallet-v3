@@ -96,3 +96,8 @@ Dependencies are 0000, 0001, 0004, 0005, and 0006. This document provides the re
 * **Account policy fields and deletion policy:** affect retention and authorization. Evidence required: approved account and API requirements. Gate: 0010 review.
 * **Reservation expiry semantics:** affect liveness and user-visible recovery. Evidence required: lifecycle and DOM transaction-expiry analysis. Gate: 0003 review.
 * **Exact canonical serialization encoding:** affects interoperability and corruption handling. Evidence required: storage and migration design with DOM cryptographic review. Gate: 0004 review.
+
+## Review Blockers
+
+* DEC-CANONICAL-SERIALIZATION
+* DEC-RESERVATION-LIFETIME

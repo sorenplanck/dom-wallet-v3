@@ -90,10 +90,15 @@ Each CI report MUST include exact commit, branch, environment, commands, require
 
 ## Acceptance criteria for promotion from DRAFT to REVIEW
 
-Promotion requires a complete requirement-to-evidence matrix for 0001 through 0011, approved deterministic harness design, severity and flake policies, CI gate design, failure-artifact retention rules, and independent-review scope. Implementation promotion requires executed evidence at the exact implementation commit; design-only evidence is not implementation evidence.
+Promotion requires a complete requirement-to-evidence matrix for 0000 through 0011, approved deterministic harness design, severity and flake policies, CI gate design, failure-artifact retention rules, and independent-review scope. Implementation promotion requires executed evidence at the exact implementation commit; design-only evidence is not implementation evidence.
 
 ## Dependencies and unresolved decisions
 
 This specification depends on Specifications 0001 through 0011.
 
 CI platform matrix, coverage thresholds, supported sanitizer and Miri matrix, dependency-policy toolchain, reproducible-build environment, release-provenance format, failure-artifact retention duration, and independent-review provider remain unresolved pending approved engineering and release policy.
+
+## Review Blockers
+
+* DEC-ASSURANCE-RELEASE
+* DEC-ECON-BLOCK-WEIGHT

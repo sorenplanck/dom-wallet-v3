@@ -63,7 +63,7 @@ On restart sessions are locked or revalidated according to their explicit policy
 
 ## Reorganization, concurrency, replay, and idempotency
 
-Read-only replies MUST mark provisional state supplied during reconciliation. Reorganization is handled by 0006, not by an adapter. Concurrent mutations rely on expected Generation and return a conflict to losing callers. Duplicated or reordered messages use ReplayId and idempotency rules from 0003. Delayed or corrupted messages are rejected or recorded as uncertainty without state mutation.
+Read-only replies MUST mark provisional state supplied during reconciliation. Reorganization is handled by 0006, not by an adapter. Concurrent mutations rely on expected Generation and return a conflict to losing callers. Duplicated or reordered messages use ReplayId and idempotency rules from 0003. Delayed or corrupted messages are rejected without lifecycle, ownership, confirmation, output, or reservation mutation; a bounded durable redacted audit or recovery uncertainty record MAY be created through its required DUW.
 
 ## Security, compatibility, and migration impact
 
@@ -92,3 +92,7 @@ Promotion requires a reviewed credential and revocation construction, authorizat
 Dependencies are 0001, 0002, 0003, 0004, 0005, 0007, 0008, and 0012.
 
 Credential format and revocation, remote transport policy, capability delegation, API version registry, concrete rate and work limits, and prolonged provisional-state presentation remain unresolved pending DOM and deployment evidence.
+
+## Review Blockers
+
+* DEC-API-DEPLOYMENT

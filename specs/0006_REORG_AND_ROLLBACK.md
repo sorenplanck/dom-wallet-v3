@@ -87,3 +87,8 @@ Dependencies are 0001, 0002, 0003, 0004, and 0005. Specifications 0007 through 0
 * **Maximum automatic ancestor depth and rescan resource budget:** affects availability and recovery latency. Evidence required: deployment capacity and adversarial-source analysis. Gate: 0012 assurance review.
 * **User policy for prolonged provisional state:** affects user experience without changing safety. Evidence required: approved interface policy. Gate: 0010 review.
 * **Final lifecycle reclassification vocabulary:** affects transaction display and cancellation. Evidence required: 0003 lifecycle state machine. Gate: 0003 review.
+
+## Review Blockers
+
+* DEC-STABLE-VIEW
+* DEC-REORG-BUDGET

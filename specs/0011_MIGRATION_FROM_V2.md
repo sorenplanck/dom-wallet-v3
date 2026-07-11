@@ -78,3 +78,8 @@ Promotion requires an approved supported-source matrix, direct format vectors, r
 Dependencies are 0001, 0002, 0004, 0005, 0006, 0007, 0008, and 0012.
 
 The supported V2 source-version matrix, source-byte retention policy, exact normalization mappings for every V2 pending state, account-label policy, and post-activation rollback retention period require direct V2 evidence and review before implementation.
+
+## Review Blockers
+
+* DEC-MIGRATION-MATRIX
+* DEC-CRYPTO-ENVELOPE-BINDING

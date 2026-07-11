@@ -15,7 +15,7 @@ Authoritative sources are Specifications 0000 through 0007, DOM Wallet V1/V2 bac
 
 | Product | May recover | Must report or omit |
 |---|---|---|
-| Seed-only recovery | Authoritatively derivable DOM material and chain observations obtainable through a full canonical scan | Non-derivable random change and interactive receive material, private contexts, finalized bytes, history, reservations, and metadata absent from seed and chain evidence |
+| Seed-only recovery | Deterministic DOM coinbase material only where canonical scan inputs satisfy the authoritative recovery contract | Receive-request recovery without its required authoritative inputs, non-derivable random change and interactive receive material, private contexts, finalized bytes, history, reservations, and metadata absent from seed and chain evidence |
 | V3 full backup | All included canonical records from one authenticated Generation | The selected schema's declared omissions; it does not prove a newer local generation was not lost |
 | V2 migration recovery | Validated V2 data normalized by 0011 | Unsupported, corrupt, ambiguous, or foreign-chain source material |
 | Repair or full-rescan | Chain-derived observations and rebuildable indexes | It MUST retain local intent, allocations, non-reuse evidence, contexts, and records; it MUST NOT invent non-derivable data |
@@ -44,7 +44,7 @@ The canonical payload MUST include WalletIdentity, Account records, ChainId, Gen
 
 Export validates the selected Generation, creates a uniquely named temporary output in the destination durability domain, writes the encrypted envelope, performs the selected file and directory synchronization, atomically publishes it, and records export completion only after its declared durability point. A temporary-file collision, sync failure, or publish failure returns a typed failure and preserves active state.
 
-Import first derives keys under bounded work limits, authenticates the envelope, validates the manifest and canonical records, rejects wrong password without a distinguishing secret-bearing message, stages normalized state, advances floors conservatively, and produces RestoreReport. It then performs DeterministicReconciliation using the height-and-hash cursor rule and either atomically activates or aborts. The previous active Generation remains available until activation is durably acknowledged.
+Import first derives keys under bounded work limits, authenticates the envelope, validates the manifest and canonical records, rejects wrong password without a distinguishing secret-bearing message, stages normalized state, advances floors conservatively, performs DeterministicReconciliation using the height-and-hash cursor rule, records completion in staging, and then atomically activates or aborts. The previous active Generation remains available until activation is durably acknowledged.
 
 Repeated import with the same authenticated backup identity and request identity MUST return the recorded outcome or perform an equivalent no-op. A different byte sequence using the same request identity is rejected.
 
@@ -58,7 +58,7 @@ Export and restore use 0004 durability semantics. Staging is non-active, encrypt
 
 ## Crash and restart behavior
 
-A crash before publication leaves only a recoverable temporary artifact or no artifact and never changes active wallet state. Restart validates or safely removes a known temporary artifact without treating it as a completed backup. A crash during import preserves staging or the old active Generation. A crash after activation acknowledgement reopens the new Generation, validates its recovery event, and resumes reconciliation if it was not complete.
+A crash before publication leaves only a recoverable temporary artifact or no artifact and never changes active wallet state. Restart validates or safely removes a known temporary artifact without treating it as a completed backup. A crash during import preserves staging or the old active Generation. A crash after activation acknowledgement reopens the new Generation and validates the completed staged reconciliation; it MAY run non-authorizing verification but MUST block selection if validation fails.
 
 ## Reorganization, concurrency, replay, and idempotency
 
@@ -91,3 +91,9 @@ Promotion requires an approved V3 format and bounded KDF policy, a reviewed seed
 Dependencies are 0001, 0002, 0004, 0005, 0006, 0007, 0011, and 0012.
 
 The V3 magic and encoding, authenticated associated-data contract, bounded KDF profile policy, anti-rollback mechanism, divergent-record conflict policy, temporary-file retention policy, and repair boundary require cryptographic, storage, source, and migration review before implementation.
+
+## Review Blockers
+
+* DEC-CRYPTO-ENVELOPE-BINDING
+* DEC-BACKUP-FORMAT
+* DEC-ROLLBACK-PROTECTION
