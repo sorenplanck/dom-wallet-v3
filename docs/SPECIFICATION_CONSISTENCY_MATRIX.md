@@ -3,7 +3,7 @@
 **Owner:** Soren Planck
 **Review date:** 2026-07-11
 
-**Closure Pass 1:** DEC-ECON-BLOCK-WEIGHT is resolved from current DOM consensus code and tests; remaining blocker references are DEC-ROLLBACK-PROTECTION, DEC-STABLE-VIEW, and DEC-V3-SECRET-DOMAINS.
+**Closure Pass 1:** DEC-ECON-BLOCK-WEIGHT is resolved from current DOM consensus code and tests. The reconciled effective blocker references are DEC-ROLLBACK-PROTECTION, DEC-STABLE-VIEW, and DEC-V3-SECRET-DOMAINS; see [Blocker Status Reconciliation](../reports/FOUNDATIONAL_BLOCKER_STATUS_RECONCILIATION.md).
 
 | Subject | Authority | Dependents and records | Atomicity, restart, reorg, migration, and security rule | Evidence and decisions | Verdict |
 |---|---|---|---|---|---|

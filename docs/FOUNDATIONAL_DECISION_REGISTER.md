@@ -54,3 +54,19 @@ Initial blocker verdicts are REFUTED as REVIEW blockers for DEC-API-CREDENTIALS,
 | BLOCKING | 1 | DEC-ECON-BLOCK-WEIGHT remains HIGH because conflicting normative DOM RFC statements cannot be selected by wallet policy. |
 
 Ownership reassessment: WALLET_POLICY 0 remaining; DOM_PROTOCOL 1 remaining; CRYPTOGRAPHIC_REVIEW 0 remaining; V2_MIGRATION_EVIDENCE 0 remaining; IMPLEMENTATION_PROOF 0 remaining; ASSURANCE_GATE 0 remaining. The remaining blocker requires a corrected or superseding DOM RFC and a consensus regression vector. Required later evidence for resolved contracts remains in their acceptance criteria and Gates 10 through 12; it is not claimed executed.
+
+## Effective Decision Status Rules
+
+The newest explicit reconciliation or closure final-status subsection for a stable decision ID determines its current status. Original cross-review rows, start verdicts, historical summaries, quoted statuses, and raw BLOCKING occurrences remain historical evidence only.
+
+## Foundational Blocker Status Reconciliation
+
+**Reconciliation date:** 2026-07-11
+
+| Decision | Evidence examined | Reconciled final status | Contradiction classification | Current impact |
+|---|---|---|---|---|
+| DEC-ROLLBACK-PROTECTION | Pass 1 diff; 0001, 0004, 0008, 0011, 0012 metadata; Pass 1 report remaining-blocker table; matrix; index and README | BLOCKING | REGISTER_STATUS_INCORRECT, MULTIPLE_ARTIFACTS_INCORRECT | Cross-device monotonic-witness evidence is absent; affected specifications remain DRAFT where this safety contract is essential. |
+| DEC-STABLE-VIEW | Pass 1 diff; 0005, 0006, affected lifecycle/recovery metadata; Pass 1 report remaining-blocker table; matrix; index and README | BLOCKING | REGISTER_STATUS_INCORRECT, MULTIPLE_ARTIFACTS_INCORRECT | V3 multipage StableView, hash-at-height, and bounded ancestry interface remain undefined by authoritative DOM evidence. |
+| DEC-V3-SECRET-DOMAINS | Pass 1 diff; 0003, 0007, 0008, 0010, 0011 metadata; Pass 1 report remaining-blocker table; matrix; index and README | BLOCKING | REGISTER_STATUS_INCORRECT, MULTIPLE_ARTIFACTS_INCORRECT | Approved private-context, backup, and authentication domain construction, vectors, and cryptographic review remain absent. |
+
+This reconciliation supersedes the contradictory Pass 1 register narrative only for current effective status. The immutable Pass 1 report is retained as historical evidence and its remaining-blocker table is the supported Pass 1 outcome. Current effective inventory: 27 RESOLVED and 3 BLOCKING; ownership is one DOM_PROTOCOL, one CRYPTOGRAPHIC_REVIEW, and one IMPLEMENTATION_PROOF decision; severity is 0 CRITICAL, 2 HIGH, and 1 MEDIUM.

@@ -68,7 +68,7 @@ No wallet crates or functional wallet implementation exist in this repository. P
 | 0011 Migration from V2 | DRAFT |
 | 0012 Testing and Assurance | REVIEW |
 
-The authoritative status table is maintained in [Specifications](specs/README.md). The review evidence is recorded in the [Consistency Matrix](docs/SPECIFICATION_CONSISTENCY_MATRIX.md), [Decision Register](docs/FOUNDATIONAL_DECISION_REGISTER.md), [Cross Review Report](reports/FOUNDATIONAL_SPECIFICATIONS_CROSS_REVIEW.md), and [Blocker Closure Pass 1](reports/FOUNDATIONAL_BLOCKER_CLOSURE_PASS1.md).
+The authoritative status table is maintained in [Specifications](specs/README.md). The review evidence is recorded in the [Consistency Matrix](docs/SPECIFICATION_CONSISTENCY_MATRIX.md), [Decision Register](docs/FOUNDATIONAL_DECISION_REGISTER.md), [Cross Review Report](reports/FOUNDATIONAL_SPECIFICATIONS_CROSS_REVIEW.md), [Blocker Closure Pass 1](reports/FOUNDATIONAL_BLOCKER_CLOSURE_PASS1.md), and [Blocker Status Reconciliation](reports/FOUNDATIONAL_BLOCKER_STATUS_RECONCILIATION.md).
 
 ## Core Design Principles
 
@@ -209,6 +209,7 @@ The required test categories for the completed specifications are recorded in th
 * [Foundational decision register](docs/FOUNDATIONAL_DECISION_REGISTER.md)
 * [Foundational cross review](reports/FOUNDATIONAL_SPECIFICATIONS_CROSS_REVIEW.md)
 * [Foundational blocker closure pass 1](reports/FOUNDATIONAL_BLOCKER_CLOSURE_PASS1.md)
+* [Foundational blocker status reconciliation](reports/FOUNDATIONAL_BLOCKER_STATUS_RECONCILIATION.md)
 
 ## Engineering References
 
