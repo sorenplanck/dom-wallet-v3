@@ -36,6 +36,16 @@ Cursor update: `next_page_height` is now enforced as the first height not durabl
 
 The remaining test coverage is recorded precisely as `ACTIVATING_FAIL_CLOSED_MATRIX_COVERAGE_PARTIAL` and `CLEANUP_CRASH_RESUME_COVERAGE_PENDING`. It is follow-up assurance work, not a detected functional failure, audit claim, safety claim, or blocker for native Tauri integration. The current focused storage/core command passes 13 tests with 0 failures; the prior broader focused backend command passed 16 tests with 0 failures.
 
+## Native completion
+
+The native Tauri runtime manages shared desktop state, registers all nineteen Phase 1A invoke commands, uses a least-privilege main-window capability, and is connected to the production frontend invoke adapter. The frontend has onboarding and lifecycle controls, backend balance projections, redacted node configuration and diagnostics surfaces, unlock-free node probe wiring, synchronization controls, full-rescan confirmation, password and credential-field clearing, and bounded status refresh.
+
+Validation accepted for this completion: src-tauri check PASS; src-tauri clippy with warnings denied PASS; 5 Tauri tests, 0 failed; frontend typecheck PASS; frontend tests 2 passed, 0 failed; frontend production build PASS; `cargo fmt --all --check` PASS; `git diff --check` PASS. `CARGO_TARGET_DIR=/tmp/dom-wallet-v3-tauri-final.7byijG CARGO_BUILD_JOBS=2 cargo tauri build` generated `/tmp/dom-wallet-v3-tauri-final.7byijG/release/dom-wallet-tauri-shell`. `INSTALLER_BUNDLE_STATUS=NOT_GENERATED_BY_CURRENT_TAURI_CONFIGURATION` is packaging follow-up work, not a native application failure.
+
+`PHASE1A_REMAINING_FUNCTIONAL_GAPS=NONE`
+
+`PHASE1B_SCOPE=SLATE_TRANSACTION_LIFECYCLE_AND_LIVE_VPS_NODE_E2E`
+
 ## Implemented workspace
 
 | Component | Result |
@@ -93,4 +103,4 @@ These are implementation gaps, not audit-status or asset-value gates. The workin
 
 ## Verdict
 
-IMPLEMENTATION_PHASE1A_FUNCTIONAL_GAPS_REMAIN
+IMPLEMENTATION_PHASE1A_COMPLETE

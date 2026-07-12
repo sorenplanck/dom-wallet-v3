@@ -13,7 +13,7 @@
 
 > A secure, recoverable, and DOM-native wallet architecture.
 
-> **Current phase: Executable Foundation 1A.** All foundational specifications have completed their first design pass; eight are in **REVIEW** and five remain **DRAFT**. The repository now contains an experimental, unaudited desktop-wallet foundation for local wallet lifecycle and deterministic mock synchronization. Implementation and launch are authorized under the open community-review policy.
+> **Current phase: Executable Foundation 1A complete.** The repository contains an experimental, unaudited native desktop-wallet foundation with a Tauri runtime and production invoke frontend. Phase 1B begins transaction and slate lifecycle work.
 
 DOM Wallet V3 is a new, independent wallet architecture for the DOM protocol. It is being specified before implementation so that wallet correctness includes failure, recovery, and adversarial behavior—not only a successful transaction path.
 

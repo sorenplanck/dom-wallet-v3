@@ -30,7 +30,9 @@ npm run build
 cargo run -p dom-wallet-tauri-shell
 ```
 
-The shell has a native Tauri v2 entry point and invoke handler. The UI source is bundled from `frontend/`; do not place passwords, root material, nonce material, contexts, or credentials in browser storage or frontend diagnostics.
+The shell has a native Tauri v2 entry point, invoke handler, and production frontend integration. The UI source is bundled from `frontend/`; do not place passwords, root material, nonce material, contexts, or credentials in browser storage or frontend diagnostics.
+
+The validated release executable was generated as ephemeral local evidence at `/tmp/dom-wallet-v3-tauri-final.7byijG/release/dom-wallet-tauri-shell`. The current Tauri configuration does not generate an installer bundle; packaging remains follow-up work.
 
 ## Wallet and node behavior
 

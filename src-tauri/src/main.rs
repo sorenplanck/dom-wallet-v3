@@ -107,8 +107,12 @@ fn synchronization_rescan(app: tauri::State<'_, DesktopApplication>) -> Result<(
     app.synchronization_rescan().map_err(|e| e.to_string())
 }
 #[tauri::command]
-fn node_probe() -> Result<(), String> {
-    Err("node probe requires a redacted, explicit node configuration and is not available from this screen".into())
+fn node_probe(
+    app: tauri::State<'_, DesktopApplication>,
+    configuration: dom_wallet_domain::NodeConfiguration,
+) -> Result<dom_wallet_chain::LiveNodeProbe, String> {
+    app.node_probe_live(configuration)
+        .map_err(|e| e.to_string())
 }
 #[tauri::command]
 fn application_shutdown(
@@ -145,5 +149,5 @@ fn main() {
             application_shutdown
         ])
         .run(tauri::generate_context!())
-        .expect("failed to run DOM Wallet V3 native runtime");
+        .unwrap_or_else(|_| std::process::exit(1));
 }

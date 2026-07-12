@@ -26,13 +26,14 @@
       </section>
       <section id="dashboard" class="screen" hidden>
         <h2>Account overview</h2><div id="balance-cards" class="cards"></div><p id="sync-status">Synchronization is not started.</p>
-        <button id="sync">Synchronize</button><button id="lock">Lock wallet</button>
+        <button id="sync">Synchronize</button><button id="pause">Pause</button><button id="resume">Resume</button><button id="retry">Retry</button><button id="rescan">Full rescan</button><button id="lock">Lock wallet</button><button id="close">Close wallet</button>
       </section>
       <section id="node" class="screen" hidden>
         <h2>Node configuration</h2><p id="node-status">No node configuration is exposed to the interface.</p>
-        <button id="probe">Probe configured node</button>
+        <form id="node-form"><label>Endpoint <input name="endpoint_url" type="url" required></label><label>Network <select name="network"><option>PRIVATE_TESTNET</option><option>PUBLIC_TESTNET</option><option>MAINNET</option></select></label><label>Chain ID <input name="chain_id" pattern="[0-9a-f]{64}" required></label><label>Genesis hash <input name="genesis_id" pattern="[0-9a-f]{64}" required></label><label>Connect timeout <input name="connect_timeout_ms" type="number" min="1" required></label><label>Request timeout <input name="request_timeout_ms" type="number" min="1" required></label><label>Poll interval <input name="poll_interval_ms" type="number" min="1" required></label><label>Retry ceiling <input name="retry_ceiling" type="number" min="1" required></label><label>Maximum backoff <input name="max_backoff_ms" type="number" min="1" required></label><label>TLS required <input name="tls_required" type="checkbox" checked></label><label>Credential replacement <input name="credential_reference" type="password" autocomplete="off"></label><button>Replace configuration</button></form>
+        <button id="config-load">Load redacted configuration</button><button id="probe">Probe configured node</button>
       </section>
-      <section id="diagnostics" class="screen" hidden><h2>Diagnostics</h2><pre id="diagnostics-output">Redacted diagnostics only.</pre></section>
+      <section id="diagnostics" class="screen" hidden><h2>Diagnostics</h2><button id="diagnostics-refresh">Refresh diagnostics</button><pre id="diagnostics-output">Redacted diagnostics only.</pre></section>
     </main>
     <script type="module" src="main.js"></script>
   </body>

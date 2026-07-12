@@ -6,24 +6,51 @@
 //! a headless environment. A production Tauri `invoke_handler` binds these
 //! names without moving domain, storage, cryptographic, or sync logic here.
 
-use dom_wallet_chain::{ChainSource, MockChainSource};
+use dom_wallet_chain::{ChainSource, LiveNodeProbe, MockChainSource};
 use dom_wallet_core::{CoreError, DiagnosticSnapshot, ProbeResult, WalletService, WalletSummary};
 use dom_wallet_domain::{
     NetworkIdentity, NodeConfiguration, RedactedNodeConfiguration, ScanBounds,
 };
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex,
+};
 use thiserror::Error;
 
 pub struct DesktopApplication {
     service: Mutex<WalletService>,
+    shutdown: AtomicBool,
 }
+
+pub const COMMAND_NAMES: [&str; 19] = [
+    "application_status",
+    "wallet_create",
+    "wallet_open",
+    "wallet_unlock",
+    "wallet_lock",
+    "wallet_close",
+    "wallet_summary",
+    "account_list",
+    "account_summary",
+    "node_configuration_get_redacted",
+    "node_configuration_set",
+    "node_probe",
+    "synchronization_start",
+    "synchronization_pause",
+    "synchronization_resume",
+    "synchronization_retry",
+    "synchronization_rescan",
+    "diagnostics_redacted",
+    "application_shutdown",
+];
 
 impl Default for DesktopApplication {
     fn default() -> Self {
         Self {
             service: Mutex::new(WalletService::default()),
+            shutdown: AtomicBool::new(false),
         }
     }
 }
@@ -56,6 +83,7 @@ impl DesktopApplication {
         password: &str,
         identity: NetworkIdentity,
     ) -> Result<WalletSummary, CommandError> {
+        self.ensure_running()?;
         checked_password(password)?;
         self.service
             .lock()
@@ -65,6 +93,7 @@ impl DesktopApplication {
     }
 
     pub fn wallet_open(&self, path: impl AsRef<Path>) -> Result<WalletSummary, CommandError> {
+        self.ensure_running()?;
         self.service
             .lock()
             .map_err(|_| CommandError::Unavailable)?
@@ -73,6 +102,7 @@ impl DesktopApplication {
     }
 
     pub fn wallet_unlock(&self, password: &str) -> Result<WalletSummary, CommandError> {
+        self.ensure_running()?;
         checked_password(password)?;
         self.service
             .lock()
@@ -82,6 +112,7 @@ impl DesktopApplication {
     }
 
     pub fn wallet_lock(&self) -> Result<(), CommandError> {
+        self.ensure_running()?;
         self.service
             .lock()
             .map_err(|_| CommandError::Unavailable)?
@@ -89,6 +120,7 @@ impl DesktopApplication {
             .map_err(CommandError::from)
     }
     pub fn wallet_close(&self) -> Result<(), CommandError> {
+        self.ensure_running()?;
         self.service
             .lock()
             .map_err(|_| CommandError::Unavailable)?
@@ -138,7 +170,12 @@ impl DesktopApplication {
             .diagnostics()
     }
     pub fn application_shutdown(&self) -> Result<(), CommandError> {
-        self.wallet_close()
+        if self.shutdown.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let mut service = self.service.lock().map_err(|_| CommandError::Unavailable)?;
+        let _ = service.close();
+        Ok(())
     }
 
     pub fn node_probe<S: ChainSource>(&self, source: &mut S) -> Result<ProbeResult, CommandError> {
@@ -154,6 +191,14 @@ impl DesktopApplication {
         expected: &NetworkIdentity,
     ) -> Result<ProbeResult, CommandError> {
         WalletService::probe_node(source, expected).map_err(CommandError::from)
+    }
+    /// Delegates to the core's node-only probe; it never opens, unlocks, or
+    /// persists a wallet and the returned projection has no credential value.
+    pub fn node_probe_live(
+        &self,
+        configuration: NodeConfiguration,
+    ) -> Result<LiveNodeProbe, CommandError> {
+        WalletService::probe_live_configuration(&configuration).map_err(CommandError::from)
     }
     pub fn synchronization_start<S: ChainSource>(
         &self,
@@ -188,6 +233,7 @@ impl DesktopApplication {
     }
 
     pub fn synchronization_start_live(&self) -> Result<WalletSummary, CommandError> {
+        self.ensure_running()?;
         self.service
             .lock()
             .map_err(|_| CommandError::Unavailable)?
@@ -197,6 +243,14 @@ impl DesktopApplication {
 
     pub fn probe_mock(&self, source: &mut MockChainSource) -> Result<ProbeResult, CommandError> {
         self.node_probe(source)
+    }
+
+    fn ensure_running(&self) -> Result<(), CommandError> {
+        if self.shutdown.load(Ordering::Acquire) {
+            Err(CommandError::Unavailable)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -253,5 +307,47 @@ mod tests {
         app.wallet_unlock("password-1").unwrap();
         let mut source = MockChainSource::new(identity);
         assert!(app.probe_mock(&mut source).unwrap().connected);
+    }
+
+    #[test]
+    fn command_manifest_is_complete_unique_and_unprivileged() {
+        let unique = COMMAND_NAMES
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique.len(), 19);
+        for required in [
+            "application_status",
+            "wallet_create",
+            "node_probe",
+            "application_shutdown",
+        ] {
+            assert!(COMMAND_NAMES.contains(&required));
+        }
+        for forbidden in ["shell", "process", "filesystem", "http", "sql", "exec"] {
+            assert!(!COMMAND_NAMES
+                .iter()
+                .any(|command| command.contains(forbidden)));
+        }
+    }
+
+    #[test]
+    fn shutdown_is_idempotent_and_rejects_new_work() {
+        let app = DesktopApplication::default();
+        app.application_shutdown().unwrap();
+        app.application_shutdown().unwrap();
+        assert!(matches!(
+            app.wallet_open("/tmp/not-used"),
+            Err(CommandError::Unavailable)
+        ));
+        assert!(!format!("{:?}", app.diagnostics_redacted()).contains("password"));
+    }
+
+    #[test]
+    fn redacted_configuration_and_errors_never_serialize_credentials() {
+        let app = DesktopApplication::default();
+        let error = app.wallet_unlock("password-contains-secret").unwrap_err();
+        let rendered = error.to_string();
+        assert!(!rendered.contains("password-contains-secret"));
+        assert!(!rendered.contains("secret"));
     }
 }
