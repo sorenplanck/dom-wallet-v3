@@ -150,6 +150,10 @@ pub struct OutputRecord {
     pub value: u64,
     pub state: OutputState,
     pub discovered_height: u64,
+    /// A reservation is durable wallet evidence, never a chain observation.
+    /// It prevents two locally-created slates selecting one canonical output.
+    #[serde(default)]
+    pub reserved_by: Option<Uuid>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -162,9 +166,65 @@ pub enum OutputOwnership {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TransactionLifecycle {
+    Draft,
+    InputsReserved,
+    RequestExported,
+    RequestImported,
+    ResponsePrepared,
+    ResponseExported,
+    ResponseImported,
+    Finalized,
+    Submitting,
     Submitted,
+    AcceptedNotRelayed,
+    InMempool,
     Confirmed { height: u64, block_hash: [u8; 32] },
+    Reorged,
+    RetransmitRequired,
+    Cancelled,
+    Failed,
     ReconciliationRequired,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TransactionRole {
+    Sender,
+    Recipient,
+}
+
+/// Secrets required to continue an interactive DOM slate. This object is
+/// encrypted as part of `WalletState`; it is deliberately redacted from Debug
+/// so it cannot reach command errors or application logs.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrivateTransactionContext {
+    #[serde(default, with = "serde_option_bytes_32")]
+    pub sender_excess_blinding: Option<[u8; 32]>,
+    #[serde(default, with = "serde_option_bytes_32")]
+    pub sender_nonce: Option<[u8; 32]>,
+    #[serde(default, with = "serde_option_bytes_32")]
+    pub recipient_output_blinding: Option<[u8; 32]>,
+}
+
+impl std::fmt::Debug for PrivateTransactionContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PrivateTransactionContext(REDACTED)")
+    }
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrivateOutputBlinding {
+    pub output_id: Uuid,
+    #[serde(with = "serde_bytes_32")]
+    pub blinding: [u8; 32],
+}
+
+impl std::fmt::Debug for PrivateOutputBlinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PrivateOutputBlinding(REDACTED)")
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -176,6 +236,34 @@ pub struct LocalTransactionIntent {
     pub kernel_excess: Vec<u8>,
     pub lifecycle: TransactionLifecycle,
     pub submitted: bool,
+    /// A protocol-independent identifier carried by the manual transport
+    /// envelope. It is not a replacement for the DOM canonical slate bytes.
+    #[serde(default)]
+    pub slate_id: Option<Uuid>,
+    #[serde(default)]
+    pub role: Option<TransactionRole>,
+    #[serde(default)]
+    pub amount: u64,
+    #[serde(default)]
+    pub fee: u64,
+    #[serde(default)]
+    pub reserved_output_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub request_bytes: Vec<u8>,
+    #[serde(default)]
+    pub response_bytes: Vec<u8>,
+    #[serde(default)]
+    pub finalized_transaction_bytes: Vec<u8>,
+    #[serde(default)]
+    pub transaction_hash: Option<[u8; 32]>,
+    #[serde(default)]
+    pub attempt_count: u32,
+    #[serde(default)]
+    pub private_context: Option<PrivateTransactionContext>,
+    #[serde(default)]
+    pub recipient_output_id: Option<Uuid>,
+    #[serde(default)]
+    pub change_output_id: Option<Uuid>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -331,6 +419,10 @@ pub struct WalletState {
     pub non_reuse_floor: u64,
     pub cursor: Option<CanonicalCursor>,
     pub outputs: Vec<OutputRecord>,
+    /// Per-output secrets are encrypted in the canonical wallet generation and
+    /// are never part of scan, summary, slate transport, or Tauri DTOs.
+    #[serde(default)]
+    pub private_output_blindings: Vec<PrivateOutputBlinding>,
     #[serde(default)]
     pub transactions: Vec<LocalTransactionIntent>,
     pub sync_status: SyncStatus,
@@ -364,6 +456,7 @@ impl WalletState {
             non_reuse_floor: 0,
             cursor: None,
             outputs: Vec::new(),
+            private_output_blindings: Vec::new(),
             transactions: Vec::new(),
             sync_status: SyncStatus::Idle,
             provisional_target: None,
@@ -399,7 +492,9 @@ impl WalletState {
             target.validate()?;
         }
         for transaction in &self.transactions {
-            if transaction.kernel_excess.len() != 33 || !transaction.submitted {
+            if (!transaction.kernel_excess.is_empty() && transaction.kernel_excess.len() != 33)
+                || (transaction.submitted && transaction.kernel_excess.len() != 33)
+            {
                 return Err(DomainError::InvalidTransactionIntent);
             }
         }
@@ -419,6 +514,14 @@ impl WalletState {
             .iter()
             .any(|output| output.account_id != self.default_account.id)
         {
+            return Err(DomainError::InvalidState);
+        }
+        if self.private_output_blindings.iter().any(|secret| {
+            !self
+                .outputs
+                .iter()
+                .any(|output| output.id == secret.output_id)
+        }) {
             return Err(DomainError::InvalidState);
         }
         Ok(())
@@ -505,6 +608,28 @@ impl WalletState {
         false
     }
 
+    pub fn output_blinding(&self, output_id: Uuid) -> Option<[u8; 32]> {
+        self.private_output_blindings
+            .iter()
+            .find(|secret| secret.output_id == output_id)
+            .map(|secret| secret.blinding)
+    }
+
+    pub fn remember_output_blinding(&mut self, output_id: Uuid, blinding: [u8; 32]) {
+        if let Some(existing) = self
+            .private_output_blindings
+            .iter_mut()
+            .find(|secret| secret.output_id == output_id)
+        {
+            existing.blinding = blinding;
+        } else {
+            self.private_output_blindings.push(PrivateOutputBlinding {
+                output_id,
+                blinding,
+            });
+        }
+    }
+
     pub fn apply_kernel_evidence(
         &mut self,
         height: u64,
@@ -531,7 +656,11 @@ impl WalletState {
             if let Some(index) = matches.first() {
                 let transaction = &mut self.transactions[*index];
                 match transaction.lifecycle {
-                    TransactionLifecycle::Submitted => {
+                    TransactionLifecycle::Submitted
+                    | TransactionLifecycle::AcceptedNotRelayed
+                    | TransactionLifecycle::InMempool
+                    | TransactionLifecycle::RetransmitRequired
+                    | TransactionLifecycle::Reorged => {
                         transaction.lifecycle =
                             TransactionLifecycle::Confirmed { height, block_hash }
                     }
@@ -542,7 +671,18 @@ impl WalletState {
                     TransactionLifecycle::Confirmed { .. } => {
                         transaction.lifecycle = TransactionLifecycle::ReconciliationRequired
                     }
-                    TransactionLifecycle::ReconciliationRequired => {}
+                    TransactionLifecycle::ReconciliationRequired
+                    | TransactionLifecycle::Draft
+                    | TransactionLifecycle::InputsReserved
+                    | TransactionLifecycle::RequestExported
+                    | TransactionLifecycle::RequestImported
+                    | TransactionLifecycle::ResponsePrepared
+                    | TransactionLifecycle::ResponseExported
+                    | TransactionLifecycle::ResponseImported
+                    | TransactionLifecycle::Finalized
+                    | TransactionLifecycle::Submitting
+                    | TransactionLifecycle::Cancelled
+                    | TransactionLifecycle::Failed => {}
                 }
             }
         }
@@ -555,7 +695,11 @@ impl WalletState {
                 transaction.lifecycle,
                 TransactionLifecycle::Confirmed { .. }
             ) {
-                transaction.lifecycle = TransactionLifecycle::Submitted;
+                transaction.lifecycle = if transaction.submitted {
+                    TransactionLifecycle::Submitted
+                } else {
+                    TransactionLifecycle::Finalized
+                };
             }
         }
     }
@@ -694,6 +838,32 @@ pub mod serde_bytes_32 {
         bytes
             .try_into()
             .map_err(|_| serde::de::Error::custom("expected exactly 32 bytes"))
+    }
+}
+
+pub mod serde_option_bytes_32 {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(value: &Option<[u8; 32]>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        value
+            .as_ref()
+            .map(|bytes| bytes.as_slice())
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<[u8; 32]>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<Vec<u8>>::deserialize(deserializer)?.map_or(Ok(None), |bytes| {
+            bytes
+                .try_into()
+                .map(Some)
+                .map_err(|_| serde::de::Error::custom("expected exactly 32 bytes"))
+        })
     }
 }
 
@@ -840,6 +1010,7 @@ mod tests {
             value: 42,
             state: OutputState::Confirmed,
             discovered_height: 3,
+            reserved_by: None,
         });
         assert!(matches!(
             state.classify_commitment(&commitment),
@@ -864,6 +1035,19 @@ mod tests {
             kernel_excess: vec![3; 33],
             lifecycle: TransactionLifecycle::Submitted,
             submitted: true,
+            slate_id: None,
+            role: None,
+            amount: 0,
+            fee: 0,
+            reserved_output_ids: Vec::new(),
+            request_bytes: Vec::new(),
+            response_bytes: Vec::new(),
+            finalized_transaction_bytes: Vec::new(),
+            transaction_hash: None,
+            attempt_count: 0,
+            private_context: None,
+            recipient_output_id: None,
+            change_output_id: None,
         });
         state
             .apply_kernel_evidence(8, [8; 32], &[[3; 33], [4; 33]])

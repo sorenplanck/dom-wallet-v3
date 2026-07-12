@@ -1,0 +1,16 @@
+[package]
+name = "dom-wallet-protocol"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+dom-consensus.workspace = true
+dom-core.workspace = true
+dom-crypto.workspace = true
+dom-serialization.workspace = true
+dom-slate.workspace = true
+dom-tx.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+uuid.workspace = true

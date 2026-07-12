@@ -15,3 +15,16 @@ test("production adapter maps every registered Phase 1A command without a mock",
   assert.equal(source.includes("fake balance"), false);
   assert.equal(source.includes("window.__TAURI__?.core?.invoke"), true);
 });
+
+test("manual slate controls use only the production invoke adapter and clear pasted text", async () => {
+  const source = await (await import("node:fs/promises")).readFile(new URL("../main.js", import.meta.url), "utf8");
+  for (const command of [
+    "transaction_fee_estimate", "transaction_send_create", "slate_request_export",
+    "slate_request_import", "slate_response_create", "slate_response_export",
+    "slate_response_import", "slate_summary_redacted", "transaction_finalize",
+    "transaction_submit", "transaction_retry_submission", "transaction_cancel",
+    "transaction_list", "transaction_detail_redacted"
+  ]) assert.equal(source.includes(`"${command}"`), true);
+  assert.equal(source.includes("clearSlateText"), true);
+  assert.equal(source.includes("/wallet/spend"), false);
+});

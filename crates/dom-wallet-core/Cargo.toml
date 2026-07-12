@@ -8,7 +8,9 @@ authors.workspace = true
 dom-wallet-chain = { path = "../dom-wallet-chain" }
 dom-wallet-crypto = { path = "../dom-wallet-crypto" }
 dom-wallet-domain = { path = "../dom-wallet-domain" }
+dom-wallet-protocol = { path = "../dom-wallet-protocol" }
 dom-wallet-storage = { path = "../dom-wallet-storage" }
+hex.workspace = true
 rand.workspace = true
 serde.workspace = true
 thiserror.workspace = true
@@ -16,4 +18,5 @@ uuid.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+dom-crypto.workspace = true
 tempfile.workspace = true

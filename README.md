@@ -13,13 +13,19 @@
 
 > A secure, recoverable, and DOM-native wallet architecture.
 
-> **Current phase: Executable Foundation 1A complete.** The repository contains an experimental, unaudited native desktop-wallet foundation with a Tauri runtime and production invoke frontend. Phase 1B begins transaction and slate lifecycle work.
+> **Current phase: Phase 1B-A transaction engine complete.** The repository contains an experimental, unaudited native desktop wallet foundation plus a protocol-pinned manual DOM slate exchange. Live VPS and mining-confirmation evidence remain a later phase.
 
 DOM Wallet V3 is a new, independent wallet architecture for the DOM protocol. It is being specified before implementation so that wallet correctness includes failure, recovery, and adversarial behavior—not only a successful transaction path.
 
 V3 preserves validated DOM Wallet V1 and V2 properties while establishing one DOM-native model for state, persistence, synchronization, recovery, and verification. It is neither a port nor a fork of another wallet project, and it is not a cosmetic refactor of DOM Wallet V2.
 
-The repository now contains the first executable engineering foundation. It can create, reopen, unlock, lock, and persist a local wallet; bind a wallet to an exact network, chain ID, and genesis ID; project redacted account state; and synchronize deterministic mock-chain state under the approved ScanTarget policy. It does not yet implement payment, slate, broadcast, backup/restore, migration, or a negotiated production DOM-node scan adapter.
+The repository now contains the executable engineering foundation and a manual
+DOM transaction path. Wallet A can create and persist a request, Wallet B can
+import it and persist a recipient response, and Wallet A can finalize canonical
+DOM transaction bytes before submitting only through the wallet-safe node
+adapter. The exchange is explicit text transport, not automatic peer transport
+or Slatepack. Backup/restore, migration, and live VPS confirmation remain out
+of scope.
 
 ## Why V3 Exists
 
@@ -123,6 +129,7 @@ Phase 1A introduces the following implementation boundaries. Their existence doe
 | `dom-wallet-crypto` | DOM-native wallet cryptographic boundaries. |
 | `dom-wallet-storage` | Encrypted durable units of work and recovery. |
 | `dom-wallet-chain` | Transport-independent ChainSource boundary, ScanTarget policy, mock source, and reconnect logic. |
+| `dom-wallet-protocol` | Revision-pinned DOM slate, transaction, serialization, proof, signature, fee, and weight adapter. |
 | `dom-wallet-core` | Wallet lifecycle, projections, synchronization orchestration, diagnostics, and capability boundary. |
 | `src-tauri` | Tauri-ready desktop command boundary with redacted DTOs. |
 | `frontend` | DOM dark-bronze-paper desktop presentation. |
@@ -218,7 +225,11 @@ The source hierarchy and adoption constraints are documented in [Engineering Sou
 
 ## Building
 
-Phase 1A provides a Rust workspace, headless-checkable Tauri command shell, and static desktop frontend. It is intentionally incomplete: send, receive, transaction finalization, broadcast, backup export, restore, migration, full reorganization execution, and a negotiated live DOM-node scan adapter are not implemented.
+Phase 1B-A provides a Rust workspace, native Tauri command shell, production
+frontend adapter, and deterministic local manual slate exchange. It is still
+intentionally incomplete: automatic transport, live VPS two-wallet evidence,
+mining confirmation, backup export, restore, migration, and full production
+operations are not implemented.
 
 ```bash
 cargo fmt --all --check
@@ -229,7 +240,7 @@ cargo test --workspace --all-targets
 cargo run -p dom-wallet-tauri-shell
 ```
 
-See [Implementation Phase 1A Architecture](docs/IMPLEMENTATION_PHASE1A_ARCHITECTURE.md), [Node Configuration](docs/NODE_CONFIGURATION.md), [Build and Run](docs/BUILD_AND_RUN.md), and the [Phase 1A foundation report](reports/IMPLEMENTATION_PHASE1A_FOUNDATION.md). The node configuration placeholder is deliberately invalid; real configurations require exact authoritative network, chain ID, and genesis identity and never bypass validation.
+See [Implementation Phase 1A Architecture](docs/IMPLEMENTATION_PHASE1A_ARCHITECTURE.md), [Transaction engine](docs/TRANSACTION_ENGINE.md), [Manual slate exchange](docs/MANUAL_SLATE_EXCHANGE.md), [Node Configuration](docs/NODE_CONFIGURATION.md), [Build and Run](docs/BUILD_AND_RUN.md), and the implementation reports. The node configuration placeholder is deliberately invalid; real configurations require exact authoritative network, chain ID, and genesis identity and never bypass validation.
 
 ## Contributing
 

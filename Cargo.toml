@@ -5,6 +5,7 @@ members = [
     "crates/dom-wallet-crypto",
     "crates/dom-wallet-storage",
     "crates/dom-wallet-chain",
+    "crates/dom-wallet-protocol",
     "crates/dom-wallet-core",
     "src-tauri",
 ]
@@ -31,3 +32,14 @@ uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = { version = "1", features = ["derive"] }
 tauri = { version = "2.11.2", default-features = false, features = ["wry"] }
 tauri-build = "2.6.2"
+
+# The transaction engine uses the immutable DOM protocol implementation as the
+# sole authority for slate construction, transaction serialization, proof and
+# signature validation.  These are deliberately revision pinned rather than
+# copied into this wallet workspace.
+dom-core = { git = "https://github.com/sorenplanck/dom-protocol", rev = "f10667d86196daf4599eff6074a7abf73b6ed55a" }
+dom-crypto = { git = "https://github.com/sorenplanck/dom-protocol", rev = "f10667d86196daf4599eff6074a7abf73b6ed55a" }
+dom-consensus = { git = "https://github.com/sorenplanck/dom-protocol", rev = "f10667d86196daf4599eff6074a7abf73b6ed55a" }
+dom-serialization = { git = "https://github.com/sorenplanck/dom-protocol", rev = "f10667d86196daf4599eff6074a7abf73b6ed55a" }
+dom-tx = { git = "https://github.com/sorenplanck/dom-protocol", rev = "f10667d86196daf4599eff6074a7abf73b6ed55a" }
+dom-slate = { git = "https://github.com/sorenplanck/dom-protocol", rev = "f10667d86196daf4599eff6074a7abf73b6ed55a" }

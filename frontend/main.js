@@ -6,6 +6,11 @@ export const COMMANDS = Object.freeze([
   "node_configuration_get_redacted", "node_configuration_set", "node_probe",
   "synchronization_start", "synchronization_pause", "synchronization_resume",
   "synchronization_retry", "synchronization_rescan", "diagnostics_redacted", "application_shutdown"
+  , "transaction_fee_estimate", "transaction_send_create", "slate_request_export",
+  "slate_request_import", "slate_response_create", "slate_response_export",
+  "slate_response_import", "slate_summary_redacted", "transaction_finalize",
+  "transaction_submit", "transaction_retry_submission", "transaction_cancel",
+  "transaction_list", "transaction_detail_redacted"
 ]);
 
 const productionInvoke = (command, args = {}) => {
@@ -107,4 +112,63 @@ document.querySelector("#retry").addEventListener("click", () => withPending(() 
 document.querySelector("#rescan").addEventListener("click", () => { if (window.confirm("Full rescan reconstructs the wallet from canonical chain evidence. Continue?")) withPending(() => productionInvoke("synchronization_rescan")).catch((error) => show(redactedError(error), true)); });
 document.querySelector("#close").addEventListener("click", () => withPending(async () => { await productionInvoke("wallet_close"); stopStatusRefresh(); selectScreen("onboarding"); show("Wallet closed."); }).catch((error) => show(redactedError(error), true)));
 document.querySelector("#diagnostics-refresh").addEventListener("click", () => withPending(async () => redactedJson(diagnostics, await productionInvoke("diagnostics_redacted"))).catch((error) => show(redactedError(error), true)));
+
+// Manual slate exchange is intentionally explicit: text stays in the DOM only
+// until an import settles and is never copied into browser storage.
+const transactionOutput = document.querySelector("#transaction-output");
+const transactionSlateId = document.querySelector("#transaction-slate-id");
+const transactionText = document.querySelector("#transaction-text");
+const renderTransaction = (value) => { redactedJson(transactionOutput, value); if (value?.slate_id) transactionSlateId.value = value.slate_id; };
+const requiredSlateId = () => { const value = transactionSlateId.value.trim(); if (!/^[0-9a-f-]{36}$/i.test(value)) throw new Error("Enter a valid slate identifier."); return value; };
+const clearSlateText = () => { transactionText.value = ""; };
+document.querySelector("#transaction-create").addEventListener("submit", async (event) => {
+  event.preventDefault(); const form = event.currentTarget; const data = new FormData(form);
+  try {
+    const created = await withPending(() => productionInvoke("transaction_send_create", { amount: Number(data.get("amount")), requestedFee: data.get("requested_fee") ? Number(data.get("requested_fee")) : null }));
+    renderTransaction(created); show("Send transaction reserved. Export the request only after review.");
+  } catch (error) { show(redactedError(error), true); }
+});
+document.querySelector("#transaction-estimate").addEventListener("click", async () => {
+  const form = document.querySelector("#transaction-create"); const data = new FormData(form);
+  try { redactedJson(transactionOutput, await withPending(() => productionInvoke("transaction_fee_estimate", { amount: Number(data.get("amount")), selectedInputCount: 1, changeOutput: true }))); } catch (error) { show(redactedError(error), true); }
+});
+document.querySelector("#request-export").addEventListener("click", async () => {
+  if (!window.confirm("Export this manual slate request? It contains public transaction data.")) return;
+  try { const result = await withPending(() => productionInvoke("slate_request_export", { slateId: requiredSlateId() })); transactionText.value = result.text; renderTransaction(result); show("Canonical request exported."); } catch (error) { show(redactedError(error), true); }
+});
+document.querySelector("#request-import").addEventListener("click", async () => {
+  const text = transactionText.value;
+  try { renderTransaction(await withPending(() => productionInvoke("slate_request_import", { text }))); show("Request imported. Review it before preparing a response."); } catch (error) { show(redactedError(error), true); } finally { clearSlateText(); }
+});
+document.querySelector("#response-create").addEventListener("click", async () => {
+  if (!window.confirm("Create the recipient output and response for this request?")) return;
+  try { renderTransaction(await withPending(() => productionInvoke("slate_response_create", { slateId: requiredSlateId() }))); show("Recipient response prepared."); } catch (error) { show(redactedError(error), true); }
+});
+document.querySelector("#response-export").addEventListener("click", async () => {
+  if (!window.confirm("Export this recipient response?")) return;
+  try { const result = await withPending(() => productionInvoke("slate_response_export", { slateId: requiredSlateId() })); transactionText.value = result.text; renderTransaction(result); show("Canonical response exported."); } catch (error) { show(redactedError(error), true); }
+});
+document.querySelector("#response-import").addEventListener("click", async () => {
+  const text = transactionText.value;
+  try { renderTransaction(await withPending(() => productionInvoke("slate_response_import", { text }))); show("Response imported."); } catch (error) { show(redactedError(error), true); } finally { clearSlateText(); }
+});
+document.querySelector("#transaction-finalize").addEventListener("click", async () => {
+  if (!window.confirm("Finalize this DOM transaction?")) return;
+  try { renderTransaction(await withPending(() => productionInvoke("transaction_finalize", { slateId: requiredSlateId() }))); show("Transaction finalized and stored."); } catch (error) { show(redactedError(error), true); }
+});
+document.querySelector("#transaction-submit").addEventListener("click", async () => {
+  if (!window.confirm("Submit the immutable finalized transaction to the configured node?")) return;
+  try { renderTransaction(await withPending(() => productionInvoke("transaction_submit", { slateId: requiredSlateId() }))); show("Submission result recorded."); } catch (error) { show(redactedError(error), true); }
+});
+document.querySelector("#transaction-retry").addEventListener("click", async () => {
+  if (!window.confirm("Retry submission using the same finalized bytes?")) return;
+  try { renderTransaction(await withPending(() => productionInvoke("transaction_retry_submission", { slateId: requiredSlateId() }))); show("Submission retry recorded."); } catch (error) { show(redactedError(error), true); }
+});
+document.querySelector("#transaction-cancel").addEventListener("click", async () => {
+  if (!window.confirm("Cancel this pre-submission transaction and release only safe reservations?")) return;
+  try { renderTransaction(await withPending(() => productionInvoke("transaction_cancel", { slateId: requiredSlateId(), confirmExported: true }))); show("Transaction cancellation recorded."); } catch (error) { show(redactedError(error), true); }
+});
+document.querySelector("#transaction-list").addEventListener("click", async () => {
+  try { redactedJson(transactionOutput, await withPending(() => productionInvoke("transaction_list"))); } catch (error) { show(redactedError(error), true); }
+});
 export { productionInvoke, refreshSummary };

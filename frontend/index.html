@@ -14,7 +14,7 @@
       </header>
       <p class="notice">Experimental foundation. Community review is open; this status never disables wallet or network functionality.</p>
       <nav aria-label="Wallet navigation">
-        <button data-screen="onboarding">Wallet</button><button data-screen="dashboard">Dashboard</button>
+        <button data-screen="onboarding">Wallet</button><button data-screen="dashboard">Dashboard</button><button data-screen="transactions">Manual exchange</button>
         <button data-screen="node">Node</button><button data-screen="diagnostics">Diagnostics</button>
       </nav>
       <section id="status" class="status" aria-live="polite">Starting desktop shell…</section>
@@ -27,6 +27,15 @@
       <section id="dashboard" class="screen" hidden>
         <h2>Account overview</h2><div id="balance-cards" class="cards"></div><p id="sync-status">Synchronization is not started.</p>
         <button id="sync">Synchronize</button><button id="pause">Pause</button><button id="resume">Resume</button><button id="retry">Retry</button><button id="rescan">Full rescan</button><button id="lock">Lock wallet</button><button id="close">Close wallet</button>
+      </section>
+      <section id="transactions" class="screen" hidden>
+        <h2>Experimental manual slate exchange</h2>
+        <p class="notice">Exchange canonical slate text only with the intended participant. Private contexts, blindings, and nonces never leave the wallet.</p>
+        <form id="transaction-create"><label>Amount <input name="amount" type="number" min="1" required></label><label>Optional fee <input name="requested_fee" type="number" min="1"></label><button>Create send request</button><button id="transaction-estimate" type="button">Estimate minimum fee</button></form>
+        <label>Slate ID <input id="transaction-slate-id" autocomplete="off"></label>
+        <label>Manual slate text <textarea id="transaction-text" rows="8" autocomplete="off" spellcheck="false"></textarea></label>
+        <div class="controls"><button id="request-export" type="button">Export request</button><button id="request-import" type="button">Import request</button><button id="response-create" type="button">Create response</button><button id="response-export" type="button">Export response</button><button id="response-import" type="button">Import response</button><button id="transaction-finalize" type="button">Finalize</button><button id="transaction-submit" type="button">Submit finalized transaction</button><button id="transaction-retry" type="button">Retry same bytes</button><button id="transaction-cancel" type="button">Cancel safely</button><button id="transaction-list" type="button">Refresh transaction list</button></div>
+        <pre id="transaction-output">Redacted transaction details only.</pre>
       </section>
       <section id="node" class="screen" hidden>
         <h2>Node configuration</h2><p id="node-status">No node configuration is exposed to the interface.</p>

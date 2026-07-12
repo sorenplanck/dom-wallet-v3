@@ -8,9 +8,11 @@ use dom_wallet_chain::{
 };
 use dom_wallet_crypto::{KdfParameters, SecretBytes};
 use dom_wallet_domain::{
-    BalanceProjection, NetworkIdentity, NodeConfiguration, RedactedNodeConfiguration, ScanBounds,
-    WalletState,
+    BalanceProjection, LocalTransactionIntent, NetworkIdentity, NodeConfiguration, OutputRecord,
+    OutputState, PrivateTransactionContext, RedactedNodeConfiguration, ScanBounds,
+    TransactionLifecycle, TransactionRole, WalletState,
 };
+use dom_wallet_protocol::{self as protocol, InputMaterial, SenderSecrets};
 use dom_wallet_storage::{
     default_node_configuration, StorageError, WalletDirectory, WalletMetadata,
 };
@@ -61,6 +63,40 @@ pub struct ProbeResult {
     pub network: dom_wallet_domain::Network,
     pub tip_height: u64,
     pub connected: bool,
+}
+
+/// Redacted transaction projection. The public slate identifier, kernel and
+/// state are safe to show; encrypted signing contexts never leave core.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransactionSummary {
+    pub id: Uuid,
+    pub slate_id: Option<Uuid>,
+    pub role: Option<String>,
+    pub state: String,
+    pub amount: u64,
+    pub fee: u64,
+    pub kernel_excess: Option<String>,
+    pub transaction_hash: Option<String>,
+    pub attempt_count: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FeeEstimate {
+    pub amount: u64,
+    pub selected_input_count: u32,
+    pub expected_output_count: u32,
+    pub weight: u32,
+    pub minimum_fee: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SlateExport {
+    pub transaction_id: Uuid,
+    pub slate_id: Uuid,
+    pub text: String,
 }
 
 pub struct WalletService {
@@ -616,6 +652,564 @@ impl WalletService {
         )
     }
 
+    /// Exact protocol fee floor for a proposed interactive DOM send. Frontends
+    /// may display it but never supply an authoritative fee calculation.
+    pub fn transaction_fee_estimate(
+        &self,
+        amount: u64,
+        selected_input_count: u32,
+        change_output: bool,
+    ) -> Result<FeeEstimate, CoreError> {
+        self.unlocked.as_ref().ok_or(CoreError::Locked)?;
+        if amount == 0 || selected_input_count == 0 {
+            return Err(CoreError::InvalidTransactionInput);
+        }
+        let count = usize::try_from(selected_input_count)
+            .map_err(|_| CoreError::InvalidTransactionInput)?;
+        let weight = protocol::expected_weight(count, change_output)
+            .map_err(|_| CoreError::InvalidTransactionInput)?;
+        let minimum_fee = protocol::minimum_fee(count, change_output)
+            .map_err(|_| CoreError::InvalidTransactionInput)?;
+        Ok(FeeEstimate {
+            amount,
+            selected_input_count,
+            expected_output_count: if change_output { 2 } else { 1 },
+            weight,
+            minimum_fee,
+        })
+    }
+
+    /// Creates and durably reserves a sender slate before any public request
+    /// text can be exported. Outputs without their encrypted local blinding
+    /// are deliberately not selectable; Phase 1A scan evidence alone is not
+    /// sufficient to spend an output.
+    pub fn transaction_send_create(
+        &mut self,
+        amount: u64,
+        requested_fee: Option<u64>,
+    ) -> Result<TransactionSummary, CoreError> {
+        if amount == 0 {
+            return Err(CoreError::InvalidTransactionInput);
+        }
+        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        let mut candidates = state
+            .outputs
+            .iter()
+            .filter(|output| {
+                matches!(output.state, OutputState::Confirmed)
+                    && output.reserved_by.is_none()
+                    && output.commitment.is_some()
+                    && state.output_blinding(output.id).is_some()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            left.value
+                .cmp(&right.value)
+                .then_with(|| left.commitment.cmp(&right.commitment))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        if candidates.is_empty() {
+            return Err(CoreError::UnsupportedSpendingEvidence);
+        }
+
+        let mut selected = Vec::new();
+        let mut total = 0u64;
+        let mut fee = 0u64;
+        for output in candidates {
+            if selected.len() >= protocol::MAX_INPUTS {
+                return Err(CoreError::InvalidTransactionInput);
+            }
+            selected.push(output);
+            fee = requested_fee
+                .unwrap_or_else(|| protocol::minimum_fee(selected.len(), true).unwrap_or(u64::MAX));
+            let minimum = protocol::minimum_fee(selected.len(), true)
+                .map_err(|_| CoreError::InvalidTransactionInput)?;
+            if fee < minimum {
+                return Err(CoreError::FeeTooLow);
+            }
+            total = total
+                .checked_add(
+                    selected
+                        .last()
+                        .ok_or(CoreError::InvalidTransactionInput)?
+                        .value,
+                )
+                .ok_or(CoreError::ArithmeticOverflow)?;
+            let required = amount
+                .checked_add(fee)
+                .ok_or(CoreError::ArithmeticOverflow)?;
+            if total >= required {
+                break;
+            }
+        }
+        let required = amount
+            .checked_add(fee)
+            .ok_or(CoreError::ArithmeticOverflow)?;
+        if total < required {
+            return Err(CoreError::InsufficientFunds);
+        }
+        let transaction_id = Uuid::new_v4();
+        let slate_id = Uuid::new_v4();
+        let input_material = selected
+            .iter()
+            .map(|output| {
+                Ok(InputMaterial {
+                    commitment: output
+                        .commitment
+                        .ok_or(CoreError::UnsupportedSpendingEvidence)?,
+                    blinding: state
+                        .output_blinding(output.id)
+                        .ok_or(CoreError::UnsupportedSpendingEvidence)?,
+                    value: output.value,
+                })
+            })
+            .collect::<Result<Vec<_>, CoreError>>()?;
+        let built = protocol::build_sender(&input_material, amount, fee, state.identity.chain_id)
+            .map_err(|_| CoreError::ProtocolRejected)?;
+        let mut change_output_id = None;
+        if let Some(change) = built.change.as_ref() {
+            let id = Uuid::new_v4();
+            state.outputs.push(OutputRecord {
+                id,
+                account_id: state.default_account.id,
+                commitment: Some(change.commitment),
+                value: change.value,
+                state: OutputState::PendingIncoming,
+                discovered_height: state.cursor.as_ref().map_or(0, |cursor| cursor.height),
+                reserved_by: None,
+            });
+            state.remember_output_blinding(id, change.blinding);
+            change_output_id = Some(id);
+        }
+        let reserved_output_ids = selected.iter().map(|output| output.id).collect::<Vec<_>>();
+        for output in &mut state.outputs {
+            if reserved_output_ids.contains(&output.id) {
+                if output.reserved_by.is_some() {
+                    return Err(CoreError::ReservationConflict);
+                }
+                output.reserved_by = Some(transaction_id);
+                output.state = OutputState::PendingOutgoing;
+            }
+        }
+        state.transactions.push(LocalTransactionIntent {
+            id: transaction_id,
+            kernel_excess: Vec::new(),
+            lifecycle: TransactionLifecycle::InputsReserved,
+            submitted: false,
+            slate_id: Some(slate_id),
+            role: Some(TransactionRole::Sender),
+            amount,
+            fee,
+            reserved_output_ids,
+            request_bytes: built.slate_bytes,
+            response_bytes: Vec::new(),
+            finalized_transaction_bytes: Vec::new(),
+            transaction_hash: None,
+            attempt_count: 0,
+            private_context: Some(PrivateTransactionContext {
+                sender_excess_blinding: Some(built.secrets.excess_blinding),
+                sender_nonce: Some(built.secrets.nonce),
+                recipient_output_blinding: None,
+            }),
+            recipient_output_id: None,
+            change_output_id,
+        });
+        self.commit(state)?;
+        self.transaction_summary(transaction_id)
+    }
+
+    pub fn slate_request_export(&mut self, slate_id: Uuid) -> Result<SlateExport, CoreError> {
+        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        let transaction = find_transaction_mut(&mut state, slate_id, TransactionRole::Sender)?;
+        match transaction.lifecycle {
+            TransactionLifecycle::InputsReserved => {
+                transaction.lifecycle = TransactionLifecycle::RequestExported
+            }
+            TransactionLifecycle::RequestExported => {}
+            _ => return Err(CoreError::InvalidTransactionTransition),
+        }
+        let text = protocol::export_transport(slate_id, false, &transaction.request_bytes)
+            .map_err(|_| CoreError::ProtocolRejected)?;
+        let id = transaction.id;
+        self.commit(state)?;
+        Ok(SlateExport {
+            transaction_id: id,
+            slate_id,
+            text,
+        })
+    }
+
+    pub fn slate_request_import(&mut self, text: &str) -> Result<TransactionSummary, CoreError> {
+        let (slate_id, response, bytes) =
+            protocol::import_transport(text).map_err(|_| CoreError::InvalidSlateTransport)?;
+        if response {
+            return Err(CoreError::InvalidSlateTransport);
+        }
+        let details =
+            protocol::slate_public_details(&bytes).map_err(|_| CoreError::InvalidSlateTransport)?;
+        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        if details.chain_id != state.identity.chain_id
+            || details.amount == 0
+            || details.has_recipient_response
+            || details.fee
+                < protocol::minimum_fee(details.input_count, details.has_sender_change)
+                    .map_err(|_| CoreError::InvalidSlateTransport)?
+        {
+            return Err(CoreError::IdentityMismatch);
+        }
+        if let Some(existing) = state
+            .transactions
+            .iter()
+            .find(|intent| intent.slate_id == Some(slate_id))
+        {
+            if existing.role == Some(TransactionRole::Recipient) && existing.request_bytes == bytes
+            {
+                return Ok(transaction_summary_from(existing));
+            }
+            return Err(CoreError::SlateReplayConflict);
+        }
+        let id = Uuid::new_v4();
+        state.transactions.push(LocalTransactionIntent {
+            id,
+            kernel_excess: Vec::new(),
+            lifecycle: TransactionLifecycle::RequestImported,
+            submitted: false,
+            slate_id: Some(slate_id),
+            role: Some(TransactionRole::Recipient),
+            amount: details.amount,
+            fee: details.fee,
+            reserved_output_ids: Vec::new(),
+            request_bytes: bytes,
+            response_bytes: Vec::new(),
+            finalized_transaction_bytes: Vec::new(),
+            transaction_hash: None,
+            attempt_count: 0,
+            private_context: None,
+            recipient_output_id: None,
+            change_output_id: None,
+        });
+        self.commit(state)?;
+        self.transaction_summary(id)
+    }
+
+    pub fn slate_response_create(
+        &mut self,
+        slate_id: Uuid,
+    ) -> Result<TransactionSummary, CoreError> {
+        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        let index = find_transaction_index(&state, slate_id, TransactionRole::Recipient)?;
+        if matches!(
+            state.transactions[index].lifecycle,
+            TransactionLifecycle::ResponsePrepared | TransactionLifecycle::ResponseExported
+        ) {
+            return Ok(transaction_summary_from(&state.transactions[index]));
+        }
+        if state.transactions[index].lifecycle != TransactionLifecycle::RequestImported {
+            return Err(CoreError::InvalidTransactionTransition);
+        }
+        let request = state.transactions[index].request_bytes.clone();
+        let amount = state.transactions[index].amount;
+        let response = protocol::create_recipient_response(&request, state.identity.chain_id)
+            .map_err(|_| CoreError::ProtocolRejected)?;
+        // The receive coordinate and non-reuse floor advance before response
+        // export. The authoritative protocol creates the output commitment.
+        state.allocate().map_err(CoreError::Domain)?;
+        let output_id = Uuid::new_v4();
+        state.outputs.push(OutputRecord {
+            id: output_id,
+            account_id: state.default_account.id,
+            commitment: Some(response.recipient_commitment),
+            value: amount,
+            state: OutputState::PendingIncoming,
+            discovered_height: state.cursor.as_ref().map_or(0, |cursor| cursor.height),
+            reserved_by: None,
+        });
+        state.remember_output_blinding(output_id, response.secrets.output_blinding);
+        let transaction = &mut state.transactions[index];
+        transaction.response_bytes = response.slate_bytes;
+        transaction.private_context = Some(PrivateTransactionContext {
+            sender_excess_blinding: None,
+            sender_nonce: None,
+            recipient_output_blinding: Some(response.secrets.output_blinding),
+        });
+        transaction.recipient_output_id = Some(output_id);
+        transaction.lifecycle = TransactionLifecycle::ResponsePrepared;
+        let id = transaction.id;
+        self.commit(state)?;
+        self.transaction_summary(id)
+    }
+
+    pub fn slate_response_export(&mut self, slate_id: Uuid) -> Result<SlateExport, CoreError> {
+        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        let transaction = find_transaction_mut(&mut state, slate_id, TransactionRole::Recipient)?;
+        match transaction.lifecycle {
+            TransactionLifecycle::ResponsePrepared => {
+                transaction.lifecycle = TransactionLifecycle::ResponseExported
+            }
+            TransactionLifecycle::ResponseExported => {}
+            _ => return Err(CoreError::InvalidTransactionTransition),
+        }
+        let id = transaction.id;
+        let text = protocol::export_transport(slate_id, true, &transaction.response_bytes)
+            .map_err(|_| CoreError::ProtocolRejected)?;
+        self.commit(state)?;
+        Ok(SlateExport {
+            transaction_id: id,
+            slate_id,
+            text,
+        })
+    }
+
+    pub fn slate_response_import(&mut self, text: &str) -> Result<TransactionSummary, CoreError> {
+        let (slate_id, response, bytes) =
+            protocol::import_transport(text).map_err(|_| CoreError::InvalidSlateTransport)?;
+        if !response {
+            return Err(CoreError::InvalidSlateTransport);
+        }
+        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        let index = find_transaction_index(&state, slate_id, TransactionRole::Sender)?;
+        let details =
+            protocol::slate_public_details(&bytes).map_err(|_| CoreError::InvalidSlateTransport)?;
+        let transaction = &mut state.transactions[index];
+        if details.chain_id != state.identity.chain_id
+            || !details.has_recipient_response
+            || details.amount != transaction.amount
+            || details.fee != transaction.fee
+            || details.fee
+                < protocol::minimum_fee(details.input_count, details.has_sender_change)
+                    .map_err(|_| CoreError::InvalidSlateTransport)?
+        {
+            return Err(CoreError::SlateReplayConflict);
+        }
+        if matches!(
+            transaction.lifecycle,
+            TransactionLifecycle::ResponseImported
+                | TransactionLifecycle::Finalized
+                | TransactionLifecycle::Submitting
+                | TransactionLifecycle::Submitted
+                | TransactionLifecycle::AcceptedNotRelayed
+        ) {
+            if transaction.response_bytes == bytes {
+                return Ok(transaction_summary_from(transaction));
+            }
+            return Err(CoreError::SlateReplayConflict);
+        }
+        if transaction.lifecycle != TransactionLifecycle::RequestExported {
+            return Err(CoreError::InvalidTransactionTransition);
+        }
+        transaction.response_bytes = bytes;
+        transaction.lifecycle = TransactionLifecycle::ResponseImported;
+        let id = transaction.id;
+        self.commit(state)?;
+        self.transaction_summary(id)
+    }
+
+    pub fn transaction_finalize(
+        &mut self,
+        slate_id: Uuid,
+    ) -> Result<TransactionSummary, CoreError> {
+        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        let index = find_transaction_index(&state, slate_id, TransactionRole::Sender)?;
+        if matches!(
+            state.transactions[index].lifecycle,
+            TransactionLifecycle::Finalized
+                | TransactionLifecycle::Submitting
+                | TransactionLifecycle::Submitted
+                | TransactionLifecycle::AcceptedNotRelayed
+        ) {
+            return Ok(transaction_summary_from(&state.transactions[index]));
+        }
+        if state.transactions[index].lifecycle != TransactionLifecycle::ResponseImported {
+            return Err(CoreError::InvalidTransactionTransition);
+        }
+        let transaction = &mut state.transactions[index];
+        let context = transaction
+            .private_context
+            .as_ref()
+            .ok_or(CoreError::MissingPrivateContext)?;
+        let sender_secrets = SenderSecrets {
+            excess_blinding: context
+                .sender_excess_blinding
+                .ok_or(CoreError::MissingPrivateContext)?,
+            nonce: context
+                .sender_nonce
+                .ok_or(CoreError::MissingPrivateContext)?,
+        };
+        let finalized = protocol::finalize_sender(
+            &transaction.response_bytes,
+            &transaction.request_bytes,
+            &sender_secrets,
+            state.identity.chain_id,
+        )
+        .map_err(|_| CoreError::ProtocolRejected)?;
+        transaction.finalized_transaction_bytes = finalized.bytes;
+        transaction.kernel_excess = finalized.kernel_excess.to_vec();
+        transaction.transaction_hash = Some(finalized.transaction_hash);
+        transaction.private_context = None; // consume sender nonce after exactly one finalization.
+        transaction.lifecycle = TransactionLifecycle::Finalized;
+        let id = transaction.id;
+        self.commit(state)?;
+        self.transaction_summary(id)
+    }
+
+    /// Submit immutable finalized bytes only through the existing wallet-safe
+    /// POST /tx/submit adapter. Timeouts deliberately remain SUBMITTING because
+    /// the node may have admitted the exact bytes before its reply was lost.
+    pub fn transaction_submit(&mut self, slate_id: Uuid) -> Result<TransactionSummary, CoreError> {
+        self.submit_transaction(slate_id, false)
+    }
+
+    pub fn transaction_retry_submission(
+        &mut self,
+        slate_id: Uuid,
+    ) -> Result<TransactionSummary, CoreError> {
+        self.submit_transaction(slate_id, true)
+    }
+
+    pub fn transaction_cancel(
+        &mut self,
+        slate_id: Uuid,
+        confirm_exported: bool,
+    ) -> Result<TransactionSummary, CoreError> {
+        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        let index = find_transaction_index(&state, slate_id, TransactionRole::Sender)?;
+        let transaction_id = state.transactions[index].id;
+        match state.transactions[index].lifecycle {
+            TransactionLifecycle::InputsReserved => {}
+            TransactionLifecycle::RequestExported if confirm_exported => {}
+            TransactionLifecycle::RequestExported => return Err(CoreError::ConfirmationRequired),
+            _ => return Err(CoreError::CannotCancelTransaction),
+        }
+        for output in &mut state.outputs {
+            if output.reserved_by == Some(transaction_id) {
+                output.reserved_by = None;
+                output.state = OutputState::Confirmed;
+            }
+        }
+        state.transactions[index].lifecycle = TransactionLifecycle::Cancelled;
+        let id = state.transactions[index].id;
+        self.commit(state)?;
+        self.transaction_summary(id)
+    }
+
+    pub fn transaction_list(&self) -> Result<Vec<TransactionSummary>, CoreError> {
+        Ok(self
+            .unlocked
+            .as_ref()
+            .ok_or(CoreError::Locked)?
+            .transactions
+            .iter()
+            .map(transaction_summary_from)
+            .collect())
+    }
+
+    pub fn transaction_detail_redacted(
+        &self,
+        slate_id: Uuid,
+    ) -> Result<TransactionSummary, CoreError> {
+        let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
+        let transaction = state
+            .transactions
+            .iter()
+            .find(|transaction| transaction.slate_id == Some(slate_id))
+            .ok_or(CoreError::TransactionNotFound)?;
+        Ok(transaction_summary_from(transaction))
+    }
+
+    fn transaction_summary(&self, id: Uuid) -> Result<TransactionSummary, CoreError> {
+        self.unlocked
+            .as_ref()
+            .ok_or(CoreError::Locked)?
+            .transactions
+            .iter()
+            .find(|transaction| transaction.id == id)
+            .map(transaction_summary_from)
+            .ok_or(CoreError::TransactionNotFound)
+    }
+
+    fn submit_transaction(
+        &mut self,
+        slate_id: Uuid,
+        retry: bool,
+    ) -> Result<TransactionSummary, CoreError> {
+        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        let index = find_transaction_index(&state, slate_id, TransactionRole::Sender)?;
+        let allowed = matches!(
+            state.transactions[index].lifecycle,
+            TransactionLifecycle::Finalized
+        ) || (retry
+            && matches!(
+                state.transactions[index].lifecycle,
+                TransactionLifecycle::AcceptedNotRelayed
+                    | TransactionLifecycle::RetransmitRequired
+                    | TransactionLifecycle::Submitting
+            ));
+        if !allowed {
+            return Err(CoreError::InvalidTransactionTransition);
+        }
+        if state.transactions[index]
+            .finalized_transaction_bytes
+            .is_empty()
+        {
+            return Err(CoreError::InvalidTransactionTransition);
+        }
+        protocol::validate_finalized_bytes(&state.transactions[index].finalized_transaction_bytes)
+            .map_err(|_| CoreError::ProtocolRejected)?;
+        state.transactions[index].lifecycle = TransactionLifecycle::Submitting;
+        state.transactions[index].attempt_count =
+            state.transactions[index].attempt_count.saturating_add(1);
+        let bytes = state.transactions[index]
+            .finalized_transaction_bytes
+            .clone();
+        let id = state.transactions[index].id;
+        let configuration = state.node_configuration.clone();
+        self.commit(state)?; // durable uncertain state before network I/O
+        let source = DomHttpChainSource::new(
+            &configuration.endpoint_url,
+            configuration.expected_identity,
+            configuration.source_identity,
+            configuration.api_compatibility_version,
+            configuration.connect_timeout_ms,
+            configuration.request_timeout_ms,
+            None,
+        )?;
+        let outcome = source.submit_finalized(&bytes);
+        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        let index = state
+            .transactions
+            .iter()
+            .position(|transaction| transaction.id == id)
+            .ok_or(CoreError::TransactionNotFound)?;
+        match outcome {
+            Ok(outcome) if outcome.accepted && outcome.relayed => {
+                state.transactions[index].lifecycle = TransactionLifecycle::Submitted;
+                state.transactions[index].submitted = true;
+                state.transactions[index].transaction_hash = outcome.tx_hash;
+                self.commit(state)?;
+                self.transaction_summary(id)
+            }
+            Ok(outcome) if outcome.accepted => {
+                state.transactions[index].lifecycle = TransactionLifecycle::AcceptedNotRelayed;
+                state.transactions[index].submitted = true;
+                state.transactions[index].transaction_hash = outcome.tx_hash;
+                self.commit(state)?;
+                self.transaction_summary(id)
+            }
+            Ok(_) => {
+                state.transactions[index].lifecycle = TransactionLifecycle::Failed;
+                self.commit(state)?;
+                Err(CoreError::SubmissionRejected)
+            }
+            Err(error) => {
+                // Leave the durably committed SUBMITTING state untouched. A
+                // later retry reuses these same canonical bytes.
+                self.last_error = Some(CoreError::Chain(error).redacted_message());
+                Err(CoreError::SubmissionUncertain)
+            }
+        }
+    }
+
     pub fn diagnostics(&self) -> DiagnosticSnapshot {
         DiagnosticSnapshot {
             application_state: application_state_name(&self.state).into(),
@@ -711,6 +1305,73 @@ impl WalletService {
     }
 }
 
+fn find_transaction_index(
+    state: &WalletState,
+    slate_id: Uuid,
+    role: TransactionRole,
+) -> Result<usize, CoreError> {
+    state
+        .transactions
+        .iter()
+        .position(|transaction| {
+            transaction.slate_id == Some(slate_id) && transaction.role == Some(role.clone())
+        })
+        .ok_or(CoreError::TransactionNotFound)
+}
+
+fn find_transaction_mut(
+    state: &mut WalletState,
+    slate_id: Uuid,
+    role: TransactionRole,
+) -> Result<&mut LocalTransactionIntent, CoreError> {
+    let index = find_transaction_index(state, slate_id, role)?;
+    state
+        .transactions
+        .get_mut(index)
+        .ok_or(CoreError::TransactionNotFound)
+}
+
+fn transaction_summary_from(transaction: &LocalTransactionIntent) -> TransactionSummary {
+    TransactionSummary {
+        id: transaction.id,
+        slate_id: transaction.slate_id,
+        role: transaction.role.as_ref().map(|role| match role {
+            TransactionRole::Sender => "SENDER".into(),
+            TransactionRole::Recipient => "RECIPIENT".into(),
+        }),
+        state: transaction_state_name(&transaction.lifecycle).into(),
+        amount: transaction.amount,
+        fee: transaction.fee,
+        kernel_excess: (transaction.kernel_excess.len() == 33)
+            .then(|| hex::encode(&transaction.kernel_excess)),
+        transaction_hash: transaction.transaction_hash.map(hex::encode),
+        attempt_count: transaction.attempt_count,
+    }
+}
+
+fn transaction_state_name(state: &TransactionLifecycle) -> &'static str {
+    match state {
+        TransactionLifecycle::Draft => "DRAFT",
+        TransactionLifecycle::InputsReserved => "INPUTS_RESERVED",
+        TransactionLifecycle::RequestExported => "REQUEST_EXPORTED",
+        TransactionLifecycle::RequestImported => "REQUEST_IMPORTED",
+        TransactionLifecycle::ResponsePrepared => "RESPONSE_PREPARED",
+        TransactionLifecycle::ResponseExported => "RESPONSE_EXPORTED",
+        TransactionLifecycle::ResponseImported => "RESPONSE_IMPORTED",
+        TransactionLifecycle::Finalized => "FINALIZED",
+        TransactionLifecycle::Submitting => "SUBMITTING",
+        TransactionLifecycle::Submitted => "SUBMITTED",
+        TransactionLifecycle::AcceptedNotRelayed => "ACCEPTED_NOT_RELAYED",
+        TransactionLifecycle::InMempool => "IN_MEMPOOL",
+        TransactionLifecycle::Confirmed { .. } => "CONFIRMED",
+        TransactionLifecycle::Reorged => "REORGED",
+        TransactionLifecycle::RetransmitRequired => "RETRANSMIT_REQUIRED",
+        TransactionLifecycle::Cancelled => "CANCELLED",
+        TransactionLifecycle::Failed => "FAILED",
+        TransactionLifecycle::ReconciliationRequired => "RECONCILIATION_REQUIRED",
+    }
+}
+
 fn application_state_name(state: &ApplicationState) -> &'static str {
     match state {
         ApplicationState::Closed => "CLOSED",
@@ -744,6 +1405,38 @@ pub enum CoreError {
     RandomnessUnavailable,
     #[error("wallet and node identities differ")]
     IdentityMismatch,
+    #[error("transaction input is invalid")]
+    InvalidTransactionInput,
+    #[error("insufficient spendable funds")]
+    InsufficientFunds,
+    #[error("selected outputs have no encrypted spending evidence")]
+    UnsupportedSpendingEvidence,
+    #[error("transaction fee is below the DOM relay floor")]
+    FeeTooLow,
+    #[error("arithmetic overflow")]
+    ArithmeticOverflow,
+    #[error("input is already reserved")]
+    ReservationConflict,
+    #[error("manual slate transport is invalid")]
+    InvalidSlateTransport,
+    #[error("manual slate replay conflicts with durable state")]
+    SlateReplayConflict,
+    #[error("transaction transition is invalid")]
+    InvalidTransactionTransition,
+    #[error("private transaction context is unavailable")]
+    MissingPrivateContext,
+    #[error("DOM protocol transaction validation failed")]
+    ProtocolRejected,
+    #[error("transaction cannot be cancelled after submission evidence")]
+    CannotCancelTransaction,
+    #[error("explicit confirmation is required")]
+    ConfirmationRequired,
+    #[error("transaction not found")]
+    TransactionNotFound,
+    #[error("transaction submission was rejected")]
+    SubmissionRejected,
+    #[error("transaction submission outcome is uncertain")]
+    SubmissionUncertain,
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
@@ -761,6 +1454,12 @@ impl CoreError {
             Self::Chain(ChainError::Timeout) => "node request timed out".into(),
             Self::Chain(ChainError::IncompatibleProtocol) => "node protocol is incompatible".into(),
             Self::Storage(_) => "wallet storage operation failed".into(),
+            Self::InsufficientFunds => "insufficient spendable funds".into(),
+            Self::FeeTooLow => "transaction fee is below the required relay floor".into(),
+            Self::SubmissionRejected => "node rejected the finalized transaction".into(),
+            Self::SubmissionUncertain => {
+                "submission outcome is uncertain; retry the same finalized transaction".into()
+            }
             _ => "wallet operation failed".into(),
         }
     }
@@ -1054,5 +1753,128 @@ mod tests {
         assert_eq!(service.summary().unwrap(), before);
         service.recover_activating_rescan().unwrap();
         assert_eq!(service.summary().unwrap(), before);
+    }
+
+    #[test]
+    fn manual_slate_round_trip_persists_contexts_and_finalizes_authoritatively() {
+        use dom_crypto::{bp2_prove, BlindingFactor};
+
+        let temp = tempfile::tempdir().unwrap();
+        let sender_path = temp.path().join("sender");
+        let recipient_path = temp.path().join("recipient");
+        let mut sender = WalletService {
+            kdf: KdfParameters::TEST,
+            ..Default::default()
+        };
+        let mut recipient = WalletService {
+            kdf: KdfParameters::TEST,
+            ..Default::default()
+        };
+        sender
+            .create(&sender_path, "password-1", identity())
+            .unwrap();
+        recipient
+            .create(&recipient_path, "password-1", identity())
+            .unwrap();
+        sender.unlock("password-1").unwrap();
+        recipient.unlock("password-1").unwrap();
+
+        let blinding = BlindingFactor::from_bytes([7; 32]).unwrap();
+        let (_, commitment) = bp2_prove(900_000, &blinding).unwrap();
+        let mut funded = sender.unlocked.as_ref().unwrap().clone();
+        let output_id = Uuid::new_v4();
+        funded.outputs.push(OutputRecord {
+            id: output_id,
+            account_id: funded.default_account.id,
+            commitment: Some(commitment),
+            value: 900_000,
+            state: OutputState::Confirmed,
+            discovered_height: 0,
+            reserved_by: None,
+        });
+        funded.remember_output_blinding(output_id, [7; 32]);
+        sender.commit(funded).unwrap();
+
+        let created = sender.transaction_send_create(600_000, None).unwrap();
+        let slate_id = created.slate_id.unwrap();
+        assert_eq!(created.state, "INPUTS_RESERVED");
+        sender.close().unwrap();
+        sender.open(&sender_path).unwrap();
+        sender.unlock("password-1").unwrap();
+        let request = sender.slate_request_export(slate_id).unwrap();
+        let imported = recipient.slate_request_import(&request.text).unwrap();
+        assert_eq!(imported.state, "REQUEST_IMPORTED");
+        recipient.slate_response_create(slate_id).unwrap();
+        let response = recipient.slate_response_export(slate_id).unwrap();
+        sender.slate_response_import(&response.text).unwrap();
+        let finalized = sender.transaction_finalize(slate_id).unwrap();
+        assert_eq!(finalized.state, "FINALIZED");
+        assert!(finalized.kernel_excess.is_some());
+        // The sender's nonce has been consumed and cannot be accidentally
+        // reused; a repeat finalize returns the persisted canonical result.
+        assert_eq!(sender.transaction_finalize(slate_id).unwrap(), finalized);
+        assert!(recipient
+            .transaction_detail_redacted(slate_id)
+            .unwrap()
+            .kernel_excess
+            .is_none());
+    }
+
+    #[test]
+    fn cancellation_releases_only_pre_submission_reservations() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("wallet");
+        let mut service = WalletService {
+            kdf: KdfParameters::TEST,
+            ..Default::default()
+        };
+        service.create(&path, "password-1", identity()).unwrap();
+        service.unlock("password-1").unwrap();
+        let state = service.unlocked.as_ref().unwrap();
+        let slate_id = Uuid::new_v4();
+        let transaction_id = Uuid::new_v4();
+        let output_id = Uuid::new_v4();
+        let mut prepared = state.clone();
+        prepared.outputs.push(OutputRecord {
+            id: output_id,
+            account_id: prepared.default_account.id,
+            commitment: Some([3; 33]),
+            value: 100,
+            state: OutputState::PendingOutgoing,
+            discovered_height: 0,
+            reserved_by: Some(transaction_id),
+        });
+        prepared.transactions.push(LocalTransactionIntent {
+            id: transaction_id,
+            kernel_excess: Vec::new(),
+            lifecycle: TransactionLifecycle::InputsReserved,
+            submitted: false,
+            slate_id: Some(slate_id),
+            role: Some(TransactionRole::Sender),
+            amount: 1,
+            fee: 1,
+            reserved_output_ids: vec![output_id],
+            request_bytes: Vec::new(),
+            response_bytes: Vec::new(),
+            finalized_transaction_bytes: Vec::new(),
+            transaction_hash: None,
+            attempt_count: 0,
+            private_context: None,
+            recipient_output_id: None,
+            change_output_id: None,
+        });
+        service.commit(prepared).unwrap();
+        service.transaction_cancel(slate_id, false).unwrap();
+        assert!(matches!(
+            service
+                .unlocked
+                .as_ref()
+                .unwrap()
+                .outputs
+                .last()
+                .unwrap()
+                .state,
+            OutputState::Confirmed
+        ));
     }
 }
