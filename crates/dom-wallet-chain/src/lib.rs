@@ -60,6 +60,7 @@ pub struct LiveNodeProbe {
     pub supports_scan: bool,
     pub supports_ancestry: bool,
     pub supports_kernel_lookup: bool,
+    pub supports_transaction_lookup: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -581,7 +582,56 @@ impl DomHttpChainSource {
             supports_scan: true,
             supports_ancestry: true,
             supports_kernel_lookup: true,
+            supports_transaction_lookup: true,
         })
+    }
+
+    /// Verifies every non-mutating wallet-safe route needed before a wallet is
+    /// opened for a live run.  It deliberately never calls `POST /tx/submit`:
+    /// there is no protocol-defined read-only submit-capability endpoint and a
+    /// preflight must not present any transaction bytes to a node.
+    pub fn verify_wallet_safe_capabilities(&mut self) -> Result<LiveNodeProbe, ChainError> {
+        let probe = self.live_probe()?;
+        let target = ScanTarget {
+            target_height: probe.tip_height,
+            target_block_hash: probe.tip_hash,
+            source_identity: self.source_identity.clone(),
+            scan_bounds: ScanBounds {
+                start_height: probe.tip_height,
+                end_height: probe.tip_height,
+                max_pages: 1,
+                max_records_per_page: 100_000,
+            },
+            evidence_version: probe.rpc_api_version,
+        };
+        self.checked_scan(&target, 0)?;
+        let ancestor_height = probe.tip_height.saturating_sub(MAX_ANCESTRY_STEPS as u64);
+        let ancestor = self.block(&ancestor_height.to_string())?;
+        if ancestor.height != ancestor_height {
+            return Err(ChainError::InconsistentNode);
+        }
+        let ancestor_hash = decode_hash(&ancestor.hash)?;
+        let ancestor_target = ScanTarget {
+            target_height: ancestor_height,
+            target_block_hash: ancestor_hash,
+            source_identity: self.source_identity.clone(),
+            scan_bounds: ScanBounds {
+                start_height: ancestor_height,
+                end_height: ancestor_height,
+                max_pages: 1,
+                max_records_per_page: 1,
+            },
+            evidence_version: probe.rpc_api_version,
+        };
+        let ancestry_bound = u32::try_from(probe.tip_height.saturating_sub(ancestor_height))
+            .map_err(|_| ChainError::AncestryUnavailable)?
+            .max(1);
+        if !self.bounded_ancestry(&ancestor_target, ancestry_bound)? {
+            return Err(ChainError::AncestryUnavailable);
+        }
+        let _ = self.lookup_kernel([1; 33])?;
+        let _ = self.lookup_transaction([1; 32])?;
+        Ok(probe)
     }
 
     /// Optional targeted evidence. It is intentionally not used as a scan

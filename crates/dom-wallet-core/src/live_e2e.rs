@@ -30,13 +30,20 @@ pub struct LiveE2eConfig {
     pub wallet_b_dir: PathBuf,
     pub wallet_b_password_file: PathBuf,
     pub amount: u64,
-    pub mutation_enabled: bool,
+    pub mode: LiveE2eMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LiveE2eMode {
+    Preflight,
+    Execute,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LiveE2eConfigError {
     Missing(Vec<&'static str>),
     Invalid,
+    InvalidMode,
     UnsafeSecretFile,
 }
 
@@ -75,6 +82,7 @@ pub fn load_from_environment() -> Result<LiveE2eConfig, LiveE2eConfigError> {
         .ok()
         .filter(|amount| *amount > 0)
         .ok_or(LiveE2eConfigError::Invalid)?;
+    let mode = parse_mode(env::var("DOM_LIVE_E2E_MODE").ok().as_deref())?;
     Ok(LiveE2eConfig {
         rpc_url,
         identity,
@@ -83,7 +91,7 @@ pub fn load_from_environment() -> Result<LiveE2eConfig, LiveE2eConfigError> {
         wallet_b_dir: PathBuf::from(required("DOM_LIVE_E2E_WALLET_B_DIR")?),
         wallet_b_password_file: PathBuf::from(required("DOM_LIVE_E2E_WALLET_B_PASSWORD_FILE")?),
         amount,
-        mutation_enabled: env::var("DOM_LIVE_E2E_ENABLE").ok().as_deref() == Some(ENABLE_TOKEN),
+        mode,
     })
 }
 
@@ -108,6 +116,22 @@ impl LiveE2eConfig {
     pub fn validate_secret_files(&self) -> Result<(), LiveE2eConfigError> {
         validate_secret_file(&self.wallet_a_password_file)?;
         validate_secret_file(&self.wallet_b_password_file)
+    }
+
+    pub fn execute_authorized(&self) -> bool {
+        execute_authorized(self.mode, env::var("DOM_LIVE_E2E_ENABLE").ok().as_deref())
+    }
+}
+
+pub fn execute_authorized(mode: LiveE2eMode, token: Option<&str>) -> bool {
+    mode == LiveE2eMode::Execute && token == Some(ENABLE_TOKEN)
+}
+
+pub fn parse_mode(value: Option<&str>) -> Result<LiveE2eMode, LiveE2eConfigError> {
+    match value {
+        Some("PREFLIGHT") => Ok(LiveE2eMode::Preflight),
+        Some("EXECUTE") => Ok(LiveE2eMode::Execute),
+        _ => Err(LiveE2eConfigError::InvalidMode),
     }
 }
 
@@ -143,4 +167,31 @@ fn validate_secret_file(path: &PathBuf) -> Result<(), LiveE2eConfigError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn modes_are_explicit_and_execute_never_falls_back_to_preflight() {
+        assert_eq!(parse_mode(Some("PREFLIGHT")), Ok(LiveE2eMode::Preflight));
+        assert_eq!(parse_mode(Some("EXECUTE")), Ok(LiveE2eMode::Execute));
+        assert_eq!(parse_mode(None), Err(LiveE2eConfigError::InvalidMode));
+        assert_eq!(
+            parse_mode(Some("dry-run")),
+            Err(LiveE2eConfigError::InvalidMode)
+        );
+    }
+
+    #[test]
+    fn execute_requires_the_exact_acknowledgement_token() {
+        assert!(!execute_authorized(
+            LiveE2eMode::Preflight,
+            Some(ENABLE_TOKEN)
+        ));
+        assert!(!execute_authorized(LiveE2eMode::Execute, None));
+        assert!(!execute_authorized(LiveE2eMode::Execute, Some("yes")));
+        assert!(execute_authorized(LiveE2eMode::Execute, Some(ENABLE_TOKEN)));
+    }
 }

@@ -93,6 +93,19 @@ pub struct FeeEstimate {
     pub minimum_fee: u64,
 }
 
+/// Redacted, read-only funding result for the live runner. It is calculated
+/// from the same deterministic spendability predicate and protocol fee floor
+/// as transaction creation, but never creates an intent or reservation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FundingPreflight {
+    pub amount: u64,
+    pub spendable: u64,
+    pub selected_input_count: u32,
+    pub estimated_fee: u64,
+    pub fundable: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SlateExport {
@@ -329,6 +342,85 @@ impl WalletService {
             None,
         )?;
         source.live_probe().map_err(CoreError::Chain)
+    }
+
+    /// Read-only, strict capability check used before opening a live wallet.
+    /// It uses only the pinned wallet-safe HTTP read surface.
+    pub fn verify_live_node_capabilities(
+        configuration: &NodeConfiguration,
+    ) -> Result<LiveNodeProbe, CoreError> {
+        configuration.validate().map_err(CoreError::Domain)?;
+        let mut source = DomHttpChainSource::new(
+            &configuration.endpoint_url,
+            configuration.expected_identity.clone(),
+            configuration.source_identity.clone(),
+            configuration.api_compatibility_version,
+            configuration.connect_timeout_ms,
+            configuration.request_timeout_ms,
+            None,
+        )?;
+        source
+            .verify_wallet_safe_capabilities()
+            .map_err(CoreError::Chain)
+    }
+
+    /// Calculates whether the current canonical local descriptors can fund an
+    /// amount. This is intentionally side-effect free.
+    pub fn preflight_funding(&self, amount: u64) -> Result<FundingPreflight, CoreError> {
+        if amount == 0 {
+            return Err(CoreError::InvalidTransactionInput);
+        }
+        let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
+        let spendable = state.balance().spendable;
+        let mut candidates = state
+            .outputs
+            .iter()
+            .filter(|output| {
+                matches!(output.state, OutputState::Confirmed)
+                    && output.reserved_by.is_none()
+                    && output.commitment.is_some()
+                    && state.output_blinding(output.id).is_some()
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            left.value
+                .cmp(&right.value)
+                .then_with(|| left.commitment.cmp(&right.commitment))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let mut total = 0u64;
+        let mut selected = 0usize;
+        let mut estimated_fee =
+            protocol::minimum_fee(1, true).map_err(|_| CoreError::InvalidTransactionInput)?;
+        for output in candidates {
+            if selected >= protocol::MAX_INPUTS {
+                break;
+            }
+            selected = selected.saturating_add(1);
+            estimated_fee = protocol::minimum_fee(selected, true)
+                .map_err(|_| CoreError::InvalidTransactionInput)?;
+            total = total
+                .checked_add(output.value)
+                .ok_or(CoreError::ArithmeticOverflow)?;
+            if total
+                >= amount
+                    .checked_add(estimated_fee)
+                    .ok_or(CoreError::ArithmeticOverflow)?
+            {
+                break;
+            }
+        }
+        let required = amount
+            .checked_add(estimated_fee)
+            .ok_or(CoreError::ArithmeticOverflow)?;
+        Ok(FundingPreflight {
+            amount,
+            spendable,
+            selected_input_count: u32::try_from(selected)
+                .map_err(|_| CoreError::InvalidTransactionInput)?,
+            estimated_fee,
+            fundable: selected > 0 && total >= required,
+        })
     }
 
     pub fn synchronize<S: ChainSource>(
@@ -1921,6 +2013,47 @@ mod tests {
             .unwrap()
             .kernel_excess
             .is_none());
+    }
+
+    #[test]
+    fn funding_preflight_is_side_effect_free_and_never_reserves_an_output() {
+        use dom_crypto::{bp2_prove, BlindingFactor};
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("wallet");
+        let mut service = WalletService {
+            kdf: KdfParameters::TEST,
+            ..Default::default()
+        };
+        service.create(&path, "password-1", identity()).unwrap();
+        service.unlock("password-1").unwrap();
+        let blinding = BlindingFactor::from_bytes([7; 32]).unwrap();
+        let (_, commitment) = bp2_prove(900_000, &blinding).unwrap();
+        let mut state = service.unlocked.as_ref().unwrap().clone();
+        let output_id = Uuid::new_v4();
+        state.outputs.push(OutputRecord {
+            id: output_id,
+            account_id: state.default_account.id,
+            commitment: Some(commitment),
+            value: 900_000,
+            state: OutputState::Confirmed,
+            discovered_height: 0,
+            reserved_by: None,
+        });
+        state.remember_output_blinding(output_id, [7; 32]);
+        service.commit(state).unwrap();
+        let before = service.unlocked.as_ref().unwrap().clone();
+        let funding = service.preflight_funding(600_000).unwrap();
+        assert!(funding.fundable);
+        assert!(funding.estimated_fee > 0);
+        assert_eq!(service.unlocked.as_ref().unwrap(), &before);
+        assert_eq!(service.unlocked.as_ref().unwrap().transactions.len(), 0);
+        assert_eq!(
+            service.unlocked.as_ref().unwrap().outputs[0].reserved_by,
+            None
+        );
+        assert!(!service.preflight_funding(1_000_000).unwrap().fundable);
+        assert_eq!(service.unlocked.as_ref().unwrap(), &before);
     }
 
     #[test]
