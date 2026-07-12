@@ -22,6 +22,8 @@ use std::path::Path;
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod live_e2e;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ApplicationState {
     Closed,
@@ -344,9 +346,30 @@ impl WalletService {
                 .begin_scan(target.clone())
                 .map_err(CoreError::Domain)?;
             let pages = collect_provisional_pages(source, &target)?;
-            let provisional = pages.iter().flat_map(|page| page.outputs.clone()).collect();
+            // HTTP scan pages contain public commitments, not wallet-owned
+            // output records. Preserve existing encrypted descriptors and
+            // merge only explicit test/source observations that are not
+            // already known locally.
+            let mut provisional = state.outputs.clone();
+            for output in pages.iter().flat_map(|page| page.outputs.iter()).cloned() {
+                let already_known = provisional.iter().any(|known| {
+                    known.id == output.id
+                        || (known.commitment.is_some() && known.commitment == output.commitment)
+                });
+                if !already_known {
+                    provisional.push(output);
+                }
+            }
+            state.outputs = provisional;
             for page in &pages {
                 for block in &page.blocks {
+                    state
+                        .mark_known_outputs_confirmed(
+                            &block.output_commitments,
+                            block.height,
+                            block.hash,
+                        )
+                        .map_err(CoreError::Domain)?;
                     state
                         .apply_kernel_evidence(block.height, block.hash, &block.kernel_excesses)
                         .map_err(CoreError::Domain)?;
@@ -356,8 +379,9 @@ impl WalletService {
                 }
             }
             validate_target(source, &state.identity, &target, ancestry_limit)?;
+            let reconciled_outputs = state.outputs.clone();
             state
-                .activate_scan(&target, provisional)
+                .activate_scan(&target, reconciled_outputs)
                 .map_err(CoreError::Domain)?;
             self.commit(state.clone())?;
             self.connection = ConnectionState::Synced;
@@ -631,7 +655,10 @@ impl WalletService {
                 state
                     .cursor
                     .as_ref()
-                    .map(|cursor| cursor.height.saturating_add(1))
+                    // Re-read the cursor block when already at the tip. This
+                    // makes a reopen/resynchronize cycle validate durable
+                    // canonical evidence instead of producing an empty range.
+                    .map(|cursor| cursor.height.saturating_add(1).min(tip.tip_height))
             })
             .unwrap_or(0);
         let span = tip
@@ -1091,6 +1118,50 @@ impl WalletService {
         self.submit_transaction(slate_id, true)
     }
 
+    /// Records only positive node mempool evidence.  A missing `/tx/{hash}`
+    /// result is intentionally a no-op: it can mean mining, eviction, or a
+    /// reorganization and is never a local rejection decision.
+    pub fn transaction_observe_mempool(
+        &mut self,
+        slate_id: Uuid,
+    ) -> Result<TransactionSummary, CoreError> {
+        let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
+        let index = find_transaction_index(state, slate_id, TransactionRole::Sender)?;
+        let transaction = &state.transactions[index];
+        if !matches!(
+            transaction.lifecycle,
+            TransactionLifecycle::Submitting
+                | TransactionLifecycle::Submitted
+                | TransactionLifecycle::AcceptedNotRelayed
+                | TransactionLifecycle::RetransmitRequired
+                | TransactionLifecycle::InMempool
+        ) {
+            return Err(CoreError::InvalidTransactionTransition);
+        }
+        let transaction_hash = transaction
+            .transaction_hash
+            .ok_or(CoreError::InvalidTransactionTransition)?;
+        let configuration = state.node_configuration.clone();
+        let source = DomHttpChainSource::new(
+            &configuration.endpoint_url,
+            configuration.expected_identity,
+            configuration.source_identity,
+            configuration.api_compatibility_version,
+            configuration.connect_timeout_ms,
+            configuration.request_timeout_ms,
+            None,
+        )?;
+        let observed = source.lookup_transaction(transaction_hash)?;
+        if !observed.in_mempool {
+            return self.transaction_summary(transaction.id);
+        }
+        let mut state = state.clone();
+        state.transactions[index].lifecycle = TransactionLifecycle::InMempool;
+        let id = state.transactions[index].id;
+        self.commit(state)?;
+        self.transaction_summary(id)
+    }
+
     pub fn transaction_cancel(
         &mut self,
         slate_id: Uuid,
@@ -1207,16 +1278,24 @@ impl WalletService {
             .ok_or(CoreError::TransactionNotFound)?;
         match outcome {
             Ok(outcome) if outcome.accepted && outcome.relayed => {
+                if outcome.tx_hash != state.transactions[index].transaction_hash {
+                    self.last_error =
+                        Some("node submission hash did not match persisted transaction".into());
+                    return Err(CoreError::SubmissionUncertain);
+                }
                 state.transactions[index].lifecycle = TransactionLifecycle::Submitted;
                 state.transactions[index].submitted = true;
-                state.transactions[index].transaction_hash = outcome.tx_hash;
                 self.commit(state)?;
                 self.transaction_summary(id)
             }
             Ok(outcome) if outcome.accepted => {
+                if outcome.tx_hash != state.transactions[index].transaction_hash {
+                    self.last_error =
+                        Some("node submission hash did not match persisted transaction".into());
+                    return Err(CoreError::SubmissionUncertain);
+                }
                 state.transactions[index].lifecycle = TransactionLifecycle::AcceptedNotRelayed;
                 state.transactions[index].submitted = true;
-                state.transactions[index].transaction_hash = outcome.tx_hash;
                 self.commit(state)?;
                 self.transaction_summary(id)
             }

@@ -68,6 +68,14 @@ pub struct KernelLookup {
     pub block_hash: Option<[u8; 32]>,
 }
 
+/// Public mempool evidence from the wallet-safe `/tx/{hash}` endpoint.  A
+/// missing result is deliberately not a rejection or a confirmation claim.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransactionLookup {
+    pub transaction_hash: [u8; 32],
+    pub in_mempool: bool,
+}
+
 pub trait ChainSource {
     fn handshake(&mut self) -> Result<NodeHandshake, ChainError>;
     fn hash_at_height(&mut self, height: u64) -> Result<Option<[u8; 32]>, ChainError>;
@@ -418,6 +426,20 @@ struct KernelFoundDto {
 struct KernelMissingDto {
     found: bool,
 }
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TxFoundDto {
+    found: bool,
+    tx_hash: String,
+    fee: u64,
+    fee_rate: u64,
+    weight: u32,
+}
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TxMissingDto {
+    found: bool,
+}
 
 impl DomHttpChainSource {
     pub fn new(
@@ -474,6 +496,12 @@ impl DomHttpChainSource {
         if !(200..300).contains(&status) {
             return Err(ChainError::HttpStatus(status));
         }
+        Self::decode_response(response)
+    }
+
+    fn decode_response<T: for<'de> Deserialize<'de>>(
+        response: reqwest::blocking::Response,
+    ) -> Result<T, ChainError> {
         if response
             .content_length()
             .is_some_and(|len| len > MAX_HTTP_RESPONSE_BYTES)
@@ -509,8 +537,8 @@ impl DomHttpChainSource {
             return Err(ChainError::MalformedResponse);
         }
         let network = match self.expected.network {
-            dom_wallet_domain::Network::PrivateTestnet => "private_testnet",
-            dom_wallet_domain::Network::PublicTestnet => "public_testnet",
+            dom_wallet_domain::Network::PrivateTestnet => "regtest",
+            dom_wallet_domain::Network::PublicTestnet => "testnet",
             dom_wallet_domain::Network::Mainnet => "mainnet",
         };
         if identity.network != network
@@ -567,8 +595,7 @@ impl DomHttpChainSource {
         }
         let response = request.send().map_err(map_http_error)?;
         if response.status().as_u16() == 404 {
-            let body: KernelMissingDto =
-                response.json().map_err(|_| ChainError::MalformedResponse)?;
+            let body: KernelMissingDto = Self::decode_response(response)?;
             if body.found {
                 return Err(ChainError::MalformedResponse);
             }
@@ -580,13 +607,71 @@ impl DomHttpChainSource {
         if !response.status().is_success() {
             return Err(ChainError::HttpStatus(response.status().as_u16()));
         }
-        let body: KernelFoundDto = response.json().map_err(|_| ChainError::MalformedResponse)?;
+        let body: KernelFoundDto = Self::decode_response(response)?;
         if !body.found || decode_commitment(&body.excess)? != excess {
             return Err(ChainError::MalformedResponse);
         }
         Ok(KernelLookup {
             excess,
             block_hash: Some(decode_hash(&body.block_hash)?),
+        })
+    }
+
+    /// Reads only the node's authoritative volatile-mempool projection.  A
+    /// false value means "not currently observed" and must never be treated
+    /// as rejection: the transaction may have been mined or evicted.
+    pub fn lookup_transaction(
+        &self,
+        transaction_hash: [u8; 32],
+    ) -> Result<TransactionLookup, ChainError> {
+        let path = format!("/tx/{}", hex::encode(transaction_hash));
+        let url = format!("{}{}", self.base_url, path);
+        let mut request = self.client.get(url);
+        if let Some(token) = &self.bearer_token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().map_err(map_http_error)?;
+        let status = response.status().as_u16();
+        if status == 401 || status == 403 {
+            return Err(ChainError::AuthenticationFailed);
+        }
+        if status == 404 {
+            return Err(ChainError::CapabilityUnavailable("/tx/{hash}".into()));
+        }
+        if status == 429 {
+            return Err(ChainError::RateLimited);
+        }
+        if status == 503 {
+            return Err(ChainError::Overloaded);
+        }
+        if !(200..300).contains(&status) {
+            return Err(ChainError::HttpStatus(status));
+        }
+        let bytes = Self::decode_response::<serde_json::Value>(response)?;
+        let found = bytes
+            .get("found")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or(ChainError::MalformedResponse)?;
+        if !found {
+            let missing: TxMissingDto =
+                serde_json::from_value(bytes).map_err(|_| ChainError::MalformedResponse)?;
+            if missing.found {
+                return Err(ChainError::MalformedResponse);
+            }
+            return Ok(TransactionLookup {
+                transaction_hash,
+                in_mempool: false,
+            });
+        }
+        let found: TxFoundDto =
+            serde_json::from_value(bytes).map_err(|_| ChainError::MalformedResponse)?;
+        if !found.found || decode_hash(&found.tx_hash)? != transaction_hash {
+            return Err(ChainError::MalformedResponse);
+        }
+        let _ = (found.fee, found.fee_rate, found.weight);
+        Ok(TransactionLookup {
+            transaction_hash,
+            in_mempool: true,
         })
     }
 
@@ -708,7 +793,13 @@ impl DomHttpChainSource {
         if status == 404 {
             return Err(ChainError::CapabilityUnavailable("/tx/submit".into()));
         }
-        let body: SubmitDto = response.json().map_err(|_| ChainError::MalformedResponse)?;
+        if status == 429 {
+            return Err(ChainError::RateLimited);
+        }
+        if status == 503 {
+            return Err(ChainError::Overloaded);
+        }
+        let body: SubmitDto = Self::decode_response(response)?;
         let tx_hash = body.tx_hash.as_deref().map(decode_hash).transpose()?;
         if body.accepted && tx_hash.is_none() {
             return Err(ChainError::MalformedResponse);
@@ -922,6 +1013,9 @@ pub enum ChainError {
 mod tests {
     use super::*;
     use dom_wallet_domain::Network;
+    use std::io::Write as _;
+    use std::net::TcpListener;
+    use std::thread;
 
     fn identity() -> NetworkIdentity {
         NetworkIdentity {
@@ -943,6 +1037,71 @@ mod tests {
         )
         .unwrap()
         .1
+    }
+
+    fn one_response_server(status: &str, body: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let status = status.to_owned();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        format!("http://{address}")
+    }
+
+    #[test]
+    fn transaction_lookup_decodes_only_exact_wallet_safe_dtos() {
+        let hash = [0xabu8; 32];
+        let found_url = one_response_server(
+            "200 OK",
+            format!(
+                r#"{{"found":true,"tx_hash":"{}","fee":7,"fee_rate":1,"weight":3}}"#,
+                hex::encode(hash)
+            ),
+        );
+        let source = DomHttpChainSource::new(
+            &found_url,
+            identity(),
+            "fixture".into(),
+            1,
+            1_000,
+            1_000,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            source.lookup_transaction(hash).unwrap(),
+            TransactionLookup {
+                transaction_hash: hash,
+                in_mempool: true,
+            }
+        );
+
+        let missing_url = one_response_server("200 OK", r#"{"found":false}"#.into());
+        let source = DomHttpChainSource::new(
+            &missing_url,
+            identity(),
+            "fixture".into(),
+            1,
+            1_000,
+            1_000,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            source.lookup_transaction(hash).unwrap(),
+            TransactionLookup {
+                transaction_hash: hash,
+                in_mempool: false,
+            }
+        );
     }
 
     #[test]

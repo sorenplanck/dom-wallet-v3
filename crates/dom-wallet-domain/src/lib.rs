@@ -524,6 +524,14 @@ impl WalletState {
         }) {
             return Err(DomainError::InvalidState);
         }
+        let mut commitments = std::collections::BTreeSet::new();
+        if self.outputs.iter().any(|output| {
+            output
+                .commitment
+                .is_some_and(|commitment| !commitments.insert(commitment))
+        }) {
+            return Err(DomainError::InvalidState);
+        }
         Ok(())
     }
 
@@ -603,9 +611,52 @@ impl WalletState {
             output.state = OutputState::Spent {
                 spent_height: height,
             };
+            output.reserved_by = None;
             return true;
         }
         false
+    }
+
+    /// Applies public block-output evidence only to already persisted local
+    /// descriptors.  The node deliberately provides commitments rather than
+    /// ownership or value claims, so an unknown commitment never becomes a
+    /// wallet output.
+    pub fn mark_known_outputs_confirmed(
+        &mut self,
+        commitments: &[[u8; 33]],
+        height: u64,
+        block_hash: [u8; 32],
+    ) -> Result<(), DomainError> {
+        let mut seen = std::collections::BTreeSet::new();
+        for commitment in commitments {
+            if !seen.insert(*commitment) {
+                return Err(DomainError::InvalidState);
+            }
+            let Some(output_index) = self
+                .outputs
+                .iter()
+                .position(|output| output.commitment == Some(*commitment))
+            else {
+                continue;
+            };
+            if !matches!(self.outputs[output_index].state, OutputState::Spent { .. }) {
+                self.outputs[output_index].state = OutputState::Confirmed;
+                self.outputs[output_index].discovered_height = height;
+            }
+            let output_id = self.outputs[output_index].id;
+            for transaction in &mut self.transactions {
+                if transaction.recipient_output_id == Some(output_id)
+                    && matches!(
+                        transaction.lifecycle,
+                        TransactionLifecycle::ResponsePrepared
+                            | TransactionLifecycle::ResponseExported
+                    )
+                {
+                    transaction.lifecycle = TransactionLifecycle::Confirmed { height, block_hash };
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn output_blinding(&self, output_id: Uuid) -> Option<[u8; 32]> {
@@ -660,6 +711,7 @@ impl WalletState {
                     | TransactionLifecycle::AcceptedNotRelayed
                     | TransactionLifecycle::InMempool
                     | TransactionLifecycle::RetransmitRequired
+                    | TransactionLifecycle::Submitting
                     | TransactionLifecycle::Reorged => {
                         transaction.lifecycle =
                             TransactionLifecycle::Confirmed { height, block_hash }
@@ -680,7 +732,6 @@ impl WalletState {
                     | TransactionLifecycle::ResponseExported
                     | TransactionLifecycle::ResponseImported
                     | TransactionLifecycle::Finalized
-                    | TransactionLifecycle::Submitting
                     | TransactionLifecycle::Cancelled
                     | TransactionLifecycle::Failed => {}
                 }
@@ -1064,6 +1115,53 @@ mod tests {
         assert_eq!(
             state.transactions[0].lifecycle,
             TransactionLifecycle::ReconciliationRequired
+        );
+    }
+
+    #[test]
+    fn canonical_output_evidence_confirms_only_persisted_recipient_descriptor() {
+        let mut state = WalletState::new(identity(), [7; 32], configuration());
+        let output_id = Uuid::new_v4();
+        state.outputs.push(OutputRecord {
+            id: output_id,
+            account_id: state.default_account.id,
+            commitment: Some([5; 33]),
+            value: 600_000,
+            state: OutputState::PendingIncoming,
+            discovered_height: 0,
+            reserved_by: None,
+        });
+        state.transactions.push(LocalTransactionIntent {
+            id: Uuid::new_v4(),
+            kernel_excess: Vec::new(),
+            lifecycle: TransactionLifecycle::ResponseExported,
+            submitted: false,
+            slate_id: Some(Uuid::new_v4()),
+            role: Some(TransactionRole::Recipient),
+            amount: 600_000,
+            fee: 50_000,
+            reserved_output_ids: Vec::new(),
+            request_bytes: Vec::new(),
+            response_bytes: Vec::new(),
+            finalized_transaction_bytes: Vec::new(),
+            transaction_hash: None,
+            attempt_count: 0,
+            private_context: None,
+            recipient_output_id: Some(output_id),
+            change_output_id: None,
+        });
+        state
+            .mark_known_outputs_confirmed(&[[5; 33], [6; 33]], 12, [7; 32])
+            .unwrap();
+        assert_eq!(state.outputs.len(), 1);
+        assert_eq!(state.outputs[0].state, OutputState::Confirmed);
+        assert_eq!(state.outputs[0].discovered_height, 12);
+        assert_eq!(
+            state.transactions[0].lifecycle,
+            TransactionLifecycle::Confirmed {
+                height: 12,
+                block_hash: [7; 32]
+            }
         );
     }
 
