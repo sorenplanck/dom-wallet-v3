@@ -60,9 +60,13 @@ unrelayed result is retained as `ACCEPTED_NOT_RELAYED` for explicit retry.
 
 ## Limits
 
-This phase has no automatic transport, Slatepack relay, QR workflow, live VPS
-two-wallet test, mining confirmation, backup/restore, migration, or payment
+This phase has no automatic transport, Slatepack relay, live VPS two-wallet
+test, mining confirmation, backup/restore, migration, or payment
 recovery for scan-only outputs. Mempool admission with a real chain view is a
 live-E2E boundary; the wallet test instead validates the completed transaction
 through the pinned consensus, serialization, range-proof, balance, and
 signature path.
+
+Manual QR exchange is another representation of the exact same versioned text
+envelope, including bounded multipart reassembly. It is local copy/scan
+transport only and is not authenticated network transport.

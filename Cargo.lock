@@ -944,6 +944,7 @@ dependencies = [
 name = "dom-wallet-protocol"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "dom-consensus",
  "dom-core",
  "dom-crypto",
@@ -975,6 +976,8 @@ dependencies = [
  "dom-wallet-chain",
  "dom-wallet-core",
  "dom-wallet-domain",
+ "dom-wallet-protocol",
+ "hex",
  "serde",
  "tauri",
  "tauri-build",

@@ -23,9 +23,10 @@ The repository now contains the executable engineering foundation and a manual
 DOM transaction path. Wallet A can create and persist a request, Wallet B can
 import it and persist a recipient response, and Wallet A can finalize canonical
 DOM transaction bytes before submitting only through the wallet-safe node
-adapter. The exchange is explicit text transport, not automatic peer transport
-or Slatepack. Backup/restore, migration, and live VPS confirmation remain out
-of scope.
+adapter. The exchange supports equivalent versioned text and local QR forms,
+including bounded multipart QR frames; it is not automatic peer transport or
+Slatepack. Backup/restore, migration, and live VPS confirmation remain out of
+scope.
 
 ## Why V3 Exists
 

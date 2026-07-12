@@ -821,6 +821,8 @@ impl WalletService {
 
     pub fn slate_request_export(&mut self, slate_id: Uuid) -> Result<SlateExport, CoreError> {
         let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        let network = state.identity.network.to_string();
+        let chain_id = state.identity.chain_id;
         let transaction = find_transaction_mut(&mut state, slate_id, TransactionRole::Sender)?;
         match transaction.lifecycle {
             TransactionLifecycle::InputsReserved => {
@@ -829,8 +831,14 @@ impl WalletService {
             TransactionLifecycle::RequestExported => {}
             _ => return Err(CoreError::InvalidTransactionTransition),
         }
-        let text = protocol::export_transport(slate_id, false, &transaction.request_bytes)
-            .map_err(|_| CoreError::ProtocolRejected)?;
+        let text = protocol::export_transport(
+            &network,
+            chain_id,
+            slate_id,
+            false,
+            &transaction.request_bytes,
+        )
+        .map_err(|_| CoreError::ProtocolRejected)?;
         let id = transaction.id;
         self.commit(state)?;
         Ok(SlateExport {
@@ -841,15 +849,19 @@ impl WalletService {
     }
 
     pub fn slate_request_import(&mut self, text: &str) -> Result<TransactionSummary, CoreError> {
-        let (slate_id, response, bytes) =
+        let envelope =
             protocol::import_transport(text).map_err(|_| CoreError::InvalidSlateTransport)?;
-        if response {
+        if envelope.response {
             return Err(CoreError::InvalidSlateTransport);
         }
+        let slate_id = envelope.slate_id;
+        let bytes = envelope.payload;
         let details =
             protocol::slate_public_details(&bytes).map_err(|_| CoreError::InvalidSlateTransport)?;
         let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
-        if details.chain_id != state.identity.chain_id
+        if envelope.network != state.identity.network.to_string()
+            || envelope.chain_id != state.identity.chain_id
+            || details.chain_id != state.identity.chain_id
             || details.amount == 0
             || details.has_recipient_response
             || details.fee
@@ -942,6 +954,8 @@ impl WalletService {
 
     pub fn slate_response_export(&mut self, slate_id: Uuid) -> Result<SlateExport, CoreError> {
         let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        let network = state.identity.network.to_string();
+        let chain_id = state.identity.chain_id;
         let transaction = find_transaction_mut(&mut state, slate_id, TransactionRole::Recipient)?;
         match transaction.lifecycle {
             TransactionLifecycle::ResponsePrepared => {
@@ -951,8 +965,14 @@ impl WalletService {
             _ => return Err(CoreError::InvalidTransactionTransition),
         }
         let id = transaction.id;
-        let text = protocol::export_transport(slate_id, true, &transaction.response_bytes)
-            .map_err(|_| CoreError::ProtocolRejected)?;
+        let text = protocol::export_transport(
+            &network,
+            chain_id,
+            slate_id,
+            true,
+            &transaction.response_bytes,
+        )
+        .map_err(|_| CoreError::ProtocolRejected)?;
         self.commit(state)?;
         Ok(SlateExport {
             transaction_id: id,
@@ -962,17 +982,21 @@ impl WalletService {
     }
 
     pub fn slate_response_import(&mut self, text: &str) -> Result<TransactionSummary, CoreError> {
-        let (slate_id, response, bytes) =
+        let envelope =
             protocol::import_transport(text).map_err(|_| CoreError::InvalidSlateTransport)?;
-        if !response {
+        if !envelope.response {
             return Err(CoreError::InvalidSlateTransport);
         }
+        let slate_id = envelope.slate_id;
+        let bytes = envelope.payload;
         let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
         let index = find_transaction_index(&state, slate_id, TransactionRole::Sender)?;
         let details =
             protocol::slate_public_details(&bytes).map_err(|_| CoreError::InvalidSlateTransport)?;
         let transaction = &mut state.transactions[index];
-        if details.chain_id != state.identity.chain_id
+        if envelope.network != state.identity.network.to_string()
+            || envelope.chain_id != state.identity.chain_id
+            || details.chain_id != state.identity.chain_id
             || !details.has_recipient_response
             || details.amount != transaction.amount
             || details.fee != transaction.fee

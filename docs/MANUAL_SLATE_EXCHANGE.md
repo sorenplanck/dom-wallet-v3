@@ -9,15 +9,17 @@ with any external transport.
 The transport text is deterministic:
 
 ```text
-dom-slate-v1:<request|response>:<slate UUID>:<lowercase hex canonical DOM slate bytes>
+DOMSLATE1.<base64url-without-padding(canonical envelope bytes)>
 ```
 
-The authoritative DOM slate bytes are canonical `dom_tx::slate::Slate`
-serialization. Import bounds text size, ASCII encoding, prefix, role, UUID,
-lowercase hexadecimal, trailing fields, canonical decode/re-encode equality,
-supported protocol version, chain ID, participant response shape, and replay
-binding. A same request imported by the recipient returns its durable record;
-conflicting reuse of a slate identifier fails closed.
+The version-one envelope binds request/response role, network, exact chain ID,
+slate UUID, canonical DOM slate byte length, canonical slate bytes, and a
+Blake2b-256 content hash. The hash detects transport corruption but is not
+authentication; DOM slate proof, signature, role, chain, and replay validation
+remain mandatory. QR uses the exact text envelope when it fits. Larger values
+use deterministic `DOMQR1` frames with the envelope content hash as message
+identity, frame index/count, bounded base64url payload, and per-frame integrity
+hash. Incomplete or mixed frames never reach slate parsing.
 
 ## Flow
 
@@ -30,12 +32,16 @@ conflicting reuse of a slate identifier fails closed.
 4. Wallet A imports the response, finalizes the canonical DOM transaction,
    then explicitly submits it through the configured node.
 
-The frontend clears imported or exported pasted slate text after processing;
-it does not persist slate text, passwords, credentials, or private material in
-browser storage. Public slate identifiers, amounts, fee, lifecycle, kernel
-identifier, and submission result may be displayed. Private contexts,
-blindings, nonces, offsets, root material, passwords, and credentials are never
-returned by the Tauri DTOs.
+The frontend renders QR locally and starts a local scanner only after explicit
+user action. It releases the camera on successful scan, cancel, lock, close,
+and page unload according to the implemented code paths. No QR frame, camera
+image, pasted text, or reassembly buffer is stored in browser storage,
+telemetry, diagnostics, URLs, or support bundles. Camera release evidence is
+`CODE_PATH_AND_FOCUSED_STATIC_COVERAGE_ONLY`; no hardware camera test ran.
+Public slate identifiers, amounts, fee, lifecycle, kernel identifier, and
+submission result may be displayed. Private contexts, blindings, nonces,
+offsets, root material, passwords, and credentials are never returned by the
+Tauri DTOs.
 
 ## Tauri commands
 
@@ -46,4 +52,8 @@ The native command boundary registers `transaction_fee_estimate`,
 `transaction_retry_submission`, `transaction_cancel`, `transaction_list`, and
 `transaction_detail_redacted`. They require an unlocked wallet where state is
 protected, have strict bounded inputs, and expose redacted serializable results
-only. No generic filesystem, shell, process, or HTTP bridge is introduced.
+only. `slate_qr_encode`, `slate_qr_decode_frame`,
+`slate_qr_reassembly_status`, and `slate_qr_reassembly_clear` handle only the
+public canonical transport representation; QR decoding never replaces backend
+slate validation. No generic filesystem, shell, process, or HTTP bridge is
+introduced.

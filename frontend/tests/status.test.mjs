@@ -28,3 +28,14 @@ test("manual slate controls use only the production invoke adapter and clear pas
   assert.equal(source.includes("clearSlateText"), true);
   assert.equal(source.includes("/wallet/spend"), false);
 });
+
+test("QR exchange stays local, uses canonical native frames, and releases camera state", async () => {
+  const source = await (await import("node:fs/promises")).readFile(new URL("../main.js", import.meta.url), "utf8");
+  for (const command of ["slate_qr_encode", "slate_qr_decode_frame", "slate_qr_reassembly_status", "slate_qr_reassembly_clear"]) {
+    assert.equal(source.includes(`"${command}"`), true);
+  }
+  assert.equal(source.includes("QrScanner"), true);
+  assert.equal(source.includes("releaseCamera"), true);
+  assert.equal(source.includes("fetch("), false);
+  assert.equal(source.includes("localStorage"), false);
+});

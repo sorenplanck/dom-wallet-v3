@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 
 [dependencies]
+base64.workspace = true
 dom-consensus.workspace = true
 dom-core.workspace = true
 dom-crypto.workspace = true

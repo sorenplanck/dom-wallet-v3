@@ -2,6 +2,9 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "DOM Wallet V3",
   "identifier": "org.domprotocol.wallet.v3",
-  "build": { "frontendDist": "../frontend" },
+  "build": {
+    "beforeBuildCommand": "npm --prefix ../frontend run build",
+    "frontendDist": "../frontend/dist"
+  },
   "app": { "windows": [{ "label": "main", "title": "DOM Wallet V3", "width": 1100, "height": 760 }] }
 }

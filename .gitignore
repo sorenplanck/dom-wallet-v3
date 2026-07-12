@@ -29,3 +29,5 @@ fuzz/target/
 tmp/
 temp/
 .cache/
+frontend/node_modules/
+frontend/dist/

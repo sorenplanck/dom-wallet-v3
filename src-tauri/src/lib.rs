@@ -14,6 +14,7 @@ use dom_wallet_core::{
 use dom_wallet_domain::{
     NetworkIdentity, NodeConfiguration, RedactedNodeConfiguration, ScanBounds,
 };
+use dom_wallet_protocol::{QrEncoding, QrReassembler};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{
@@ -24,10 +25,11 @@ use thiserror::Error;
 
 pub struct DesktopApplication {
     service: Mutex<WalletService>,
+    qr_reassembler: Mutex<QrReassembler>,
     shutdown: AtomicBool,
 }
 
-pub const COMMAND_NAMES: [&str; 33] = [
+pub const COMMAND_NAMES: [&str; 37] = [
     "application_status",
     "wallet_create",
     "wallet_open",
@@ -61,12 +63,17 @@ pub const COMMAND_NAMES: [&str; 33] = [
     "transaction_cancel",
     "transaction_list",
     "transaction_detail_redacted",
+    "slate_qr_encode",
+    "slate_qr_decode_frame",
+    "slate_qr_reassembly_status",
+    "slate_qr_reassembly_clear",
 ];
 
 impl Default for DesktopApplication {
     fn default() -> Self {
         Self {
             service: Mutex::new(WalletService::default()),
+            qr_reassembler: Mutex::new(QrReassembler::default()),
             shutdown: AtomicBool::new(false),
         }
     }
@@ -78,6 +85,23 @@ pub struct ApplicationStatusDto {
     pub state: String,
     pub experimental: bool,
     pub unaudited: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SlateQrExportDto {
+    pub frames: Vec<String>,
+    pub multipart: bool,
+    pub content_hash: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SlateQrReassemblyDto {
+    pub message_id: Option<String>,
+    pub received_frames: u16,
+    pub total_frames: u16,
+    pub complete_text: Option<String>,
 }
 
 impl DesktopApplication {
@@ -130,6 +154,7 @@ impl DesktopApplication {
 
     pub fn wallet_lock(&self) -> Result<(), CommandError> {
         self.ensure_running()?;
+        self.clear_qr_buffers()?;
         self.service
             .lock()
             .map_err(|_| CommandError::Unavailable)?
@@ -138,6 +163,7 @@ impl DesktopApplication {
     }
     pub fn wallet_close(&self) -> Result<(), CommandError> {
         self.ensure_running()?;
+        self.clear_qr_buffers()?;
         self.service
             .lock()
             .map_err(|_| CommandError::Unavailable)?
@@ -190,6 +216,7 @@ impl DesktopApplication {
         if self.shutdown.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
+        self.clear_qr_buffers()?;
         let mut service = self.service.lock().map_err(|_| CommandError::Unavailable)?;
         let _ = service.close();
         Ok(())
@@ -295,6 +322,67 @@ impl DesktopApplication {
             .map_err(|_| CommandError::Unavailable)?
             .slate_request_export(slate_id)
             .map_err(CommandError::from)
+    }
+
+    /// Encodes exactly the existing canonical text envelope. It creates no
+    /// alternative slate format and carries no private wallet material.
+    pub fn slate_qr_encode(
+        &self,
+        slate_id: uuid::Uuid,
+        response: bool,
+    ) -> Result<SlateQrExportDto, CommandError> {
+        self.ensure_running()?;
+        let exported = if response {
+            self.slate_response_export(slate_id)?
+        } else {
+            self.slate_request_export(slate_id)?
+        };
+        match dom_wallet_protocol::qr_encode_transport(&exported.text)
+            .map_err(|_| CommandError::InvalidInput("canonical slate QR encoding failed".into()))?
+        {
+            QrEncoding::Single { text, content_hash } => Ok(SlateQrExportDto {
+                frames: vec![text],
+                multipart: false,
+                content_hash: hex::encode(content_hash),
+            }),
+            QrEncoding::Multi {
+                frames,
+                content_hash,
+            } => Ok(SlateQrExportDto {
+                frames,
+                multipart: true,
+                content_hash: hex::encode(content_hash),
+            }),
+        }
+    }
+
+    /// Reassembles public QR transport frames only. A completed text envelope
+    /// must still pass the normal role-bound core import path.
+    pub fn slate_qr_decode_frame(&self, frame: &str) -> Result<SlateQrReassemblyDto, CommandError> {
+        self.ensure_running()?;
+        if frame.is_empty() || frame.len() > 2_097_280 || !frame.is_ascii() {
+            return Err(CommandError::InvalidInput("QR frame is invalid".into()));
+        }
+        let status = self
+            .qr_reassembler
+            .lock()
+            .map_err(|_| CommandError::Unavailable)?
+            .push(frame)
+            .map_err(|_| CommandError::InvalidInput("QR frame is invalid".into()))?;
+        Ok(qr_status_dto(status))
+    }
+
+    pub fn slate_qr_reassembly_status(&self) -> Result<SlateQrReassemblyDto, CommandError> {
+        let status = self
+            .qr_reassembler
+            .lock()
+            .map_err(|_| CommandError::Unavailable)?
+            .status();
+        Ok(qr_status_dto(status))
+    }
+
+    pub fn slate_qr_reassembly_clear(&self) -> Result<(), CommandError> {
+        self.clear_qr_buffers()
     }
 
     pub fn slate_request_import(&self, text: &str) -> Result<TransactionSummary, CommandError> {
@@ -419,6 +507,23 @@ impl DesktopApplication {
             Ok(())
         }
     }
+
+    fn clear_qr_buffers(&self) -> Result<(), CommandError> {
+        self.qr_reassembler
+            .lock()
+            .map_err(|_| CommandError::Unavailable)?
+            .clear();
+        Ok(())
+    }
+}
+
+fn qr_status_dto(status: dom_wallet_protocol::QrReassemblyStatus) -> SlateQrReassemblyDto {
+    SlateQrReassemblyDto {
+        message_id: status.message_id.map(hex::encode),
+        received_frames: status.received_frames,
+        total_frames: status.total_frames,
+        complete_text: status.complete_text,
+    }
 }
 
 fn checked_password(value: &str) -> Result<(), CommandError> {
@@ -491,7 +596,7 @@ mod tests {
         let unique = COMMAND_NAMES
             .iter()
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(unique.len(), 33);
+        assert_eq!(unique.len(), 37);
         for required in [
             "application_status",
             "wallet_create",
@@ -499,6 +604,8 @@ mod tests {
             "application_shutdown",
             "transaction_send_create",
             "transaction_submit",
+            "slate_qr_encode",
+            "slate_qr_decode_frame",
         ] {
             assert!(COMMAND_NAMES.contains(&required));
         }

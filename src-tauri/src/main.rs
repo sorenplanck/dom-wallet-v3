@@ -235,6 +235,32 @@ fn transaction_detail_redacted(
     app.slate_summary_redacted(slate_id)
         .map_err(|e| e.to_string())
 }
+#[tauri::command]
+fn slate_qr_encode(
+    app: tauri::State<'_, DesktopApplication>,
+    slate_id: uuid::Uuid,
+    response: bool,
+) -> Result<dom_wallet_tauri_shell::SlateQrExportDto, String> {
+    app.slate_qr_encode(slate_id, response)
+        .map_err(|e| e.to_string())
+}
+#[tauri::command]
+fn slate_qr_decode_frame(
+    app: tauri::State<'_, DesktopApplication>,
+    frame: String,
+) -> Result<dom_wallet_tauri_shell::SlateQrReassemblyDto, String> {
+    app.slate_qr_decode_frame(&frame).map_err(|e| e.to_string())
+}
+#[tauri::command]
+fn slate_qr_reassembly_status(
+    app: tauri::State<'_, DesktopApplication>,
+) -> Result<dom_wallet_tauri_shell::SlateQrReassemblyDto, String> {
+    app.slate_qr_reassembly_status().map_err(|e| e.to_string())
+}
+#[tauri::command]
+fn slate_qr_reassembly_clear(app: tauri::State<'_, DesktopApplication>) -> Result<(), String> {
+    app.slate_qr_reassembly_clear().map_err(|e| e.to_string())
+}
 
 fn main() {
     tauri::Builder::default()
@@ -272,7 +298,11 @@ fn main() {
             transaction_retry_submission,
             transaction_cancel,
             transaction_list,
-            transaction_detail_redacted
+            transaction_detail_redacted,
+            slate_qr_encode,
+            slate_qr_decode_frame,
+            slate_qr_reassembly_status,
+            slate_qr_reassembly_clear
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|_| std::process::exit(1));

@@ -6,17 +6,22 @@
 //! DTO.  It converts public canonical slate bytes to and from the authoritative
 //! DOM serialization and returns private material only to the encrypted core.
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use dom_consensus::{validate_balance_equation, validate_transaction_structure};
 use dom_crypto::bp2_verify;
 use dom_serialization::{DomDeserialize, DomSerialize, Reader, Writer};
 use dom_slate::{build_send, finalize, respond_receive, SlateInput};
 use dom_tx::slate::Slate;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const TRANSPORT_PREFIX: &str = "dom-slate-v1:";
+pub const TRANSPORT_PREFIX: &str = "DOMSLATE1.";
+pub const QR_FRAME_PREFIX: &str = "DOMQR1.";
 pub const MAX_TRANSPORT_BYTES: usize = 1_048_576;
+pub const MAX_QR_SINGLE_TEXT_BYTES: usize = 900;
+pub const QR_FRAME_PAYLOAD_BYTES: usize = 600;
+pub const MAX_QR_FRAMES: usize = 128;
 pub const MIN_RELAY_FEE_RATE: u64 = dom_core::MIN_RELAY_FEE_RATE;
 pub const MAX_INPUTS: usize = dom_core::MAX_INPUTS_PER_TX;
 
@@ -91,6 +96,44 @@ pub struct SlatePublicDetails {
     pub has_recipient_response: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransportEnvelope {
+    pub version: u8,
+    pub response: bool,
+    pub network: String,
+    pub chain_id: [u8; 32],
+    pub slate_id: Uuid,
+    pub payload: Vec<u8>,
+    pub content_hash: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QrEncoding {
+    Single {
+        text: String,
+        content_hash: [u8; 32],
+    },
+    Multi {
+        frames: Vec<String>,
+        content_hash: [u8; 32],
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QrReassemblyStatus {
+    pub message_id: Option<[u8; 32]>,
+    pub received_frames: u16,
+    pub total_frames: u16,
+    pub complete_text: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct QrReassembler {
+    message_id: Option<[u8; 32]>,
+    total_frames: Option<u16>,
+    frames: BTreeMap<u16, Vec<u8>>,
+}
+
 #[derive(Debug, Error)]
 pub enum ProtocolAdapterError {
     #[error("invalid canonical DOM slate or transaction")]
@@ -105,6 +148,8 @@ pub enum ProtocolAdapterError {
     ProtocolRejected,
     #[error("manual slate envelope is malformed")]
     InvalidTransport,
+    #[error("QR frame or reassembly is malformed")]
+    InvalidQrFrame,
     #[error("manual slate envelope does not match the expected slate")]
     SlateBindingMismatch,
 }
@@ -315,6 +360,8 @@ pub fn validate_finalized_bytes(
 }
 
 pub fn export_transport(
+    network: &str,
+    chain_id: [u8; 32],
     slate_id: Uuid,
     response: bool,
     slate_bytes: &[u8],
@@ -326,46 +373,327 @@ pub fn export_transport(
     if canonical != slate_bytes {
         return Err(ProtocolAdapterError::InvalidCanonicalEncoding);
     }
+    let network = canonical_network(network)?;
+    let mut body = Vec::with_capacity(slate_bytes.len().saturating_add(96));
+    body.push(1);
+    body.push(u8::from(response));
+    body.push(u8::try_from(network.len()).map_err(|_| ProtocolAdapterError::InvalidTransport)?);
+    body.extend_from_slice(network.as_bytes());
+    body.extend_from_slice(&chain_id);
+    body.extend_from_slice(slate_id.as_bytes());
+    let length =
+        u32::try_from(slate_bytes.len()).map_err(|_| ProtocolAdapterError::InvalidTransport)?;
+    body.extend_from_slice(&length.to_le_bytes());
+    body.extend_from_slice(slate_bytes);
+    let hash = *dom_crypto::blake2b_256(&body).as_bytes();
+    body.extend_from_slice(&hash);
     Ok(format!(
-        "{TRANSPORT_PREFIX}{}:{}:{}",
-        if response { "response" } else { "request" },
-        slate_id.hyphenated(),
-        hex::encode(slate_bytes)
+        "{TRANSPORT_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(body)
     ))
 }
 
-pub fn import_transport(text: &str) -> Result<(Uuid, bool, Vec<u8>), ProtocolAdapterError> {
-    if text.len() > MAX_TRANSPORT_BYTES.saturating_mul(2).saturating_add(128) || !text.is_ascii() {
-        return Err(ProtocolAdapterError::InvalidTransport);
-    }
-    let mut parts = text.split(':');
-    if parts.next() != Some("dom-slate-v1") {
-        return Err(ProtocolAdapterError::InvalidTransport);
-    }
-    let kind = match parts.next() {
-        Some("request") => false,
-        Some("response") => true,
-        _ => return Err(ProtocolAdapterError::InvalidTransport),
-    };
-    let slate_id = parts
-        .next()
-        .ok_or(ProtocolAdapterError::InvalidTransport)?
-        .parse()
-        .map_err(|_| ProtocolAdapterError::InvalidTransport)?;
-    let encoded = parts.next().ok_or(ProtocolAdapterError::InvalidTransport)?;
-    if parts.next().is_some()
-        || encoded.len() % 2 != 0
-        || encoded
-            .bytes()
-            .any(|byte| !(byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+pub fn import_transport(text: &str) -> Result<TransportEnvelope, ProtocolAdapterError> {
+    if text.len() > MAX_TRANSPORT_BYTES.saturating_mul(2).saturating_add(128)
+        || !text.is_ascii()
+        || text.bytes().any(|byte| byte.is_ascii_whitespace())
+        || !text.starts_with(TRANSPORT_PREFIX)
     {
         return Err(ProtocolAdapterError::InvalidTransport);
     }
-    let bytes = hex::decode(encoded).map_err(|_| ProtocolAdapterError::InvalidTransport)?;
-    if bytes.len() > MAX_TRANSPORT_BYTES || encode_slate(&decode_slate(&bytes)?)? != bytes {
+    let encoded = text
+        .strip_prefix(TRANSPORT_PREFIX)
+        .ok_or(ProtocolAdapterError::InvalidTransport)?;
+    if encoded.is_empty() || encoded.contains('=') {
+        return Err(ProtocolAdapterError::InvalidTransport);
+    }
+    let bytes = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| ProtocolAdapterError::InvalidTransport)?;
+    if bytes.len() < 1 + 1 + 1 + 32 + 16 + 4 + 32 {
+        return Err(ProtocolAdapterError::InvalidTransport);
+    }
+    let (without_hash, supplied_hash) = bytes.split_at(
+        bytes
+            .len()
+            .checked_sub(32)
+            .ok_or(ProtocolAdapterError::InvalidTransport)?,
+    );
+    if *dom_crypto::blake2b_256(without_hash).as_bytes() != supplied_hash {
+        return Err(ProtocolAdapterError::InvalidTransport);
+    }
+    let mut offset = 0usize;
+    let version = take_u8(without_hash, &mut offset)?;
+    if version != 1 {
+        return Err(ProtocolAdapterError::InvalidTransport);
+    }
+    let response = match take_u8(without_hash, &mut offset)? {
+        0 => false,
+        1 => true,
+        _ => return Err(ProtocolAdapterError::InvalidTransport),
+    };
+    let network_len = usize::from(take_u8(without_hash, &mut offset)?);
+    let network_bytes = take(without_hash, &mut offset, network_len)?;
+    let network =
+        std::str::from_utf8(network_bytes).map_err(|_| ProtocolAdapterError::InvalidTransport)?;
+    let network = canonical_network(network)?;
+    let chain_id = take_array::<32>(without_hash, &mut offset)?;
+    let slate_id = Uuid::from_bytes(take_array::<16>(without_hash, &mut offset)?);
+    let payload_len = usize::try_from(u32::from_le_bytes(take_array::<4>(
+        without_hash,
+        &mut offset,
+    )?))
+    .map_err(|_| ProtocolAdapterError::InvalidTransport)?;
+    if payload_len > MAX_TRANSPORT_BYTES {
+        return Err(ProtocolAdapterError::InvalidTransport);
+    }
+    let payload = take(without_hash, &mut offset, payload_len)?.to_vec();
+    if offset != without_hash.len() || encode_slate(&decode_slate(&payload)?)? != payload {
         return Err(ProtocolAdapterError::InvalidCanonicalEncoding);
     }
-    Ok((slate_id, kind, bytes))
+    let mut content_hash = [0u8; 32];
+    content_hash.copy_from_slice(supplied_hash);
+    Ok(TransportEnvelope {
+        version,
+        response,
+        network: network.to_owned(),
+        chain_id,
+        slate_id,
+        payload,
+        content_hash,
+    })
+}
+
+pub fn qr_encode_transport(text: &str) -> Result<QrEncoding, ProtocolAdapterError> {
+    let envelope = import_transport(text)?;
+    if text.len() <= MAX_QR_SINGLE_TEXT_BYTES {
+        return Ok(QrEncoding::Single {
+            text: text.to_owned(),
+            content_hash: envelope.content_hash,
+        });
+    }
+    let message_id = envelope.content_hash;
+    let total = text.len().div_ceil(QR_FRAME_PAYLOAD_BYTES);
+    if total == 0 || total > MAX_QR_FRAMES {
+        return Err(ProtocolAdapterError::InvalidQrFrame);
+    }
+    let total_u16 = u16::try_from(total).map_err(|_| ProtocolAdapterError::InvalidQrFrame)?;
+    let frames = text
+        .as_bytes()
+        .chunks(QR_FRAME_PAYLOAD_BYTES)
+        .enumerate()
+        .map(|(index, chunk)| {
+            let index = u16::try_from(index).map_err(|_| ProtocolAdapterError::InvalidQrFrame)?;
+            let mut integrity = Vec::with_capacity(32 + 2 + 2 + chunk.len());
+            integrity.extend_from_slice(&message_id);
+            integrity.extend_from_slice(&index.to_le_bytes());
+            integrity.extend_from_slice(&total_u16.to_le_bytes());
+            integrity.extend_from_slice(chunk);
+            let checksum = dom_crypto::blake2b_256(&integrity);
+            Ok(format!(
+                "{QR_FRAME_PREFIX}{}.{}.{}.{}.{}",
+                hex::encode(message_id),
+                index,
+                total_u16,
+                URL_SAFE_NO_PAD.encode(chunk),
+                hex::encode(checksum.as_bytes())
+            ))
+        })
+        .collect::<Result<Vec<_>, ProtocolAdapterError>>()?;
+    Ok(QrEncoding::Multi {
+        frames,
+        content_hash: message_id,
+    })
+}
+
+impl QrReassembler {
+    pub fn status(&self) -> QrReassemblyStatus {
+        QrReassemblyStatus {
+            message_id: self.message_id,
+            received_frames: u16::try_from(self.frames.len()).unwrap_or(u16::MAX),
+            total_frames: self.total_frames.unwrap_or(0),
+            complete_text: None,
+        }
+    }
+
+    pub fn push(&mut self, scanned: &str) -> Result<QrReassemblyStatus, ProtocolAdapterError> {
+        if scanned.starts_with(TRANSPORT_PREFIX) {
+            if self.message_id.is_some() {
+                return Err(ProtocolAdapterError::InvalidQrFrame);
+            }
+            let envelope = import_transport(scanned)?;
+            return Ok(QrReassemblyStatus {
+                message_id: Some(envelope.content_hash),
+                received_frames: 1,
+                total_frames: 1,
+                complete_text: Some(scanned.to_owned()),
+            });
+        }
+        let frame = parse_qr_frame(scanned)?;
+        match (self.message_id, self.total_frames) {
+            (None, None) => {
+                self.message_id = Some(frame.message_id);
+                self.total_frames = Some(frame.total);
+            }
+            (Some(message_id), Some(total))
+                if message_id == frame.message_id && total == frame.total => {}
+            _ => return Err(ProtocolAdapterError::InvalidQrFrame),
+        }
+        if let Some(existing) = self.frames.get(&frame.index) {
+            if existing != &frame.payload {
+                return Err(ProtocolAdapterError::InvalidQrFrame);
+            }
+        } else {
+            self.frames.insert(frame.index, frame.payload);
+        }
+        let total = self
+            .total_frames
+            .ok_or(ProtocolAdapterError::InvalidQrFrame)?;
+        if self.frames.len() > usize::from(total) {
+            return Err(ProtocolAdapterError::InvalidQrFrame);
+        }
+        let complete_text = if self.frames.len() == usize::from(total) {
+            let mut bytes = Vec::new();
+            for index in 0..total {
+                bytes.extend_from_slice(
+                    self.frames
+                        .get(&index)
+                        .ok_or(ProtocolAdapterError::InvalidQrFrame)?,
+                );
+            }
+            if bytes.len() > MAX_TRANSPORT_BYTES.saturating_mul(2).saturating_add(128) {
+                return Err(ProtocolAdapterError::InvalidQrFrame);
+            }
+            let text =
+                String::from_utf8(bytes).map_err(|_| ProtocolAdapterError::InvalidQrFrame)?;
+            let envelope = import_transport(&text)?;
+            if Some(envelope.content_hash) != self.message_id {
+                return Err(ProtocolAdapterError::InvalidQrFrame);
+            }
+            Some(text)
+        } else {
+            None
+        };
+        Ok(QrReassemblyStatus {
+            message_id: self.message_id,
+            received_frames: u16::try_from(self.frames.len())
+                .map_err(|_| ProtocolAdapterError::InvalidQrFrame)?,
+            total_frames: total,
+            complete_text,
+        })
+    }
+
+    pub fn clear(&mut self) {
+        self.message_id = None;
+        self.total_frames = None;
+        self.frames.clear();
+    }
+}
+
+struct ParsedQrFrame {
+    message_id: [u8; 32],
+    index: u16,
+    total: u16,
+    payload: Vec<u8>,
+}
+
+fn parse_qr_frame(value: &str) -> Result<ParsedQrFrame, ProtocolAdapterError> {
+    if value.len() > QR_FRAME_PAYLOAD_BYTES.saturating_mul(2).saturating_add(256)
+        || !value.is_ascii()
+        || value.bytes().any(|byte| byte.is_ascii_whitespace())
+    {
+        return Err(ProtocolAdapterError::InvalidQrFrame);
+    }
+    let mut fields = value.split('.');
+    if fields.next() != Some("DOMQR1") {
+        return Err(ProtocolAdapterError::InvalidQrFrame);
+    }
+    let id_hex = fields.next().ok_or(ProtocolAdapterError::InvalidQrFrame)?;
+    let index = fields
+        .next()
+        .ok_or(ProtocolAdapterError::InvalidQrFrame)?
+        .parse::<u16>()
+        .map_err(|_| ProtocolAdapterError::InvalidQrFrame)?;
+    let total = fields
+        .next()
+        .ok_or(ProtocolAdapterError::InvalidQrFrame)?
+        .parse::<u16>()
+        .map_err(|_| ProtocolAdapterError::InvalidQrFrame)?;
+    let encoded = fields.next().ok_or(ProtocolAdapterError::InvalidQrFrame)?;
+    let checksum_hex = fields.next().ok_or(ProtocolAdapterError::InvalidQrFrame)?;
+    if fields.next().is_some()
+        || total == 0
+        || usize::from(total) > MAX_QR_FRAMES
+        || index >= total
+        || id_hex.len() != 64
+        || checksum_hex.len() != 64
+        || !id_hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || !checksum_hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || encoded.contains('=')
+    {
+        return Err(ProtocolAdapterError::InvalidQrFrame);
+    }
+    let id = hex::decode(id_hex).map_err(|_| ProtocolAdapterError::InvalidQrFrame)?;
+    let checksum = hex::decode(checksum_hex).map_err(|_| ProtocolAdapterError::InvalidQrFrame)?;
+    let message_id: [u8; 32] = id
+        .try_into()
+        .map_err(|_| ProtocolAdapterError::InvalidQrFrame)?;
+    let payload = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| ProtocolAdapterError::InvalidQrFrame)?;
+    if payload.len() > QR_FRAME_PAYLOAD_BYTES {
+        return Err(ProtocolAdapterError::InvalidQrFrame);
+    }
+    let mut integrity = Vec::with_capacity(32 + 2 + 2 + payload.len());
+    integrity.extend_from_slice(&message_id);
+    integrity.extend_from_slice(&index.to_le_bytes());
+    integrity.extend_from_slice(&total.to_le_bytes());
+    integrity.extend_from_slice(&payload);
+    if *dom_crypto::blake2b_256(&integrity).as_bytes() != checksum.as_slice() {
+        return Err(ProtocolAdapterError::InvalidQrFrame);
+    }
+    Ok(ParsedQrFrame {
+        message_id,
+        index,
+        total,
+        payload,
+    })
+}
+
+fn canonical_network(value: &str) -> Result<&str, ProtocolAdapterError> {
+    match value {
+        "PRIVATE_TESTNET" | "PUBLIC_TESTNET" | "MAINNET" => Ok(value),
+        _ => Err(ProtocolAdapterError::InvalidTransport),
+    }
+}
+fn take<'a>(
+    bytes: &'a [u8],
+    offset: &mut usize,
+    length: usize,
+) -> Result<&'a [u8], ProtocolAdapterError> {
+    let end = offset
+        .checked_add(length)
+        .ok_or(ProtocolAdapterError::InvalidTransport)?;
+    let value = bytes
+        .get(*offset..end)
+        .ok_or(ProtocolAdapterError::InvalidTransport)?;
+    *offset = end;
+    Ok(value)
+}
+fn take_u8(bytes: &[u8], offset: &mut usize) -> Result<u8, ProtocolAdapterError> {
+    Ok(take(bytes, offset, 1)?[0])
+}
+fn take_array<const N: usize>(
+    bytes: &[u8],
+    offset: &mut usize,
+) -> Result<[u8; N], ProtocolAdapterError> {
+    take(bytes, offset, N)?
+        .try_into()
+        .map_err(|_| ProtocolAdapterError::InvalidTransport)
 }
 
 fn encode_slate(slate: &Slate) -> Result<Vec<u8>, ProtocolAdapterError> {
@@ -455,20 +783,32 @@ mod tests {
                 .kernel_excess,
             finalized.kernel_excess
         );
-        let text = export_transport(Uuid::nil(), false, &sender.slate_bytes).unwrap();
-        assert_eq!(import_transport(&text).unwrap().2, sender.slate_bytes);
+        let text = export_transport(
+            "PRIVATE_TESTNET",
+            [9; 32],
+            Uuid::nil(),
+            false,
+            &sender.slate_bytes,
+        )
+        .unwrap();
+        assert_eq!(import_transport(&text).unwrap().payload, sender.slate_bytes);
+        let qr = qr_encode_transport(&text).unwrap();
+        let frames = match qr {
+            QrEncoding::Single { text, .. } => vec![text],
+            QrEncoding::Multi { frames, .. } => frames,
+        };
+        let mut reassembler = QrReassembler::default();
+        let mut completed = None;
+        for frame in frames.iter().rev() {
+            completed = reassembler.push(frame).unwrap().complete_text.or(completed);
+        }
+        assert_eq!(completed.unwrap(), text);
     }
 
     #[test]
     fn transport_rejects_noncanonical_and_wrong_role_data() {
-        assert!(import_transport("dom-slate-v1:request:not-a-uuid:00").is_err());
-        assert!(
-            import_transport("dom-slate-v1:unknown:00000000-0000-0000-0000-000000000000:00")
-                .is_err()
-        );
-        assert!(
-            import_transport("dom-slate-v1:request:00000000-0000-0000-0000-000000000000:AA")
-                .is_err()
-        );
+        assert!(import_transport("DOMSLATE1.bad").is_err());
+        assert!(import_transport("DOMSLATE1. bad").is_err());
+        assert!(QrReassembler::default().push("DOMQR1.bad").is_err());
     }
 }

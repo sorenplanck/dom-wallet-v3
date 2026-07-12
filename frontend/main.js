@@ -1,3 +1,6 @@
+import QRCode from "qrcode";
+import QrScanner from "qr-scanner";
+
 // The packaged application has exactly one transport: Tauri invoke. There is
 // intentionally no production mock, balance calculator, or browser storage.
 export const COMMANDS = Object.freeze([
@@ -10,7 +13,8 @@ export const COMMANDS = Object.freeze([
   "slate_request_import", "slate_response_create", "slate_response_export",
   "slate_response_import", "slate_summary_redacted", "transaction_finalize",
   "transaction_submit", "transaction_retry_submission", "transaction_cancel",
-  "transaction_list", "transaction_detail_redacted"
+  "transaction_list", "transaction_detail_redacted", "slate_qr_encode",
+  "slate_qr_decode_frame", "slate_qr_reassembly_status", "slate_qr_reassembly_clear"
 ]);
 
 const productionInvoke = (command, args = {}) => {
@@ -72,7 +76,7 @@ const decodeHex32 = (value) => {
 document.querySelector("#create-form").addEventListener("submit", async (event) => { event.preventDefault(); const form = event.currentTarget; try { await withPending(() => productionInvoke("wallet_create", { path: new FormData(form).get("path"), password: new FormData(form).get("password"), identity: { network: new FormData(form).get("network"), chain_id: decodeHex32(new FormData(form).get("chain_id")), genesis_id: decodeHex32(new FormData(form).get("genesis_id")) } })); show("Wallet created. Unlock it to use protected capabilities."); } catch (error) { show(redactedError(error), true); } finally { clearPasswords(form); } });
 document.querySelector("#open-form").addEventListener("submit", async (event) => { event.preventDefault(); const form = event.currentTarget; try { await withPending(() => productionInvoke("wallet_open", { path: new FormData(form).get("path") })); show("Wallet opened in locked state."); } catch (error) { show(redactedError(error), true); } finally { clearPasswords(form); } });
 document.querySelector("#unlock-form").addEventListener("submit", async (event) => { event.preventDefault(); const form = event.currentTarget; try { await withPending(async () => { await productionInvoke("wallet_unlock", { password: new FormData(form).get("password") }); await refreshSummary(); }); show("Wallet unlocked."); selectScreen("dashboard"); } catch (error) { show(redactedError(error), true); } finally { clearPasswords(form); } });
-document.querySelector("#lock").addEventListener("click", () => withPending(async () => { await productionInvoke("wallet_lock"); show("Wallet locked; protected capabilities were revoked."); } ).catch((error) => show(redactedError(error), true)));
+document.querySelector("#lock").addEventListener("click", () => withPending(async () => { await releaseCamera(); await productionInvoke("wallet_lock"); show("Wallet locked; protected capabilities were revoked."); } ).catch((error) => show(redactedError(error), true)));
 document.querySelector("#sync").addEventListener("click", () => withPending(async () => { await productionInvoke("synchronization_start"); await refreshSummary(); show("Synchronization request completed."); }).catch((error) => show(redactedError(error), true)));
 
 productionInvoke("application_status").then((app) => show(`Application state: ${renderState(app.state)}.`)).catch((error) => show(redactedError(error), true));
@@ -110,7 +114,7 @@ document.querySelector("#pause").addEventListener("click", () => withPending(() 
 document.querySelector("#resume").addEventListener("click", () => withPending(() => productionInvoke("synchronization_resume")).catch((error) => show(redactedError(error), true)));
 document.querySelector("#retry").addEventListener("click", () => withPending(() => productionInvoke("synchronization_retry")).catch((error) => show(redactedError(error), true)));
 document.querySelector("#rescan").addEventListener("click", () => { if (window.confirm("Full rescan reconstructs the wallet from canonical chain evidence. Continue?")) withPending(() => productionInvoke("synchronization_rescan")).catch((error) => show(redactedError(error), true)); });
-document.querySelector("#close").addEventListener("click", () => withPending(async () => { await productionInvoke("wallet_close"); stopStatusRefresh(); selectScreen("onboarding"); show("Wallet closed."); }).catch((error) => show(redactedError(error), true)));
+document.querySelector("#close").addEventListener("click", () => withPending(async () => { await releaseCamera(); await productionInvoke("wallet_close"); stopStatusRefresh(); selectScreen("onboarding"); show("Wallet closed."); }).catch((error) => show(redactedError(error), true)));
 document.querySelector("#diagnostics-refresh").addEventListener("click", () => withPending(async () => redactedJson(diagnostics, await productionInvoke("diagnostics_redacted"))).catch((error) => show(redactedError(error), true)));
 
 // Manual slate exchange is intentionally explicit: text stays in the DOM only
@@ -118,9 +122,50 @@ document.querySelector("#diagnostics-refresh").addEventListener("click", () => w
 const transactionOutput = document.querySelector("#transaction-output");
 const transactionSlateId = document.querySelector("#transaction-slate-id");
 const transactionText = document.querySelector("#transaction-text");
+const qrCanvas = document.querySelector("#slate-qr-canvas");
+const qrMeta = document.querySelector("#slate-qr-meta");
+const scannerVideo = document.querySelector("#slate-qr-video");
+let qrFrames = [];
+let qrFrameIndex = 0;
+let qrAnimation = null;
+let activeScanner = null;
 const renderTransaction = (value) => { redactedJson(transactionOutput, value); if (value?.slate_id) transactionSlateId.value = value.slate_id; };
 const requiredSlateId = () => { const value = transactionSlateId.value.trim(); if (!/^[0-9a-f-]{36}$/i.test(value)) throw new Error("Enter a valid slate identifier."); return value; };
 const clearSlateText = () => { transactionText.value = ""; };
+const stopQrAnimation = () => { if (qrAnimation) clearInterval(qrAnimation); qrAnimation = null; };
+const clearQrExport = () => { stopQrAnimation(); qrFrames = []; qrFrameIndex = 0; qrCanvas.getContext("2d").clearRect(0, 0, qrCanvas.width, qrCanvas.height); qrMeta.textContent = "No QR export shown."; };
+const releaseCamera = async () => {
+  if (activeScanner) { activeScanner.stop(); activeScanner.destroy(); activeScanner = null; }
+  scannerVideo.srcObject = null;
+  try { await productionInvoke("slate_qr_reassembly_clear"); } catch { /* native shutdown or lock can reject cleanup safely */ }
+};
+const renderQrFrame = async () => {
+  if (!qrFrames.length) return;
+  const frame = qrFrames[qrFrameIndex];
+  await QRCode.toCanvas(qrCanvas, frame, { errorCorrectionLevel: "M", margin: 2, width: 360 });
+  qrMeta.textContent = `Frame ${qrFrameIndex + 1} of ${qrFrames.length} · share only with the intended counterparty.`;
+};
+const showQr = async (response) => {
+  const result = await withPending(() => productionInvoke("slate_qr_encode", { slateId: requiredSlateId(), response }));
+  qrFrames = result.frames; qrFrameIndex = 0; await renderQrFrame();
+  show(`Canonical ${response ? "response" : "request"} QR prepared (${result.content_hash.slice(0, 12)}…).`);
+};
+const acceptScannedFrame = async (value) => {
+  const result = await productionInvoke("slate_qr_decode_frame", { frame: value });
+  if (result.complete_text) {
+    await releaseCamera();
+    transactionText.value = result.complete_text;
+    show("Complete QR transport decoded. Review and confirm import; it has not been processed yet.");
+  } else { qrMeta.textContent = `Collected ${result.received_frames} of ${result.total_frames} QR frames.`; }
+};
+const startScanner = async () => {
+  await releaseCamera();
+  try {
+    activeScanner = new QrScanner(scannerVideo, (result) => acceptScannedFrame(result.data), { preferredCamera: "environment", returnDetailedScanResult: true });
+    await activeScanner.start();
+    show("Camera scanner active. Cancel when finished.");
+  } catch (error) { await releaseCamera(); show("Camera permission or QR scanner is unavailable. Paste the code instead.", true); }
+};
 document.querySelector("#transaction-create").addEventListener("submit", async (event) => {
   event.preventDefault(); const form = event.currentTarget; const data = new FormData(form);
   try {
@@ -136,9 +181,10 @@ document.querySelector("#request-export").addEventListener("click", async () => 
   if (!window.confirm("Export this manual slate request? It contains public transaction data.")) return;
   try { const result = await withPending(() => productionInvoke("slate_request_export", { slateId: requiredSlateId() })); transactionText.value = result.text; renderTransaction(result); show("Canonical request exported."); } catch (error) { show(redactedError(error), true); }
 });
+document.querySelector("#request-qr").addEventListener("click", () => showQr(false).catch((error) => show(redactedError(error), true)));
 document.querySelector("#request-import").addEventListener("click", async () => {
   const text = transactionText.value;
-  try { renderTransaction(await withPending(() => productionInvoke("slate_request_import", { text }))); show("Request imported. Review it before preparing a response."); } catch (error) { show(redactedError(error), true); } finally { clearSlateText(); }
+  try { renderTransaction(await withPending(() => productionInvoke("slate_request_import", { text }))); show("Request imported. Review it before preparing a response."); } catch (error) { show(redactedError(error), true); } finally { clearSlateText(); clearQrExport(); await releaseCamera(); }
 });
 document.querySelector("#response-create").addEventListener("click", async () => {
   if (!window.confirm("Create the recipient output and response for this request?")) return;
@@ -148,9 +194,10 @@ document.querySelector("#response-export").addEventListener("click", async () =>
   if (!window.confirm("Export this recipient response?")) return;
   try { const result = await withPending(() => productionInvoke("slate_response_export", { slateId: requiredSlateId() })); transactionText.value = result.text; renderTransaction(result); show("Canonical response exported."); } catch (error) { show(redactedError(error), true); }
 });
+document.querySelector("#response-qr").addEventListener("click", () => showQr(true).catch((error) => show(redactedError(error), true)));
 document.querySelector("#response-import").addEventListener("click", async () => {
   const text = transactionText.value;
-  try { renderTransaction(await withPending(() => productionInvoke("slate_response_import", { text }))); show("Response imported."); } catch (error) { show(redactedError(error), true); } finally { clearSlateText(); }
+  try { renderTransaction(await withPending(() => productionInvoke("slate_response_import", { text }))); show("Response imported."); } catch (error) { show(redactedError(error), true); } finally { clearSlateText(); clearQrExport(); await releaseCamera(); }
 });
 document.querySelector("#transaction-finalize").addEventListener("click", async () => {
   if (!window.confirm("Finalize this DOM transaction?")) return;
@@ -171,4 +218,12 @@ document.querySelector("#transaction-cancel").addEventListener("click", async ()
 document.querySelector("#transaction-list").addEventListener("click", async () => {
   try { redactedJson(transactionOutput, await withPending(() => productionInvoke("transaction_list"))); } catch (error) { show(redactedError(error), true); }
 });
+document.querySelector("#qr-scan").addEventListener("click", () => startScanner());
+document.querySelector("#qr-cancel").addEventListener("click", () => releaseCamera());
+document.querySelector("#qr-next").addEventListener("click", async () => { if (qrFrames.length) { qrFrameIndex = (qrFrameIndex + 1) % qrFrames.length; await renderQrFrame(); } });
+document.querySelector("#qr-previous").addEventListener("click", async () => { if (qrFrames.length) { qrFrameIndex = (qrFrameIndex + qrFrames.length - 1) % qrFrames.length; await renderQrFrame(); } });
+document.querySelector("#qr-animate").addEventListener("click", () => { stopQrAnimation(); if (qrFrames.length > 1) qrAnimation = setInterval(() => { qrFrameIndex = (qrFrameIndex + 1) % qrFrames.length; renderQrFrame(); }, 1400); });
+document.querySelector("#qr-pause").addEventListener("click", stopQrAnimation);
+document.querySelector("#qr-clear").addEventListener("click", async () => { clearQrExport(); clearSlateText(); await releaseCamera(); });
+window.addEventListener("beforeunload", releaseCamera, { once: true });
 export { productionInvoke, refreshSummary };

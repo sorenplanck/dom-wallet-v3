@@ -43,17 +43,22 @@ and rollback authority.
 
 ## Manual transport and interface
 
-The experimental text envelope is
-`dom-slate-v1:<request|response>:<slate UUID>:<lowercase canonical slate hex>`.
-Imports reject malformed, oversized, non-ASCII, wrong-role, noncanonical,
-wrong-chain, unsupported, and conflicting replay data. It is not Slatepack.
+The manual envelope is `DOMSLATE1.<canonical base64url envelope>`. It carries
+version, request/response role, exact network and chain ID, slate ID, payload
+length, canonical DOM slate bytes, and a content hash. QR encodes that exact
+text when it fits; otherwise `DOMQR1` bounded frames reassemble the exact text
+before any slate parsing. Imports reject malformed, oversized, non-ASCII,
+noncanonical, wrong-role, wrong-network, wrong-chain, unsupported, corrupt,
+incomplete, mixed-frame, and conflicting replay data. The content hash is not
+authentication and the format is not Slatepack.
 
-Tauri registers bounded redacted transaction commands for fee estimate, send
-creation, request/response import and export, summary, finalization,
-submission/retry, cancellation, list, and redacted detail. The DOM frontend
-uses the production invoke adapter, requires confirmations for external
-effects, and clears pasted slate text after import. No private context,
-blinding, nonce, offset, credential, or seed is serialized into the UI.
+Tauri additionally registers bounded QR encoding, frame decoding, reassembly
+status, and reassembly clearing commands. The DOM frontend renders QR locally,
+uses a local bundled scanner only after explicit user action, clears pasted
+text and QR buffers after import/cancel, and stops the camera on successful
+scan, cancellation, lock, close, and page unload according to code paths.
+No private context, blinding, nonce, offset, credential, seed, QR image, or
+camera frame is serialized into the UI, diagnostics, or browser storage.
 
 ## Compatibility and validation evidence
 
@@ -79,8 +84,12 @@ cd frontend && npm run typecheck && npm test && npm run build
 Validation passed with `cargo fmt --all --check`, `cargo check --workspace
 --all-targets`, scoped `cargo clippy -D warnings`, and `git diff --check`.
 Focused wallet tests: 18 passed, 0 failed (6 domain, 2 protocol-adapter, and
-10 core). Focused Tauri tests: 6 passed, 0 failed. Frontend tests: 3 passed,
-0 failed; frontend typecheck and production build passed.
+10 core). Focused Tauri tests: 6 passed, 0 failed. The QR follow-up adds
+canonical text/QR equivalence and out-of-order multipart reassembly coverage
+in the protocol adapter plus local frontend QR boundary coverage. Frontend
+tests: 4 passed, 0 failed; frontend typecheck and production build passed.
+Camera release evidence is `CODE_PATH_AND_FOCUSED_STATIC_COVERAGE_ONLY`; a
+hardware camera test was not executed.
 
 ## Remaining work
 
