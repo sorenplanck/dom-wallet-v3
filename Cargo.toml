@@ -9,6 +9,7 @@ members = [
     "crates/dom-wallet-core",
     "crates/dom-wallet-embedded-core",
     "crates/dom-wallet-core-sync",
+    "crates/dom-wallet-core-submit",
     "src-tauri",
 ]
 
