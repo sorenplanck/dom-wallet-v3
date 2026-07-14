@@ -1362,6 +1362,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "dom-wallet-core-protocol"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "dom-consensus",
+ "dom-core",
+ "dom-crypto",
+ "dom-serialization",
+ "dom-tx",
+ "dom-wallet-core-api",
+ "dom-wallet-core-sync",
+ "dom-wallet-embedded-core",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "dom-wallet-core-submit"
 version = "0.1.0"
 dependencies = [
