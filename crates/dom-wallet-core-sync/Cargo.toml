@@ -1,0 +1,18 @@
+[package]
+name = "dom-wallet-core-sync"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+dom-core.workspace = true
+dom-crypto.workspace = true
+dom-wallet-core-api.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+dom-consensus.workspace = true
+dom-wallet-embedded-core = { path = "../dom-wallet-embedded-core" }
+tempfile.workspace = true
