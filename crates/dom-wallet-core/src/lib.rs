@@ -6,11 +6,12 @@ use dom_wallet_chain::{
     acquire_target, collect_provisional_pages, validate_target, ChainError, ChainSource,
     ConnectionState, DomHttpChainSource, LiveNodeProbe, ReconnectController,
 };
+use dom_wallet_core_recovery::CanonicalWalletSeed;
 use dom_wallet_crypto::{KdfParameters, SecretBytes};
 use dom_wallet_domain::{
     BalanceProjection, LocalTransactionIntent, NetworkIdentity, NodeConfiguration, OutputRecord,
-    OutputState, PrivateTransactionContext, RedactedNodeConfiguration, ScanBounds,
-    TransactionLifecycle, TransactionRole, WalletState,
+    OutputState, PrivateTransactionContext, RecoveryMetadata, RedactedNodeConfiguration,
+    ScanBounds, TransactionLifecycle, TransactionRole, WalletState, RECOVERY_SCHEME_BIP39_256_V1,
 };
 use dom_wallet_protocol::{self as protocol, InputMaterial, SenderSecrets};
 use dom_wallet_storage::{
@@ -18,9 +19,11 @@ use dom_wallet_storage::{
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use thiserror::Error;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 pub mod live_e2e;
 
@@ -114,6 +117,14 @@ pub struct SlateExport {
     pub text: String,
 }
 
+/// One-time result for the explicit new-wallet recovery ceremony.
+///
+/// This type intentionally has no `Debug`, `Clone`, or serialization support.
+pub struct RecoveryCreateResult {
+    pub wallet: WalletSummary,
+    pub mnemonic: Zeroizing<String>,
+}
+
 pub struct WalletService {
     location: Option<WalletDirectory>,
     metadata: Option<WalletMetadata>,
@@ -153,17 +164,46 @@ impl WalletService {
         if password.len() < 8 || password.len() > 1024 {
             return Err(CoreError::InvalidPassword);
         }
-        let mut root = [0u8; 32];
+        let mut root = Zeroizing::new([0u8; 32]);
         rand::rngs::OsRng
-            .try_fill_bytes(&mut root)
+            .try_fill_bytes(root.as_mut())
             .map_err(|_| CoreError::RandomnessUnavailable)?;
         let node = default_node_configuration(identity.clone());
-        let state = WalletState::new(identity, root, node);
+        let state = WalletState::new(identity, *root, node);
         let directory = WalletDirectory::create(path, &state, password, self.kdf)?;
         self.metadata = Some(directory.metadata()?);
         self.location = Some(directory);
         self.state = ApplicationState::Locked;
         self.summary_locked()
+    }
+
+    /// Create a wallet from canonical 256-bit BIP-39 entropy.
+    pub fn create_recoverable(
+        &mut self,
+        path: impl AsRef<Path>,
+        password: &str,
+        identity: NetworkIdentity,
+    ) -> Result<RecoveryCreateResult, CoreError> {
+        self.ensure_closed()?;
+        if password.len() < 8 || password.len() > 1024 {
+            return Err(CoreError::InvalidPassword);
+        }
+        let seed = CanonicalWalletSeed::generate().map_err(|_| CoreError::RecoveryPhraseInvalid)?;
+        let mut root_material = Zeroizing::new([0u8; 32]);
+        seed.copy_entropy_to(&mut root_material);
+        let mut state = recoverable_state(identity, *root_material);
+        state.recovery = Some(RecoveryMetadata {
+            scheme: RECOVERY_SCHEME_BIP39_256_V1.into(),
+            phrase_confirmed: false,
+        });
+        let directory = WalletDirectory::create(path, &state, password, self.kdf)?;
+        self.metadata = Some(directory.metadata()?);
+        self.location = Some(directory);
+        self.state = ApplicationState::Locked;
+        Ok(RecoveryCreateResult {
+            wallet: self.summary_locked()?,
+            mnemonic: seed.mnemonic_text(),
+        })
     }
 
     pub fn open(&mut self, path: impl AsRef<Path>) -> Result<WalletSummary, CoreError> {
@@ -1500,6 +1540,27 @@ impl WalletService {
     }
 }
 
+fn recoverable_state(identity: NetworkIdentity, root: [u8; 32]) -> WalletState {
+    let node = default_node_configuration(identity.clone());
+    let mut state = WalletState::new(identity.clone(), root, node);
+    state.wallet_id = recovery_uuid(b"DOM-WALLET-V3-RECOVERY-WALLET", &root, &identity);
+    state.default_account.id = recovery_uuid(b"DOM-WALLET-V3-RECOVERY-ACCOUNT", &root, &identity);
+    state
+}
+
+fn recovery_uuid(domain: &[u8], root: &[u8; 32], identity: &NetworkIdentity) -> Uuid {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update(root);
+    digest.update(identity.chain_id);
+    digest.update(identity.genesis_id);
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest.finalize()[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
 fn find_transaction_index(
     state: &WalletState,
     slate_id: Uuid,
@@ -1598,6 +1659,8 @@ pub enum CoreError {
     InvalidPassword,
     #[error("secure randomness is unavailable")]
     RandomnessUnavailable,
+    #[error("recovery phrase is invalid")]
+    RecoveryPhraseInvalid,
     #[error("wallet and node identities differ")]
     IdentityMismatch,
     #[error("transaction input is invalid")]

@@ -6,12 +6,14 @@ authors.workspace = true
 
 [dependencies]
 dom-wallet-chain = { path = "../dom-wallet-chain" }
+dom-wallet-core-recovery = { path = "../dom-wallet-core-recovery" }
 dom-wallet-crypto = { path = "../dom-wallet-crypto" }
 dom-wallet-domain = { path = "../dom-wallet-domain" }
 dom-wallet-protocol = { path = "../dom-wallet-protocol" }
 dom-wallet-storage = { path = "../dom-wallet-storage" }
 hex.workspace = true
 rand.workspace = true
+sha2.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 uuid.workspace = true

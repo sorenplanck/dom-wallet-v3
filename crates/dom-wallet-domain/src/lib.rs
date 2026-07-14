@@ -406,6 +406,60 @@ pub struct RedactedNodeConfiguration {
     pub has_credential_reference: bool,
 }
 
+/// BIP-39 eligibility marker for encrypted Wallet V3 state.
+pub const RECOVERY_SCHEME_BIP39_256_V1: &str = "BIP39_ENTROPY_256_V1";
+
+/// Non-secret recovery eligibility. Mnemonic and seed bytes are never stored.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryMetadata {
+    pub scheme: String,
+    pub phrase_confirmed: bool,
+}
+
+/// Wallet-owned output purpose used to reserve a durable recovery coordinate.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryOutputClass {
+    ReceiveRequest,
+    ReceiveSlate,
+    Change,
+    SelfTransfer,
+    Coinbase,
+}
+
+/// Persisted independent non-reuse floors for recovery metadata domains.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RecoveryAllocationFloors {
+    pub received: u64,
+    pub change: u64,
+    pub self_transfer: u64,
+    pub coinbase: u64,
+}
+
+/// A coordinate is returned only after its corresponding floor is advanced.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReservedRecoveryCoordinate {
+    account: u32,
+    derivation_index: u64,
+    class: RecoveryOutputClass,
+}
+
+impl ReservedRecoveryCoordinate {
+    pub fn account(self) -> u32 {
+        self.account
+    }
+
+    pub fn derivation_index(self) -> u64 {
+        self.derivation_index
+    }
+
+    pub fn class(self) -> RecoveryOutputClass {
+        self.class
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WalletState {
@@ -429,6 +483,10 @@ pub struct WalletState {
     pub provisional_target: Option<ScanTarget>,
     #[serde(default)]
     pub rescan_plan: Option<RescanPlan>,
+    #[serde(default)]
+    pub recovery: Option<RecoveryMetadata>,
+    #[serde(default)]
+    pub recovery_allocation_floors: RecoveryAllocationFloors,
     pub node_configuration: NodeConfiguration,
     #[serde(with = "serde_bytes_32")]
     pub root_material: [u8; 32],
@@ -461,6 +519,8 @@ impl WalletState {
             sync_status: SyncStatus::Idle,
             provisional_target: None,
             rescan_plan: None,
+            recovery: None,
+            recovery_allocation_floors: RecoveryAllocationFloors::default(),
             node_configuration,
             root_material,
         }
@@ -487,6 +547,13 @@ impl WalletState {
         }
         if self.non_reuse_floor < self.allocation_floor {
             return Err(DomainError::NonReuseFloorRegression);
+        }
+        if self
+            .recovery
+            .as_ref()
+            .is_some_and(|value| value.scheme != RECOVERY_SCHEME_BIP39_256_V1)
+        {
+            return Err(DomainError::InvalidState);
         }
         if let Some(target) = &self.provisional_target {
             target.validate()?;
@@ -543,6 +610,32 @@ impl WalletState {
         self.allocation_floor = position;
         self.non_reuse_floor = self.non_reuse_floor.max(position);
         Ok(position)
+    }
+
+    /// Burn the next domain-specific coordinate before public material exists.
+    pub fn reserve_recovery_coordinate(
+        &mut self,
+        account: u32,
+        class: RecoveryOutputClass,
+    ) -> Result<ReservedRecoveryCoordinate, DomainError> {
+        let floor = match class {
+            RecoveryOutputClass::ReceiveRequest | RecoveryOutputClass::ReceiveSlate => {
+                &mut self.recovery_allocation_floors.received
+            }
+            RecoveryOutputClass::Change => &mut self.recovery_allocation_floors.change,
+            RecoveryOutputClass::SelfTransfer => &mut self.recovery_allocation_floors.self_transfer,
+            RecoveryOutputClass::Coinbase => &mut self.recovery_allocation_floors.coinbase,
+        };
+        let derivation_index = floor
+            .checked_add(1)
+            .ok_or(DomainError::AllocationOverflow)?;
+        *floor = derivation_index;
+        self.non_reuse_floor = self.non_reuse_floor.max(derivation_index);
+        Ok(ReservedRecoveryCoordinate {
+            account,
+            derivation_index,
+            class,
+        })
     }
 
     pub fn begin_scan(&mut self, target: ScanTarget) -> Result<(), DomainError> {

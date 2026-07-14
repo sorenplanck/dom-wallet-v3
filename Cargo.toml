@@ -11,6 +11,7 @@ members = [
     "crates/dom-wallet-core-sync",
     "crates/dom-wallet-core-submit",
     "crates/dom-wallet-core-protocol",
+    "crates/dom-wallet-core-recovery",
     "src-tauri",
 ]
 
@@ -23,6 +24,7 @@ repository = "https://github.com/sorenplanck/dom-wallet-v3"
 [workspace.dependencies]
 argon2 = "0.5"
 base64 = "0.22"
+bip39 = "2.1"
 chacha20poly1305 = "0.10"
 hex = "0.4"
 hkdf = "0.12"
