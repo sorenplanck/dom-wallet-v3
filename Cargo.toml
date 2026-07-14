@@ -38,9 +38,9 @@ tauri-build = "2.6.2"
 # sole authority for slate construction, transaction serialization, proof and
 # signature validation.  These are deliberately revision pinned rather than
 # copied into this wallet workspace.
-dom-core = { git = "https://github.com/sorenplanck/dom-protocol", rev = "f10667d86196daf4599eff6074a7abf73b6ed55a" }
-dom-crypto = { git = "https://github.com/sorenplanck/dom-protocol", rev = "f10667d86196daf4599eff6074a7abf73b6ed55a" }
-dom-consensus = { git = "https://github.com/sorenplanck/dom-protocol", rev = "f10667d86196daf4599eff6074a7abf73b6ed55a" }
-dom-serialization = { git = "https://github.com/sorenplanck/dom-protocol", rev = "f10667d86196daf4599eff6074a7abf73b6ed55a" }
-dom-tx = { git = "https://github.com/sorenplanck/dom-protocol", rev = "f10667d86196daf4599eff6074a7abf73b6ed55a" }
-dom-slate = { git = "https://github.com/sorenplanck/dom-protocol", rev = "f10667d86196daf4599eff6074a7abf73b6ed55a" }
+dom-core = { git = "https://github.com/sorenplanck/dom-protocol", rev = "973757b64fee2b07e516febe53275f10a727b38f" }
+dom-crypto = { git = "https://github.com/sorenplanck/dom-protocol", rev = "973757b64fee2b07e516febe53275f10a727b38f" }
+dom-consensus = { git = "https://github.com/sorenplanck/dom-protocol", rev = "973757b64fee2b07e516febe53275f10a727b38f" }
+dom-serialization = { git = "https://github.com/sorenplanck/dom-protocol", rev = "973757b64fee2b07e516febe53275f10a727b38f" }
+dom-tx = { git = "https://github.com/sorenplanck/dom-protocol", rev = "973757b64fee2b07e516febe53275f10a727b38f" }
+dom-slate = { git = "https://github.com/sorenplanck/dom-protocol", rev = "973757b64fee2b07e516febe53275f10a727b38f" }
