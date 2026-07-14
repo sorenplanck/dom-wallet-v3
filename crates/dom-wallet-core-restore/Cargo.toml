@@ -1,27 +1,26 @@
 [package]
-name = "dom-wallet-core"
+name = "dom-wallet-core-restore"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+repository.workspace = true
+publish = false
 
 [dependencies]
-dom-wallet-chain = { path = "../dom-wallet-chain" }
-dom-wallet-core-recovery = { path = "../dom-wallet-core-recovery" }
-dom-wallet-core-restore = { path = "../dom-wallet-core-restore" }
+dom-crypto.workspace = true
+dom-tx.workspace = true
 dom-wallet-core-api.workspace = true
+dom-wallet-recovery.workspace = true
+dom-wallet-core-recovery = { path = "../dom-wallet-core-recovery" }
 dom-wallet-core-sync = { path = "../dom-wallet-core-sync" }
 dom-wallet-crypto = { path = "../dom-wallet-crypto" }
 dom-wallet-domain = { path = "../dom-wallet-domain" }
-dom-wallet-protocol = { path = "../dom-wallet-protocol" }
 dom-wallet-storage = { path = "../dom-wallet-storage" }
-hex.workspace = true
-rand.workspace = true
-sha2.workspace = true
-serde.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
-dom-crypto.workspace = true
+dom-consensus.workspace = true
+dom-core.workspace = true
 tempfile.workspace = true

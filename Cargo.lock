@@ -1337,7 +1337,10 @@ version = "0.1.0"
 dependencies = [
  "dom-crypto",
  "dom-wallet-chain",
+ "dom-wallet-core-api",
  "dom-wallet-core-recovery",
+ "dom-wallet-core-restore",
+ "dom-wallet-core-sync",
  "dom-wallet-crypto 0.1.0",
  "dom-wallet-domain",
  "dom-wallet-protocol",
@@ -1396,10 +1399,32 @@ dependencies = [
  "dom-wallet-core-sync",
  "dom-wallet-domain",
  "dom-wallet-embedded-core",
+ "dom-wallet-recovery",
  "rand 0.8.6",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "zeroize",
+]
+
+[[package]]
+name = "dom-wallet-core-restore"
+version = "0.1.0"
+dependencies = [
+ "dom-consensus",
+ "dom-core",
+ "dom-crypto",
+ "dom-tx",
+ "dom-wallet-core-api",
+ "dom-wallet-core-recovery",
+ "dom-wallet-core-sync",
+ "dom-wallet-crypto 0.1.0",
+ "dom-wallet-domain",
+ "dom-wallet-recovery",
+ "dom-wallet-storage",
+ "tempfile",
+ "thiserror 2.0.18",
+ "uuid",
  "zeroize",
 ]
 
@@ -1512,6 +1537,18 @@ dependencies = [
  "hex",
  "thiserror 2.0.18",
  "uuid",
+]
+
+[[package]]
+name = "dom-wallet-recovery"
+version = "0.1.0"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=973757b64fee2b07e516febe53275f10a727b38f#973757b64fee2b07e516febe53275f10a727b38f"
+dependencies = [
+ "dom-core",
+ "dom-crypto",
+ "dom-tx",
+ "dom-wallet-core-api",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -3043,7 +3080,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5049,7 +5086,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

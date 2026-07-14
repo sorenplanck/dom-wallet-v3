@@ -19,11 +19,13 @@ use dom_slate::{
     build_send_recoverable, respond_receive_recoverable, RecoveryBuildContext, SlateInput,
 };
 use dom_tx::{build_recoverable_output, slate::Slate};
+use dom_wallet_core_api::ScanBlock;
 use dom_wallet_core_protocol::{RecoverySlateBody, RecoverySlateSidecars};
 use dom_wallet_core_sync::CoreChainIdentity;
 use dom_wallet_domain::{
     RecoveryOutputClass, ReservedRecoveryCoordinate, WalletState, RECOVERY_SCHEME_BIP39_256_V1,
 };
+use dom_wallet_recovery::{restore_from_canonical_scan, RestoreError, RestoredWalletState};
 use rand::RngCore;
 use std::fmt;
 use thiserror::Error;
@@ -99,6 +101,15 @@ impl CanonicalWalletSeed {
         derive_recovery_root(self.seed.as_slice(), chain)
             .map_err(|_| RecoveryMaterialError::RecoveryRootDerivation)
     }
+
+    /// Run the frozen canonical ownership-recovery algorithm without exposing seed bytes.
+    pub fn restore_canonical_scan(
+        &self,
+        chain: RecoveryChainContext,
+        blocks: &[ScanBlock],
+    ) -> Result<RestoredWalletState, RestoreError> {
+        restore_from_canonical_scan(self.seed.as_slice(), chain, blocks)
+    }
 }
 
 /// Public production-path declaration used to prevent proof-only additions.
@@ -150,6 +161,13 @@ pub struct RecoverableOutputResult {
     pub derivation_index: u64,
     pub class: RecoveryOutputClass,
     secret: OutputSpendSecret,
+}
+
+impl RecoverableOutputResult {
+    /// Compare encrypted-state spending evidence without exposing this blinding.
+    pub fn matches_spend_blinding(&self, candidate: &[u8; 32]) -> bool {
+        self.secret.0.as_bytes() == candidate
+    }
 }
 
 impl fmt::Debug for RecoverableOutputResult {

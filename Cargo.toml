@@ -12,6 +12,7 @@ members = [
     "crates/dom-wallet-core-submit",
     "crates/dom-wallet-core-protocol",
     "crates/dom-wallet-core-recovery",
+    "crates/dom-wallet-core-restore",
     "src-tauri",
 ]
 
@@ -54,3 +55,4 @@ dom-slate = { git = "https://github.com/sorenplanck/dom-protocol", rev = "973757
 dom-config = { git = "https://github.com/sorenplanck/dom-protocol", rev = "973757b64fee2b07e516febe53275f10a727b38f" }
 dom-node = { git = "https://github.com/sorenplanck/dom-protocol", rev = "973757b64fee2b07e516febe53275f10a727b38f" }
 dom-wallet-core-api = { git = "https://github.com/sorenplanck/dom-protocol", rev = "973757b64fee2b07e516febe53275f10a727b38f" }
+dom-wallet-recovery = { git = "https://github.com/sorenplanck/dom-protocol", rev = "973757b64fee2b07e516febe53275f10a727b38f" }

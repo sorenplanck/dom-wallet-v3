@@ -6,7 +6,10 @@ use dom_wallet_chain::{
     acquire_target, collect_provisional_pages, validate_target, ChainError, ChainSource,
     ConnectionState, DomHttpChainSource, LiveNodeProbe, ReconnectController,
 };
+use dom_wallet_core_api::WalletCoreApi;
 use dom_wallet_core_recovery::CanonicalWalletSeed;
+use dom_wallet_core_restore::{SeedRestoreResult, SeedRestoreService};
+use dom_wallet_core_sync::CoreChainIdentity;
 use dom_wallet_crypto::{KdfParameters, SecretBytes};
 use dom_wallet_domain::{
     BalanceProjection, LocalTransactionIntent, NetworkIdentity, NodeConfiguration, OutputRecord,
@@ -20,7 +23,7 @@ use dom_wallet_storage::{
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 use thiserror::Error;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -125,6 +128,12 @@ pub struct RecoveryCreateResult {
     pub mnemonic: Zeroizing<String>,
 }
 
+/// Completed canonical seed restore. No secret material crosses this boundary.
+pub struct RecoveryRestoreResult {
+    pub wallet: WalletSummary,
+    pub recovery: SeedRestoreResult,
+}
+
 pub struct WalletService {
     location: Option<WalletDirectory>,
     metadata: Option<WalletMetadata>,
@@ -203,6 +212,30 @@ impl WalletService {
         Ok(RecoveryCreateResult {
             wallet: self.summary_locked()?,
             mnemonic: seed.mnemonic_text(),
+        })
+    }
+
+    /// Restore capsule-v1 confirmed funds from BIP-39 plus canonical Core scan.
+    pub fn restore_from_mnemonic(
+        &mut self,
+        path: impl AsRef<Path>,
+        password: &str,
+        phrase: &str,
+        core_api: Arc<dyn WalletCoreApi + Send + Sync>,
+        expected_identity: CoreChainIdentity,
+    ) -> Result<RecoveryRestoreResult, CoreError> {
+        self.ensure_closed()?;
+        let destination = path.as_ref();
+        let recovery = SeedRestoreService::new(core_api, expected_identity, self.kdf)
+            .restore(phrase, password, destination)
+            .map_err(|_| CoreError::CanonicalRecoveryFailed)?;
+        let directory = WalletDirectory::open(destination)?;
+        self.metadata = Some(directory.metadata()?);
+        self.location = Some(directory);
+        self.state = ApplicationState::Locked;
+        Ok(RecoveryRestoreResult {
+            wallet: self.summary_locked()?,
+            recovery,
         })
     }
 
@@ -1661,6 +1694,8 @@ pub enum CoreError {
     RandomnessUnavailable,
     #[error("recovery phrase is invalid")]
     RecoveryPhraseInvalid,
+    #[error("canonical seed recovery failed")]
+    CanonicalRecoveryFailed,
     #[error("wallet and node identities differ")]
     IdentityMismatch,
     #[error("transaction input is invalid")]
