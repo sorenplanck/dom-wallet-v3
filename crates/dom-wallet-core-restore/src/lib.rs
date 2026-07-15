@@ -387,9 +387,9 @@ impl RestoreSink<'_> {
         let expected_generation = state.generation;
         let result = (|| {
             if let Some(anchor) = reorg_anchor {
-                rewind_state(&mut state, anchor.height, batch.observed_tip.height);
+                rewind_recovery_state(&mut state, anchor.height, batch.observed_tip.height);
             }
-            apply_batch(self.seed, self.chain, self.identity, &mut state, batch)?;
+            apply_recovery_batch(self.seed, self.chain, self.identity, &mut state, batch)?;
             state.core_scan_cursor = Some(cursor.as_bytes().to_vec());
             state.seed_restore_status = Some(SeedRestoreStatus::InProgress);
             state.sync_status = SyncStatus::Synchronizing;
@@ -414,7 +414,8 @@ impl RestoreSink<'_> {
     }
 }
 
-fn apply_batch(
+/// Apply one already validated canonical Core batch to encrypted Wallet state.
+pub fn apply_recovery_batch(
     seed: &CanonicalWalletSeed,
     chain: RecoveryChainContext,
     identity: &CoreChainIdentity,
@@ -637,7 +638,8 @@ fn refresh_maturity(
     Ok(())
 }
 
-fn rewind_state(state: &mut WalletState, safe_height: u64, tip_height: u64) {
+/// Rewind canonical recovery evidence while preserving allocation non-reuse floors.
+pub fn rewind_recovery_state(state: &mut WalletState, safe_height: u64, tip_height: u64) {
     let removed_ids = state
         .outputs
         .iter()

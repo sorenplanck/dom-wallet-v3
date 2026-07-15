@@ -110,7 +110,7 @@ fn synchronization_rescan(app: tauri::State<'_, DesktopApplication>) -> Result<(
 fn node_probe(
     app: tauri::State<'_, DesktopApplication>,
     configuration: dom_wallet_domain::NodeConfiguration,
-) -> Result<dom_wallet_chain::LiveNodeProbe, String> {
+) -> Result<dom_wallet_core::ProbeResult, String> {
     app.node_probe_live(configuration)
         .map_err(|e| e.to_string())
 }

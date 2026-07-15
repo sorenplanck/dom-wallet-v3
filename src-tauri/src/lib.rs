@@ -6,16 +6,13 @@
 //! a headless environment. A production Tauri `invoke_handler` binds these
 //! names without moving domain, storage, cryptographic, or sync logic here.
 
-use dom_wallet_chain::{ChainSource, LiveNodeProbe, MockChainSource};
 use dom_wallet_core::{
     CoreError, DiagnosticSnapshot, FeeEstimate, ProbeResult, SlateExport, TransactionSummary,
     WalletService, WalletSummary,
 };
-use dom_wallet_domain::{
-    NetworkIdentity, NodeConfiguration, RedactedNodeConfiguration, ScanBounds,
-};
-use dom_wallet_protocol::{QrEncoding, QrReassembler};
+use dom_wallet_domain::{NetworkIdentity, NodeConfiguration, RedactedNodeConfiguration};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -25,7 +22,7 @@ use thiserror::Error;
 
 pub struct DesktopApplication {
     service: Mutex<WalletService>,
-    qr_reassembler: Mutex<QrReassembler>,
+    qr_reassembler: Mutex<Option<String>>,
     shutdown: AtomicBool,
 }
 
@@ -73,7 +70,7 @@ impl Default for DesktopApplication {
     fn default() -> Self {
         Self {
             service: Mutex::new(WalletService::default()),
-            qr_reassembler: Mutex::new(QrReassembler::default()),
+            qr_reassembler: Mutex::new(None),
             shutdown: AtomicBool::new(false),
         }
     }
@@ -222,55 +219,15 @@ impl DesktopApplication {
         Ok(())
     }
 
-    pub fn node_probe<S: ChainSource>(&self, source: &mut S) -> Result<ProbeResult, CommandError> {
-        self.service
-            .lock()
-            .map_err(|_| CommandError::Unavailable)?
-            .probe(source)
-            .map_err(CommandError::from)
-    }
-    pub fn node_probe_unlocked_free<S: ChainSource>(
-        &self,
-        source: &mut S,
-        expected: &NetworkIdentity,
-    ) -> Result<ProbeResult, CommandError> {
-        WalletService::probe_node(source, expected).map_err(CommandError::from)
-    }
-    /// Delegates to the core's node-only probe; it never opens, unlocks, or
-    /// persists a wallet and the returned projection has no credential value.
+    /// Legacy endpoint configuration has no authority after the embedded cutover.
     pub fn node_probe_live(
         &self,
-        configuration: NodeConfiguration,
-    ) -> Result<LiveNodeProbe, CommandError> {
-        WalletService::probe_live_configuration(&configuration).map_err(CommandError::from)
-    }
-    pub fn synchronization_start<S: ChainSource>(
-        &self,
-        source: &mut S,
-        bounds: ScanBounds,
-    ) -> Result<WalletSummary, CommandError> {
-        self.service
-            .lock()
-            .map_err(|_| CommandError::Unavailable)?
-            .synchronize(source, bounds, 256)
-            .map_err(CommandError::from)
+        _configuration: NodeConfiguration,
+    ) -> Result<ProbeResult, CommandError> {
+        Err(CommandError::Unavailable)
     }
     pub fn synchronization_pause(&self) -> Result<(), CommandError> {
         Ok(())
-    }
-    pub fn synchronization_resume<S: ChainSource>(
-        &self,
-        source: &mut S,
-        bounds: ScanBounds,
-    ) -> Result<WalletSummary, CommandError> {
-        self.synchronization_start(source, bounds)
-    }
-    pub fn synchronization_retry<S: ChainSource>(
-        &self,
-        source: &mut S,
-        bounds: ScanBounds,
-    ) -> Result<WalletSummary, CommandError> {
-        self.synchronization_start(source, bounds)
     }
     pub fn synchronization_rescan(&self) -> Result<(), CommandError> {
         Ok(())
@@ -337,23 +294,12 @@ impl DesktopApplication {
         } else {
             self.slate_request_export(slate_id)?
         };
-        match dom_wallet_protocol::qr_encode_transport(&exported.text)
-            .map_err(|_| CommandError::InvalidInput("canonical slate QR encoding failed".into()))?
-        {
-            QrEncoding::Single { text, content_hash } => Ok(SlateQrExportDto {
-                frames: vec![text],
-                multipart: false,
-                content_hash: hex::encode(content_hash),
-            }),
-            QrEncoding::Multi {
-                frames,
-                content_hash,
-            } => Ok(SlateQrExportDto {
-                frames,
-                multipart: true,
-                content_hash: hex::encode(content_hash),
-            }),
-        }
+        let content_hash = Sha256::digest(exported.text.as_bytes());
+        Ok(SlateQrExportDto {
+            frames: vec![format!("DOMQR4.{}", exported.text)],
+            multipart: false,
+            content_hash: hex::encode(content_hash),
+        })
     }
 
     /// Reassembles public QR transport frames only. A completed text envelope
@@ -363,22 +309,36 @@ impl DesktopApplication {
         if frame.is_empty() || frame.len() > 2_097_280 || !frame.is_ascii() {
             return Err(CommandError::InvalidInput("QR frame is invalid".into()));
         }
-        let status = self
+        let text = frame
+            .strip_prefix("DOMQR4.")
+            .ok_or_else(|| CommandError::InvalidInput("QR frame is invalid".into()))?;
+        checked_slate_text(text)?;
+        *self
             .qr_reassembler
             .lock()
-            .map_err(|_| CommandError::Unavailable)?
-            .push(frame)
-            .map_err(|_| CommandError::InvalidInput("QR frame is invalid".into()))?;
-        Ok(qr_status_dto(status))
+            .map_err(|_| CommandError::Unavailable)? = Some(text.to_owned());
+        Ok(SlateQrReassemblyDto {
+            message_id: Some(hex::encode(Sha256::digest(text.as_bytes()))),
+            received_frames: 1,
+            total_frames: 1,
+            complete_text: Some(text.to_owned()),
+        })
     }
 
     pub fn slate_qr_reassembly_status(&self) -> Result<SlateQrReassemblyDto, CommandError> {
-        let status = self
+        let text = self
             .qr_reassembler
             .lock()
             .map_err(|_| CommandError::Unavailable)?
-            .status();
-        Ok(qr_status_dto(status))
+            .clone();
+        Ok(SlateQrReassemblyDto {
+            message_id: text
+                .as_ref()
+                .map(|value| hex::encode(Sha256::digest(value.as_bytes()))),
+            received_frames: u16::from(text.is_some()),
+            total_frames: u16::from(text.is_some()),
+            complete_text: text,
+        })
     }
 
     pub fn slate_qr_reassembly_clear(&self) -> Result<(), CommandError> {
@@ -496,10 +456,6 @@ impl DesktopApplication {
             .map_err(CommandError::from)
     }
 
-    pub fn probe_mock(&self, source: &mut MockChainSource) -> Result<ProbeResult, CommandError> {
-        self.node_probe(source)
-    }
-
     fn ensure_running(&self) -> Result<(), CommandError> {
         if self.shutdown.load(Ordering::Acquire) {
             Err(CommandError::Unavailable)
@@ -512,17 +468,8 @@ impl DesktopApplication {
         self.qr_reassembler
             .lock()
             .map_err(|_| CommandError::Unavailable)?
-            .clear();
+            .take();
         Ok(())
-    }
-}
-
-fn qr_status_dto(status: dom_wallet_protocol::QrReassemblyStatus) -> SlateQrReassemblyDto {
-    SlateQrReassemblyDto {
-        message_id: status.message_id.map(hex::encode),
-        received_frames: status.received_frames,
-        total_frames: status.total_frames,
-        complete_text: status.complete_text,
     }
 }
 
@@ -565,7 +512,6 @@ impl From<CoreError> for CommandError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dom_wallet_domain::{Network, NetworkIdentity};
 
     #[test]
     fn command_errors_and_status_do_not_expose_passwords() {
@@ -573,22 +519,6 @@ mod tests {
         let error = app.wallet_unlock("password-1").unwrap_err();
         assert!(!format!("{error}").contains("password-1"));
         assert!(app.application_status().experimental);
-    }
-
-    #[test]
-    fn mock_probe_uses_redacted_dto() {
-        let app = DesktopApplication::default();
-        let identity = NetworkIdentity {
-            network: Network::PrivateTestnet,
-            chain_id: [1; 32],
-            genesis_id: [2; 32],
-        };
-        let temp = tempfile::tempdir().unwrap();
-        app.wallet_create(temp.path().join("wallet"), "password-1", identity.clone())
-            .unwrap();
-        app.wallet_unlock("password-1").unwrap();
-        let mut source = MockChainSource::new(identity);
-        assert!(app.probe_mock(&mut source).unwrap().connected);
     }
 
     #[test]

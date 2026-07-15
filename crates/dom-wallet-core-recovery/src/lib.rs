@@ -16,7 +16,8 @@ use dom_crypto::{
 };
 use dom_serialization::{DomDeserialize, DomSerialize};
 use dom_slate::{
-    build_send_recoverable, respond_receive_recoverable, RecoveryBuildContext, SlateInput,
+    build_send_recoverable, finalize, respond_receive_recoverable, sender_phase_slate,
+    RecoveryBuildContext, SlateInput,
 };
 use dom_tx::{build_recoverable_output, slate::Slate};
 use dom_wallet_core_api::ScanBlock;
@@ -408,7 +409,13 @@ impl RecoverableOutputBuilder {
         let private = SlatePrivateMaterial::Sender {
             excess_blinding: Zeroizing::new(sender.excess_blinding),
             nonce: Zeroizing::new(sender.nonce),
-            change_blinding: sender.change.map(|change| Zeroizing::new(change.blinding)),
+            change: sender.change.map(|change| {
+                (
+                    change.commitment,
+                    change.value,
+                    Zeroizing::new(change.blinding),
+                )
+            }),
         };
         RecoverableSlateMaterial::from_slate(sender.slate, private)
     }
@@ -507,26 +514,216 @@ impl RecoverableSlateMaterial {
             SlatePrivateMaterial::Sender {
                 excess_blinding,
                 nonce,
-                change_blinding,
+                change,
             } => {
                 excess_blinding.iter().any(|byte| *byte != 0)
                     && nonce.iter().any(|byte| *byte != 0)
-                    && change_blinding
+                    && change
                         .as_ref()
-                        .is_none_or(|value| value.iter().any(|byte| *byte != 0))
+                        .is_none_or(|value| value.2.iter().any(|byte| *byte != 0))
             }
             SlatePrivateMaterial::Recipient { output_blinding } => {
                 output_blinding.iter().any(|byte| *byte != 0)
             }
         }
     }
+
+    /// Consume sender material into encrypted-state secrets and public change data.
+    pub fn into_sender_parts(self) -> Result<RecoverableSenderParts, RecoveryMaterialError> {
+        match self.private {
+            SlatePrivateMaterial::Sender {
+                excess_blinding,
+                nonce,
+                change,
+            } => Ok(RecoverableSenderParts {
+                body: self.body,
+                sidecars: self.sidecars,
+                excess_blinding,
+                nonce,
+                change: change.map(|(commitment, value, blinding)| RecoverableOwnedOutput {
+                    commitment,
+                    value,
+                    blinding,
+                }),
+            }),
+            SlatePrivateMaterial::Recipient { .. } => {
+                Err(RecoveryMaterialError::CoordinateDomainMismatch)
+            }
+        }
+    }
+
+    /// Consume recipient material into encrypted-state secrets and public output data.
+    pub fn into_recipient_parts(self) -> Result<RecoverableRecipientParts, RecoveryMaterialError> {
+        let (commitment, value) = recipient_public(&self.body)?;
+        match self.private {
+            SlatePrivateMaterial::Recipient { output_blinding } => Ok(RecoverableRecipientParts {
+                body: self.body,
+                sidecars: self.sidecars,
+                output: RecoverableOwnedOutput {
+                    commitment,
+                    value,
+                    blinding: output_blinding,
+                },
+            }),
+            SlatePrivateMaterial::Sender { .. } => {
+                Err(RecoveryMaterialError::CoordinateDomainMismatch)
+            }
+        }
+    }
+}
+
+/// Public output coordinates plus a secret intended only for encrypted Wallet state.
+pub struct RecoverableOwnedOutput {
+    pub commitment: [u8; 33],
+    pub value: u64,
+    blinding: Zeroizing<[u8; 32]>,
+}
+
+impl fmt::Debug for RecoverableOwnedOutput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RecoverableOwnedOutput")
+            .field("commitment", &"[PUBLIC COMMITMENT]")
+            .field("value", &"[REDACTED]")
+            .field("blinding", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl RecoverableOwnedOutput {
+    pub fn copy_blinding_to(&self, destination: &mut [u8; 32]) {
+        destination.copy_from_slice(self.blinding.as_ref());
+    }
+}
+
+pub struct RecoverableSenderParts {
+    pub body: RecoverySlateBody,
+    pub sidecars: RecoverySlateSidecars,
+    pub change: Option<RecoverableOwnedOutput>,
+    excess_blinding: Zeroizing<[u8; 32]>,
+    nonce: Zeroizing<[u8; 32]>,
+}
+
+impl fmt::Debug for RecoverableSenderParts {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RecoverableSenderParts([REDACTED])")
+    }
+}
+
+impl RecoverableSenderParts {
+    /// Rehydrate encrypted sender context after restart without changing Slate bytes.
+    pub fn from_encrypted_context(
+        body: RecoverySlateBody,
+        excess_blinding: [u8; 32],
+        nonce: [u8; 32],
+    ) -> Result<Self, RecoveryMaterialError> {
+        let slate = Slate::from_bytes(body.canonical_bytes())
+            .map_err(|_| RecoveryMaterialError::SlateConstruction)?;
+        if slate.version != dom_tx::slate::RECOVERY_SLATE_VERSION
+            || excess_blinding == [0u8; 32]
+            || nonce == [0u8; 32]
+        {
+            return Err(RecoveryMaterialError::SlateConstruction);
+        }
+        Ok(Self {
+            sidecars: RecoverySlateSidecars {
+                sender_change: optional_capsule(&slate.sender_change_recovery_capsule)?,
+                recipient: optional_capsule(&slate.recipient_recovery_capsule)?,
+            },
+            body,
+            change: None,
+            excess_blinding: Zeroizing::new(excess_blinding),
+            nonce: Zeroizing::new(nonce),
+        })
+    }
+
+    pub fn copy_signing_secrets_to(&self, excess: &mut [u8; 32], nonce: &mut [u8; 32]) {
+        excess.copy_from_slice(self.excess_blinding.as_ref());
+        nonce.copy_from_slice(self.nonce.as_ref());
+    }
+}
+
+pub struct RecoverableRecipientParts {
+    pub body: RecoverySlateBody,
+    pub sidecars: RecoverySlateSidecars,
+    pub output: RecoverableOwnedOutput,
+}
+
+impl fmt::Debug for RecoverableRecipientParts {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RecoverableRecipientParts([REDACTED])")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalizedRecoverableTransaction {
+    pub canonical_bytes: Vec<u8>,
+    pub transaction_hash: [u8; 32],
+    pub kernel_excess: [u8; 33],
+    pub fee: u64,
+    pub weight: u32,
+}
+
+/// Finalize only when the response strips exactly to the persisted recovery offer.
+pub fn finalize_recoverable_transaction(
+    response: &RecoverySlateBody,
+    offer: &RecoverySlateBody,
+    sender: &RecoverableSenderParts,
+    chain_id: [u8; 32],
+) -> Result<FinalizedRecoverableTransaction, RecoveryMaterialError> {
+    let response_slate = Slate::from_bytes(response.canonical_bytes())
+        .map_err(|_| RecoveryMaterialError::SlateConstruction)?;
+    let offer_slate = Slate::from_bytes(offer.canonical_bytes())
+        .map_err(|_| RecoveryMaterialError::SlateConstruction)?;
+    let stripped = sender_phase_slate(&response_slate)
+        .to_bytes()
+        .map_err(|_| RecoveryMaterialError::SlateConstruction)?;
+    let expected = offer_slate
+        .to_bytes()
+        .map_err(|_| RecoveryMaterialError::SlateConstruction)?;
+    if stripped != expected || sender.body.canonical_bytes() != offer.canonical_bytes() {
+        return Err(RecoveryMaterialError::SlateBindingMismatch);
+    }
+    let transaction = finalize(
+        &response_slate,
+        &sender.excess_blinding,
+        &sender.nonce,
+        &chain_id,
+    )
+    .map_err(|_| RecoveryMaterialError::SlateConstruction)?;
+    let canonical_bytes = transaction
+        .to_bytes()
+        .map_err(|_| RecoveryMaterialError::CanonicalEncoding)?;
+    let transaction_hash = *dom_crypto::blake2b_256(&canonical_bytes).as_bytes();
+    let kernel = transaction
+        .kernels
+        .first()
+        .ok_or(RecoveryMaterialError::SlateConstruction)?;
+    Ok(FinalizedRecoverableTransaction {
+        canonical_bytes,
+        transaction_hash,
+        kernel_excess: *kernel.excess.as_bytes(),
+        fee: transaction
+            .total_fee()
+            .map_err(|_| RecoveryMaterialError::SlateConstruction)?,
+        weight: transaction.weight(),
+    })
+}
+
+fn recipient_public(body: &RecoverySlateBody) -> Result<([u8; 33], u64), RecoveryMaterialError> {
+    let slate = Slate::from_bytes(body.canonical_bytes())
+        .map_err(|_| RecoveryMaterialError::SlateConstruction)?;
+    let output = slate
+        .recipient_output
+        .ok_or(RecoveryMaterialError::SlateConstruction)?;
+    Ok((*output.commitment.as_bytes(), slate.amount))
 }
 
 enum SlatePrivateMaterial {
     Sender {
         excess_blinding: Zeroizing<[u8; 32]>,
         nonce: Zeroizing<[u8; 32]>,
-        change_blinding: Option<Zeroizing<[u8; 32]>>,
+        change: Option<([u8; 33], u64, Zeroizing<[u8; 32]>)>,
     },
     Recipient {
         output_blinding: Zeroizing<[u8; 32]>,
@@ -646,6 +843,8 @@ pub enum RecoveryMaterialError {
     SelfRecoveryMismatch,
     #[error("recoverable Slate construction failed")]
     SlateConstruction,
+    #[error("recoverable Slate response does not bind to the persisted offer")]
+    SlateBindingMismatch,
 }
 
 /// Whether encrypted state is eligible for the canonical BIP-39 boundary.

@@ -1335,14 +1335,20 @@ dependencies = [
 name = "dom-wallet-core"
 version = "0.1.0"
 dependencies = [
+ "dom-consensus",
  "dom-crypto",
+ "dom-serialization",
  "dom-wallet-chain",
  "dom-wallet-core-api",
+ "dom-wallet-core-protocol",
  "dom-wallet-core-recovery",
  "dom-wallet-core-restore",
+ "dom-wallet-core-submit",
  "dom-wallet-core-sync",
  "dom-wallet-crypto 0.1.0",
  "dom-wallet-domain",
+ "dom-wallet-embedded-core",
+ "dom-wallet-production-backend",
  "dom-wallet-protocol",
  "dom-wallet-storage",
  "hex",
@@ -1524,6 +1530,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "dom-wallet-production-backend"
+version = "0.1.0"
+dependencies = [
+ "dom-wallet-core-api",
+ "dom-wallet-core-protocol",
+ "dom-wallet-core-recovery",
+ "dom-wallet-core-restore",
+ "dom-wallet-core-submit",
+ "dom-wallet-core-sync",
+ "dom-wallet-crypto 0.1.0",
+ "dom-wallet-embedded-core",
+ "dom-wallet-storage",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "dom-wallet-protocol"
 version = "0.1.0"
 dependencies = [
@@ -1568,12 +1591,11 @@ dependencies = [
 name = "dom-wallet-tauri-shell"
 version = "0.1.0"
 dependencies = [
- "dom-wallet-chain",
  "dom-wallet-core",
  "dom-wallet-domain",
- "dom-wallet-protocol",
  "hex",
  "serde",
+ "sha2",
  "tauri",
  "tauri-build",
  "tempfile",
