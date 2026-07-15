@@ -11,5 +11,8 @@
     "esbuild": "0.25.0",
     "qr-scanner": "1.4.2",
     "qrcode": "1.5.4"
+  },
+  "devDependencies": {
+    "playwright": "1.57.0"
   }
 }

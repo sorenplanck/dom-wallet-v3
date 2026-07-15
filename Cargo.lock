@@ -1592,7 +1592,11 @@ name = "dom-wallet-tauri-shell"
 version = "0.1.0"
 dependencies = [
  "dom-wallet-core",
+ "dom-wallet-core-api",
+ "dom-wallet-core-restore",
+ "dom-wallet-core-sync",
  "dom-wallet-domain",
+ "dom-wallet-embedded-core",
  "hex",
  "serde",
  "sha2",

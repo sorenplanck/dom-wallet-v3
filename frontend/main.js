@@ -1,229 +1,237 @@
 import QRCode from "qrcode";
 import QrScanner from "qr-scanner";
 
-// The packaged application has exactly one transport: Tauri invoke. There is
-// intentionally no production mock, balance calculator, or browser storage.
 export const COMMANDS = Object.freeze([
-  "application_status", "wallet_create", "wallet_open", "wallet_unlock", "wallet_lock",
-  "wallet_close", "wallet_summary", "account_list", "account_summary",
-  "node_configuration_get_redacted", "node_configuration_set", "node_probe",
-  "synchronization_start", "synchronization_pause", "synchronization_resume",
-  "synchronization_retry", "synchronization_rescan", "diagnostics_redacted", "application_shutdown"
-  , "transaction_fee_estimate", "transaction_send_create", "slate_request_export",
-  "slate_request_import", "slate_response_create", "slate_response_export",
-  "slate_response_import", "slate_summary_redacted", "transaction_finalize",
-  "transaction_submit", "transaction_retry_submission", "transaction_cancel",
+  "application_status", "wallet_create_recoverable", "wallet_restore_from_mnemonic",
+  "wallet_backup_export", "wallet_backup_import", "wallet_recovery_phrase_confirm",
+  "wallet_open", "wallet_unlock", "wallet_lock", "wallet_close", "wallet_summary",
+  "account_list", "account_summary", "embedded_node_start", "embedded_node_status",
+  "wallet_address_validate", "synchronization_start", "synchronization_pause",
+  "synchronization_resume", "synchronization_retry", "synchronization_rescan",
+  "diagnostics_redacted", "application_shutdown", "transaction_fee_estimate",
+  "transaction_send_create", "slate_request_export", "slate_request_import",
+  "slate_response_create", "slate_response_export", "slate_response_import",
+  "slate_summary_redacted", "transaction_finalize", "transaction_submit",
+  "transaction_retry_submission", "transaction_reconcile_submission", "transaction_cancel",
   "transaction_list", "transaction_detail_redacted", "slate_qr_encode",
   "slate_qr_decode_frame", "slate_qr_reassembly_status", "slate_qr_reassembly_clear"
 ]);
 
-const productionInvoke = (command, args = {}) => {
+const invoke = (command, args = {}) => {
   if (!COMMANDS.includes(command)) return Promise.reject(new Error("Unsupported desktop command."));
   const bridge = window.__TAURI__?.core?.invoke;
-  if (!bridge) return Promise.reject(new Error("Native desktop command bridge is unavailable."));
-  return bridge(command, args);
+  return bridge ? bridge(command, args) : Promise.reject(new Error("Native desktop command bridge is unavailable."));
 };
-
-const status = document.querySelector("#status");
-const identity = document.querySelector("#network-identity");
-const cards = document.querySelector("#balance-cards");
-const syncStatus = document.querySelector("#sync-status");
+const byId = (id) => document.getElementById(id);
+const status = byId("status");
+const toast = byId("toast");
 let pending = false;
-let refreshTimer = null;
-let refreshActive = false;
-const STATUS_REFRESH_MS = 15_000;
+let toastTimer;
+let refreshTimer;
+let scanner;
+let qrFrames = [];
+let qrIndex = 0;
+let phrasePending = false;
 
-const show = (message, failure = false) => { status.textContent = message; status.style.borderColor = failure ? "var(--danger)" : "var(--bronze)"; };
-export const clearPasswords = (form) => form.querySelectorAll('input[type="password"]').forEach((input) => { input.value = ""; });
-const amount = (value) => `${value ?? 0} DOM atomic units`;
-export const redactedError = (error) => {
-  const text = String(error?.message ?? "Operation failed");
-  return /password|secret|key|token|credential|bearer|:\/\//i.test(text) ? "The desktop operation failed." : text;
+export const clearPasswords = (form) => form?.querySelectorAll('input[type="password"]').forEach((input) => { input.value = ""; });
+export const redactedError = (error) => error?.message && !/password|mnemonic|seed|secret|key|token|credential|:\/\//i.test(error.message)
+  ? error.message : "The desktop operation failed.";
+const show = (message, failed = false) => {
+  status.textContent = message;
+  toast.textContent = message;
+  toast.classList.toggle("err", failed);
+  toast.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toast.classList.remove("show"), 5000);
 };
-
-export function selectScreen(name) { document.querySelectorAll(".screen").forEach((screen) => { screen.hidden = screen.id !== name; }); }
-document.querySelectorAll("[data-screen]").forEach((button) => button.addEventListener("click", () => selectScreen(button.dataset.screen)));
-
-const withPending = async (action) => {
-  if (pending) return;
+const run = async (action) => {
+  if (pending) return undefined;
   pending = true;
   document.querySelectorAll("button").forEach((button) => { button.disabled = true; });
-  try { return await action(); } finally { pending = false; document.querySelectorAll("button").forEach((button) => { button.disabled = false; }); }
+  try { return await action(); } finally {
+    pending = false;
+    document.querySelectorAll("button").forEach((button) => { button.disabled = false; });
+  }
+};
+const redactJson = (target, value) => { target.textContent = JSON.stringify(value, null, 2); };
+const integerNoms = (value, optional = false) => {
+  if (optional && value === "") return null;
+  if (!/^[0-9]+$/.test(String(value))) throw new Error("Use an integer number of noms.");
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) throw new Error("Amount exceeds the safe desktop boundary.");
+  return parsed;
+};
+const nodeRequest = (form) => {
+  const data = new FormData(form);
+  return { network: data.get("network"), data_directory: data.get("node_data_directory"), listen_address: data.get("listen_address"), maximum_inbound_peers: 8 };
+};
+const startNode = (form) => invoke("embedded_node_start", { request: nodeRequest(form) });
+const clearSecretForms = () => {
+  document.querySelectorAll('textarea[name="mnemonic"], #transaction-text').forEach((node) => { node.value = ""; });
+  document.querySelectorAll("form").forEach(clearPasswords);
 };
 
-export const renderState = (value) => {
-  const supported = new Set(["CLOSED", "LOCKED", "UNLOCKING", "UNLOCKED", "DISCONNECTED", "CONNECTING", "VERIFYING_IDENTITY", "CONNECTED", "SYNCHRONIZING", "SYNCED", "PAUSED", "RESCANNING", "DEGRADED", "BACKING_OFF", "WRONG_NETWORK", "AUTHENTICATION_FAILED", "INCOMPATIBLE_PROTOCOL", "STORAGE_ERROR", "FATAL_CONFIGURATION_ERROR", "ERROR"]);
-  return supported.has(value) ? value : "Unsupported desktop state";
-};
-
-async function refreshSummary() {
-  if (refreshActive) return;
-  refreshActive = true;
-  try {
-    const summary = await productionInvoke("wallet_summary");
-    if (!summary?.balance || !summary?.state) throw new Error("Invalid wallet summary response.");
-    identity.textContent = `${summary.network} · wallet ${summary.wallet_id}`;
-    cards.replaceChildren(...Object.entries(summary.balance).map(([name, value]) => { const node = document.createElement("div"); node.className = "card"; node.textContent = `${name}: ${amount(value)}`; return node; }));
-    syncStatus.textContent = `Cursor ${summary.cursor_height ?? "not activated"}; state ${renderState(summary.state)}.`;
-  } finally { refreshActive = false; }
+export function selectScreen(name) {
+  clearSecretForms();
+  document.querySelectorAll("#app .screen").forEach((screen) => { screen.hidden = screen.id !== name; });
+  document.querySelectorAll(".nav [data-screen]").forEach((button) => button.classList.toggle("active", button.dataset.screen === name));
 }
+document.querySelectorAll("[data-screen]").forEach((button) => button.addEventListener("click", () => selectScreen(button.dataset.screen)));
+document.querySelectorAll("[data-gate-panel]").forEach((button) => button.addEventListener("click", () => {
+  clearSecretForms();
+  const panel = button.dataset.gatePanel;
+  document.querySelectorAll(".gate-panel").forEach((node) => { node.hidden = node.id !== panel; });
+}));
+const enterApp = () => { byId("gate").classList.add("hidden"); byId("app").classList.remove("hidden"); selectScreen("dashboard"); };
+const enterGate = () => { byId("app").classList.add("hidden"); byId("gate").classList.remove("hidden"); clearSecretForms(); };
 
-const decodeHex32 = (value) => {
-  if (!/^[0-9a-f]{64}$/.test(value)) throw new Error("Chain and genesis values must be 64 lowercase hexadecimal characters.");
-  return Array.from(value.match(/../g), (pair) => Number.parseInt(pair, 16));
+const clearPhrase = () => {
+  byId("recovery-phrase").textContent = "";
+  byId("recovery-confirmed").checked = false;
+  byId("recovery-complete").disabled = true;
+  byId("recovery-ceremony").hidden = true;
+  clearPasswords(byId("recovery-ceremony"));
+  phrasePending = false;
 };
+const beginPhrase = (mnemonic) => {
+  document.querySelectorAll(".gate-panel").forEach((node) => { node.hidden = node.id !== "recovery-ceremony"; });
+  byId("recovery-phrase").textContent = mnemonic;
+  phrasePending = true;
+};
+byId("recovery-confirmed").addEventListener("change", (event) => { byId("recovery-complete").disabled = !event.target.checked; });
+byId("recovery-complete").addEventListener("click", async () => {
+  if (!phrasePending || !byId("recovery-confirmed").checked) return;
+  const password = byId("recovery-confirm-password").value;
+  try { await run(() => invoke("wallet_recovery_phrase_confirm", { password })); clearPhrase(); show("Recovery phrase confirmed. Unlock wallet to continue."); }
+  catch (error) { clearPasswords(byId("recovery-ceremony")); show(redactedError(error), true); }
+});
+byId("recovery-abandon").addEventListener("click", () => { clearPhrase(); show("Recovery ceremony closed."); });
 
-document.querySelector("#create-form").addEventListener("submit", async (event) => { event.preventDefault(); const form = event.currentTarget; try { await withPending(() => productionInvoke("wallet_create", { path: new FormData(form).get("path"), password: new FormData(form).get("password"), identity: { network: new FormData(form).get("network"), chain_id: decodeHex32(new FormData(form).get("chain_id")), genesis_id: decodeHex32(new FormData(form).get("genesis_id")) } })); show("Wallet created. Unlock it to use protected capabilities."); } catch (error) { show(redactedError(error), true); } finally { clearPasswords(form); } });
-document.querySelector("#open-form").addEventListener("submit", async (event) => { event.preventDefault(); const form = event.currentTarget; try { await withPending(() => productionInvoke("wallet_open", { path: new FormData(form).get("path") })); show("Wallet opened in locked state."); } catch (error) { show(redactedError(error), true); } finally { clearPasswords(form); } });
-document.querySelector("#unlock-form").addEventListener("submit", async (event) => { event.preventDefault(); const form = event.currentTarget; try { await withPending(async () => { await productionInvoke("wallet_unlock", { password: new FormData(form).get("password") }); await refreshSummary(); }); show("Wallet unlocked."); selectScreen("dashboard"); } catch (error) { show(redactedError(error), true); } finally { clearPasswords(form); } });
-document.querySelector("#lock").addEventListener("click", () => withPending(async () => { await releaseCamera(); await productionInvoke("wallet_lock"); show("Wallet locked; protected capabilities were revoked."); } ).catch((error) => show(redactedError(error), true)));
-document.querySelector("#sync").addEventListener("click", () => withPending(async () => { await productionInvoke("synchronization_start"); await refreshSummary(); show("Synchronization request completed."); }).catch((error) => show(redactedError(error), true)));
-
-productionInvoke("application_status").then((app) => show(`Application state: ${renderState(app.state)}.`)).catch((error) => show(redactedError(error), true));
-export const stopStatusRefresh = () => { if (refreshTimer) clearTimeout(refreshTimer); refreshTimer = null; };
-const scheduleStatusRefresh = () => {
-  stopStatusRefresh();
-  const tick = async () => {
-    if (refreshActive) return;
-    refreshActive = true;
-    try {
-      const app = await productionInvoke("application_status");
-      const state = renderState(app?.state);
-      show(`Application state: ${state}.`, state === "Unsupported desktop state");
-      if (!new Set(["CLOSED", "FATAL_CONFIGURATION_ERROR", "Unsupported desktop state"]).has(state)) refreshTimer = setTimeout(tick, STATUS_REFRESH_MS);
-    } catch (error) { show(redactedError(error), true); } finally { refreshActive = false; }
-  };
-  refreshTimer = setTimeout(tick, STATUS_REFRESH_MS);
-};
-scheduleStatusRefresh();
-window.addEventListener("beforeunload", stopStatusRefresh, { once: true });
-const diagnostics = document.querySelector("#diagnostics-output");
-const nodeStatus = document.querySelector("#node-status");
-const nodeForm = document.querySelector("#node-form");
-const numeric = (value) => { const parsed = Number(value); if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new Error("Invalid numeric configuration value."); return parsed; };
-const configurationFromForm = (form) => {
-  const value = new FormData(form);
-  const credential = value.get("credential_reference");
-  return { endpoint_url: value.get("endpoint_url"), expected_identity: { network: value.get("network"), chain_id: decodeHex32(value.get("chain_id")), genesis_id: decodeHex32(value.get("genesis_id")) }, source_identity: "configured-dom-node", api_compatibility_version: 1, connect_timeout_ms: numeric(value.get("connect_timeout_ms")), request_timeout_ms: numeric(value.get("request_timeout_ms")), poll_interval_ms: numeric(value.get("poll_interval_ms")), retry_ceiling: numeric(value.get("retry_ceiling")), max_backoff_ms: numeric(value.get("max_backoff_ms")), stable_success_threshold: 3, tls_required: value.get("tls_required") === "on", credential_reference: credential || null };
-};
-const redactedJson = (target, value) => { target.textContent = JSON.stringify(value, null, 2); };
-document.querySelector("#config-load").addEventListener("click", () => withPending(async () => { const value = await productionInvoke("node_configuration_get_redacted"); redactedJson(nodeStatus, value); }).catch((error) => show(redactedError(error), true)));
-nodeForm.addEventListener("submit", async (event) => { event.preventDefault(); const form = event.currentTarget; if (!window.confirm("Replace the active node configuration?")) return; try { await withPending(() => productionInvoke("node_configuration_set", { configuration: configurationFromForm(form) })); show("Redacted node configuration updated."); } catch (error) { show(redactedError(error), true); } finally { clearPasswords(form); } });
-document.querySelector("#probe").addEventListener("click", () => withPending(async () => { const result = await productionInvoke("node_probe", { configuration: configurationFromForm(nodeForm) }); redactedJson(nodeStatus, result); }).catch((error) => show(redactedError(error), true)));
-document.querySelector("#pause").addEventListener("click", () => withPending(() => productionInvoke("synchronization_pause")).catch((error) => show(redactedError(error), true)));
-document.querySelector("#resume").addEventListener("click", () => withPending(() => productionInvoke("synchronization_resume")).catch((error) => show(redactedError(error), true)));
-document.querySelector("#retry").addEventListener("click", () => withPending(() => productionInvoke("synchronization_retry")).catch((error) => show(redactedError(error), true)));
-document.querySelector("#rescan").addEventListener("click", () => { if (window.confirm("Full rescan reconstructs the wallet from canonical chain evidence. Continue?")) withPending(() => productionInvoke("synchronization_rescan")).catch((error) => show(redactedError(error), true)); });
-document.querySelector("#close").addEventListener("click", () => withPending(async () => { await releaseCamera(); await productionInvoke("wallet_close"); stopStatusRefresh(); selectScreen("onboarding"); show("Wallet closed."); }).catch((error) => show(redactedError(error), true)));
-document.querySelector("#diagnostics-refresh").addEventListener("click", () => withPending(async () => redactedJson(diagnostics, await productionInvoke("diagnostics_redacted"))).catch((error) => show(redactedError(error), true)));
-
-// Manual slate exchange is intentionally explicit: text stays in the DOM only
-// until an import settles and is never copied into browser storage.
-const transactionOutput = document.querySelector("#transaction-output");
-const transactionSlateId = document.querySelector("#transaction-slate-id");
-const transactionText = document.querySelector("#transaction-text");
-const qrCanvas = document.querySelector("#slate-qr-canvas");
-const qrMeta = document.querySelector("#slate-qr-meta");
-const scannerVideo = document.querySelector("#slate-qr-video");
-let qrFrames = [];
-let qrFrameIndex = 0;
-let qrAnimation = null;
-let activeScanner = null;
-const renderTransaction = (value) => { redactedJson(transactionOutput, value); if (value?.slate_id) transactionSlateId.value = value.slate_id; };
-const requiredSlateId = () => { const value = transactionSlateId.value.trim(); if (!/^[0-9a-f-]{36}$/i.test(value)) throw new Error("Enter a valid slate identifier."); return value; };
-const clearSlateText = () => { transactionText.value = ""; };
-const stopQrAnimation = () => { if (qrAnimation) clearInterval(qrAnimation); qrAnimation = null; };
-const clearQrExport = () => { stopQrAnimation(); qrFrames = []; qrFrameIndex = 0; qrCanvas.getContext("2d").clearRect(0, 0, qrCanvas.width, qrCanvas.height); qrMeta.textContent = "No QR export shown."; };
-const releaseCamera = async () => {
-  if (activeScanner) { activeScanner.stop(); activeScanner.destroy(); activeScanner = null; }
-  scannerVideo.srcObject = null;
-  try { await productionInvoke("slate_qr_reassembly_clear"); } catch { /* native shutdown or lock can reject cleanup safely */ }
-};
-const renderQrFrame = async () => {
-  if (!qrFrames.length) return;
-  const frame = qrFrames[qrFrameIndex];
-  await QRCode.toCanvas(qrCanvas, frame, { errorCorrectionLevel: "M", margin: 2, width: 360 });
-  qrMeta.textContent = `Frame ${qrFrameIndex + 1} of ${qrFrames.length} · share only with the intended counterparty.`;
-};
-const showQr = async (response) => {
-  const result = await withPending(() => productionInvoke("slate_qr_encode", { slateId: requiredSlateId(), response }));
-  qrFrames = result.frames; qrFrameIndex = 0; await renderQrFrame();
-  show(`Canonical ${response ? "response" : "request"} QR prepared (${result.content_hash.slice(0, 12)}…).`);
-};
-const acceptScannedFrame = async (value) => {
-  const result = await productionInvoke("slate_qr_decode_frame", { frame: value });
-  if (result.complete_text) {
-    await releaseCamera();
-    transactionText.value = result.complete_text;
-    show("Complete QR transport decoded. Review and confirm import; it has not been processed yet.");
-  } else { qrMeta.textContent = `Collected ${result.received_frames} of ${result.total_frames} QR frames.`; }
-};
-const startScanner = async () => {
-  await releaseCamera();
-  try {
-    activeScanner = new QrScanner(scannerVideo, (result) => acceptScannedFrame(result.data), { preferredCamera: "environment", returnDetailedScanResult: true });
-    await activeScanner.start();
-    show("Camera scanner active. Cancel when finished.");
-  } catch (error) { await releaseCamera(); show("Camera permission or QR scanner is unavailable. Paste the code instead.", true); }
-};
-document.querySelector("#transaction-create").addEventListener("submit", async (event) => {
+byId("create-form").addEventListener("submit", async (event) => {
   event.preventDefault(); const form = event.currentTarget; const data = new FormData(form);
   try {
-    const created = await withPending(() => productionInvoke("transaction_send_create", { amount: Number(data.get("amount")), requestedFee: data.get("requested_fee") ? Number(data.get("requested_fee")) : null }));
-    renderTransaction(created); show("Send transaction reserved. Export the request only after review.");
+    await run(() => startNode(form));
+    const created = await run(() => invoke("wallet_create_recoverable", { path: data.get("path"), password: data.get("password") }));
+    clearPasswords(form); beginPhrase(created.mnemonic); show("Write down and confirm the recovery phrase.");
+  } catch (error) { clearPasswords(form); show(redactedError(error), true); }
+});
+byId("restore-form").addEventListener("submit", async (event) => {
+  event.preventDefault(); const form = event.currentTarget; const data = new FormData(form);
+  try {
+    show("Restore: initializing."); await run(() => startNode(form)); show("Restore: scanning canonical chain.");
+    const result = await run(() => invoke("wallet_restore_from_mnemonic", { path: data.get("path"), password: data.get("password"), mnemonic: data.get("mnemonic") }));
+    form.querySelector('textarea[name="mnemonic"]').value = ""; clearPasswords(form);
+    show(`Restore completed: ${result.owned_output_count} owned outputs, ${result.confirmed_balance} confirmed noms.`);
+  } catch (error) { form.querySelector('textarea[name="mnemonic"]').value = ""; clearPasswords(form); show(redactedError(error), true); }
+});
+byId("open-form").addEventListener("submit", async (event) => {
+  event.preventDefault(); const form = event.currentTarget;
+  try { await run(() => startNode(form)); await run(() => invoke("wallet_open", { path: new FormData(form).get("path") })); show("Wallet opened in locked state."); }
+  catch (error) { show(redactedError(error), true); }
+});
+byId("unlock-form").addEventListener("submit", async (event) => {
+  event.preventDefault(); const form = event.currentTarget;
+  try { await run(() => invoke("wallet_unlock", { password: new FormData(form).get("password") })); clearPasswords(form); enterApp(); await refreshSummary(); show("Wallet unlocked."); }
+  catch (error) { clearPasswords(form); show(redactedError(error), true); }
+});
+
+const refreshSummary = async () => {
+  const summary = await invoke("wallet_summary");
+  byId("network-identity").textContent = `${summary.network} · ${summary.state}`;
+  byId("balance-total").firstChild.textContent = `${summary.balance.total ?? 0} `;
+  byId("balance-cards").replaceChildren(...Object.entries(summary.balance).map(([key, value]) => {
+    const card = document.createElement("div"); card.className = "card"; card.textContent = `${key}: ${value} noms`; return card;
+  }));
+  byId("sync-status").textContent = `Cursor ${summary.cursor_height ?? "not activated"}`;
+};
+const refreshNode = async () => redactJson(byId("node-status"), await invoke("embedded_node_status"));
+byId("sync").addEventListener("click", () => run(async () => { await invoke("synchronization_start"); await refreshSummary(); }).catch((error) => show(redactedError(error), true)));
+byId("node-sync").addEventListener("click", () => run(async () => { await invoke("synchronization_start"); await refreshNode(); }).catch((error) => show(redactedError(error), true)));
+byId("node-refresh").addEventListener("click", () => run(refreshNode).catch((error) => show(redactedError(error), true)));
+for (const [id, command] of [["pause", "synchronization_pause"], ["resume", "synchronization_resume"], ["retry", "synchronization_retry"]]) {
+  byId(id).addEventListener("click", () => run(() => invoke(command)).catch((error) => show(redactedError(error), true)));
+}
+byId("rescan").addEventListener("click", () => { if (window.confirm("Rescan from canonical chain evidence?")) run(() => invoke("synchronization_rescan")).catch((error) => show(redactedError(error), true)); });
+byId("diagnostics-refresh").addEventListener("click", () => run(async () => redactJson(byId("diagnostics-output"), await invoke("diagnostics_redacted"))).catch((error) => show(redactedError(error), true)));
+byId("lock").addEventListener("click", () => run(async () => { await stopScanner(); await invoke("wallet_lock"); enterGate(); }).catch((error) => show(redactedError(error), true)));
+byId("close").addEventListener("click", () => run(async () => { await stopScanner(); await invoke("wallet_close"); enterGate(); }).catch((error) => show(redactedError(error), true)));
+
+byId("backup-export-form").addEventListener("submit", async (event) => {
+  event.preventDefault(); const form = event.currentTarget; const data = new FormData(form);
+  try { const result = await run(() => invoke("wallet_backup_export", { destination: data.get("destination"), backupPassword: data.get("backup_password") })); show(`Encrypted backup created: ${result.destination_name}.`); }
+  catch (error) { show(redactedError(error), true); } finally { clearPasswords(form); }
+});
+byId("backup-import-form").addEventListener("submit", async (event) => {
+  event.preventDefault(); const form = event.currentTarget; const data = new FormData(form);
+  try { await run(() => invoke("wallet_backup_import", { destination: data.get("destination"), backupPath: data.get("backup_path"), backupPassword: data.get("backup_password"), password: data.get("password") })); enterGate(); show("Encrypted backup imported in locked state."); }
+  catch (error) { show(redactedError(error), true); } finally { clearPasswords(form); }
+});
+
+const output = byId("transaction-output");
+const slateId = byId("transaction-slate-id");
+const slateText = byId("transaction-text");
+const renderTransaction = (value) => { redactJson(output, value); if (value?.slate_id) slateId.value = value.slate_id; if (value?.transaction?.slate_id) slateId.value = value.transaction.slate_id; };
+const requiredId = () => { if (!/^[0-9a-f-]{36}$/i.test(slateId.value.trim())) throw new Error("Enter a valid payment identifier."); return slateId.value.trim(); };
+const requiredSlate = () => { const text = slateText.value.trim(); if (!text.startsWith("DOMSLATE4.")) throw new Error("A canonical DOMSLATE4 transport is required."); return text; };
+byId("transaction-create").addEventListener("submit", async (event) => {
+  event.preventDefault(); const data = new FormData(event.currentTarget);
+  try {
+    const senderAddress = await run(() => invoke("wallet_address_validate", { address: data.get("sender_address") }));
+    const receiverAddress = await run(() => invoke("wallet_address_validate", { address: data.get("receiver_address") }));
+    const result = await run(() => invoke("transaction_send_create", { amount: integerNoms(data.get("amount")), requestedFee: integerNoms(data.get("requested_fee"), true), senderAddress, receiverAddress, expiresAtHeight: integerNoms(data.get("expires_at_height")) }));
+    renderTransaction(result); show("Recoverable Slate v4 request created.");
   } catch (error) { show(redactedError(error), true); }
 });
-document.querySelector("#transaction-estimate").addEventListener("click", async () => {
-  const form = document.querySelector("#transaction-create"); const data = new FormData(form);
-  try { redactedJson(transactionOutput, await withPending(() => productionInvoke("transaction_fee_estimate", { amount: Number(data.get("amount")), selectedInputCount: 1, changeOutput: true }))); } catch (error) { show(redactedError(error), true); }
+byId("transaction-estimate").addEventListener("click", async () => {
+  const data = new FormData(byId("transaction-create"));
+  try { renderTransaction(await run(() => invoke("transaction_fee_estimate", { amount: integerNoms(data.get("amount")), selectedInputCount: 1, changeOutput: true }))); }
+  catch (error) { show(redactedError(error), true); }
 });
-document.querySelector("#request-export").addEventListener("click", async () => {
-  if (!window.confirm("Export this manual slate request? It contains public transaction data.")) return;
-  try { const result = await withPending(() => productionInvoke("slate_request_export", { slateId: requiredSlateId() })); transactionText.value = result.text; renderTransaction(result); show("Canonical request exported."); } catch (error) { show(redactedError(error), true); }
+const tx = (id, command, args = () => ({ slateId: requiredId() })) => byId(id).addEventListener("click", async () => {
+  try { renderTransaction(await run(() => invoke(command, args()))); show(`${command.replaceAll("_", " ")} completed.`); }
+  catch (error) { show(redactedError(error), true); }
 });
-document.querySelector("#request-qr").addEventListener("click", () => showQr(false).catch((error) => show(redactedError(error), true)));
-document.querySelector("#request-import").addEventListener("click", async () => {
-  const text = transactionText.value;
-  try { renderTransaction(await withPending(() => productionInvoke("slate_request_import", { text }))); show("Request imported. Review it before preparing a response."); } catch (error) { show(redactedError(error), true); } finally { clearSlateText(); clearQrExport(); await releaseCamera(); }
+tx("request-export", "slate_request_export", () => ({ slateId: requiredId() }));
+tx("request-import", "slate_request_import", () => ({ text: requiredSlate() }));
+tx("response-create", "slate_response_create");
+tx("response-export", "slate_response_export");
+tx("response-import", "slate_response_import", () => ({ text: requiredSlate() }));
+tx("transaction-finalize", "transaction_finalize");
+tx("transaction-submit", "transaction_submit");
+tx("transaction-retry", "transaction_retry_submission");
+tx("transaction-reconcile", "transaction_reconcile_submission");
+tx("transaction-cancel", "transaction_cancel", () => ({ slateId: requiredId(), confirmExported: window.confirm("Cancel this payment and retain its consumed recovery coordinate?") }));
+
+const renderHistory = async () => {
+  const transactions = await invoke("transaction_list");
+  const nodes = transactions.map((transaction) => { const node = document.createElement("article"); node.className = "history-item"; node.textContent = `${transaction.state} · ${transaction.amount} noms · ${transaction.slate_id}`; return node; });
+  byId("history-output").replaceChildren(...nodes);
+  renderTransaction(transactions);
+};
+byId("history-refresh").addEventListener("click", () => run(renderHistory).catch((error) => show(redactedError(error), true)));
+byId("transaction-list").addEventListener("click", () => run(renderHistory).catch((error) => show(redactedError(error), true)));
+
+const canvas = byId("slate-qr-canvas");
+const qrMeta = byId("slate-qr-meta");
+const video = byId("slate-qr-video");
+const drawQr = async () => { if (!qrFrames.length) return; await QRCode.toCanvas(canvas, qrFrames[qrIndex], { errorCorrectionLevel: "M", margin: 2, width: 360 }); qrMeta.textContent = `Frame ${qrIndex + 1} of ${qrFrames.length}`; };
+const exportQr = async (response) => { const result = await run(() => invoke("slate_qr_encode", { slateId: requiredId(), response })); qrFrames = result.frames; qrIndex = 0; await drawQr(); };
+const stopScanner = async () => { if (scanner) { scanner.stop(); scanner.destroy(); scanner = undefined; } video.srcObject = null; try { await invoke("slate_qr_reassembly_clear"); } catch { /* lifecycle may already be closed */ } };
+byId("request-qr").addEventListener("click", () => exportQr(false).catch((error) => show(redactedError(error), true)));
+byId("response-qr").addEventListener("click", () => exportQr(true).catch((error) => show(redactedError(error), true)));
+byId("qr-next").addEventListener("click", () => { if (qrFrames.length) { qrIndex = (qrIndex + 1) % qrFrames.length; drawQr(); } });
+byId("qr-previous").addEventListener("click", () => { if (qrFrames.length) { qrIndex = (qrIndex + qrFrames.length - 1) % qrFrames.length; drawQr(); } });
+byId("qr-clear").addEventListener("click", () => { qrFrames = []; canvas.getContext("2d").clearRect(0, 0, canvas.width, canvas.height); qrMeta.textContent = "No QR export shown."; });
+byId("qr-cancel").addEventListener("click", () => stopScanner());
+byId("qr-scan").addEventListener("click", async () => {
+  await stopScanner();
+  scanner = new QrScanner(video, async (scan) => { const decoded = await invoke("slate_qr_decode_frame", { frame: scan.data }); if (decoded.complete_text) { slateText.value = decoded.complete_text; await stopScanner(); } }, { preferredCamera: "environment", returnDetailedScanResult: true });
+  try { await scanner.start(); } catch (error) { await stopScanner(); show(redactedError(error), true); }
 });
-document.querySelector("#response-create").addEventListener("click", async () => {
-  if (!window.confirm("Create the recipient output and response for this request?")) return;
-  try { renderTransaction(await withPending(() => productionInvoke("slate_response_create", { slateId: requiredSlateId() }))); show("Recipient response prepared."); } catch (error) { show(redactedError(error), true); }
-});
-document.querySelector("#response-export").addEventListener("click", async () => {
-  if (!window.confirm("Export this recipient response?")) return;
-  try { const result = await withPending(() => productionInvoke("slate_response_export", { slateId: requiredSlateId() })); transactionText.value = result.text; renderTransaction(result); show("Canonical response exported."); } catch (error) { show(redactedError(error), true); }
-});
-document.querySelector("#response-qr").addEventListener("click", () => showQr(true).catch((error) => show(redactedError(error), true)));
-document.querySelector("#response-import").addEventListener("click", async () => {
-  const text = transactionText.value;
-  try { renderTransaction(await withPending(() => productionInvoke("slate_response_import", { text }))); show("Response imported."); } catch (error) { show(redactedError(error), true); } finally { clearSlateText(); clearQrExport(); await releaseCamera(); }
-});
-document.querySelector("#transaction-finalize").addEventListener("click", async () => {
-  if (!window.confirm("Finalize this DOM transaction?")) return;
-  try { renderTransaction(await withPending(() => productionInvoke("transaction_finalize", { slateId: requiredSlateId() }))); show("Transaction finalized and stored."); } catch (error) { show(redactedError(error), true); }
-});
-document.querySelector("#transaction-submit").addEventListener("click", async () => {
-  if (!window.confirm("Submit the immutable finalized transaction to the configured node?")) return;
-  try { renderTransaction(await withPending(() => productionInvoke("transaction_submit", { slateId: requiredSlateId() }))); show("Submission result recorded."); } catch (error) { show(redactedError(error), true); }
-});
-document.querySelector("#transaction-retry").addEventListener("click", async () => {
-  if (!window.confirm("Retry submission using the same finalized bytes?")) return;
-  try { renderTransaction(await withPending(() => productionInvoke("transaction_retry_submission", { slateId: requiredSlateId() }))); show("Submission retry recorded."); } catch (error) { show(redactedError(error), true); }
-});
-document.querySelector("#transaction-cancel").addEventListener("click", async () => {
-  if (!window.confirm("Cancel this pre-submission transaction and release only safe reservations?")) return;
-  try { renderTransaction(await withPending(() => productionInvoke("transaction_cancel", { slateId: requiredSlateId(), confirmExported: true }))); show("Transaction cancellation recorded."); } catch (error) { show(redactedError(error), true); }
-});
-document.querySelector("#transaction-list").addEventListener("click", async () => {
-  try { redactedJson(transactionOutput, await withPending(() => productionInvoke("transaction_list"))); } catch (error) { show(redactedError(error), true); }
-});
-document.querySelector("#qr-scan").addEventListener("click", () => startScanner());
-document.querySelector("#qr-cancel").addEventListener("click", () => releaseCamera());
-document.querySelector("#qr-next").addEventListener("click", async () => { if (qrFrames.length) { qrFrameIndex = (qrFrameIndex + 1) % qrFrames.length; await renderQrFrame(); } });
-document.querySelector("#qr-previous").addEventListener("click", async () => { if (qrFrames.length) { qrFrameIndex = (qrFrameIndex + qrFrames.length - 1) % qrFrames.length; await renderQrFrame(); } });
-document.querySelector("#qr-animate").addEventListener("click", () => { stopQrAnimation(); if (qrFrames.length > 1) qrAnimation = setInterval(() => { qrFrameIndex = (qrFrameIndex + 1) % qrFrames.length; renderQrFrame(); }, 1400); });
-document.querySelector("#qr-pause").addEventListener("click", stopQrAnimation);
-document.querySelector("#qr-clear").addEventListener("click", async () => { clearQrExport(); clearSlateText(); await releaseCamera(); });
-window.addEventListener("beforeunload", releaseCamera, { once: true });
-export { productionInvoke, refreshSummary };
+byId("qr-animate").addEventListener("click", () => show("Single canonical QR frame requires no animation."));
+byId("qr-pause").addEventListener("click", () => show("QR presentation paused."));
+
+invoke("application_status").then((result) => show(`Application state: ${result.state}.`)).catch((error) => show(redactedError(error), true));
+const refresh = async () => { try { await refreshNode(); } catch { /* wallet or node may not be open */ } refreshTimer = setTimeout(refresh, 15000); };
+refreshTimer = setTimeout(refresh, 15000);
+window.addEventListener("beforeunload", () => { clearTimeout(refreshTimer); clearPhrase(); clearSecretForms(); stopScanner(); }, { once: true });

@@ -6,7 +6,11 @@ authors.workspace = true
 
 [dependencies]
 dom-wallet-core = { path = "../crates/dom-wallet-core" }
+dom-wallet-core-api.workspace = true
+dom-wallet-core-restore = { path = "../crates/dom-wallet-core-restore" }
+dom-wallet-core-sync = { path = "../crates/dom-wallet-core-sync" }
 dom-wallet-domain = { path = "../crates/dom-wallet-domain" }
+dom-wallet-embedded-core = { path = "../crates/dom-wallet-embedded-core" }
 hex.workspace = true
 serde.workspace = true
 sha2.workspace = true

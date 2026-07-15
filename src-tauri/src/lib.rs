@@ -7,28 +7,35 @@
 //! names without moving domain, storage, cryptographic, or sync logic here.
 
 use dom_wallet_core::{
-    CoreError, DiagnosticSnapshot, FeeEstimate, ProbeResult, SlateExport, TransactionSummary,
-    WalletService, WalletSummary,
+    BackupStatus, CoreError, DiagnosticSnapshot, FeeEstimate, RecoveryCreateResult,
+    RecoveryRestoreResult, SlateExport, TransactionSummary, WalletService, WalletSummary,
 };
-use dom_wallet_domain::{NetworkIdentity, NodeConfiguration, RedactedNodeConfiguration};
+use dom_wallet_core_api::CoreNetwork;
+use dom_wallet_domain::{BalanceProjection, Network, NetworkIdentity};
+use dom_wallet_embedded_core::{EmbeddedCoreConfiguration, EmbeddedCoreNetwork};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Mutex,
 };
+use std::{net::SocketAddr, path::Path};
 use thiserror::Error;
 
 pub struct DesktopApplication {
     service: Mutex<WalletService>,
     qr_reassembler: Mutex<Option<String>>,
+    node_started: AtomicBool,
     shutdown: AtomicBool,
 }
 
-pub const COMMAND_NAMES: [&str; 37] = [
+pub const COMMAND_NAMES: [&str; 42] = [
     "application_status",
-    "wallet_create",
+    "wallet_create_recoverable",
+    "wallet_restore_from_mnemonic",
+    "wallet_backup_export",
+    "wallet_backup_import",
+    "wallet_recovery_phrase_confirm",
     "wallet_open",
     "wallet_unlock",
     "wallet_lock",
@@ -36,9 +43,8 @@ pub const COMMAND_NAMES: [&str; 37] = [
     "wallet_summary",
     "account_list",
     "account_summary",
-    "node_configuration_get_redacted",
-    "node_configuration_set",
-    "node_probe",
+    "embedded_node_start",
+    "embedded_node_status",
     "synchronization_start",
     "synchronization_pause",
     "synchronization_resume",
@@ -47,6 +53,7 @@ pub const COMMAND_NAMES: [&str; 37] = [
     "diagnostics_redacted",
     "application_shutdown",
     "transaction_fee_estimate",
+    "wallet_address_validate",
     "transaction_send_create",
     "slate_request_export",
     "slate_request_import",
@@ -57,6 +64,7 @@ pub const COMMAND_NAMES: [&str; 37] = [
     "transaction_finalize",
     "transaction_submit",
     "transaction_retry_submission",
+    "transaction_reconcile_submission",
     "transaction_cancel",
     "transaction_list",
     "transaction_detail_redacted",
@@ -71,6 +79,7 @@ impl Default for DesktopApplication {
         Self {
             service: Mutex::new(WalletService::default()),
             qr_reassembler: Mutex::new(None),
+            node_started: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
         }
     }
@@ -82,6 +91,111 @@ pub struct ApplicationStatusDto {
     pub state: String,
     pub experimental: bool,
     pub unaudited: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum EmbeddedNetworkDto {
+    Mainnet,
+    Testnet,
+    Regtest,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddedNodeStartDto {
+    pub network: EmbeddedNetworkDto,
+    pub data_directory: String,
+    pub listen_address: String,
+    pub maximum_inbound_peers: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum WalletReadinessDto {
+    Stopped,
+    Starting,
+    Synchronizing,
+    Ready,
+    NotReady,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddedNodeStatusDto {
+    pub lifecycle: WalletReadinessDto,
+    pub network: Option<String>,
+    pub chain_id: Option<String>,
+    pub genesis_hash: Option<String>,
+    pub canonical_tip_height: Option<u64>,
+    pub canonical_tip_hash: Option<String>,
+    pub protocol_version: Option<u32>,
+    pub range_proof_version: Option<u8>,
+    pub ready: bool,
+    pub error_code: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryCreateDto {
+    pub wallet: WalletSummary,
+    pub mnemonic: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RecoveryCompletionDto {
+    OwnedOutputsRecovered,
+    NoOwnedOutputs,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryResultDto {
+    pub wallet: WalletSummary,
+    pub completion: RecoveryCompletionDto,
+    pub scanned_blocks: u64,
+    pub scanned_outputs: u64,
+    pub owned_outputs: u64,
+    pub spent_outputs: u64,
+    pub unspent_outputs: u64,
+    pub coinbase_outputs: u64,
+    pub legacy_outputs: u64,
+    pub balance: BalanceProjection,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SubmissionOutcomeDto {
+    Accepted,
+    AcceptedNotRelayed,
+    AlreadyKnown,
+    RejectedInvalid,
+    RejectedFee,
+    RejectedDoubleSpend,
+    RejectedImmatureCoinbase,
+    RejectedExpired,
+    RejectedPolicy,
+    NodeNotReady,
+    TemporaryFailure,
+    InternalFailure,
+    Confirmed,
+    Reorged,
+    Cancelled,
+    Other,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmissionResultDto {
+    pub transaction: TransactionSummary,
+    pub outcome: SubmissionOutcomeDto,
+    pub retryable: bool,
+    pub accepted: bool,
+    pub relayed: Option<bool>,
+    pub diagnostic_code: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -115,18 +229,127 @@ impl DesktopApplication {
         }
     }
 
-    pub fn wallet_create(
+    pub fn wallet_create_recoverable(
         &self,
         path: impl AsRef<Path>,
         password: &str,
-        identity: NetworkIdentity,
+    ) -> Result<RecoveryCreateDto, CommandError> {
+        self.ensure_running()?;
+        checked_password(password)?;
+        let result: RecoveryCreateResult = self
+            .service
+            .lock()
+            .map_err(|_| CommandError::Unavailable)?
+            .create_recoverable_for_embedded(path, password)
+            .map_err(CommandError::from)?;
+        Ok(RecoveryCreateDto {
+            wallet: result.wallet,
+            mnemonic: result.mnemonic.to_string(),
+        })
+    }
+
+    pub fn wallet_restore_from_mnemonic(
+        &self,
+        path: impl AsRef<Path>,
+        password: &str,
+        mnemonic: &str,
+    ) -> Result<RecoveryResultDto, CommandError> {
+        self.ensure_running()?;
+        checked_password(password)?;
+        if mnemonic.len() > 4096 {
+            return Err(CommandError::InvalidInput(
+                "recovery phrase is invalid".into(),
+            ));
+        }
+        let result: RecoveryRestoreResult = self
+            .service
+            .lock()
+            .map_err(|_| CommandError::Unavailable)?
+            .restore_from_mnemonic(path, password, mnemonic)
+            .map_err(CommandError::from)?;
+        let completion = match result.recovery.completion {
+            dom_wallet_core_restore::SeedRestoreCompletion::OwnedOutputsRecovered => {
+                RecoveryCompletionDto::OwnedOutputsRecovered
+            }
+            dom_wallet_core_restore::SeedRestoreCompletion::NoOwnedOutputs => {
+                RecoveryCompletionDto::NoOwnedOutputs
+            }
+        };
+        Ok(RecoveryResultDto {
+            wallet: result.wallet,
+            completion,
+            scanned_blocks: result.recovery.scanned_blocks,
+            scanned_outputs: result.recovery.scanned_outputs,
+            owned_outputs: result.recovery.owned_outputs,
+            spent_outputs: result.recovery.spent_outputs,
+            unspent_outputs: result.recovery.unspent_outputs,
+            coinbase_outputs: result.recovery.coinbase_outputs,
+            legacy_outputs: result.recovery.legacy_outputs,
+            balance: result.recovery.balance,
+            warnings: result
+                .recovery
+                .warnings
+                .into_iter()
+                .map(|warning| match warning {
+                    dom_wallet_core_restore::SeedRestoreWarning::LegacyBackupRequired => {
+                        "LEGACY_BACKUP_REQUIRED".into()
+                    }
+                    dom_wallet_core_restore::SeedRestoreWarning::OffChainMetadataNotRecoverableWithSeed => {
+                        "OFF_CHAIN_METADATA_NOT_RECOVERABLE_WITH_SEED".into()
+                    }
+                })
+                .collect(),
+        })
+    }
+
+    pub fn wallet_backup_export(
+        &self,
+        destination: impl AsRef<Path>,
+        backup_password: &str,
+    ) -> Result<BackupStatus, CommandError> {
+        self.ensure_running()?;
+        checked_password(backup_password)?;
+        self.service
+            .lock()
+            .map_err(|_| CommandError::Unavailable)?
+            .backup_export(destination, backup_password)
+            .map_err(CommandError::from)
+    }
+
+    pub fn wallet_backup_import(
+        &self,
+        destination: impl AsRef<Path>,
+        backup_path: impl AsRef<Path>,
+        backup_password: &str,
+        password: &str,
     ) -> Result<WalletSummary, CommandError> {
+        self.ensure_running()?;
+        checked_password(backup_password)?;
+        checked_password(password)?;
+        let mut service = self.service.lock().map_err(|_| CommandError::Unavailable)?;
+        let identity = domain_identity(
+            &service
+                .embedded_core_identity()
+                .map_err(CommandError::from)?,
+        );
+        service
+            .backup_import(
+                destination,
+                backup_path,
+                backup_password,
+                password,
+                identity,
+            )
+            .map_err(CommandError::from)
+    }
+
+    pub fn wallet_recovery_phrase_confirm(&self, password: &str) -> Result<(), CommandError> {
         self.ensure_running()?;
         checked_password(password)?;
         self.service
             .lock()
             .map_err(|_| CommandError::Unavailable)?
-            .create(path, password, identity)
+            .recovery_phrase_confirmed(password)
             .map_err(CommandError::from)
     }
 
@@ -165,7 +388,9 @@ impl DesktopApplication {
             .lock()
             .map_err(|_| CommandError::Unavailable)?
             .close()
-            .map_err(CommandError::from)
+            .map_err(CommandError::from)?;
+        self.node_started.store(false, Ordering::Release);
+        Ok(())
     }
     pub fn wallet_summary(&self) -> Result<WalletSummary, CommandError> {
         self.service
@@ -184,24 +409,72 @@ impl DesktopApplication {
     pub fn account_summary(&self) -> Result<WalletSummary, CommandError> {
         self.wallet_summary()
     }
-    pub fn node_configuration_get_redacted(
+    pub fn embedded_node_start(
         &self,
-    ) -> Result<RedactedNodeConfiguration, CommandError> {
+        request: EmbeddedNodeStartDto,
+    ) -> Result<EmbeddedNodeStatusDto, CommandError> {
+        self.ensure_running()?;
+        if self.node_started.load(Ordering::Acquire) {
+            return self.embedded_node_status();
+        }
+        if request.data_directory.is_empty() || request.data_directory.len() > 4096 {
+            return Err(CommandError::InvalidInput(
+                "embedded node data directory is invalid".into(),
+            ));
+        }
+        let listen_address: SocketAddr = request
+            .listen_address
+            .parse()
+            .map_err(|_| CommandError::InvalidInput("listen address is invalid".into()))?;
+        if request.maximum_inbound_peers == 0 || request.maximum_inbound_peers > 1_024 {
+            return Err(CommandError::InvalidInput("peer limit is invalid".into()));
+        }
+        let network = match request.network {
+            EmbeddedNetworkDto::Mainnet => EmbeddedCoreNetwork::Mainnet,
+            EmbeddedNetworkDto::Testnet => EmbeddedCoreNetwork::Testnet,
+            EmbeddedNetworkDto::Regtest => EmbeddedCoreNetwork::Regtest,
+        };
+        let configuration =
+            EmbeddedCoreConfiguration::new(network, request.data_directory, listen_address)
+                .with_maximum_inbound_peers(request.maximum_inbound_peers as usize);
         self.service
             .lock()
             .map_err(|_| CommandError::Unavailable)?
-            .node_configuration()
-            .map_err(CommandError::from)
+            .start_embedded_core(configuration)
+            .map_err(CommandError::from)?;
+        self.node_started.store(true, Ordering::Release);
+        self.embedded_node_status()
     }
-    pub fn node_configuration_set(
-        &self,
-        configuration: NodeConfiguration,
-    ) -> Result<(), CommandError> {
-        self.service
-            .lock()
-            .map_err(|_| CommandError::Unavailable)?
-            .set_node_configuration(configuration)
-            .map_err(CommandError::from)
+
+    pub fn embedded_node_status(&self) -> Result<EmbeddedNodeStatusDto, CommandError> {
+        if !self.node_started.load(Ordering::Acquire) {
+            return Ok(stopped_node_status());
+        }
+        let service = self.service.lock().map_err(|_| CommandError::Unavailable)?;
+        let identity = service
+            .embedded_core_identity()
+            .map_err(CommandError::from)?;
+        let ready = service.embedded_core_ready().unwrap_or(false);
+        let diagnostic = service.diagnostics();
+        let lifecycle = if ready {
+            WalletReadinessDto::Ready
+        } else if diagnostic.application_state == "SYNCHRONIZING" {
+            WalletReadinessDto::Synchronizing
+        } else {
+            WalletReadinessDto::Starting
+        };
+        Ok(EmbeddedNodeStatusDto {
+            lifecycle,
+            network: Some(core_network_name(identity.network).into()),
+            chain_id: Some(hex::encode(identity.chain_id)),
+            genesis_hash: Some(hex::encode(identity.genesis_hash)),
+            canonical_tip_height: Some(identity.current_tip.height),
+            canonical_tip_hash: Some(hex::encode(identity.current_tip.hash)),
+            protocol_version: Some(identity.protocol_version),
+            range_proof_version: Some(identity.range_proof_serialization_version),
+            ready,
+            error_code: diagnostic.last_error.map(|_| "CORE_NOT_READY".into()),
+        })
     }
     pub fn diagnostics_redacted(&self) -> DiagnosticSnapshot {
         self.service
@@ -216,15 +489,8 @@ impl DesktopApplication {
         self.clear_qr_buffers()?;
         let mut service = self.service.lock().map_err(|_| CommandError::Unavailable)?;
         let _ = service.close();
+        self.node_started.store(false, Ordering::Release);
         Ok(())
-    }
-
-    /// Legacy endpoint configuration has no authority after the embedded cutover.
-    pub fn node_probe_live(
-        &self,
-        _configuration: NodeConfiguration,
-    ) -> Result<ProbeResult, CommandError> {
-        Err(CommandError::Unavailable)
     }
     pub fn synchronization_pause(&self) -> Result<(), CommandError> {
         Ok(())
@@ -260,6 +526,9 @@ impl DesktopApplication {
         &self,
         amount: u64,
         requested_fee: Option<u64>,
+        sender_address: &str,
+        receiver_address: &str,
+        expires_at_height: u64,
     ) -> Result<TransactionSummary, CommandError> {
         self.ensure_running()?;
         if amount == 0 {
@@ -268,7 +537,22 @@ impl DesktopApplication {
         self.service
             .lock()
             .map_err(|_| CommandError::Unavailable)?
-            .transaction_send_create(amount, requested_fee)
+            .transaction_send_create_with_addresses(
+                amount,
+                requested_fee,
+                sender_address,
+                receiver_address,
+                expires_at_height,
+            )
+            .map_err(CommandError::from)
+    }
+
+    pub fn wallet_address_validate(&self, address: &str) -> Result<String, CommandError> {
+        self.ensure_running()?;
+        self.service
+            .lock()
+            .map_err(|_| CommandError::Unavailable)?
+            .validate_wallet_address(address)
             .map_err(CommandError::from)
     }
 
@@ -413,24 +697,39 @@ impl DesktopApplication {
     pub fn transaction_submit(
         &self,
         slate_id: uuid::Uuid,
-    ) -> Result<TransactionSummary, CommandError> {
+    ) -> Result<SubmissionResultDto, CommandError> {
         self.ensure_running()?;
         self.service
             .lock()
             .map_err(|_| CommandError::Unavailable)?
             .transaction_submit(slate_id)
+            .map(submission_result)
             .map_err(CommandError::from)
     }
 
     pub fn transaction_retry_submission(
         &self,
         slate_id: uuid::Uuid,
-    ) -> Result<TransactionSummary, CommandError> {
+    ) -> Result<SubmissionResultDto, CommandError> {
         self.ensure_running()?;
         self.service
             .lock()
             .map_err(|_| CommandError::Unavailable)?
             .transaction_retry_submission(slate_id)
+            .map(submission_result)
+            .map_err(CommandError::from)
+    }
+
+    pub fn transaction_reconcile_submission(
+        &self,
+        slate_id: uuid::Uuid,
+    ) -> Result<SubmissionResultDto, CommandError> {
+        self.ensure_running()?;
+        self.service
+            .lock()
+            .map_err(|_| CommandError::Unavailable)?
+            .transaction_reconcile_submission(slate_id)
+            .map(submission_result)
             .map_err(CommandError::from)
     }
 
@@ -473,6 +772,70 @@ impl DesktopApplication {
     }
 }
 
+fn stopped_node_status() -> EmbeddedNodeStatusDto {
+    EmbeddedNodeStatusDto {
+        lifecycle: WalletReadinessDto::Stopped,
+        network: None,
+        chain_id: None,
+        genesis_hash: None,
+        canonical_tip_height: None,
+        canonical_tip_hash: None,
+        protocol_version: None,
+        range_proof_version: None,
+        ready: false,
+        error_code: None,
+    }
+}
+
+fn core_network_name(network: CoreNetwork) -> &'static str {
+    match network {
+        CoreNetwork::Mainnet => "MAINNET",
+        CoreNetwork::Testnet => "TESTNET",
+        CoreNetwork::Regtest => "REGTEST",
+    }
+}
+
+fn domain_identity(identity: &dom_wallet_core_sync::CoreChainIdentity) -> NetworkIdentity {
+    NetworkIdentity {
+        network: match identity.network {
+            CoreNetwork::Mainnet => Network::Mainnet,
+            CoreNetwork::Testnet => Network::PublicTestnet,
+            CoreNetwork::Regtest => Network::PrivateTestnet,
+        },
+        chain_id: identity.chain_id,
+        genesis_id: identity.genesis_hash,
+    }
+}
+
+fn submission_result(transaction: TransactionSummary) -> SubmissionResultDto {
+    let (outcome, retryable, accepted, relayed) = match transaction.state.as_str() {
+        "SUBMITTED" => (SubmissionOutcomeDto::Accepted, false, true, Some(true)),
+        "ACCEPTED_NOT_RELAYED" => (
+            SubmissionOutcomeDto::AcceptedNotRelayed,
+            true,
+            true,
+            Some(false),
+        ),
+        "IN_MEMPOOL" => (SubmissionOutcomeDto::AlreadyKnown, false, true, None),
+        "RETRANSMIT_REQUIRED" | "RECONCILIATION_REQUIRED" => {
+            (SubmissionOutcomeDto::TemporaryFailure, true, false, None)
+        }
+        "CONFIRMED" => (SubmissionOutcomeDto::Confirmed, false, true, None),
+        "REORGED" => (SubmissionOutcomeDto::Reorged, true, false, None),
+        "CANCELLED" => (SubmissionOutcomeDto::Cancelled, false, false, None),
+        "FAILED" => (SubmissionOutcomeDto::InternalFailure, false, false, None),
+        _ => (SubmissionOutcomeDto::Other, false, false, None),
+    };
+    SubmissionResultDto {
+        transaction,
+        outcome,
+        retryable,
+        accepted,
+        relayed,
+        diagnostic_code: None,
+    }
+}
+
 fn checked_password(value: &str) -> Result<(), CommandError> {
     if value.len() < 8 || value.len() > 1024 {
         Err(CommandError::InvalidInput(
@@ -503,6 +866,40 @@ pub enum CommandError {
     Wallet,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandErrorDto {
+    pub code: String,
+    pub category: String,
+    pub message: String,
+    pub retryable: bool,
+}
+
+impl From<CommandError> for CommandErrorDto {
+    fn from(value: CommandError) -> Self {
+        match value {
+            CommandError::InvalidInput(_) => Self {
+                code: "INVALID_INPUT".into(),
+                category: "VALIDATION".into(),
+                message: "The provided value is invalid.".into(),
+                retryable: false,
+            },
+            CommandError::Unavailable => Self {
+                code: "APPLICATION_UNAVAILABLE".into(),
+                category: "TEMPORARY".into(),
+                message: "The embedded wallet service is unavailable.".into(),
+                retryable: true,
+            },
+            CommandError::Wallet => Self {
+                code: "WALLET_OPERATION_FAILED".into(),
+                category: "WALLET".into(),
+                message: "The wallet operation failed.".into(),
+                retryable: false,
+            },
+        }
+    }
+}
+
 impl From<CoreError> for CommandError {
     fn from(_: CoreError) -> Self {
         Self::Wallet
@@ -526,11 +923,17 @@ mod tests {
         let unique = COMMAND_NAMES
             .iter()
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(unique.len(), 37);
+        assert_eq!(unique.len(), 42);
         for required in [
             "application_status",
-            "wallet_create",
-            "node_probe",
+            "wallet_create_recoverable",
+            "wallet_restore_from_mnemonic",
+            "wallet_backup_export",
+            "wallet_backup_import",
+            "wallet_recovery_phrase_confirm",
+            "embedded_node_start",
+            "embedded_node_status",
+            "wallet_address_validate",
             "application_shutdown",
             "transaction_send_create",
             "transaction_submit",
@@ -588,7 +991,9 @@ mod tests {
         ] {
             assert!(COMMAND_NAMES.contains(&command));
         }
-        let error = app.transaction_send_create(42, None).unwrap_err();
+        let error = app
+            .transaction_send_create(42, None, "invalid", "invalid", 100)
+            .unwrap_err();
         assert_eq!(error.to_string(), "wallet operation failed");
         assert!(app.slate_request_import("invalid=not-a-slate").is_err());
         assert!(!format!("{error:?}").contains("password"));

@@ -6,7 +6,8 @@ use dom_consensus::Transaction;
 use dom_serialization::{DomDeserialize, DomSerialize};
 use dom_wallet_core_api::WalletScanCursor;
 use dom_wallet_core_protocol::{
-    CanonicalSlate, ProtocolAdapterError, SlatePhase, WalletAddress, WalletTransactionShape,
+    AddressIdentityPurpose, CanonicalSlate, ProtocolAdapterError, SlatePhase, WalletAddress,
+    WalletTransactionShape,
 };
 use dom_wallet_core_recovery::{
     finalize_recoverable_transaction, CanonicalWalletSeed, RecoverableOutputBuilder,
@@ -137,6 +138,13 @@ pub struct RecoveryRestoreResult {
     pub recovery: SeedRestoreResult,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupStatus {
+    pub format_version: u16,
+    pub destination_name: String,
+}
+
 pub struct WalletService {
     location: Option<WalletDirectory>,
     metadata: Option<WalletMetadata>,
@@ -220,6 +228,28 @@ impl WalletService {
         })
     }
 
+    pub fn create_recoverable_for_embedded(
+        &mut self,
+        path: impl AsRef<Path>,
+        password: &str,
+    ) -> Result<RecoveryCreateResult, CoreError> {
+        let identity = self
+            .backend
+            .as_ref()
+            .ok_or(CoreError::EmbeddedCoreRequired)?
+            .identity()
+            .clone();
+        self.create_recoverable(
+            path,
+            password,
+            NetworkIdentity {
+                network: map_network(identity.network),
+                chain_id: identity.chain_id,
+                genesis_id: identity.genesis_hash,
+            },
+        )
+    }
+
     pub fn open(&mut self, path: impl AsRef<Path>) -> Result<WalletSummary, CoreError> {
         self.ensure_closed()?;
         let directory = WalletDirectory::open(path)?;
@@ -278,6 +308,37 @@ impl WalletService {
         Ok(result)
     }
 
+    pub fn embedded_core_identity(&self) -> Result<CoreChainIdentity, CoreError> {
+        self.backend
+            .as_ref()
+            .map(|backend| backend.identity().clone())
+            .ok_or(CoreError::EmbeddedCoreRequired)
+    }
+
+    pub fn embedded_core_ready(&self) -> Result<bool, CoreError> {
+        self.backend
+            .as_ref()
+            .ok_or(CoreError::EmbeddedCoreRequired)?
+            .is_ready()
+            .map_err(CoreError::from)
+    }
+
+    pub fn validate_wallet_address(&self, address: &str) -> Result<String, CoreError> {
+        let network = self
+            .backend
+            .as_ref()
+            .ok_or(CoreError::EmbeddedCoreRequired)?
+            .identity()
+            .network;
+        WalletAddress::parse(
+            address,
+            network,
+            AddressIdentityPurpose::TransactionInteraction,
+        )
+        .map(|value| value.encode())
+        .map_err(CoreError::from)
+    }
+
     pub fn restore_from_mnemonic(
         &mut self,
         path: impl AsRef<Path>,
@@ -298,6 +359,78 @@ impl WalletService {
             wallet: self.summary_locked()?,
             recovery,
         })
+    }
+
+    pub fn recovery_phrase_confirmed(&mut self, password: &str) -> Result<(), CoreError> {
+        if self.state != ApplicationState::Locked {
+            return Err(CoreError::InvalidLifecycleState);
+        }
+        validate_password(password)?;
+        let location = self.location.as_ref().ok_or(CoreError::WalletNotOpen)?;
+        let mut state = location.load(password)?;
+        let recovery = state
+            .recovery
+            .as_mut()
+            .ok_or(CoreError::RecoveryUnavailable)?;
+        recovery.phrase_confirmed = true;
+        let expected = state.generation;
+        let committed = location.commit(expected, state, password, self.kdf)?;
+        self.metadata = Some(location.metadata()?);
+        debug_assert!(committed.recovery.is_some());
+        Ok(())
+    }
+
+    pub fn backup_export(
+        &self,
+        destination: impl AsRef<Path>,
+        backup_password: &str,
+    ) -> Result<BackupStatus, CoreError> {
+        validate_password(backup_password)?;
+        let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
+        let password = self.password.as_ref().ok_or(CoreError::Locked)?;
+        let wallet_password = std::str::from_utf8(password.expose_for_crypto())
+            .map_err(|_| CoreError::InvalidPassword)?;
+        let name = destination
+            .as_ref()
+            .file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .ok_or(CoreError::InvalidBackupDestination)?
+            .to_owned();
+        self.location
+            .as_ref()
+            .ok_or(CoreError::WalletNotOpen)?
+            .export_backup(wallet_password, backup_password, self.kdf, destination)?;
+        let _ = state.wallet_id;
+        Ok(BackupStatus {
+            format_version: dom_wallet_storage::BACKUP_FORMAT_VERSION,
+            destination_name: name,
+        })
+    }
+
+    pub fn backup_import(
+        &mut self,
+        destination: impl AsRef<Path>,
+        backup_path: impl AsRef<Path>,
+        backup_password: &str,
+        wallet_password: &str,
+        expected_identity: NetworkIdentity,
+    ) -> Result<WalletSummary, CoreError> {
+        self.ensure_closed()?;
+        validate_password(backup_password)?;
+        validate_password(wallet_password)?;
+        let directory = WalletDirectory::import_backup(
+            destination,
+            backup_path,
+            backup_password,
+            wallet_password,
+            &expected_identity,
+            self.kdf,
+        )?;
+        self.metadata = Some(directory.metadata()?);
+        self.location = Some(directory);
+        self.state = ApplicationState::Locked;
+        self.summary_locked()
     }
 
     pub fn lock(&mut self) -> Result<(), CoreError> {
@@ -664,6 +797,40 @@ impl WalletService {
         self.commit(state)?;
         self.sender_secrets = Some((public_slate_id, sender_parts));
         self.transaction_summary(transaction_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn transaction_send_create_with_addresses(
+        &mut self,
+        amount: u64,
+        requested_fee: Option<u64>,
+        sender_address: &str,
+        receiver_address: &str,
+        expires_at_height: u64,
+    ) -> Result<TransactionSummary, CoreError> {
+        let network = self
+            .backend
+            .as_ref()
+            .ok_or(CoreError::EmbeddedCoreRequired)?
+            .identity()
+            .network;
+        let sender = WalletAddress::parse(
+            sender_address,
+            network,
+            AddressIdentityPurpose::TransactionInteraction,
+        )?;
+        let receiver = WalletAddress::parse(
+            receiver_address,
+            network,
+            AddressIdentityPurpose::TransactionInteraction,
+        )?;
+        self.transaction_send_create_recoverable(
+            amount,
+            requested_fee,
+            &sender,
+            &receiver,
+            expires_at_height,
+        )
     }
 
     pub fn slate_request_export(&mut self, slate_id: Uuid) -> Result<SlateExport, CoreError> {
@@ -1499,6 +1666,10 @@ pub enum CoreError {
     RecoveryCeremonyRequired,
     #[error("recovery phrase is invalid")]
     RecoveryPhraseInvalid,
+    #[error("wallet is not eligible for mnemonic recovery")]
+    RecoveryUnavailable,
+    #[error("backup destination is invalid")]
+    InvalidBackupDestination,
     #[error("embedded DOM Core must be running")]
     EmbeddedCoreRequired,
     #[error("embedded DOM Core is not ready")]
@@ -1584,6 +1755,66 @@ pub const PRODUCTION_REACHABILITY: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn backup_identity() -> NetworkIdentity {
+        NetworkIdentity {
+            network: Network::PrivateTestnet,
+            chain_id: [1; 32],
+            genesis_id: [2; 32],
+        }
+    }
+
+    #[test]
+    fn backup_round_trip_preserves_existing_state_and_rejects_wrong_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let wallet_path = temp.path().join("wallet");
+        let backup_path = temp.path().join("wallet.dombackup");
+        let mut service = WalletService {
+            kdf: KdfParameters::TEST,
+            ..Default::default()
+        };
+        let created = service
+            .create_recoverable(&wallet_path, "password-1", backup_identity())
+            .unwrap();
+        service.unlock("password-1").unwrap();
+        service
+            .backup_export(&backup_path, "backup-password")
+            .unwrap();
+        service.close().unwrap();
+
+        let mut imported = WalletService {
+            kdf: KdfParameters::TEST,
+            ..Default::default()
+        };
+        let summary = imported
+            .backup_import(
+                temp.path().join("imported"),
+                &backup_path,
+                "backup-password",
+                "password-2",
+                backup_identity(),
+            )
+            .unwrap();
+        assert_eq!(summary.wallet_id, created.wallet.wallet_id);
+        imported.close().unwrap();
+
+        let mut wrong_identity = backup_identity();
+        wrong_identity.chain_id[0] ^= 1;
+        let mut rejected = WalletService {
+            kdf: KdfParameters::TEST,
+            ..Default::default()
+        };
+        assert!(matches!(
+            rejected.backup_import(
+                temp.path().join("wrong-identity"),
+                &backup_path,
+                "backup-password",
+                "password-3",
+                wrong_identity,
+            ),
+            Err(CoreError::Storage(StorageError::IdentityMismatch))
+        ));
+    }
 
     #[test]
     fn no_legacy_production_reachability() {
