@@ -3,6 +3,7 @@ name = "dom-wallet-storage"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license.workspace = true
 
 [dependencies]
 dom-wallet-crypto = { path = "../dom-wallet-crypto" }

@@ -3,6 +3,7 @@ name = "dom-wallet-tauri-shell"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license.workspace = true
 
 [dependencies]
 dom-wallet-core = { path = "../crates/dom-wallet-core" }

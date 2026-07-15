@@ -1764,15 +1764,18 @@ mod tests {
         }
     }
 
+    fn test_service() -> WalletService {
+        let mut service = WalletService::default();
+        service.kdf = KdfParameters::TEST;
+        service
+    }
+
     #[test]
     fn backup_round_trip_preserves_existing_state_and_rejects_wrong_identity() {
         let temp = tempfile::tempdir().unwrap();
         let wallet_path = temp.path().join("wallet");
         let backup_path = temp.path().join("wallet.dombackup");
-        let mut service = WalletService {
-            kdf: KdfParameters::TEST,
-            ..Default::default()
-        };
+        let mut service = test_service();
         let created = service
             .create_recoverable(&wallet_path, "password-1", backup_identity())
             .unwrap();
@@ -1782,10 +1785,7 @@ mod tests {
             .unwrap();
         service.close().unwrap();
 
-        let mut imported = WalletService {
-            kdf: KdfParameters::TEST,
-            ..Default::default()
-        };
+        let mut imported = test_service();
         let summary = imported
             .backup_import(
                 temp.path().join("imported"),
@@ -1800,10 +1800,7 @@ mod tests {
 
         let mut wrong_identity = backup_identity();
         wrong_identity.chain_id[0] ^= 1;
-        let mut rejected = WalletService {
-            kdf: KdfParameters::TEST,
-            ..Default::default()
-        };
+        let mut rejected = test_service();
         assert!(matches!(
             rejected.backup_import(
                 temp.path().join("wrong-identity"),

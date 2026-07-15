@@ -1,0 +1,227 @@
+name: Validate and package DOM Wallet
+
+on:
+  push:
+    tags:
+      - "wallet-v*"
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Publish a release (tag events only; ignored for branch validation)"
+        required: true
+        default: false
+        type: boolean
+      validation_only:
+        description: "Run validation without native packaging"
+        required: true
+        default: false
+        type: boolean
+      release_version:
+        description: "Optional expected version (must equal the application version)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dom-wallet-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: "1"
+  RUST_TEST_THREADS: "1"
+  RAYON_NUM_THREADS: "1"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: stable
+          components: clippy,rustfmt
+      - name: Validate workflow syntax with pinned actionlint
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=actionlint_1.7.7_linux_amd64.tar.gz
+          curl --fail --location --silent --show-error \
+            "https://github.com/rhysd/actionlint/releases/download/v1.7.7/${archive}" \
+            --output "/tmp/${archive}"
+          echo "023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757  /tmp/${archive}" | sha256sum --check
+          tar -xzf "/tmp/${archive}" -C /tmp actionlint
+          /tmp/actionlint .github/workflows/release-wallet.yml
+      - name: Verify source, event, and version binding
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
+          FRONTEND_VERSION="$(node -p 'require("./frontend/package.json").version')"
+          test -n "$VERSION"
+          test "$VERSION" = "$FRONTEND_VERSION"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            test "$GITHUB_REF_TYPE" = "tag"
+            [[ "$GITHUB_REF_NAME" == wallet-v* ]]
+            test "${GITHUB_REF_NAME#wallet-v}" = "$VERSION"
+            test "$(git rev-parse "${GITHUB_REF}^{commit}")" = "$GITHUB_SHA"
+          else
+            test "${{ inputs.publish_release }}" = "false"
+            if [[ -n "${{ inputs.release_version }}" ]]; then
+              test "${{ inputs.release_version }}" = "$VERSION"
+            fi
+          fi
+      - name: Install locked frontend dependencies
+        run: npm ci --prefix frontend
+      - name: Test and build frontend
+        run: npm test --prefix frontend && npm run build --prefix frontend
+      - name: Validate locked Rust workspace
+        run: |
+          cargo metadata --locked --format-version 1 > /tmp/cargo-metadata.json
+          cargo tree --locked > /tmp/cargo-tree.txt
+          cargo fmt --all --check
+          cargo clippy --locked -p dom-wallet-tauri-shell --all-targets -- -D warnings
+          cargo test --locked -p dom-wallet-production-backend -- --test-threads=1
+          cargo test --locked -p dom-wallet-core-restore -- --test-threads=1
+          cargo test --locked -p dom-wallet-tauri-shell --lib -- --test-threads=1
+      - name: Audit Rust dependency policy
+        run: |
+          cargo install --locked cargo-audit --version 0.22.2
+          cargo install --locked cargo-deny --version 0.19.9
+          cargo audit
+          cargo deny check
+      - name: Validate release workflow contract
+        run: npm test --prefix frontend -- --test-name-pattern="release workflow"
+
+  package:
+    if: github.event_name == 'push' || !inputs.validation_only
+    needs: validate
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            bundles: appimage,deb,rpm
+            artifact: dom-wallet-linux-x86_64
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            bundles: nsis,msi
+            artifact: dom-wallet-windows-x86_64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            bundles: dmg,app
+            artifact: dom-wallet-macos-aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+      - name: Install Linux bundle dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential clang cmake libappindicator3-dev librsvg2-dev libssl-dev libwebkit2gtk-4.1-dev patchelf pkg-config rpm
+      - name: Install and test frontend
+        run: npm ci --prefix frontend && npm test --prefix frontend && npm run build --prefix frontend
+      - name: Build unsigned native installers
+        uses: tauri-apps/tauri-action@fce9c6108b31ea247710505d3aaaa893ee6768d4
+        with:
+          projectPath: src-tauri
+          args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} -- --locked
+      - name: Archive macOS application bundle
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="$(find src-tauri/target/${{ matrix.target }}/release/bundle/macos -maxdepth 1 -name '*.app' -print -quit)"
+          test -n "$APP"
+          tar -C "$(dirname "$APP")" -czf "${APP}.tar.gz" "$(basename "$APP")"
+      - name: Require installer families and create checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="src-tauri/target/${{ matrix.target }}/release/bundle"
+          case "$RUNNER_OS" in
+            Linux) for ext in AppImage deb rpm; do find "$ROOT" -type f -name "*.${ext}" -print -quit | grep -q .; done ;;
+            Windows) for ext in exe msi; do find "$ROOT" -type f -name "*.${ext}" -print -quit | grep -q .; done ;;
+            macOS) find "$ROOT" -type f -name '*.dmg' -print -quit | grep -q .; find "$ROOT" -type f -name '*.app.tar.gz' -print -quit | grep -q . ;;
+          esac
+          ROOT="$ROOT" TARGET="${{ matrix.target }}" node <<'NODE'
+          const { createHash } = require("node:crypto");
+          const { readdirSync, readFileSync, statSync, writeFileSync } = require("node:fs");
+          const { join, relative } = require("node:path");
+          const root = process.env.ROOT;
+          const suffixes = [".AppImage", ".deb", ".rpm", ".exe", ".msi", ".dmg", ".app.tar.gz"];
+          const files = [];
+          const visit = (directory) => readdirSync(directory).forEach((name) => {
+            const path = join(directory, name);
+            if (statSync(path).isDirectory()) visit(path);
+            else if (suffixes.some((suffix) => name.endsWith(suffix))) files.push(path);
+          });
+          visit(root);
+          const lines = files.sort().map((path) => {
+            const digest = createHash("sha256").update(readFileSync(path)).digest("hex");
+            return `${digest}  ${relative(root, path).replaceAll("\\\\", "/")}`;
+          });
+          if (lines.length === 0) throw new Error("no release artifacts found");
+          writeFileSync(join(root, `SHA256SUMS-${process.env.TARGET}.txt`), `${lines.join("\n")}\n`);
+          NODE
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ matrix.artifact }}-${{ github.sha }}
+          path: src-tauri/target/${{ matrix.target }}/release/bundle/**
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/wallet-v')
+    needs: [validate, package]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: release-assets
+      - name: Aggregate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          find release-assets -type f ! -name 'SHA256SUMS-*' -print0 | sort -z | xargs -0 sha256sum > release-assets/SHA256SUMS.txt
+      - name: Publish experimental release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/release-notes.md <<'NOTES'
+          DOM and DOM Wallet are experimental software. DOM initially has no monetary value. Do not use real funds. There is no guarantee of fitness, availability, or absence of defects. Store seed phrases securely and never share them. Installers are unsigned, so operating-system warnings are expected.
+          NOTES
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "DOM Wallet ${GITHUB_REF_NAME#wallet-v}" --notes-file /tmp/release-notes.md release-assets/**/* release-assets/SHA256SUMS.txt
