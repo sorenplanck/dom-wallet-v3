@@ -31,3 +31,9 @@ test("release workflow provides pinned experimental dry-run packaging", async ()
   assert.equal(workflow.includes("dom-wallet-v1"), false);
   assert.equal(workflow.includes("dom-wallet-v2"), false);
 });
+
+test("Tauri resolves the frontend build from the workspace root", async () => {
+  const config = JSON.parse(await readFile(new URL("../../src-tauri/tauri.conf.json", import.meta.url), "utf8"));
+  assert.equal(config.build.beforeBuildCommand, "npm --prefix frontend run build");
+  assert.equal(config.build.frontendDist, "../frontend/dist");
+});

@@ -3,7 +3,7 @@
   "productName": "DOM Wallet V3",
   "identifier": "org.domprotocol.wallet.v3",
   "build": {
-    "beforeBuildCommand": "npm --prefix ../frontend run build",
+    "beforeBuildCommand": "npm --prefix frontend run build",
     "frontendDist": "../frontend/dist"
   },
   "app": { "windows": [{ "label": "main", "title": "DOM Wallet V3", "width": 1100, "height": 760 }] }
