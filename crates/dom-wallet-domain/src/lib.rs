@@ -314,22 +314,28 @@ impl BalanceProjection {
     pub fn from_outputs(outputs: &[OutputRecord]) -> Self {
         let mut balance = Self::default();
         for output in outputs {
-            balance.total = balance.total.saturating_add(output.value);
             match output.state {
                 OutputState::Confirmed => {
+                    balance.total = balance.total.saturating_add(output.value);
                     balance.confirmed = balance.confirmed.saturating_add(output.value);
                     balance.spendable = balance.spendable.saturating_add(output.value);
                 }
                 OutputState::Immature { .. } => {
+                    balance.total = balance.total.saturating_add(output.value);
                     balance.immature = balance.immature.saturating_add(output.value)
                 }
                 OutputState::PendingIncoming => {
+                    balance.total = balance.total.saturating_add(output.value);
                     balance.pending_incoming = balance.pending_incoming.saturating_add(output.value)
                 }
                 OutputState::PendingOutgoing => {
+                    balance.total = balance.total.saturating_add(output.value);
                     balance.pending_outgoing = balance.pending_outgoing.saturating_add(output.value)
                 }
-                OutputState::Locked => balance.locked = balance.locked.saturating_add(output.value),
+                OutputState::Locked => {
+                    balance.total = balance.total.saturating_add(output.value);
+                    balance.locked = balance.locked.saturating_add(output.value)
+                }
                 OutputState::Spent { .. } => {}
             }
         }
@@ -438,6 +444,56 @@ pub struct RecoveryAllocationFloors {
     pub coinbase: u64,
 }
 
+/// Canonical private recovery domain stored only after capsule authentication.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveredOutputDomain {
+    Received,
+    Change,
+    SelfTransfer,
+    Coinbase,
+}
+
+/// Non-secret metadata bound to one authenticated restored output.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveredOutputMetadata {
+    pub output_id: Uuid,
+    pub recovery_account: u32,
+    pub derivation_index: u64,
+    pub domain: RecoveredOutputDomain,
+    pub is_coinbase: bool,
+    pub block_hash: [u8; 32],
+    pub output_position: u32,
+}
+
+/// Mapping from authenticated capsule account numbers to local account IDs.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveredAccountMapping {
+    pub recovery_account: u32,
+    pub account_id: Uuid,
+}
+
+/// Canonical block identity retained for bounded reorg reconciliation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryCanonicalBlock {
+    pub height: u64,
+    pub block_hash: [u8; 32],
+    pub previous_block_hash: [u8; 32],
+    pub output_count: u32,
+    pub legacy_proof_only_outputs: u32,
+}
+
+/// Durable publication state for a seed-only restore staging wallet.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeedRestoreStatus {
+    InProgress,
+    Complete,
+}
+
 /// A coordinate is returned only after its corresponding floor is advanced.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReservedRecoveryCoordinate {
@@ -487,6 +543,24 @@ pub struct WalletState {
     pub recovery: Option<RecoveryMetadata>,
     #[serde(default)]
     pub recovery_allocation_floors: RecoveryAllocationFloors,
+    /// Exact canonical WalletScanCursor v1 bytes for the Core recovery stream.
+    #[serde(default)]
+    pub core_scan_cursor: Option<Vec<u8>>,
+    /// Encrypted canonical anchors used only for recovery reorg reconciliation.
+    #[serde(default)]
+    pub recovery_canonical_blocks: Vec<RecoveryCanonicalBlock>,
+    /// Local account IDs reconstructed from authenticated capsule account IDs.
+    #[serde(default)]
+    pub recovered_accounts: Vec<RecoveredAccountMapping>,
+    /// Authenticated metadata keyed to restored output IDs.
+    #[serde(default)]
+    pub recovered_output_metadata: Vec<RecoveredOutputMetadata>,
+    /// Present only in a seed-restore staging wallet or a completed restore.
+    #[serde(default)]
+    pub seed_restore_status: Option<SeedRestoreStatus>,
+    /// Count of canonical proof-only outputs observed during recovery.
+    #[serde(default)]
+    pub legacy_proof_only_outputs: u64,
     pub node_configuration: NodeConfiguration,
     #[serde(with = "serde_bytes_32")]
     pub root_material: [u8; 32],
@@ -521,6 +595,12 @@ impl WalletState {
             rescan_plan: None,
             recovery: None,
             recovery_allocation_floors: RecoveryAllocationFloors::default(),
+            core_scan_cursor: None,
+            recovery_canonical_blocks: Vec::new(),
+            recovered_accounts: Vec::new(),
+            recovered_output_metadata: Vec::new(),
+            seed_restore_status: None,
+            legacy_proof_only_outputs: 0,
             node_configuration,
             root_material,
         }
@@ -576,10 +656,29 @@ impl WalletState {
                 return Err(DomainError::InvalidRescanPlan);
             }
         }
+        let mut account_ids = std::collections::BTreeSet::from([self.default_account.id]);
+        let mut recovery_accounts = std::collections::BTreeSet::new();
+        if self.recovered_accounts.len() > MAX_ACCOUNTS
+            || self.recovered_accounts.iter().any(|account| {
+                !account_ids.insert(account.account_id)
+                    || !recovery_accounts.insert(account.recovery_account)
+            })
+            || self
+                .outputs
+                .iter()
+                .any(|output| !account_ids.contains(&output.account_id))
+        {
+            return Err(DomainError::InvalidState);
+        }
         if self
-            .outputs
-            .iter()
-            .any(|output| output.account_id != self.default_account.id)
+            .core_scan_cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.len() != 86)
+            || self.recovery_canonical_blocks.len() > MAX_OUTPUTS
+            || self.recovery_canonical_blocks.windows(2).any(|blocks| {
+                blocks[1].height != blocks[0].height.saturating_add(1)
+                    || blocks[1].previous_block_hash != blocks[0].block_hash
+            })
         {
             return Err(DomainError::InvalidState);
         }
@@ -596,6 +695,18 @@ impl WalletState {
             output
                 .commitment
                 .is_some_and(|commitment| !commitments.insert(commitment))
+        }) {
+            return Err(DomainError::InvalidState);
+        }
+        let mut recovered_output_ids = std::collections::BTreeSet::new();
+        if self.recovered_output_metadata.iter().any(|metadata| {
+            !recovered_output_ids.insert(metadata.output_id)
+                || !self
+                    .outputs
+                    .iter()
+                    .any(|output| output.id == metadata.output_id)
+                || metadata.is_coinbase != (metadata.domain == RecoveredOutputDomain::Coinbase)
+                || metadata.block_hash == [0u8; 32]
         }) {
             return Err(DomainError::InvalidState);
         }
@@ -1314,5 +1425,45 @@ mod tests {
             state.rescan_plan.as_ref().unwrap().phase,
             RescanPhase::ValidatingTarget
         );
+    }
+
+    #[test]
+    fn recovery_schema_fields_default_for_existing_encrypted_state() {
+        let state = WalletState::new(identity(), [7; 32], configuration());
+        let mut value = serde_json::to_value(&state).unwrap();
+        let object = value.as_object_mut().unwrap();
+        for field in [
+            "core_scan_cursor",
+            "recovery_canonical_blocks",
+            "recovered_accounts",
+            "recovered_output_metadata",
+            "seed_restore_status",
+            "legacy_proof_only_outputs",
+        ] {
+            object.remove(field);
+        }
+        let decoded: WalletState = serde_json::from_value(value).unwrap();
+        assert!(decoded.core_scan_cursor.is_none());
+        assert!(decoded.recovery_canonical_blocks.is_empty());
+        assert!(decoded.recovered_accounts.is_empty());
+        assert!(decoded.recovered_output_metadata.is_empty());
+        assert!(decoded.seed_restore_status.is_none());
+        assert_eq!(decoded.legacy_proof_only_outputs, 0);
+        decoded.validate().unwrap();
+    }
+
+    #[test]
+    fn spent_outputs_do_not_inflate_current_balance() {
+        let mut state = WalletState::new(identity(), [7; 32], configuration());
+        state.outputs.push(OutputRecord {
+            id: Uuid::new_v4(),
+            account_id: state.default_account.id,
+            commitment: Some([8; 33]),
+            value: 42,
+            state: OutputState::Spent { spent_height: 5 },
+            discovered_height: 2,
+            reserved_by: None,
+        });
+        assert_eq!(state.balance(), BalanceProjection::default());
     }
 }

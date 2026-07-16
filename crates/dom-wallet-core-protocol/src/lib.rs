@@ -222,6 +222,26 @@ impl RecoverySlateBody {
     pub fn canonical_bytes(&self) -> &[u8] {
         &self.canonical_bytes
     }
+
+    /// Return the transfer amount without exposing implementation-private types.
+    pub fn amount_noms(&self) -> u64 {
+        self.inner.amount
+    }
+
+    /// Return the fee without duplicating policy arithmetic.
+    pub fn fee_noms(&self) -> u64 {
+        self.inner.fee
+    }
+
+    /// Return the canonical input count for Core fee-policy queries.
+    pub fn input_count(&self) -> u32 {
+        u32::try_from(self.inner.sender_inputs.len()).unwrap_or(u32::MAX)
+    }
+
+    /// Report whether the sender Slate carries a change output.
+    pub fn has_sender_change(&self) -> bool {
+        self.inner.sender_change_output.is_some()
+    }
 }
 
 /// Durable replay identity to be recorded atomically by Wallet state.
@@ -432,6 +452,47 @@ impl CanonicalSlate {
 
     pub fn fee_noms(&self) -> u64 {
         self.inner.body.fee
+    }
+
+    /// Return a canonical recovery body for the frozen recoverable builder.
+    pub fn recovery_body(&self) -> Result<RecoverySlateBody, ProtocolAdapterError> {
+        RecoverySlateBody::from_canonical_bytes(
+            &self
+                .inner
+                .body
+                .to_canonical_bytes()
+                .map_err(|_| ProtocolAdapterError::InvalidSlateEncoding)?,
+        )
+    }
+
+    /// Replace only the canonical body and phase while preserving all signed identity fields.
+    pub fn with_recovery_body(
+        &self,
+        phase: SlatePhase,
+        body: RecoverySlateBody,
+        identity: &CoreChainIdentity,
+        current_height: u64,
+    ) -> Result<Self, ProtocolAdapterError> {
+        Self::new_recoverable(
+            identity,
+            self.inner.slate_id,
+            self.inner.replay_id,
+            phase,
+            self.inner.expires_at_height,
+            &WalletAddress {
+                inner: self.inner.sender_address.clone(),
+                purpose: AddressIdentityPurpose::TransactionInteraction,
+            },
+            &WalletAddress {
+                inner: self.inner.receiver_address.clone(),
+                purpose: AddressIdentityPurpose::TransactionInteraction,
+            },
+            body,
+        )
+        .and_then(|value| {
+            value.validate_height(current_height)?;
+            Ok(value)
+        })
     }
 
     fn from_validated(

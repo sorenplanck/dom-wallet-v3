@@ -5,12 +5,13 @@ use dom_crypto::{
     recovery::{RecoveryCapsule, RECOVERY_CAPSULE_SIZE, RECOVERY_VERSION},
     MAX_PROVABLE_VALUE, RANGE_PROOF_SERIALIZATION_VERSION, RANGE_PROOF_SIZE,
 };
-use dom_serialization::DomDeserialize;
+use dom_serialization::{DomDeserialize, DomSerialize};
 use dom_wallet_core_api::CoreNetwork;
 use dom_wallet_core_recovery::{
-    frozen_versions, public_output_kind, state_uses_canonical_seed, CanonicalWalletSeed,
-    RecoverableOutputBuilder, RecoveryMaterialError, WalletSlateInput,
-    CANONICAL_TRANSACTION_OUTPUT_SIZE, PRODUCTION_OUTPUT_PATHS, RECOVERY_PROOF_ENVELOPE_SIZE,
+    finalize_recoverable_transaction, frozen_versions, public_output_kind,
+    state_uses_canonical_seed, CanonicalWalletSeed, RecoverableOutputBuilder,
+    RecoveryMaterialError, WalletSlateInput, CANONICAL_TRANSACTION_OUTPUT_SIZE,
+    PRODUCTION_OUTPUT_PATHS, RECOVERY_PROOF_ENVELOPE_SIZE,
 };
 use dom_wallet_core_sync::{CoreBlockReference, CoreChainIdentity};
 use dom_wallet_domain::{
@@ -474,6 +475,45 @@ fn slate_change_and_recipient_sidecars_are_exact_and_role_ordered() {
         response.sidecars.recipient.unwrap().len(),
         RECOVERY_CAPSULE_SIZE
     );
+}
+
+#[test]
+fn recoverable_sender_receiver_round_trip_e2e() {
+    let id = identity(CoreNetwork::Regtest, [8; 32]);
+    let sender_builder = RecoverableOutputBuilder::new(&seed(31), &id).unwrap();
+    let receiver_builder = RecoverableOutputBuilder::new(&seed(32), &id).unwrap();
+    let input_blinding = BlindingFactor::from_bytes([5; 32]).unwrap();
+    let input = WalletSlateInput::new(
+        *Commitment::commit(1_600, &input_blinding).as_bytes(),
+        *input_blinding.as_bytes(),
+    );
+    let mut sender_state = state();
+    let sender_coordinate = sender_state
+        .reserve_recovery_coordinate(0, RecoveryOutputClass::Change)
+        .unwrap();
+    let sender = sender_builder
+        .build_sender_offer(&[input], 500, 1_000, 100, sender_coordinate)
+        .unwrap()
+        .into_sender_parts()
+        .unwrap();
+    let offer = sender.body.clone();
+    let mut receiver_state = state();
+    let receiver_coordinate = receiver_state
+        .reserve_recovery_coordinate(0, RecoveryOutputClass::ReceiveSlate)
+        .unwrap();
+    let recipient = receiver_builder
+        .build_recipient_response(&offer, receiver_coordinate)
+        .unwrap()
+        .into_recipient_parts()
+        .unwrap();
+    let finalized =
+        finalize_recoverable_transaction(&recipient.body, &offer, &sender, id.chain_id).unwrap();
+    let transaction = dom_consensus::Transaction::from_bytes(&finalized.canonical_bytes).unwrap();
+    assert_eq!(transaction.outputs.len(), 2);
+    assert!(transaction.outputs.iter().all(|output| {
+        output.recovery_capsule().unwrap().is_some()
+            && output.to_bytes().unwrap().len() == CANONICAL_TRANSACTION_OUTPUT_SIZE
+    }));
 }
 
 #[test]

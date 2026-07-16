@@ -20,6 +20,9 @@ const GENERATIONS_DIR: &str = "generations";
 const STATE_FILE: &str = "state.envelope";
 const RESCAN_PLAN_FILE: &str = "rescan-plan.envelope";
 const MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
+pub const BACKUP_MAGIC: [u8; 8] = *b"DOMWBK01";
+pub const BACKUP_FORMAT_VERSION: u16 = 1;
+pub const MAX_BACKUP_BYTES: usize = 20 * 1024 * 1024;
 pub const RETAIN_SUPERSEDED_GENERATIONS: usize = 1;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -31,6 +34,28 @@ pub struct WalletMetadata {
     pub schema_version: u16,
     pub secret_profile_version: u16,
     pub active_generation: u64,
+}
+
+/// The outer, non-secret backup header is authenticated as AEAD associated
+/// data.  The encrypted payload carries the complete active V3 state and the
+/// durable rescan plan; it is never an archive of filesystem paths.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupContainer {
+    pub magic: [u8; 8],
+    pub format_version: u16,
+    pub created_unix_seconds: u64,
+    pub wallet_id: Uuid,
+    pub identity: NetworkIdentity,
+    pub envelope: dom_wallet_crypto::EncryptedEnvelope,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BackupPayload {
+    payload_version: u16,
+    state: WalletState,
+    rescan_plan: Option<RescanPlan>,
 }
 
 impl WalletMetadata {
@@ -233,6 +258,127 @@ impl WalletDirectory {
         Ok(())
     }
 
+    /// Exports one coherent committed generation, rather than a collection of
+    /// mutable wallet files. The outer envelope uses the same Argon2id and
+    /// authenticated-encryption profile as storage, with independent salt and
+    /// nonce under the explicitly supplied backup password.
+    pub fn export_backup(
+        &self,
+        wallet_password: &str,
+        backup_password: &str,
+        kdf: KdfParameters,
+        destination: impl AsRef<Path>,
+    ) -> Result<(), StorageError> {
+        let destination = destination.as_ref();
+        if destination.exists() {
+            return Err(StorageError::BackupDestinationExists);
+        }
+        let state = self.load(wallet_password)?;
+        let plan = self.load_rescan_plan(&state, wallet_password)?;
+        let created_unix_seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| StorageError::Clock)?
+            .as_secs();
+        let payload = BackupPayload {
+            payload_version: BACKUP_FORMAT_VERSION,
+            state: state.clone(),
+            rescan_plan: plan,
+        };
+        let plaintext =
+            serde_json::to_vec(&payload).map_err(|_| StorageError::CanonicalEncoding)?;
+        if plaintext.is_empty() || plaintext.len() > MAX_STATE_BYTES {
+            return Err(StorageError::FileSizeOutOfBounds);
+        }
+        let context = backup_context(created_unix_seconds, state.wallet_id, &state.identity);
+        let envelope =
+            seal(&plaintext, backup_password, &context, kdf).map_err(StorageError::Crypto)?;
+        let container = BackupContainer {
+            magic: BACKUP_MAGIC,
+            format_version: BACKUP_FORMAT_VERSION,
+            created_unix_seconds,
+            wallet_id: state.wallet_id,
+            identity: state.identity,
+            envelope,
+        };
+        let encoded =
+            serde_json::to_vec(&container).map_err(|_| StorageError::CanonicalEncoding)?;
+        atomic_write_private(destination, &encoded, MAX_BACKUP_BYTES)
+    }
+
+    /// Authenticates and validates the complete backup before creating any
+    /// destination state. Installation happens through a sibling staging
+    /// directory and a single rename; an existing wallet is never replaced.
+    pub fn import_backup(
+        destination: impl AsRef<Path>,
+        backup_path: impl AsRef<Path>,
+        backup_password: &str,
+        wallet_password: &str,
+        expected_identity: &NetworkIdentity,
+        kdf: KdfParameters,
+    ) -> Result<Self, StorageError> {
+        let destination = destination.as_ref();
+        if destination.exists() {
+            return Err(StorageError::AlreadyExists);
+        }
+        let encoded = read_bounded_with_limit(backup_path.as_ref(), MAX_BACKUP_BYTES)?;
+        let container: BackupContainer =
+            serde_json::from_slice(&encoded).map_err(|_| StorageError::InvalidBackup)?;
+        if container.magic != BACKUP_MAGIC || container.format_version != BACKUP_FORMAT_VERSION {
+            return Err(StorageError::UnsupportedBackupVersion);
+        }
+        if &container.identity != expected_identity {
+            return Err(StorageError::IdentityMismatch);
+        }
+        let context = backup_context(
+            container.created_unix_seconds,
+            container.wallet_id,
+            &container.identity,
+        );
+        let plaintext =
+            open(&container.envelope, backup_password, &context).map_err(StorageError::Crypto)?;
+        let payload: BackupPayload =
+            serde_json::from_slice(&plaintext).map_err(|_| StorageError::InvalidBackup)?;
+        if payload.payload_version != BACKUP_FORMAT_VERSION
+            || payload.state.wallet_id != container.wallet_id
+            || payload.state.identity != container.identity
+            || payload.state.identity != *expected_identity
+        {
+            return Err(StorageError::IdentityMismatch);
+        }
+        payload.state.validate().map_err(StorageError::Domain)?;
+        if let Some(plan) = &payload.rescan_plan {
+            if plan.wallet_id != payload.state.wallet_id || plan.identity != payload.state.identity
+            {
+                return Err(StorageError::InvalidBackup);
+            }
+        }
+        let file_name = destination.file_name().ok_or(StorageError::InvalidBackup)?;
+        let parent = destination.parent().ok_or(StorageError::InvalidBackup)?;
+        let staging = parent.join(format!(".{}.backup-import", file_name.to_string_lossy()));
+        if staging.exists() {
+            return Err(StorageError::IncompleteGeneration);
+        }
+        let staged = match WalletDirectory::create(&staging, &payload.state, wallet_password, kdf) {
+            Ok(staged) => staged,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(error);
+            }
+        };
+        let result = (|| {
+            if let Some(plan) = &payload.rescan_plan {
+                staged.save_rescan_plan(&payload.state, plan, wallet_password, kdf)?;
+            }
+            fs::rename(&staging, destination).map_err(StorageError::Io)?;
+            sync_directory(parent)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&staging);
+        }
+        result?;
+        WalletDirectory::open(destination)
+    }
+
     /// Conservative, idempotent cleanup. It only considers complete named
     /// generations after reading the authoritative active pointer; callers
     /// provide generations referenced by a durable nonterminal plan.
@@ -409,12 +555,60 @@ fn rescan_context(wallet_id: Uuid, identity: &NetworkIdentity) -> Vec<u8> {
     context
 }
 
+fn backup_context(
+    created_unix_seconds: u64,
+    wallet_id: Uuid,
+    identity: &NetworkIdentity,
+) -> Vec<u8> {
+    let mut context = Vec::with_capacity(8 + 2 + 8 + 16 + 32 + 32);
+    context.extend_from_slice(&BACKUP_MAGIC);
+    context.extend_from_slice(&BACKUP_FORMAT_VERSION.to_le_bytes());
+    context.extend_from_slice(&created_unix_seconds.to_le_bytes());
+    context.extend_from_slice(wallet_id.as_bytes());
+    context.extend_from_slice(&identity.chain_id);
+    context.extend_from_slice(&identity.genesis_id);
+    context
+}
+
 fn read_bounded(path: &Path) -> Result<Vec<u8>, StorageError> {
+    read_bounded_with_limit(path, MAX_STATE_BYTES)
+}
+
+fn read_bounded_with_limit(path: &Path, max_bytes: usize) -> Result<Vec<u8>, StorageError> {
     let metadata = fs::metadata(path).map_err(StorageError::Io)?;
-    if metadata.len() == 0 || metadata.len() as usize > MAX_STATE_BYTES {
+    if metadata.len() == 0 || metadata.len() as usize > max_bytes {
         return Err(StorageError::FileSizeOutOfBounds);
     }
     fs::read(path).map_err(StorageError::Io)
+}
+
+fn atomic_write_private(path: &Path, bytes: &[u8], max_bytes: usize) -> Result<(), StorageError> {
+    if bytes.is_empty() || bytes.len() > max_bytes {
+        return Err(StorageError::FileSizeOutOfBounds);
+    }
+    let temporary = path.with_extension("tmp");
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary).map_err(StorageError::Io)?;
+    let result = (|| {
+        file.write_all(bytes).map_err(StorageError::Io)?;
+        file.sync_all().map_err(StorageError::Io)?;
+        drop(file);
+        fs::rename(&temporary, path).map_err(StorageError::Io)?;
+        if let Some(parent) = path.parent() {
+            sync_directory(parent)?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
@@ -474,6 +668,14 @@ pub enum StorageError {
     GenerationOverflow,
     #[error("bounded file size validation failed")]
     FileSizeOutOfBounds,
+    #[error("backup destination already exists")]
+    BackupDestinationExists,
+    #[error("backup data is invalid")]
+    InvalidBackup,
+    #[error("backup format is unsupported")]
+    UnsupportedBackupVersion,
+    #[error("system clock is unavailable")]
+    Clock,
     #[error("canonical state encoding failed")]
     CanonicalEncoding,
     #[error(transparent)]
@@ -617,5 +819,79 @@ mod tests {
         assert!(wallet.cleanup_superseded_generations(&[]).is_err());
         assert!(active.exists());
         assert_eq!(wallet.load("correct").unwrap().generation, 0);
+    }
+
+    #[test]
+    fn backup_round_trip_authenticates_header_ciphertext_and_identity_before_install() {
+        let temp = tempfile::tempdir().unwrap();
+        let wallet = WalletDirectory::create(
+            temp.path().join("wallet"),
+            &WalletState::new(identity(), [6; 32], default_node_configuration(identity())),
+            "wallet-password",
+            KdfParameters::TEST,
+        )
+        .unwrap();
+        let backup = temp.path().join("wallet.dombackup");
+        wallet
+            .export_backup(
+                "wallet-password",
+                "backup-password",
+                KdfParameters::TEST,
+                &backup,
+            )
+            .unwrap();
+        let imported = WalletDirectory::import_backup(
+            temp.path().join("restored"),
+            &backup,
+            "backup-password",
+            "new-wallet-password",
+            &identity(),
+            KdfParameters::TEST,
+        )
+        .unwrap();
+        assert_eq!(
+            imported.load("new-wallet-password").unwrap().wallet_id,
+            wallet.load("wallet-password").unwrap().wallet_id
+        );
+
+        assert!(matches!(
+            WalletDirectory::import_backup(
+                temp.path().join("wrong-password"),
+                &backup,
+                "wrong-password",
+                "new-wallet-password",
+                &identity(),
+                KdfParameters::TEST,
+            ),
+            Err(StorageError::Crypto(CryptoError::AuthenticationFailed))
+        ));
+        let mut wrong = identity();
+        wrong.genesis_id[0] ^= 1;
+        assert!(matches!(
+            WalletDirectory::import_backup(
+                temp.path().join("wrong-identity"),
+                &backup,
+                "backup-password",
+                "new-wallet-password",
+                &wrong,
+                KdfParameters::TEST,
+            ),
+            Err(StorageError::IdentityMismatch)
+        ));
+        let mut corrupted = fs::read(&backup).unwrap();
+        let last = corrupted.len() - 2;
+        corrupted[last] ^= 1;
+        let damaged = temp.path().join("damaged.dombackup");
+        fs::write(&damaged, corrupted).unwrap();
+        assert!(WalletDirectory::import_backup(
+            temp.path().join("damaged"),
+            &damaged,
+            "backup-password",
+            "new-wallet-password",
+            &identity(),
+            KdfParameters::TEST,
+        )
+        .is_err());
+        assert!(!temp.path().join("damaged").exists());
     }
 }
