@@ -7,5 +7,5 @@
     "frontendDist": "../frontend/dist"
   },
   "app": { "windows": [{ "label": "main", "title": "DOM Wallet V3", "width": 1100, "height": 760 }] },
-  "bundle": { "icon": ["../frontend/assets/dom-coin.png"] }
+  "bundle": { "icon": ["../frontend/assets/dom-coin.png", "icons/icon.ico"] }
 }
