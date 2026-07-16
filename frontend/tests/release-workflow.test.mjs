@@ -36,4 +36,5 @@ test("Tauri resolves the frontend build from the workspace root", async () => {
   const config = JSON.parse(await readFile(new URL("../../src-tauri/tauri.conf.json", import.meta.url), "utf8"));
   assert.equal(config.build.beforeBuildCommand, "npm --prefix frontend run build");
   assert.equal(config.build.frontendDist, "../frontend/dist");
+  assert.deepEqual(config.bundle.icon, ["../frontend/assets/dom-coin.png"]);
 });
