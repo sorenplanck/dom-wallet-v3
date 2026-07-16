@@ -18,6 +18,7 @@ test("release workflow provides pinned experimental dry-run packaging", async ()
     "backup remains additional", "No independent security audit is claimed",
     "release-upload/SHA256SUMS.txt",
     "target/${{ matrix.target }}/release/bundle",
+    "Install Linux validation dependencies",
   ]) assert.equal(workflow.includes(required), true, `missing ${required}`);
 
   const actionRefs = [...workflow.matchAll(/uses:\s+[^@\s]+@([^\s]+)/g)].map((match) => match[1]);
