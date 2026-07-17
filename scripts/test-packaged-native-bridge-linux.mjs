@@ -157,7 +157,13 @@ try {
 } finally {
   if (sessionId) await request(`/session/${sessionId}`, undefined, { method: "DELETE" }).catch(() => {});
   driver.kill("SIGTERM");
-  await new Promise((done) => setTimeout(done, 250));
-  if (!driver.killed) driver.kill("SIGKILL");
-  await rm(profile, { recursive: true, force: true });
+  await Promise.race([
+    new Promise((done) => driver.once("exit", done)),
+    new Promise((done) => setTimeout(done, 2_000)),
+  ]);
+  if (driver.exitCode === null) {
+    driver.kill("SIGKILL");
+    await new Promise((done) => driver.once("exit", done));
+  }
+  await rm(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 }
