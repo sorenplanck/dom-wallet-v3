@@ -4,7 +4,7 @@
   "version": "0.1.1",
   "identifier": "org.domprotocol.wallet.v3",
   "build": {
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm --prefix frontend run build",
     "frontendDist": "../frontend/dist"
   },
   "app": { "windows": [{ "label": "main", "title": "DOM Wallet V3", "width": 1100, "height": 760 }] },
