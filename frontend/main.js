@@ -1,8 +1,9 @@
 import QRCode from "qrcode";
 import QrScanner from "qr-scanner";
+import { nativeBridge } from "./bridge.js";
 
 export const COMMANDS = Object.freeze([
-  "application_status", "wallet_create_recoverable", "wallet_restore_from_mnemonic",
+  "native_bridge_status", "application_status", "wallet_create_recoverable", "wallet_restore_from_mnemonic",
   "wallet_backup_export", "wallet_backup_import", "wallet_recovery_phrase_confirm",
   "wallet_open", "wallet_unlock", "wallet_lock", "wallet_close", "wallet_summary",
   "account_list", "account_summary", "embedded_node_start", "embedded_node_status",
@@ -19,8 +20,7 @@ export const COMMANDS = Object.freeze([
 
 const invoke = (command, args = {}) => {
   if (!COMMANDS.includes(command)) return Promise.reject(new Error("Unsupported desktop command."));
-  const bridge = window.__TAURI__?.core?.invoke;
-  return bridge ? bridge(command, args) : Promise.reject(new Error("Native desktop command bridge is unavailable."));
+  return nativeBridge.invoke(command, args);
 };
 const byId = (id) => document.getElementById(id);
 const status = byId("status");
@@ -231,7 +231,17 @@ byId("qr-scan").addEventListener("click", async () => {
 byId("qr-animate").addEventListener("click", () => show("Single canonical QR frame requires no animation."));
 byId("qr-pause").addEventListener("click", () => show("QR presentation paused."));
 
-invoke("application_status").then((result) => show(`Application state: ${result.state}.`)).catch((error) => show(redactedError(error), true));
+document.documentElement.dataset.nativeBridge = nativeBridge.state;
+nativeBridge.initialize()
+  .then(() => {
+    document.documentElement.dataset.nativeBridge = nativeBridge.state;
+    return invoke("application_status");
+  })
+  .then((result) => show(`Application state: ${result.state}.`))
+  .catch((error) => {
+    document.documentElement.dataset.nativeBridge = nativeBridge.state;
+    show(redactedError(error), true);
+  });
 const refresh = async () => { try { await refreshNode(); } catch { /* wallet or node may not be open */ } refreshTimer = setTimeout(refresh, 15000); };
 refreshTimer = setTimeout(refresh, 15000);
 window.addEventListener("beforeunload", () => { clearTimeout(refreshTimer); clearPhrase(); clearSecretForms(); stopScanner(); }, { once: true });

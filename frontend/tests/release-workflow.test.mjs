@@ -19,6 +19,9 @@ test("release workflow provides pinned experimental dry-run packaging", async ()
     "release-upload/SHA256SUMS.txt",
     "target/${{ matrix.target }}/release/bundle",
     "Install Linux validation dependencies",
+    "Test native bridge in packaged Linux application", "webkit2gtk-driver", "xvfb-run -a",
+    "scripts/test-packaged-native-bridge-linux.mjs", "tauri-driver --version 2.0.6",
+    "TAURI_VERSION", "test \"$VERSION\" = \"$TAURI_VERSION\"",
   ]) assert.equal(workflow.includes(required), true, `missing ${required}`);
 
   const actionRefs = [...workflow.matchAll(/uses:\s+[^@\s]+@([^\s]+)/g)].map((match) => match[1]);
@@ -34,7 +37,7 @@ test("release workflow provides pinned experimental dry-run packaging", async ()
 
 test("Tauri resolves the frontend build from the workspace root", async () => {
   const config = JSON.parse(await readFile(new URL("../../src-tauri/tauri.conf.json", import.meta.url), "utf8"));
-  assert.equal(config.build.beforeBuildCommand, "npm --prefix frontend run build");
+  assert.equal(config.build.beforeBuildCommand, "npm run build");
   assert.equal(config.build.frontendDist, "../frontend/dist");
   assert.deepEqual(config.bundle.icon, ["../frontend/assets/dom-coin.png", "icons/icon.ico"]);
   const ico = await readFile(new URL("../../src-tauri/icons/icon.ico", import.meta.url));

@@ -12,6 +12,10 @@ test("DOM visual shell preserves all thirteen Wallet journeys", async () => {
   }
   assert.equal(html.includes("remote HTTP endpoint"), false);
   assert.equal(html.includes("Embedded node settings"), true);
+  for (const panel of ["create-form", "restore-form", "open-form"]) {
+    assert.equal(html.includes(`data-gate-panel="${panel}"`), true, `missing gate target ${panel}`);
+    assert.equal(html.includes(`id="${panel}"`), true, `missing gate panel ${panel}`);
+  }
 });
 
 test("production protocol and secret boundaries are explicit", async () => {
@@ -33,9 +37,10 @@ test("DOM visual tokens preserve the validated dark bronze desktop geometry", as
 });
 
 test("presentation adapter does not create browser persistence or a second lifecycle", async () => {
-  const js = await source("main.js");
+  const [js, bridge] = await Promise.all([source("main.js"), source("bridge.js")]);
   for (const forbidden of ["localStorage", "sessionStorage", "indexedDB", "fetch(", "eval(", "new Function"]) assert.equal(js.includes(forbidden), false);
-  assert.equal(js.includes("window.__TAURI__?.core?.invoke"), true);
+  assert.equal(js.includes("window.__TAURI__"), false);
+  assert.equal(bridge.includes("@tauri-apps/api/core"), true);
   assert.equal(js.includes("enterApp"), true);
   assert.equal(js.includes("enterGate"), true);
 });

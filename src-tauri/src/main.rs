@@ -4,6 +4,11 @@ use dom_wallet_tauri_shell::DesktopApplication;
 use tauri::Manager;
 
 #[tauri::command]
+fn native_bridge_status() -> dom_wallet_tauri_shell::NativeBridgeStatusDto {
+    dom_wallet_tauri_shell::native_bridge_status()
+}
+
+#[tauri::command]
 fn application_status(
     app: tauri::State<'_, DesktopApplication>,
 ) -> dom_wallet_tauri_shell::ApplicationStatusDto {
@@ -319,10 +324,11 @@ fn slate_qr_reassembly_clear(
     app.slate_qr_reassembly_clear().map_err(Into::into)
 }
 
-fn main() {
+fn application_builder() -> tauri::Builder<tauri::Wry> {
     tauri::Builder::default()
         .manage(DesktopApplication::default())
         .invoke_handler(tauri::generate_handler![
+            native_bridge_status,
             application_status,
             wallet_create_recoverable,
             wallet_restore_from_mnemonic,
@@ -364,8 +370,24 @@ fn main() {
             slate_qr_encode,
             slate_qr_decode_frame,
             slate_qr_reassembly_status,
-            slate_qr_reassembly_clear
+            slate_qr_reassembly_clear,
         ])
+}
+
+fn main() {
+    application_builder()
         .run(tauri::generate_context!())
         .unwrap_or_else(|_| std::process::exit(1));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packaged_entrypoint_constructs_the_registered_builder() {
+        let _builder = application_builder();
+        assert_eq!(dom_wallet_tauri_shell::COMMAND_NAMES.len(), 43);
+        assert!(dom_wallet_tauri_shell::COMMAND_NAMES.contains(&"native_bridge_status"));
+    }
 }

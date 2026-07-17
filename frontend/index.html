@@ -11,7 +11,7 @@
       <img class="coin-hero" src="assets/dom-coin.png" alt="DOM">
       <div class="gate-body">
         <header class="gate-title" data-screen-contract="welcome"><h1>DOM Wallet</h1><p class="sub">Secure desktop wallet</p></header>
-        <p id="status" class="status" role="status" aria-live="polite">Starting desktop wallet…</p>
+        <p id="status" class="status" role="status" aria-live="polite">Initializing native desktop bridge…</p>
         <section id="onboarding" class="screen card">
           <div class="access-grid">
             <form id="unlock-form" class="access-primary" data-screen-contract="unlock">
@@ -20,9 +20,9 @@
               <button class="btn w-full" type="submit">Unlock wallet</button>
             </form>
             <div class="access-actions">
-              <button class="btn ghost w-full" type="button" data-gate-panel="create-panel">Create wallet</button>
-              <button class="btn ghost w-full" type="button" data-gate-panel="restore-panel">Restore wallet</button>
-              <button class="btn ghost w-full" type="button" data-gate-panel="locate-panel">Locate wallet</button>
+              <button class="btn ghost w-full" type="button" data-gate-panel="create-form">Create wallet</button>
+              <button class="btn ghost w-full" type="button" data-gate-panel="restore-form">Restore wallet</button>
+              <button class="btn ghost w-full" type="button" data-gate-panel="open-form">Locate wallet</button>
             </div>
           </div>
           <form id="create-form" class="gate-panel" hidden data-screen-contract="create">
