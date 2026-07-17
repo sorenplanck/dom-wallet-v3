@@ -8,8 +8,8 @@ No independent security audit is claimed.
 
 ## Release identity
 
-- Wallet version: `0.1.0`
-- Recommended tag: `wallet-v0.1.0`
+- Wallet version: `0.1.1`
+- Recommended tag: `wallet-v0.1.1`
 - DOM Core revision: `6a8a6475b36ad68bb760d61cf323126d95cd7416`
 - Mainnet chain ID: `f9831fadabc8a4234beab35fbb6327e84581645f33e9f75ed2ea78e8bcf1165b`
 - Testnet identity: `2ab5e6c73607e8bfbbec2d4ce3ea1419cda29ae6892e7f1c24facc465cd65821`
@@ -34,11 +34,11 @@ tag and without creating a GitHub Release.
 ## Later release authorization
 
 After all local and CI gates pass and explicit authorization is given, verify
-that the clean release commit reports version `0.1.0`, then run:
+that the clean release commit reports version `0.1.1`, then run:
 
 ```bash
-git tag -a wallet-v0.1.0 -m "DOM Wallet V3 0.1.0 experimental"
-git push origin wallet-v0.1.0
+git tag -a wallet-v0.1.1 -m "DOM Wallet V3 0.1.1 experimental"
+git push origin wallet-v0.1.1
 ```
 
 Do not run these commands as part of validation. The tag workflow verifies

@@ -72,8 +72,10 @@ jobs:
           set -euo pipefail
           VERSION="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
           FRONTEND_VERSION="$(node -p 'require("./frontend/package.json").version')"
+          TAURI_VERSION="$(node -p 'require("./src-tauri/tauri.conf.json").version')"
           test -n "$VERSION"
           test "$VERSION" = "$FRONTEND_VERSION"
+          test "$VERSION" = "$TAURI_VERSION"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
             test "$GITHUB_REF_TYPE" = "tag"
@@ -146,7 +148,10 @@ jobs:
           target: ${{ matrix.target }}
       - name: Install Linux bundle dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y build-essential clang cmake libappindicator3-dev librsvg2-dev libssl-dev libwebkit2gtk-4.1-dev patchelf pkg-config rpm
+        run: sudo apt-get update && sudo apt-get install -y build-essential clang cmake jq libappindicator3-dev librsvg2-dev libssl-dev libwebkit2gtk-4.1-dev patchelf pkg-config rpm webkit2gtk-driver xvfb
+      - name: Install pinned Linux Tauri WebDriver
+        if: runner.os == 'Linux'
+        run: cargo install --locked tauri-driver --version 2.0.6
       - name: Install and test frontend
         run: npm ci --prefix frontend && npm test --prefix frontend && npm run build --prefix frontend
       - name: Build unsigned native installers
@@ -154,6 +159,18 @@ jobs:
         with:
           projectPath: src-tauri
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} -- --locked
+      - name: Test native bridge in packaged Linux application
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEB="$(find target/${{ matrix.target }}/release/bundle/deb -type f -name '*.deb' -print -quit)"
+          test -n "$DEB"
+          mkdir /tmp/dom-wallet-package
+          dpkg-deb --extract "$DEB" /tmp/dom-wallet-package
+          BINARY="$(find /tmp/dom-wallet-package/usr/bin -maxdepth 1 -type f -name 'dom-wallet*' -print -quit)"
+          test -x "$BINARY"
+          xvfb-run -a node scripts/test-packaged-native-bridge-linux.mjs "$BINARY"
       - name: Archive macOS application bundle
         if: runner.os == 'macOS'
         shell: bash
@@ -218,7 +235,10 @@ jobs:
           set -euo pipefail
           mkdir release-upload
           while IFS= read -r -d '' source; do
-            name="$(basename "$source")"
+            relative="${source#release-assets/}"
+            artifact="${relative%%/*}"
+            platform="${artifact%-"$GITHUB_SHA"}"
+            name="${platform}-$(basename "$source")"
             test ! -e "release-upload/$name"
             cp "$source" "release-upload/$name"
           done < <(find release-assets -type f \( -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' -o -name '*.exe' -o -name '*.msi' -o -name '*.dmg' -o -name '*.app.tar.gz' \) -print0)

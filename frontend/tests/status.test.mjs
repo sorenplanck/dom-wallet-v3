@@ -9,11 +9,17 @@ test("frontend source contains no durable browser storage access", async () => {
 });
 
 test("production adapter maps each recovery and backup command without a mock", async () => {
-  const source = await (await import("node:fs/promises")).readFile(new URL("../main.js", import.meta.url), "utf8");
+  const { readFile } = await import("node:fs/promises");
+  const [source, bridge] = await Promise.all([
+    readFile(new URL("../main.js", import.meta.url), "utf8"),
+    readFile(new URL("../bridge.js", import.meta.url), "utf8"),
+  ]);
   assert.equal((source.match(/"application_status"/g) ?? []).length > 0, true);
   assert.equal(source.includes("const developmentMock"), false);
   assert.equal(source.includes("fake balance"), false);
-  assert.equal(source.includes("window.__TAURI__?.core?.invoke"), true);
+  assert.equal(source.includes("window.__TAURI__"), false);
+  assert.equal(bridge.includes('@tauri-apps/api/core'), true);
+  assert.equal(bridge.includes("window.__TAURI__"), false);
   for (const command of [
     "wallet_create_recoverable", "wallet_recovery_phrase_confirm",
     "wallet_restore_from_mnemonic", "wallet_backup_export", "wallet_backup_import"

@@ -29,7 +29,8 @@ pub struct DesktopApplication {
     shutdown: AtomicBool,
 }
 
-pub const COMMAND_NAMES: [&str; 42] = [
+pub const COMMAND_NAMES: [&str; 43] = [
+    "native_bridge_status",
     "application_status",
     "wallet_create_recoverable",
     "wallet_restore_from_mnemonic",
@@ -73,6 +74,20 @@ pub const COMMAND_NAMES: [&str; 42] = [
     "slate_qr_reassembly_status",
     "slate_qr_reassembly_clear",
 ];
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeBridgeStatusDto {
+    pub bridge: &'static str,
+    pub app_version: &'static str,
+}
+
+pub fn native_bridge_status() -> NativeBridgeStatusDto {
+    NativeBridgeStatusDto {
+        bridge: "ready",
+        app_version: env!("CARGO_PKG_VERSION"),
+    }
+}
 
 impl Default for DesktopApplication {
     fn default() -> Self {
@@ -923,8 +938,9 @@ mod tests {
         let unique = COMMAND_NAMES
             .iter()
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(unique.len(), 42);
+        assert_eq!(unique.len(), 43);
         for required in [
+            "native_bridge_status",
             "application_status",
             "wallet_create_recoverable",
             "wallet_restore_from_mnemonic",
@@ -947,6 +963,15 @@ mod tests {
                 .iter()
                 .any(|command| command.contains(forbidden)));
         }
+    }
+
+    #[test]
+    fn native_bridge_probe_is_static_redacted_and_versioned() {
+        let status = native_bridge_status();
+        assert_eq!(status.bridge, "ready");
+        assert_eq!(status.app_version, "0.1.1");
+        fn assert_serializable<T: serde::Serialize>(_: &T) {}
+        assert_serializable(&status);
     }
 
     #[test]
