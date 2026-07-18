@@ -12,24 +12,30 @@ use dom_wallet_core::{
 };
 use dom_wallet_core_api::CoreNetwork;
 use dom_wallet_domain::{BalanceProjection, Network, NetworkIdentity};
-use dom_wallet_embedded_core::{EmbeddedCoreConfiguration, EmbeddedCoreNetwork};
+use dom_wallet_embedded_core::{
+    mine_wallet_block, EmbeddedCoreConfiguration, WalletMiningOutcome, MAINNET_BOOTSTRAP_FALLBACK,
+    MAINNET_DNS_SEEDS,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex,
 };
-use std::{net::SocketAddr, path::Path};
+use std::{net::SocketAddr, path::Path, thread::JoinHandle};
 use thiserror::Error;
 
 pub struct DesktopApplication {
-    service: Mutex<WalletService>,
+    service: Arc<Mutex<WalletService>>,
     qr_reassembler: Mutex<Option<String>>,
     node_started: AtomicBool,
+    last_peer_connected_unix_seconds: AtomicU64,
+    synchronization_paused: AtomicBool,
+    mining: Mutex<MiningRuntime>,
     shutdown: AtomicBool,
 }
 
-pub const COMMAND_NAMES: [&str; 43] = [
+pub const COMMAND_NAMES: [&str; 56] = [
     "native_bridge_status",
     "application_status",
     "wallet_create_recoverable",
@@ -46,6 +52,19 @@ pub const COMMAND_NAMES: [&str; 43] = [
     "account_summary",
     "embedded_node_start",
     "embedded_node_status",
+    "node_network_status",
+    "node_peer_status",
+    "wallet_sync_status",
+    "wallet_sync_start",
+    "wallet_sync_pause",
+    "wallet_sync_resume",
+    "wallet_rescan",
+    "wallet_sync_retry",
+    "mining_status",
+    "mining_config_get",
+    "mining_config_set",
+    "mining_start",
+    "mining_stop",
     "synchronization_start",
     "synchronization_pause",
     "synchronization_resume",
@@ -92,9 +111,12 @@ pub fn native_bridge_status() -> NativeBridgeStatusDto {
 impl Default for DesktopApplication {
     fn default() -> Self {
         Self {
-            service: Mutex::new(WalletService::default()),
+            service: Arc::new(Mutex::new(WalletService::default())),
             qr_reassembler: Mutex::new(None),
             node_started: AtomicBool::new(false),
+            last_peer_connected_unix_seconds: AtomicU64::new(0),
+            synchronization_paused: AtomicBool::new(false),
+            mining: Mutex::new(MiningRuntime::default()),
             shutdown: AtomicBool::new(false),
         }
     }
@@ -106,23 +128,6 @@ pub struct ApplicationStatusDto {
     pub state: String,
     pub experimental: bool,
     pub unaudited: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum EmbeddedNetworkDto {
-    Mainnet,
-    Testnet,
-    Regtest,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct EmbeddedNodeStartDto {
-    pub network: EmbeddedNetworkDto,
-    pub data_directory: String,
-    pub listen_address: String,
-    pub maximum_inbound_peers: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -148,6 +153,122 @@ pub struct EmbeddedNodeStatusDto {
     pub protocol_version: Option<u32>,
     pub range_proof_version: Option<u8>,
     pub ready: bool,
+    pub error_code: Option<String>,
+    pub connected_peers: u64,
+    pub bootstrap_phase: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeedResolutionDto {
+    pub seed: String,
+    pub state: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodePeerStatusDto {
+    pub connected_inbound: u64,
+    pub connected_outbound: u64,
+    pub total_connected_peers: u64,
+    pub known_peer_count: u64,
+    pub bootstrap_phase: String,
+    pub last_successful_connection_time: Option<u64>,
+    pub last_connection_error_code: Option<String>,
+    pub seed_resolution_summary: Vec<SeedResolutionDto>,
+    pub canonical_height: u64,
+    pub highest_known_peer_height: Option<u64>,
+    pub peer_addresses: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeNetworkStatusDto {
+    pub network: String,
+    pub chain_id: String,
+    pub genesis_hash: String,
+    pub canonical_height: u64,
+    pub ready: bool,
+    pub data_directory: String,
+    pub bootstrap_fallback: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WalletSyncStatusDto {
+    pub state: String,
+    pub cursor_height: Option<u64>,
+    pub canonical_height: Option<u64>,
+    pub synchronized: bool,
+    pub paused: bool,
+    pub last_result: String,
+    pub last_error: Option<String>,
+}
+
+const MINING_DISABLED: u64 = 0;
+const MINING_READY: u64 = 1;
+const MINING_STARTING: u64 = 2;
+const MINING_RUNNING: u64 = 3;
+const MINING_STOPPING: u64 = 4;
+const MINING_ERROR: u64 = 5;
+
+struct MiningRuntime {
+    state: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    hash_attempts: Arc<AtomicU64>,
+    accepted_blocks: Arc<AtomicU64>,
+    rejected_work: Arc<AtomicU64>,
+    last_candidate_time: Arc<AtomicU64>,
+    last_accepted_height: Arc<AtomicU64>,
+    started_at: Arc<AtomicU64>,
+    error_code: Arc<Mutex<Option<String>>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl Default for MiningRuntime {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(AtomicU64::new(MINING_DISABLED)),
+            stop: Arc::new(AtomicBool::new(false)),
+            hash_attempts: Arc::new(AtomicU64::new(0)),
+            accepted_blocks: Arc::new(AtomicU64::new(0)),
+            rejected_work: Arc::new(AtomicU64::new(0)),
+            last_candidate_time: Arc::new(AtomicU64::new(0)),
+            last_accepted_height: Arc::new(AtomicU64::new(u64::MAX)),
+            started_at: Arc::new(AtomicU64::new(0)),
+            error_code: Arc::new(Mutex::new(None)),
+            worker: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MiningConfigDto {
+    pub enabled: bool,
+    pub cpu_threads: usize,
+    pub available_logical_cpus: usize,
+    pub recommended_cpu_threads: usize,
+    pub mining_address: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MiningStatusDto {
+    pub status: String,
+    pub enabled: bool,
+    pub running: bool,
+    pub cpu_threads: usize,
+    pub mining_address: String,
+    pub hash_attempts: u64,
+    pub hashrate_hps: f64,
+    pub current_height: u64,
+    pub connected_peers: u64,
+    pub accepted_blocks: u64,
+    pub rejected_work: u64,
+    pub last_block_candidate_time: Option<u64>,
+    pub last_accepted_block_height: Option<u64>,
+    pub uptime_seconds: u64,
     pub error_code: Option<String>,
 }
 
@@ -389,6 +510,7 @@ impl DesktopApplication {
 
     pub fn wallet_lock(&self) -> Result<(), CommandError> {
         self.ensure_running()?;
+        let _ = self.mining_stop();
         self.clear_qr_buffers()?;
         self.service
             .lock()
@@ -398,6 +520,7 @@ impl DesktopApplication {
     }
     pub fn wallet_close(&self) -> Result<(), CommandError> {
         self.ensure_running()?;
+        let _ = self.mining_stop();
         self.clear_qr_buffers()?;
         self.service
             .lock()
@@ -424,34 +547,22 @@ impl DesktopApplication {
     pub fn account_summary(&self) -> Result<WalletSummary, CommandError> {
         self.wallet_summary()
     }
-    pub fn embedded_node_start(
+    pub fn embedded_node_start_mainnet(
         &self,
-        request: EmbeddedNodeStartDto,
+        data_directory: impl AsRef<Path>,
+        listen_address: SocketAddr,
     ) -> Result<EmbeddedNodeStatusDto, CommandError> {
         self.ensure_running()?;
         if self.node_started.load(Ordering::Acquire) {
             return self.embedded_node_status();
         }
-        if request.data_directory.is_empty() || request.data_directory.len() > 4096 {
+        if !listen_address.ip().is_loopback() || listen_address.port() == 0 {
             return Err(CommandError::InvalidInput(
-                "embedded node data directory is invalid".into(),
+                "automatic local node listener is invalid".into(),
             ));
         }
-        let listen_address: SocketAddr = request
-            .listen_address
-            .parse()
-            .map_err(|_| CommandError::InvalidInput("listen address is invalid".into()))?;
-        if request.maximum_inbound_peers == 0 || request.maximum_inbound_peers > 1_024 {
-            return Err(CommandError::InvalidInput("peer limit is invalid".into()));
-        }
-        let network = match request.network {
-            EmbeddedNetworkDto::Mainnet => EmbeddedCoreNetwork::Mainnet,
-            EmbeddedNetworkDto::Testnet => EmbeddedCoreNetwork::Testnet,
-            EmbeddedNetworkDto::Regtest => EmbeddedCoreNetwork::Regtest,
-        };
         let configuration =
-            EmbeddedCoreConfiguration::new(network, request.data_directory, listen_address)
-                .with_maximum_inbound_peers(request.maximum_inbound_peers as usize);
+            EmbeddedCoreConfiguration::mainnet(data_directory.as_ref(), listen_address);
         self.service
             .lock()
             .map_err(|_| CommandError::Unavailable)?
@@ -471,6 +582,7 @@ impl DesktopApplication {
             .map_err(CommandError::from)?;
         let ready = service.embedded_core_ready().unwrap_or(false);
         let diagnostic = service.diagnostics();
+        let peers = service.embedded_peer_status().map_err(CommandError::from)?;
         let lifecycle = if ready {
             WalletReadinessDto::Ready
         } else if diagnostic.application_state == "SYNCHRONIZING" {
@@ -489,7 +601,339 @@ impl DesktopApplication {
             range_proof_version: Some(identity.range_proof_serialization_version),
             ready,
             error_code: diagnostic.last_error.map(|_| "CORE_NOT_READY".into()),
+            connected_peers: peers.connected_total,
+            bootstrap_phase: peers.bootstrap_phase.into(),
         })
+    }
+
+    pub fn node_network_status(&self) -> Result<NodeNetworkStatusDto, CommandError> {
+        let status = self.embedded_node_status()?;
+        Ok(NodeNetworkStatusDto {
+            network: status.network.ok_or(CommandError::Unavailable)?,
+            chain_id: status.chain_id.ok_or(CommandError::Unavailable)?,
+            genesis_hash: status.genesis_hash.ok_or(CommandError::Unavailable)?,
+            canonical_height: status
+                .canonical_tip_height
+                .ok_or(CommandError::Unavailable)?,
+            ready: status.ready,
+            data_directory: "…/DOM Wallet V3/mainnet/node".into(),
+            bootstrap_fallback: MAINNET_BOOTSTRAP_FALLBACK.into(),
+        })
+    }
+
+    pub fn node_peer_status(&self) -> Result<NodePeerStatusDto, CommandError> {
+        let service = self.service.lock().map_err(|_| CommandError::Unavailable)?;
+        let status = service.embedded_peer_status().map_err(CommandError::from)?;
+        let observed = if status.connected_total > 0 {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0);
+            let _ = self.last_peer_connected_unix_seconds.compare_exchange(
+                0,
+                now,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            Some(
+                self.last_peer_connected_unix_seconds
+                    .load(Ordering::Acquire),
+            )
+        } else {
+            None
+        };
+        Ok(NodePeerStatusDto {
+            connected_inbound: status.connected_inbound,
+            connected_outbound: status.connected_outbound,
+            total_connected_peers: status.connected_total,
+            known_peer_count: status.known_peers,
+            bootstrap_phase: status.bootstrap_phase.into(),
+            last_successful_connection_time: observed,
+            last_connection_error_code: None,
+            seed_resolution_summary: MAINNET_DNS_SEEDS
+                .iter()
+                .zip(status.seed_resolution_states)
+                .map(|(seed, state)| SeedResolutionDto {
+                    seed: (*seed).into(),
+                    state: state.into(),
+                })
+                .collect(),
+            canonical_height: status.canonical_height,
+            highest_known_peer_height: (status.connected_total > 0)
+                .then_some(status.canonical_height),
+            peer_addresses: status.peer_addresses,
+        })
+    }
+
+    pub fn wallet_sync_status(&self) -> Result<WalletSyncStatusDto, CommandError> {
+        let service = self.service.lock().map_err(|_| CommandError::Unavailable)?;
+        let diagnostic = service.diagnostics();
+        let canonical_height = service
+            .embedded_core_identity()
+            .ok()
+            .map(|identity| identity.current_tip.height);
+        let synchronized = diagnostic.cursor_height.is_some()
+            && diagnostic.cursor_height == canonical_height
+            && diagnostic.last_error.is_none();
+        Ok(WalletSyncStatusDto {
+            state: diagnostic.application_state,
+            cursor_height: diagnostic.cursor_height,
+            canonical_height,
+            synchronized,
+            paused: self.synchronization_paused.load(Ordering::Acquire),
+            last_result: if synchronized {
+                "SUCCESS"
+            } else {
+                "NOT_SYNCHRONIZED"
+            }
+            .into(),
+            last_error: diagnostic.last_error,
+        })
+    }
+
+    pub fn mining_config_get(&self) -> Result<MiningConfigDto, CommandError> {
+        let service = self.service.lock().map_err(|_| CommandError::Unavailable)?;
+        let preferences = service.mining_preferences().map_err(CommandError::from)?;
+        let available = available_logical_cpus();
+        let recommended = (available / 2).max(1);
+        Ok(MiningConfigDto {
+            enabled: preferences.enabled,
+            cpu_threads: if preferences.cpu_threads == 0 {
+                recommended
+            } else {
+                preferences.cpu_threads.min(available).max(1)
+            },
+            available_logical_cpus: available,
+            recommended_cpu_threads: recommended,
+            mining_address: service
+                .mining_reward_destination()
+                .map_err(CommandError::from)?,
+        })
+    }
+
+    pub fn mining_config_set(
+        &self,
+        enabled: bool,
+        cpu_threads: usize,
+    ) -> Result<MiningConfigDto, CommandError> {
+        let state = self
+            .mining
+            .lock()
+            .map_err(|_| CommandError::Unavailable)?
+            .state
+            .load(Ordering::Acquire);
+        if matches!(state, MINING_STARTING | MINING_RUNNING | MINING_STOPPING) {
+            return Err(CommandError::MiningRunning);
+        }
+        let available = available_logical_cpus();
+        if cpu_threads == 0 || cpu_threads > available {
+            return Err(CommandError::InvalidInput(
+                "CPU thread count is invalid".into(),
+            ));
+        }
+        self.service
+            .lock()
+            .map_err(|_| CommandError::Unavailable)?
+            .set_mining_preferences(enabled, cpu_threads)
+            .map_err(CommandError::from)?;
+        let mining = self.mining.lock().map_err(|_| CommandError::Unavailable)?;
+        mining.state.store(
+            if enabled {
+                MINING_READY
+            } else {
+                MINING_DISABLED
+            },
+            Ordering::Release,
+        );
+        drop(mining);
+        self.mining_config_get()
+    }
+
+    pub fn mining_status(&self) -> Result<MiningStatusDto, CommandError> {
+        let config = self.mining_config_get()?;
+        let mining = self.mining.lock().map_err(|_| CommandError::Unavailable)?;
+        let raw_state = mining.state.load(Ordering::Acquire);
+        let attempts = mining.hash_attempts.load(Ordering::Relaxed);
+        let started_at = mining.started_at.load(Ordering::Acquire);
+        let uptime = if matches!(
+            raw_state,
+            MINING_STARTING | MINING_RUNNING | MINING_STOPPING
+        ) && started_at > 0
+        {
+            unix_seconds().saturating_sub(started_at)
+        } else {
+            0
+        };
+        let peer_status = self
+            .service
+            .lock()
+            .map_err(|_| CommandError::Unavailable)?
+            .embedded_peer_status()
+            .map_err(CommandError::from)?;
+        let last_candidate = mining.last_candidate_time.load(Ordering::Acquire);
+        let last_height = mining.last_accepted_height.load(Ordering::Acquire);
+        Ok(MiningStatusDto {
+            status: mining_state_name(raw_state, config.enabled).into(),
+            enabled: config.enabled,
+            running: raw_state == MINING_RUNNING,
+            cpu_threads: config.cpu_threads,
+            mining_address: config.mining_address,
+            hash_attempts: attempts,
+            hashrate_hps: if uptime > 0 {
+                attempts as f64 / uptime as f64
+            } else {
+                0.0
+            },
+            current_height: peer_status.canonical_height,
+            connected_peers: peer_status.connected_total,
+            accepted_blocks: mining.accepted_blocks.load(Ordering::Relaxed),
+            rejected_work: mining.rejected_work.load(Ordering::Relaxed),
+            last_block_candidate_time: (last_candidate > 0).then_some(last_candidate),
+            last_accepted_block_height: (last_height != u64::MAX).then_some(last_height),
+            uptime_seconds: uptime,
+            error_code: mining
+                .error_code
+                .lock()
+                .ok()
+                .and_then(|error| error.clone()),
+        })
+    }
+
+    pub fn mining_start(&self, confirmed: bool) -> Result<MiningStatusDto, CommandError> {
+        if !confirmed {
+            return Err(CommandError::MiningConfirmationRequired);
+        }
+        let config = self.mining_config_get()?;
+        if !config.enabled {
+            return Err(CommandError::MiningDisabled);
+        }
+        let sync = self.wallet_sync_status()?;
+        if !sync.synchronized {
+            return Err(CommandError::CursorInitializationFailed);
+        }
+        let peers = self.node_peer_status()?;
+        if peers.total_connected_peers == 0 {
+            return Err(CommandError::NoPeers);
+        }
+        let service = Arc::clone(&self.service);
+        let node = service
+            .lock()
+            .map_err(|_| CommandError::Unavailable)?
+            .embedded_node_handle()
+            .map_err(CommandError::from)?;
+        let mut mining = self.mining.lock().map_err(|_| CommandError::Unavailable)?;
+        if mining.worker.is_some()
+            || matches!(
+                mining.state.load(Ordering::Acquire),
+                MINING_STARTING | MINING_RUNNING | MINING_STOPPING
+            )
+        {
+            return Err(CommandError::MiningRunning);
+        }
+        mining.stop.store(false, Ordering::Release);
+        mining.hash_attempts.store(0, Ordering::Release);
+        mining.accepted_blocks.store(0, Ordering::Release);
+        mining.rejected_work.store(0, Ordering::Release);
+        mining.last_candidate_time.store(0, Ordering::Release);
+        mining
+            .last_accepted_height
+            .store(u64::MAX, Ordering::Release);
+        mining.started_at.store(unix_seconds(), Ordering::Release);
+        if let Ok(mut error) = mining.error_code.lock() {
+            *error = None;
+        }
+        mining.state.store(MINING_STARTING, Ordering::Release);
+        let stop = Arc::clone(&mining.stop);
+        let attempts = Arc::clone(&mining.hash_attempts);
+        let accepted = Arc::clone(&mining.accepted_blocks);
+        let rejected = Arc::clone(&mining.rejected_work);
+        let candidate_time = Arc::clone(&mining.last_candidate_time);
+        let accepted_height = Arc::clone(&mining.last_accepted_height);
+        let state = Arc::clone(&mining.state);
+        let error_code = Arc::clone(&mining.error_code);
+        let threads = config.cpu_threads;
+        mining.worker = Some(
+            std::thread::Builder::new()
+                .name("dom-wallet-cpu-miner".into())
+                .spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build();
+                    let Ok(runtime) = runtime else {
+                        state.store(MINING_ERROR, Ordering::Release);
+                        if let Ok(mut error) = error_code.lock() {
+                            *error = Some("MINER_RUNTIME_START_FAILED".into());
+                        }
+                        return;
+                    };
+                    node.metrics.mining_active.store(1, Ordering::Release);
+                    state.store(MINING_RUNNING, Ordering::Release);
+                    while !stop.load(Ordering::Acquire) {
+                        let height = node
+                            .metrics
+                            .chain_height
+                            .load(Ordering::Acquire)
+                            .saturating_add(1);
+                        candidate_time.store(unix_seconds(), Ordering::Release);
+                        let coinbase = service.lock().map_err(|_| ()).and_then(|mut wallet| {
+                            wallet.mining_coinbase_candidate(height).map_err(|_| ())
+                        });
+                        let Ok(coinbase) = coinbase else {
+                            state.store(MINING_ERROR, Ordering::Release);
+                            if let Ok(mut error) = error_code.lock() {
+                                *error = Some("MINING_COINBASE_PREPARATION_FAILED".into());
+                            }
+                            break;
+                        };
+                        match runtime.block_on(mine_wallet_block(
+                            Arc::clone(&node),
+                            coinbase,
+                            threads,
+                            Arc::clone(&stop),
+                            Arc::clone(&attempts),
+                        )) {
+                            Ok(WalletMiningOutcome::Accepted { height }) => {
+                                accepted.fetch_add(1, Ordering::Relaxed);
+                                accepted_height.store(height, Ordering::Release);
+                            }
+                            Ok(WalletMiningOutcome::Rejected { .. }) => {
+                                rejected.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Ok(WalletMiningOutcome::Stopped) => break,
+                            Err(_) => {
+                                rejected.fetch_add(1, Ordering::Relaxed);
+                                state.store(MINING_ERROR, Ordering::Release);
+                                if let Ok(mut error) = error_code.lock() {
+                                    *error = Some("MINING_WORK_FAILED".into());
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    node.metrics.mining_active.store(0, Ordering::Release);
+                    if state.load(Ordering::Acquire) != MINING_ERROR {
+                        state.store(MINING_READY, Ordering::Release);
+                    }
+                })
+                .map_err(|_| CommandError::Unavailable)?,
+        );
+        drop(mining);
+        self.mining_status()
+    }
+
+    pub fn mining_stop(&self) -> Result<MiningStatusDto, CommandError> {
+        let worker = {
+            let mut mining = self.mining.lock().map_err(|_| CommandError::Unavailable)?;
+            if mining.worker.is_some() {
+                mining.state.store(MINING_STOPPING, Ordering::Release);
+                mining.stop.store(true, Ordering::Release);
+            }
+            mining.worker.take()
+        };
+        if let Some(worker) = worker {
+            worker.join().map_err(|_| CommandError::Unavailable)?;
+        }
+        self.mining_status()
     }
     pub fn diagnostics_redacted(&self) -> DiagnosticSnapshot {
         self.service
@@ -501,6 +945,7 @@ impl DesktopApplication {
         if self.shutdown.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
+        let _ = self.mining_stop();
         self.clear_qr_buffers()?;
         let mut service = self.service.lock().map_err(|_| CommandError::Unavailable)?;
         let _ = service.close();
@@ -508,14 +953,27 @@ impl DesktopApplication {
         Ok(())
     }
     pub fn synchronization_pause(&self) -> Result<(), CommandError> {
+        self.synchronization_paused.store(true, Ordering::Release);
         Ok(())
     }
-    pub fn synchronization_rescan(&self) -> Result<(), CommandError> {
-        Ok(())
+    pub fn synchronization_resume_live(&self) -> Result<WalletSummary, CommandError> {
+        self.synchronization_paused.store(false, Ordering::Release);
+        self.synchronization_start_live()
+    }
+    pub fn synchronization_rescan(&self) -> Result<WalletSummary, CommandError> {
+        self.synchronization_paused.store(false, Ordering::Release);
+        self.service
+            .lock()
+            .map_err(|_| CommandError::Unavailable)?
+            .rescan_from_genesis()
+            .map_err(CommandError::from)
     }
 
     pub fn synchronization_start_live(&self) -> Result<WalletSummary, CommandError> {
         self.ensure_running()?;
+        if self.synchronization_paused.load(Ordering::Acquire) {
+            return Err(CommandError::SynchronizationPaused);
+        }
         self.service
             .lock()
             .map_err(|_| CommandError::Unavailable)?
@@ -541,8 +999,6 @@ impl DesktopApplication {
         &self,
         amount: u64,
         requested_fee: Option<u64>,
-        sender_address: &str,
-        receiver_address: &str,
         expires_at_height: u64,
     ) -> Result<TransactionSummary, CommandError> {
         self.ensure_running()?;
@@ -552,13 +1008,7 @@ impl DesktopApplication {
         self.service
             .lock()
             .map_err(|_| CommandError::Unavailable)?
-            .transaction_send_create_with_addresses(
-                amount,
-                requested_fee,
-                sender_address,
-                receiver_address,
-                expires_at_height,
-            )
+            .transaction_send_create(amount, requested_fee, expires_at_height)
             .map_err(CommandError::from)
     }
 
@@ -799,6 +1249,8 @@ fn stopped_node_status() -> EmbeddedNodeStatusDto {
         range_proof_version: None,
         ready: false,
         error_code: None,
+        connected_peers: 0,
+        bootstrap_phase: "STOPPED".into(),
     }
 }
 
@@ -807,6 +1259,31 @@ fn core_network_name(network: CoreNetwork) -> &'static str {
         CoreNetwork::Mainnet => "MAINNET",
         CoreNetwork::Testnet => "TESTNET",
         CoreNetwork::Regtest => "REGTEST",
+    }
+}
+
+fn available_logical_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn mining_state_name(state: u64, enabled: bool) -> &'static str {
+    match state {
+        MINING_STARTING => "STARTING",
+        MINING_RUNNING => "RUNNING",
+        MINING_STOPPING => "STOPPING",
+        MINING_ERROR => "ERROR",
+        MINING_READY if enabled => "READY",
+        _ => "DISABLED",
     }
 }
 
@@ -877,8 +1354,28 @@ pub enum CommandError {
     InvalidInput(String),
     #[error("application is unavailable")]
     Unavailable,
-    #[error("wallet operation failed")]
-    Wallet,
+    #[error("wallet and Mainnet identities differ")]
+    IdentityMismatch,
+    #[error("embedded node is not ready")]
+    NodeNotReady,
+    #[error("wallet synchronization is paused")]
+    SynchronizationPaused,
+    #[error("wallet cursor initialization failed")]
+    CursorInitializationFailed,
+    #[error("mining is already running")]
+    MiningRunning,
+    #[error("mining is disabled")]
+    MiningDisabled,
+    #[error("mining confirmation is required")]
+    MiningConfirmationRequired,
+    #[error("no remote peers are connected")]
+    NoPeers,
+    #[error("wallet operation rejected ({code})")]
+    Wallet {
+        code: &'static str,
+        message: &'static str,
+        retryable: bool,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -905,19 +1402,117 @@ impl From<CommandError> for CommandErrorDto {
                 message: "The embedded wallet service is unavailable.".into(),
                 retryable: true,
             },
-            CommandError::Wallet => Self {
-                code: "WALLET_OPERATION_FAILED".into(),
-                category: "WALLET".into(),
-                message: "The wallet operation failed.".into(),
+            CommandError::IdentityMismatch => Self {
+                code: "CHAIN_IDENTITY_MISMATCH".into(),
+                category: "NETWORK_IDENTITY".into(),
+                message: "This wallet does not belong to DOM Mainnet and was not opened.".into(),
                 retryable: false,
+            },
+            CommandError::NodeNotReady => Self {
+                code: "EMBEDDED_NODE_NOT_READY".into(),
+                category: "NODE".into(),
+                message: "The embedded Mainnet node is still starting.".into(),
+                retryable: true,
+            },
+            CommandError::SynchronizationPaused => Self {
+                code: "WALLET_SYNC_PAUSED".into(),
+                category: "SYNCHRONIZATION".into(),
+                message: "Wallet synchronization is paused.".into(),
+                retryable: true,
+            },
+            CommandError::CursorInitializationFailed => Self {
+                code: "CURSOR_INITIALIZATION_FAILED".into(),
+                category: "CURSOR".into(),
+                message: "The wallet cursor could not be initialized from the canonical chain."
+                    .into(),
+                retryable: true,
+            },
+            CommandError::MiningRunning => Self {
+                code: "MINING_ALREADY_RUNNING".into(),
+                category: "MINING".into(),
+                message: "Stop the active miner before changing its configuration.".into(),
+                retryable: false,
+            },
+            CommandError::MiningDisabled => Self {
+                code: "MINING_DISABLED".into(),
+                category: "MINING".into(),
+                message: "Enable mining controls before starting the miner.".into(),
+                retryable: false,
+            },
+            CommandError::MiningConfirmationRequired => Self {
+                code: "MINING_CONFIRMATION_REQUIRED".into(),
+                category: "MINING".into(),
+                message: "Explicit confirmation is required before mining starts.".into(),
+                retryable: false,
+            },
+            CommandError::NoPeers => Self {
+                code: "NO_REMOTE_PEERS".into(),
+                category: "P2P".into(),
+                message: "Connect to at least one Mainnet peer before starting mining.".into(),
+                retryable: true,
+            },
+            CommandError::Wallet {
+                code,
+                message,
+                retryable,
+            } => Self {
+                code: code.into(),
+                category: "WALLET".into(),
+                message: message.into(),
+                retryable,
             },
         }
     }
 }
 
 impl From<CoreError> for CommandError {
-    fn from(_: CoreError) -> Self {
-        Self::Wallet
+    fn from(value: CoreError) -> Self {
+        match value {
+            CoreError::IdentityMismatch => Self::IdentityMismatch,
+            CoreError::NodeNotReady | CoreError::EmbeddedCoreRequired => Self::NodeNotReady,
+            CoreError::InvalidCoreCursor => Self::CursorInitializationFailed,
+            CoreError::WalletNotOpen => Self::Wallet {
+                code: "WALLET_NOT_OPEN",
+                message: "Open a Mainnet wallet before using this operation.",
+                retryable: false,
+            },
+            CoreError::Locked => Self::Wallet {
+                code: "WALLET_LOCKED",
+                message: "Unlock the wallet before using this operation.",
+                retryable: false,
+            },
+            CoreError::InsufficientFunds => Self::Wallet {
+                code: "INSUFFICIENT_FUNDS",
+                message: "The wallet does not have enough spendable funds for this payment.",
+                retryable: false,
+            },
+            CoreError::InvalidSlateTransport => Self::Wallet {
+                code: "SLATE_V4_TRANSPORT_INVALID",
+                message: "The imported Slate v4 data is invalid or has been altered.",
+                retryable: false,
+            },
+            CoreError::MissingPrivateContext => Self::Wallet {
+                code: "SLATE_PRIVATE_CONTEXT_MISSING",
+                message: "The private context required to continue this Slate is unavailable.",
+                retryable: false,
+            },
+            CoreError::FeeTooLow => Self::Wallet {
+                code: "FEE_TOO_LOW",
+                message: "The fee is below the embedded node policy minimum.",
+                retryable: false,
+            },
+            CoreError::Backend(_) => Self::Wallet {
+                code: "EMBEDDED_NODE_OPERATION_FAILED",
+                message: "The embedded Mainnet node could not complete the requested operation.",
+                retryable: true,
+            },
+            other => Self::Wallet {
+                code: other.redacted_code(),
+                message:
+                    "The wallet rejected the requested operation. Review its typed error code.",
+                retryable: false,
+            },
+        }
     }
 }
 
@@ -938,7 +1533,7 @@ mod tests {
         let unique = COMMAND_NAMES
             .iter()
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(unique.len(), 43);
+        assert_eq!(unique.len(), COMMAND_NAMES.len());
         for required in [
             "native_bridge_status",
             "application_status",
@@ -969,7 +1564,7 @@ mod tests {
     fn native_bridge_probe_is_static_redacted_and_versioned() {
         let status = native_bridge_status();
         assert_eq!(status.bridge, "ready");
-        assert_eq!(status.app_version, "0.1.1");
+        assert_eq!(status.app_version, "0.1.2");
         fn assert_serializable<T: serde::Serialize>(_: &T) {}
         assert_serializable(&status);
     }
@@ -1016,11 +1611,50 @@ mod tests {
         ] {
             assert!(COMMAND_NAMES.contains(&command));
         }
-        let error = app
-            .transaction_send_create(42, None, "invalid", "invalid", 100)
-            .unwrap_err();
-        assert_eq!(error.to_string(), "wallet operation failed");
+        let error = app.transaction_send_create(42, None, 100).unwrap_err();
+        assert_eq!(error.to_string(), "embedded node is not ready");
         assert!(app.slate_request_import("invalid=not-a-slate").is_err());
         assert!(!format!("{error:?}").contains("password"));
+    }
+
+    #[test]
+    #[ignore = "live packaged-equivalent Mainnet acceptance gate"]
+    fn live_mainnet_genesis_wallet_syncs_at_zero_without_mining() {
+        let node_directory = tempfile::tempdir().expect("temporary node directory");
+        let wallet_directory = tempfile::tempdir().expect("temporary wallet parent");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+        let address = listener.local_addr().expect("local address");
+        drop(listener);
+        let app = DesktopApplication::default();
+        let node = app
+            .embedded_node_start_mainnet(node_directory.path(), address)
+            .expect("Mainnet node starts");
+        assert_eq!(node.network.as_deref(), Some("MAINNET"));
+        assert_eq!(node.canonical_tip_height, Some(0));
+        let destination = wallet_directory.path().join("wallet");
+        let created = app
+            .wallet_create_recoverable(&destination, "correct-horse-battery")
+            .expect("Mainnet wallet created");
+        assert_eq!(created.wallet.network, Network::Mainnet);
+        app.wallet_recovery_phrase_confirm("correct-horse-battery")
+            .expect("phrase confirmation");
+        app.wallet_unlock("correct-horse-battery")
+            .expect("wallet unlock");
+        let synchronized = app.synchronization_start_live().unwrap_or_else(|error| {
+            panic!(
+                "genesis-only synchronization: {error:?}; diagnostics={:?}",
+                app.diagnostics_redacted()
+            )
+        });
+        assert_eq!(synchronized.cursor_height, Some(0));
+        let status = app.wallet_sync_status().expect("sync status");
+        assert!(status.synchronized);
+        assert_eq!(status.canonical_height, Some(0));
+        assert_eq!(status.cursor_height, Some(0));
+        let mining = app.mining_status().expect("mining status");
+        assert_eq!(mining.status, "DISABLED");
+        assert!(!mining.running);
+        assert_eq!(mining.hash_attempts, 0);
+        app.application_shutdown().expect("shutdown");
     }
 }

@@ -460,7 +460,32 @@ impl CoreChainAdapter {
             .map_err(|_| CoreScanError::Persistence)?
         {
             PersistedCoreCursorState::Absent => {
-                let batch = self.scan_from_height(0, self.maximum_batch_blocks)?;
+                let identity = self.current_identity()?;
+                let batch = if identity.current_tip.height == 0 {
+                    if self.canonical_hash_at_height(0)? != Some(identity.current_tip.hash) {
+                        return Err(CoreScanError::InvalidScan {
+                            code: "GENESIS_HASH_DISAGREEMENT",
+                        });
+                    }
+                    let cursor = WalletScanCursor::new(
+                        identity.network,
+                        identity.chain_id,
+                        1,
+                        BlockRef {
+                            height: 0,
+                            hash: identity.current_tip.hash,
+                        },
+                    );
+                    let cursor = CoreCursorBytes::from_cursor(cursor, &identity)?;
+                    self.validate_cursor(cursor)?;
+                    CoreScanBatch {
+                        observed_tip: identity.current_tip,
+                        blocks: Vec::new(),
+                        commit_cursor: Some(cursor),
+                    }
+                } else {
+                    self.scan_from_height(0, self.maximum_batch_blocks)?
+                };
                 self.commit_normal(sink, batch)
             }
             PersistedCoreCursorState::Valid(cursor) => match self.validate_cursor(cursor) {
@@ -624,7 +649,22 @@ impl CoreChainAdapter {
                         code: "CURSOR_WITHOUT_BLOCKS",
                     });
                 }
-                None
+                if expected_start == 0 && result.tip.height == 0 {
+                    let cursor = WalletScanCursor::new(
+                        identity.network,
+                        identity.chain_id,
+                        1,
+                        BlockRef {
+                            height: 0,
+                            hash: result.tip.hash,
+                        },
+                    );
+                    let bytes = CoreCursorBytes::from_cursor(cursor, identity)?;
+                    self.validate_cursor(bytes)?;
+                    Some(bytes)
+                } else {
+                    None
+                }
             }
             Some(last) => {
                 let cursor = if let Some(cursor) = result.continuation {

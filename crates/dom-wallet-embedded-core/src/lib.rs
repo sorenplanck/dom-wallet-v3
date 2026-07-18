@@ -24,6 +24,9 @@ use std::{
 };
 use thiserror::Error;
 
+mod miner;
+pub use miner::{mine_wallet_block, WalletMiningError, WalletMiningOutcome};
+
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const STATE_UNINITIALIZED: u8 = 0;
@@ -32,6 +35,21 @@ const STATE_RUNNING: u8 = 2;
 const STATE_STOPPING: u8 = 3;
 const STATE_STOPPED: u8 = 4;
 const STATE_FAILED: u8 = 5;
+const SEED_PENDING: u8 = 0;
+const SEED_RESOLVING: u8 = 1;
+const SEED_RESOLVED: u8 = 2;
+const SEED_RETRYING: u8 = 3;
+
+/// Canonical desktop-wallet Mainnet DNS seeds.
+pub const MAINNET_DNS_SEEDS: [&str; 3] = [
+    "seed1.dom-protocol.org",
+    "seed2.dom-protocol.org",
+    "seed3.dom-protocol.org",
+];
+/// Canonical Mainnet P2P port.
+pub const MAINNET_P2P_PORT: u16 = 33_369;
+/// Direct P2P bootstrap fallback. This is never used as a Wallet backend.
+pub const MAINNET_BOOTSTRAP_FALLBACK: &str = "168.100.9.70:33369";
 
 /// Network selected for the embedded node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +98,19 @@ impl EmbeddedCoreConfiguration {
         }
     }
 
+    /// Build the single production configuration used by the desktop Wallet.
+    pub fn mainnet(data_directory: impl Into<PathBuf>, p2p_listen_address: SocketAddr) -> Self {
+        Self::new(
+            EmbeddedCoreNetwork::Mainnet,
+            data_directory,
+            p2p_listen_address,
+        )
+        .with_maximum_inbound_peers(1)
+        .with_seed_peers(vec![MAINNET_BOOTSTRAP_FALLBACK
+            .parse()
+            .expect("fixed Mainnet bootstrap address is valid")])
+    }
+
     /// Set the maximum inbound peer count.
     pub fn with_maximum_inbound_peers(mut self, maximum: usize) -> Self {
         self.maximum_inbound_peers = maximum;
@@ -108,6 +139,14 @@ impl EmbeddedCoreConfiguration {
                 code: "ZERO_INBOUND_LIMIT",
             });
         }
+        if self.network == EmbeddedCoreNetwork::Mainnet
+            && (!self.p2p_listen_address.ip().is_loopback()
+                || self.seed_peers.contains(&self.p2p_listen_address))
+        {
+            return Err(EmbeddedCoreAdapterError::InvalidConfiguration {
+                code: "UNSAFE_MAINNET_LISTENER_OR_SELF_PEER",
+            });
+        }
         Ok(())
     }
 
@@ -120,7 +159,10 @@ impl EmbeddedCoreConfiguration {
         config.data_dir = self.data_directory.to_string_lossy().into_owned();
         config.p2p_listen_addr = self.p2p_listen_address.to_string();
         config.max_inbound = self.maximum_inbound_peers;
-        config.min_outbound = 0;
+        config.min_outbound = usize::from(self.network == EmbeddedCoreNetwork::Mainnet);
+        // The Wallet owns DNS discovery so each seed has independent bounded
+        // backoff. Core's resolver logs every failed seed on every connector
+        // pass and is therefore deliberately disabled here.
         config.dns_seeds.clear();
         config.disable_dns_seeds = true;
         config.seed_peers = self.seed_peers.iter().map(ToString::to_string).collect();
@@ -133,6 +175,19 @@ impl EmbeddedCoreConfiguration {
         config.metrics_listen_addr = None;
         config
     }
+}
+
+/// Privacy-safe live peer counters from the embedded node.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmbeddedPeerStatus {
+    pub connected_inbound: u64,
+    pub connected_outbound: u64,
+    pub connected_total: u64,
+    pub known_peers: u64,
+    pub bootstrap_phase: &'static str,
+    pub peer_addresses: Vec<String>,
+    pub canonical_height: u64,
+    pub seed_resolution_states: Vec<&'static str>,
 }
 
 impl fmt::Debug for EmbeddedCoreConfiguration {
@@ -269,6 +324,7 @@ pub struct EmbeddedCoreLifecycle {
     wallet_api: Option<Arc<EmbeddedWalletApiHandle>>,
     command_sender: Option<tokio::sync::mpsc::UnboundedSender<LifecycleCommand>>,
     runtime_thread: Option<JoinHandle<()>>,
+    seed_resolution: Arc<[AtomicU8; MAINNET_DNS_SEEDS.len()]>,
 }
 
 impl fmt::Debug for EmbeddedCoreLifecycle {
@@ -291,6 +347,7 @@ impl EmbeddedCoreLifecycle {
             wallet_api: None,
             command_sender: None,
             runtime_thread: None,
+            seed_resolution: Arc::new(std::array::from_fn(|_| AtomicU8::new(SEED_PENDING))),
         }
     }
 
@@ -326,6 +383,8 @@ impl EmbeddedCoreLifecycle {
         let lifecycle = self.lifecycle.clone();
         let listen_address = self.configuration.p2p_listen_address;
         let runtime_node = node.clone();
+        let discover_mainnet = self.configuration.network == EmbeddedCoreNetwork::Mainnet;
+        let seed_resolution = Arc::clone(&self.seed_resolution);
 
         let runtime_thread = thread::Builder::new()
             .name("dom-wallet-embedded-core".to_owned())
@@ -336,6 +395,8 @@ impl EmbeddedCoreLifecycle {
                     lifecycle,
                     command_receiver,
                     startup_sender,
+                    discover_mainnet,
+                    seed_resolution,
                 );
             })
             .map_err(|_| {
@@ -403,6 +464,77 @@ impl EmbeddedCoreLifecycle {
             })
     }
 
+    /// Return safe live peer and bootstrap diagnostics without exposing Noise state.
+    pub fn peer_status(&self) -> Result<EmbeddedPeerStatus, EmbeddedCoreAdapterError> {
+        if self.state() != EmbeddedCoreLifecycleState::Running {
+            return Err(EmbeddedCoreAdapterError::NotRunning);
+        }
+        let node = self
+            .node
+            .as_ref()
+            .ok_or(EmbeddedCoreAdapterError::Internal {
+                code: "MISSING_NODE",
+            })?;
+        let connected_inbound = node.metrics.inbound_peers.load(Ordering::Relaxed);
+        let connected_outbound = node.metrics.outbound_peers.load(Ordering::Relaxed);
+        let connected_total = node.metrics.peer_count.load(Ordering::Relaxed);
+        let canonical_height = node.metrics.chain_height.load(Ordering::Relaxed);
+        let known_peers = node
+            .pex
+            .try_lock()
+            .map(|pex| pex.known_count() as u64)
+            .unwrap_or(connected_total);
+        let peer_addresses = node
+            .peers
+            .try_lock()
+            .map(|peers| {
+                peers
+                    .connected_peers()
+                    .into_iter()
+                    .filter_map(|peer| peer.parse::<SocketAddr>().ok())
+                    .map(redact_peer_address)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(EmbeddedPeerStatus {
+            connected_inbound,
+            connected_outbound,
+            connected_total,
+            known_peers,
+            bootstrap_phase: if connected_total > 0 {
+                "CONNECTED"
+            } else {
+                "DISCOVERING_PEERS"
+            },
+            peer_addresses,
+            canonical_height,
+            seed_resolution_states: self
+                .seed_resolution
+                .iter()
+                .map(|state| match state.load(Ordering::Acquire) {
+                    SEED_RESOLVING => "RESOLVING",
+                    SEED_RESOLVED => "RESOLVED",
+                    SEED_RETRYING => "RETRYING_WITH_BACKOFF",
+                    _ => "PENDING",
+                })
+                .collect(),
+        })
+    }
+
+    /// Return an in-process node handle for the Wallet-owned miner interface.
+    /// No seed, key, password, or private recovery material is attached to it.
+    pub fn node_handle(&self) -> Result<Arc<DomNode>, EmbeddedCoreAdapterError> {
+        if self.state() != EmbeddedCoreLifecycleState::Running {
+            return Err(EmbeddedCoreAdapterError::NotRunning);
+        }
+        self.node
+            .as_ref()
+            .cloned()
+            .ok_or(EmbeddedCoreAdapterError::Internal {
+                code: "MISSING_NODE",
+            })
+    }
+
     /// Request shutdown. Repeated requests are safe.
     pub fn request_shutdown(&mut self) -> Result<(), EmbeddedCoreAdapterError> {
         match self.state() {
@@ -451,6 +583,16 @@ impl EmbeddedCoreLifecycle {
     }
 }
 
+fn redact_peer_address(address: SocketAddr) -> String {
+    match address.ip() {
+        std::net::IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            format!("{}.{}.x.x:{}", octets[0], octets[1], address.port())
+        }
+        std::net::IpAddr::V6(_) => format!("[IPv6]:{}", address.port()),
+    }
+}
+
 impl Drop for EmbeddedCoreLifecycle {
     fn drop(&mut self) {
         let _ = self.request_shutdown();
@@ -464,6 +606,8 @@ fn run_node_thread(
     lifecycle: Arc<AtomicU8>,
     mut command_receiver: tokio::sync::mpsc::UnboundedReceiver<LifecycleCommand>,
     startup_sender: mpsc::SyncSender<Result<(), ()>>,
+    discover_mainnet: bool,
+    seed_resolution: Arc<[AtomicU8; MAINNET_DNS_SEEDS.len()]>,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -478,12 +622,30 @@ fn run_node_thread(
     };
 
     runtime.block_on(async move {
+        let discovery_task = if discover_mainnet {
+            let discovery_shutdown = node.task_supervisor.shutdown_token();
+            let discovery_node = Arc::clone(&node);
+            Some(tokio::spawn(async move {
+                run_wallet_dns_discovery(
+                    discovery_node,
+                    listen_address,
+                    discovery_shutdown,
+                    seed_resolution,
+                )
+                .await;
+            }))
+        } else {
+            None
+        };
         let mut node_task = tokio::spawn(node.clone().run());
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         loop {
             if node_task.is_finished() || Instant::now() >= deadline {
                 node.request_shutdown().await;
                 let _ = node_task.await;
+                if let Some(task) = &discovery_task {
+                    task.abort();
+                }
                 lifecycle.store(STATE_FAILED, Ordering::Release);
                 let _ = startup_sender.send(Err(()));
                 return;
@@ -514,7 +676,70 @@ fn run_node_thread(
                 lifecycle.store(STATE_FAILED, Ordering::Release);
             }
         }
+        if let Some(task) = discovery_task {
+            task.abort();
+        }
     });
+}
+
+async fn run_wallet_dns_discovery(
+    node: Arc<DomNode>,
+    local_address: SocketAddr,
+    shutdown: dom_node::task_supervisor::ShutdownToken,
+    seed_resolution: Arc<[AtomicU8; MAINNET_DNS_SEEDS.len()]>,
+) {
+    const INITIAL_BACKOFF: Duration = Duration::from_secs(5);
+    const MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
+    const SUCCESS_REFRESH: Duration = Duration::from_secs(30 * 60);
+    let mut failures = [0u8; MAINNET_DNS_SEEDS.len()];
+    let mut next_attempt = [Instant::now(); MAINNET_DNS_SEEDS.len()];
+    loop {
+        if shutdown.is_shutdown() {
+            return;
+        }
+        let now = Instant::now();
+        for (index, seed) in MAINNET_DNS_SEEDS.iter().enumerate() {
+            if now < next_attempt[index] {
+                continue;
+            }
+            seed_resolution[index].store(SEED_RESOLVING, Ordering::Release);
+            let resolved = tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::net::lookup_host((*seed, MAINNET_P2P_PORT)),
+            )
+            .await;
+            match resolved {
+                Ok(Ok(addresses)) => {
+                    let addresses = addresses
+                        .filter(|address| *address != local_address)
+                        .map(|address| address.to_string())
+                        .collect::<Vec<_>>();
+                    if !addresses.is_empty() {
+                        if let Ok(mut pex) = node.pex.try_lock() {
+                            pex.seed_from_config(&addresses);
+                        }
+                        failures[index] = 0;
+                        seed_resolution[index].store(SEED_RESOLVED, Ordering::Release);
+                        next_attempt[index] = Instant::now() + SUCCESS_REFRESH;
+                        continue;
+                    }
+                    failures[index] = failures[index].saturating_add(1);
+                }
+                _ => failures[index] = failures[index].saturating_add(1),
+            }
+            let exponent = failures[index].saturating_sub(1).min(6) as u32;
+            seed_resolution[index].store(SEED_RETRYING, Ordering::Release);
+            let delay = INITIAL_BACKOFF
+                .checked_mul(1u32.checked_shl(exponent).unwrap_or(u32::MAX))
+                .unwrap_or(MAX_BACKOFF)
+                .min(MAX_BACKOFF);
+            next_attempt[index] = Instant::now() + delay;
+        }
+        tokio::select! {
+            _ = shutdown.wait() => return,
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+    }
 }
 
 fn listener_is_bound(address: SocketAddr) -> bool {
@@ -548,6 +773,68 @@ mod tests {
             unused_loopback_address(),
         )
         .with_maximum_inbound_peers(2)
+    }
+
+    #[test]
+    fn mainnet_wallet_configuration_is_fixed_private_and_non_mining() {
+        let directory = TempDir::new().expect("temporary directory");
+        let address = unused_loopback_address();
+        let configuration = EmbeddedCoreConfiguration::mainnet(directory.path(), address);
+        configuration
+            .validate()
+            .expect("fixed configuration is valid");
+        let node = configuration.node_config();
+        assert_eq!(node.network, Network::Mainnet);
+        assert_eq!(node.p2p_listen_addr, address.to_string());
+        assert_eq!(node.min_outbound, 1);
+        assert_eq!(node.max_inbound, 1);
+        assert!(node.disable_dns_seeds);
+        assert!(node.dns_seeds.is_empty());
+        assert_eq!(node.seed_peers, vec![MAINNET_BOOTSTRAP_FALLBACK]);
+        assert!(!node.mine);
+        assert!(node.wallet_path.is_none());
+        assert!(node.wallet_password.is_none());
+        assert!(node.rpc_listen_addr.is_none());
+    }
+
+    #[test]
+    fn mainnet_configuration_rejects_public_listener_and_self_bootstrap() {
+        let directory = TempDir::new().expect("temporary directory");
+        let public = EmbeddedCoreConfiguration::mainnet(
+            directory.path(),
+            "0.0.0.0:33369".parse().expect("address"),
+        );
+        assert!(public.validate().is_err());
+        let address = unused_loopback_address();
+        let self_peer = EmbeddedCoreConfiguration::mainnet(directory.path(), address)
+            .with_seed_peers(vec![address]);
+        assert!(self_peer.validate().is_err());
+    }
+
+    #[test]
+    #[ignore = "live Mainnet acceptance gate"]
+    fn live_mainnet_bootnode_connects_without_mining() {
+        let directory = TempDir::new().expect("temporary directory");
+        let mut lifecycle = EmbeddedCoreLifecycle::new(EmbeddedCoreConfiguration::mainnet(
+            directory.path(),
+            unused_loopback_address(),
+        ));
+        lifecycle.start().expect("Mainnet embedded node starts");
+        let deadline = Instant::now() + Duration::from_secs(45);
+        let mut status = lifecycle.peer_status().expect("peer status");
+        while status.connected_total == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(250));
+            status = lifecycle.peer_status().expect("peer status");
+        }
+        assert!(
+            status.connected_total >= 1,
+            "no live Mainnet peer connected"
+        );
+        assert_eq!(status.canonical_height, 0);
+        let node = lifecycle.node_handle().expect("node handle");
+        assert_eq!(node.metrics.mining_active.load(Ordering::Relaxed), 0);
+        lifecycle.request_shutdown().expect("shutdown request");
+        lifecycle.wait_for_shutdown().expect("shutdown");
     }
 
     #[test]
@@ -602,6 +889,13 @@ mod tests {
         let api = lifecycle.wallet_api().expect("running Wallet Core API");
         let identity = api.chain_identity().expect("chain identity");
         assert_eq!(identity.network, dom_wallet_core_api::CoreNetwork::Regtest);
+        assert_eq!(
+            lifecycle
+                .peer_status()
+                .expect("peer status")
+                .seed_resolution_states,
+            vec!["PENDING"; MAINNET_DNS_SEEDS.len()]
+        );
         assert!(lifecycle.sync_status().is_ok());
         assert!(lifecycle.is_ready_for_wallet_operations().is_ok());
         assert!(matches!(

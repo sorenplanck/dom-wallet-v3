@@ -1,7 +1,49 @@
 #![forbid(unsafe_code)]
 
 use dom_wallet_tauri_shell::DesktopApplication;
+use std::net::TcpListener;
 use tauri::Manager;
+
+fn ensure_mainnet_node(
+    handle: &tauri::AppHandle,
+    app: &DesktopApplication,
+) -> Result<dom_wallet_tauri_shell::EmbeddedNodeStatusDto, dom_wallet_tauri_shell::CommandErrorDto>
+{
+    if let Ok(status) = app.embedded_node_status() {
+        if status.ready {
+            return Ok(status);
+        }
+    }
+    let data_directory = handle
+        .path()
+        .app_data_dir()
+        .map_err(|_| dom_wallet_tauri_shell::CommandErrorDto {
+            code: "APP_DATA_DIRECTORY_UNAVAILABLE".into(),
+            category: "PLATFORM".into(),
+            message: "The platform application data directory is unavailable.".into(),
+            retryable: false,
+        })?
+        .join("mainnet")
+        .join("node");
+    let listener =
+        TcpListener::bind("127.0.0.1:0").map_err(|_| dom_wallet_tauri_shell::CommandErrorDto {
+            code: "LOCAL_LISTENER_UNAVAILABLE".into(),
+            category: "NODE".into(),
+            message: "A private local node listener could not be reserved.".into(),
+            retryable: true,
+        })?;
+    let address = listener
+        .local_addr()
+        .map_err(|_| dom_wallet_tauri_shell::CommandErrorDto {
+            code: "LOCAL_LISTENER_UNAVAILABLE".into(),
+            category: "NODE".into(),
+            message: "A private local node listener could not be reserved.".into(),
+            retryable: true,
+        })?;
+    drop(listener);
+    app.embedded_node_start_mainnet(data_directory, address)
+        .map_err(Into::into)
+}
 
 #[tauri::command]
 fn native_bridge_status() -> dom_wallet_tauri_shell::NativeBridgeStatusDto {
@@ -16,20 +58,24 @@ fn application_status(
 }
 #[tauri::command]
 fn wallet_create_recoverable(
+    handle: tauri::AppHandle,
     app: tauri::State<'_, DesktopApplication>,
     path: String,
     password: String,
 ) -> Result<dom_wallet_tauri_shell::RecoveryCreateDto, dom_wallet_tauri_shell::CommandErrorDto> {
+    ensure_mainnet_node(&handle, &app)?;
     app.wallet_create_recoverable(path, &password)
         .map_err(Into::into)
 }
 #[tauri::command]
 fn wallet_restore_from_mnemonic(
+    handle: tauri::AppHandle,
     app: tauri::State<'_, DesktopApplication>,
     path: String,
     password: String,
     mnemonic: String,
 ) -> Result<dom_wallet_tauri_shell::RecoveryResultDto, dom_wallet_tauri_shell::CommandErrorDto> {
+    ensure_mainnet_node(&handle, &app)?;
     app.wallet_restore_from_mnemonic(path, &password, &mnemonic)
         .map_err(Into::into)
 }
@@ -44,12 +90,14 @@ fn wallet_backup_export(
 }
 #[tauri::command]
 fn wallet_backup_import(
+    handle: tauri::AppHandle,
     app: tauri::State<'_, DesktopApplication>,
     destination: String,
     backup_path: String,
     backup_password: String,
     password: String,
 ) -> Result<dom_wallet_core::WalletSummary, dom_wallet_tauri_shell::CommandErrorDto> {
+    ensure_mainnet_node(&handle, &app)?;
     app.wallet_backup_import(destination, backup_path, &backup_password, &password)
         .map_err(Into::into)
 }
@@ -63,9 +111,11 @@ fn wallet_recovery_phrase_confirm(
 }
 #[tauri::command]
 fn wallet_open(
+    handle: tauri::AppHandle,
     app: tauri::State<'_, DesktopApplication>,
     path: String,
 ) -> Result<dom_wallet_core::WalletSummary, dom_wallet_tauri_shell::CommandErrorDto> {
+    ensure_mainnet_node(&handle, &app)?;
     app.wallet_open(path).map_err(Into::into)
 }
 #[tauri::command]
@@ -107,11 +157,11 @@ fn account_summary(
 }
 #[tauri::command]
 fn embedded_node_start(
+    handle: tauri::AppHandle,
     app: tauri::State<'_, DesktopApplication>,
-    request: dom_wallet_tauri_shell::EmbeddedNodeStartDto,
 ) -> Result<dom_wallet_tauri_shell::EmbeddedNodeStatusDto, dom_wallet_tauri_shell::CommandErrorDto>
 {
-    app.embedded_node_start(request).map_err(Into::into)
+    ensure_mainnet_node(&handle, &app)
 }
 #[tauri::command]
 fn embedded_node_status(
@@ -119,6 +169,88 @@ fn embedded_node_status(
 ) -> Result<dom_wallet_tauri_shell::EmbeddedNodeStatusDto, dom_wallet_tauri_shell::CommandErrorDto>
 {
     app.embedded_node_status().map_err(Into::into)
+}
+#[tauri::command]
+fn node_network_status(
+    app: tauri::State<'_, DesktopApplication>,
+) -> Result<dom_wallet_tauri_shell::NodeNetworkStatusDto, dom_wallet_tauri_shell::CommandErrorDto> {
+    app.node_network_status().map_err(Into::into)
+}
+#[tauri::command]
+fn node_peer_status(
+    app: tauri::State<'_, DesktopApplication>,
+) -> Result<dom_wallet_tauri_shell::NodePeerStatusDto, dom_wallet_tauri_shell::CommandErrorDto> {
+    app.node_peer_status().map_err(Into::into)
+}
+#[tauri::command]
+fn wallet_sync_status(
+    app: tauri::State<'_, DesktopApplication>,
+) -> Result<dom_wallet_tauri_shell::WalletSyncStatusDto, dom_wallet_tauri_shell::CommandErrorDto> {
+    app.wallet_sync_status().map_err(Into::into)
+}
+#[tauri::command]
+fn wallet_sync_start(
+    app: tauri::State<'_, DesktopApplication>,
+) -> Result<dom_wallet_core::WalletSummary, dom_wallet_tauri_shell::CommandErrorDto> {
+    app.synchronization_start_live().map_err(Into::into)
+}
+#[tauri::command]
+fn wallet_sync_pause(
+    app: tauri::State<'_, DesktopApplication>,
+) -> Result<(), dom_wallet_tauri_shell::CommandErrorDto> {
+    app.synchronization_pause().map_err(Into::into)
+}
+#[tauri::command]
+fn wallet_sync_resume(
+    app: tauri::State<'_, DesktopApplication>,
+) -> Result<dom_wallet_core::WalletSummary, dom_wallet_tauri_shell::CommandErrorDto> {
+    app.synchronization_resume_live().map_err(Into::into)
+}
+#[tauri::command]
+fn wallet_sync_retry(
+    app: tauri::State<'_, DesktopApplication>,
+) -> Result<dom_wallet_core::WalletSummary, dom_wallet_tauri_shell::CommandErrorDto> {
+    app.synchronization_resume_live().map_err(Into::into)
+}
+#[tauri::command]
+fn wallet_rescan(
+    app: tauri::State<'_, DesktopApplication>,
+) -> Result<dom_wallet_core::WalletSummary, dom_wallet_tauri_shell::CommandErrorDto> {
+    app.synchronization_rescan().map_err(Into::into)
+}
+#[tauri::command]
+fn mining_status(
+    app: tauri::State<'_, DesktopApplication>,
+) -> Result<dom_wallet_tauri_shell::MiningStatusDto, dom_wallet_tauri_shell::CommandErrorDto> {
+    app.mining_status().map_err(Into::into)
+}
+#[tauri::command]
+fn mining_config_get(
+    app: tauri::State<'_, DesktopApplication>,
+) -> Result<dom_wallet_tauri_shell::MiningConfigDto, dom_wallet_tauri_shell::CommandErrorDto> {
+    app.mining_config_get().map_err(Into::into)
+}
+#[tauri::command]
+fn mining_config_set(
+    app: tauri::State<'_, DesktopApplication>,
+    enabled: bool,
+    cpu_threads: usize,
+) -> Result<dom_wallet_tauri_shell::MiningConfigDto, dom_wallet_tauri_shell::CommandErrorDto> {
+    app.mining_config_set(enabled, cpu_threads)
+        .map_err(Into::into)
+}
+#[tauri::command]
+fn mining_start(
+    app: tauri::State<'_, DesktopApplication>,
+    confirmed: bool,
+) -> Result<dom_wallet_tauri_shell::MiningStatusDto, dom_wallet_tauri_shell::CommandErrorDto> {
+    app.mining_start(confirmed).map_err(Into::into)
+}
+#[tauri::command]
+fn mining_stop(
+    app: tauri::State<'_, DesktopApplication>,
+) -> Result<dom_wallet_tauri_shell::MiningStatusDto, dom_wallet_tauri_shell::CommandErrorDto> {
+    app.mining_stop().map_err(Into::into)
 }
 #[tauri::command]
 fn diagnostics_redacted(
@@ -142,7 +274,7 @@ fn synchronization_start(
 fn synchronization_resume(
     app: tauri::State<'_, DesktopApplication>,
 ) -> Result<dom_wallet_core::WalletSummary, dom_wallet_tauri_shell::CommandErrorDto> {
-    app.synchronization_start_live().map_err(Into::into)
+    app.synchronization_resume_live().map_err(Into::into)
 }
 #[tauri::command]
 fn synchronization_retry(
@@ -153,7 +285,7 @@ fn synchronization_retry(
 #[tauri::command]
 fn synchronization_rescan(
     app: tauri::State<'_, DesktopApplication>,
-) -> Result<(), dom_wallet_tauri_shell::CommandErrorDto> {
+) -> Result<dom_wallet_core::WalletSummary, dom_wallet_tauri_shell::CommandErrorDto> {
     app.synchronization_rescan().map_err(Into::into)
 }
 #[tauri::command]
@@ -189,18 +321,10 @@ fn transaction_send_create(
     app: tauri::State<'_, DesktopApplication>,
     amount: u64,
     requested_fee: Option<u64>,
-    sender_address: String,
-    receiver_address: String,
     expires_at_height: u64,
 ) -> Result<dom_wallet_core::TransactionSummary, dom_wallet_tauri_shell::CommandErrorDto> {
-    app.transaction_send_create(
-        amount,
-        requested_fee,
-        &sender_address,
-        &receiver_address,
-        expires_at_height,
-    )
-    .map_err(Into::into)
+    app.transaction_send_create(amount, requested_fee, expires_at_height)
+        .map_err(Into::into)
 }
 #[tauri::command]
 fn slate_request_export(
@@ -344,6 +468,19 @@ fn application_builder() -> tauri::Builder<tauri::Wry> {
             account_summary,
             embedded_node_start,
             embedded_node_status,
+            node_network_status,
+            node_peer_status,
+            wallet_sync_status,
+            wallet_sync_start,
+            wallet_sync_pause,
+            wallet_sync_resume,
+            wallet_sync_retry,
+            wallet_rescan,
+            mining_status,
+            mining_config_get,
+            mining_config_set,
+            mining_start,
+            mining_stop,
             synchronization_start,
             synchronization_pause,
             synchronization_resume,
@@ -387,7 +524,7 @@ mod tests {
     #[test]
     fn packaged_entrypoint_constructs_the_registered_builder() {
         let _builder = application_builder();
-        assert_eq!(dom_wallet_tauri_shell::COMMAND_NAMES.len(), 43);
+        assert_eq!(dom_wallet_tauri_shell::COMMAND_NAMES.len(), 56);
         assert!(dom_wallet_tauri_shell::COMMAND_NAMES.contains(&"native_bridge_status"));
     }
 }

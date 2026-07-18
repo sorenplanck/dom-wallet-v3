@@ -344,6 +344,29 @@ impl RecoverableOutputBuilder {
         })
     }
 
+    /// Build a spendable recovery-capable coinbase through the canonical DOM
+    /// wallet-miner constructor. Only the public coinbase leaves this boundary.
+    pub fn build_coinbase(
+        &self,
+        height: dom_core::BlockHeight,
+        total_fees: u64,
+        coordinate: ReservedRecoveryCoordinate,
+    ) -> Result<dom_consensus::CoinbaseTransaction, RecoveryMaterialError> {
+        if coordinate.class() != RecoveryOutputClass::Coinbase {
+            return Err(RecoveryMaterialError::CoordinateDomainMismatch);
+        }
+        dom_node::miner::build_seed_recoverable_coinbase(
+            height,
+            total_fees,
+            &self.chain.chain_id,
+            &self.root,
+            self.chain,
+            coordinate.account(),
+            coordinate.derivation_index(),
+        )
+        .map_err(|_| RecoveryMaterialError::OutputConstruction)
+    }
+
     /// Attempt authenticated ownership recovery without exposing secret bytes.
     pub fn try_recover(
         &self,
