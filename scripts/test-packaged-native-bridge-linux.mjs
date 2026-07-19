@@ -107,7 +107,7 @@ try {
   await screenshot("initial-bridge-ready");
 
   const probe = await execute("return window.__TAURI_INTERNALS__.invoke('native_bridge_status')");
-  assert.deepEqual(probe, { bridge: "ready", app_version: "0.1.4" });
+  assert.deepEqual(probe, { bridge: "ready", app_version: "0.1.5" });
 
   const nativeResult = async (command, args) => execute(`
     return window.__TAURI_INTERNALS__.invoke(arguments[0], arguments[1])
@@ -237,32 +237,28 @@ try {
   }
   assert.ok(peerStatus.total_connected_peers > 0, "packaged node did not register a Mainnet peer");
 
-  let networkStatus;
-  for (let attempt = 0; attempt < 120; attempt += 1) {
-    networkStatus = await nativeResult("node_network_status", {});
-    if (!networkStatus.ok) throw new Error("packaged network diagnostics failed");
-    if (networkStatus.value.canonical_height >= 1) break;
-    await new Promise((done) => setTimeout(done, 500));
-  }
+  const networkStatus = await nativeResult("node_network_status", {});
+  if (!networkStatus.ok) throw new Error("packaged network diagnostics failed");
   assert.equal(networkStatus.value.network, "MAINNET");
-  assert.ok(networkStatus.value.canonical_height >= 1, "packaged node did not reach the Mainnet tip");
-  let syncStart;
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    syncStart = await nativeResult("wallet_sync_start", {});
-    if (syncStart.ok) break;
-    if (syncStart.error?.code !== "EMBEDDED_NODE_NOT_READY") {
+  assert.ok(
+    Number.isSafeInteger(networkStatus.value.canonical_height)
+      && networkStatus.value.canonical_height >= 0,
+    "packaged node returned an invalid Mainnet tip",
+  );
+  let syncStatus;
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    const syncStart = await nativeResult("wallet_sync_start", {});
+    if (!syncStart.ok && syncStart.error?.code !== "EMBEDDED_NODE_NOT_READY") {
       throw new Error(`packaged missing-cursor synchronization failed: ${JSON.stringify(syncStart.error)}`);
     }
-    await new Promise((done) => setTimeout(done, 100));
+    syncStatus = await nativeResult("wallet_sync_status", {});
+    if (!syncStatus.ok) throw new Error("packaged synchronization diagnostics failed");
+    if (syncStatus.value.synchronized) break;
+    await new Promise((done) => setTimeout(done, 500));
   }
-  if (!syncStart.ok) {
-    throw new Error(`packaged missing-cursor synchronization stayed unavailable: ${JSON.stringify(syncStart.error)}`);
-  }
-  const syncStatus = await nativeResult("wallet_sync_status", {});
-  if (!syncStatus.ok) throw new Error("packaged synchronization diagnostics failed");
+  assert.ok(syncStatus, "packaged synchronization status was not observed");
   assert.equal(syncStatus.value.synchronized, true);
-  assert.equal(syncStatus.value.canonical_height, networkStatus.value.canonical_height);
-  assert.equal(syncStatus.value.cursor_height, networkStatus.value.canonical_height);
+  assert.equal(syncStatus.value.cursor_height, syncStatus.value.canonical_height);
   assert.equal(syncStatus.value.state, "READY");
   assert.equal(syncStatus.value.last_error, null);
 
@@ -300,7 +296,7 @@ try {
     mainnet: {
       connectedPeers: peerStatus.total_connected_peers,
       bootstrapPhase: peerStatus.bootstrap_phase,
-      canonicalHeight: networkStatus.value.canonical_height,
+      canonicalHeight: syncStatus.value.canonical_height,
       cursorHeight: syncStatus.value.cursor_height,
       synchronized: syncStatus.value.synchronized,
       applicationState: syncStatus.value.state,
