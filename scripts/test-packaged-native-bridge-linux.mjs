@@ -107,7 +107,7 @@ try {
   await screenshot("initial-bridge-ready");
 
   const probe = await execute("return window.__TAURI_INTERNALS__.invoke('native_bridge_status')");
-  assert.deepEqual(probe, { bridge: "ready", app_version: "0.1.3" });
+  assert.deepEqual(probe, { bridge: "ready", app_version: "0.1.4" });
 
   const nativeResult = async (command, args) => execute(`
     return window.__TAURI_INTERNALS__.invoke(arguments[0], arguments[1])
@@ -246,8 +246,18 @@ try {
   }
   assert.equal(networkStatus.value.network, "MAINNET");
   assert.ok(networkStatus.value.canonical_height >= 1, "packaged node did not reach the Mainnet tip");
-  const syncStart = await nativeResult("wallet_sync_start", {});
-  if (!syncStart.ok) throw new Error("packaged missing-cursor synchronization failed");
+  let syncStart;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    syncStart = await nativeResult("wallet_sync_start", {});
+    if (syncStart.ok) break;
+    if (syncStart.error?.code !== "EMBEDDED_NODE_NOT_READY") {
+      throw new Error(`packaged missing-cursor synchronization failed: ${JSON.stringify(syncStart.error)}`);
+    }
+    await new Promise((done) => setTimeout(done, 100));
+  }
+  if (!syncStart.ok) {
+    throw new Error(`packaged missing-cursor synchronization stayed unavailable: ${JSON.stringify(syncStart.error)}`);
+  }
   const syncStatus = await nativeResult("wallet_sync_status", {});
   if (!syncStatus.ok) throw new Error("packaged synchronization diagnostics failed");
   assert.equal(syncStatus.value.synchronized, true);
