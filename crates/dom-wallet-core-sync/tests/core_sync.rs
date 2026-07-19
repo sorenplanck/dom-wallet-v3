@@ -29,6 +29,7 @@ struct FakeState {
     identity: ChainIdentity,
     blocks: Vec<ScanBlock>,
     mutation: Mutation,
+    fail_scan_at_genesis: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -66,7 +67,7 @@ impl FakeCore {
                     network: CoreNetwork::Regtest,
                     network_magic: CoreNetwork::Regtest.magic(),
                     chain_id: [8; 32],
-                    genesis_hash: [9; 32],
+                    genesis_hash: [1; 32],
                     protocol_version: dom_core::PROTOCOL_VERSION,
                     range_proof_serialization_version:
                         dom_crypto::RANGE_PROOF_SERIALIZATION_VERSION,
@@ -75,6 +76,7 @@ impl FakeCore {
                 },
                 blocks,
                 mutation: Mutation::None,
+                fail_scan_at_genesis: false,
             })),
         }
     }
@@ -85,6 +87,16 @@ impl FakeCore {
 
     fn set_mutation(&self, mutation: Mutation) {
         self.state.lock().expect("fake state").mutation = mutation;
+    }
+
+    fn reject_genesis_scan(&self) {
+        self.state.lock().expect("fake state").fail_scan_at_genesis = true;
+    }
+
+    fn clear_outputs(&self) {
+        for block in &mut self.state.lock().expect("fake state").blocks {
+            block.outputs.clear();
+        }
     }
 
     fn mutate_identity(&self, change: impl FnOnce(&mut ChainIdentity)) {
@@ -140,6 +152,11 @@ impl WalletCoreApi for FakeCore {
                 cursor.next_height
             }
         };
+        if start == 0 && state.fail_scan_at_genesis {
+            return Err(WalletCoreError::InternalFailure(
+                "genesis is an anchor, not a wallet scan block".into(),
+            ));
+        }
         let end = start
             .saturating_add(request.max_blocks.saturating_sub(1))
             .min(state.identity.current_tip.height);
@@ -516,7 +533,7 @@ fn identity_mapping_is_complete_and_network_bound() {
     let identity = adapter.identity();
     assert_eq!(identity.network_magic, CoreNetwork::Regtest.magic());
     assert_eq!(identity.chain_id, [8; 32]);
-    assert_eq!(identity.genesis_hash, [9; 32]);
+    assert_eq!(identity.genesis_hash, [1; 32]);
     assert_eq!(identity.protocol_version, dom_core::PROTOCOL_VERSION);
     assert_eq!(identity.coinbase_maturity, 1);
 }
@@ -734,6 +751,75 @@ fn state_and_cursor_commit_together() {
     assert!(matches!(result, CoreReconcileResult::Committed(_)));
     assert_eq!(sink.hashes.len(), 2);
     assert!(matches!(sink.cursor, PersistedCoreCursorState::Valid(_)));
+}
+
+#[test]
+fn missing_cursor_genesis_only_initializes_height_zero() {
+    let core = FakeCore::new(1);
+    let adapter = core.adapter();
+    let mut sink = MemorySink::default();
+
+    adapter.reconcile_to_tip(&mut sink).unwrap();
+
+    let PersistedCoreCursorState::Valid(cursor) = sink.cursor else {
+        panic!("missing persisted cursor");
+    };
+    let cursor = cursor.decode().unwrap();
+    assert_eq!(cursor.anchor_height, 0);
+    assert_eq!(cursor.anchor_hash, [1; 32]);
+    assert!(sink.hashes.is_empty());
+}
+
+#[test]
+fn missing_cursor_scans_existing_height_one() {
+    let core = FakeCore::new(2);
+    core.reject_genesis_scan();
+    let adapter = core.adapter();
+    let mut sink = MemorySink::default();
+
+    adapter.reconcile_to_tip(&mut sink).unwrap();
+
+    let PersistedCoreCursorState::Valid(cursor) = sink.cursor else {
+        panic!("missing persisted cursor");
+    };
+    let cursor = cursor.decode().unwrap();
+    assert_eq!(cursor.anchor_height, 1);
+    assert_eq!(cursor.anchor_hash, [2; 32]);
+    assert_eq!(sink.hashes, BTreeMap::from([(1, [2; 32])]));
+}
+
+#[test]
+fn empty_wallet_scan_is_success() {
+    let core = FakeCore::new(2);
+    core.clear_outputs();
+    let adapter = core.adapter();
+    let mut sink = MemorySink::default();
+
+    adapter.reconcile_to_tip(&mut sink).unwrap();
+
+    let PersistedCoreCursorState::Valid(cursor) = sink.cursor else {
+        panic!("missing persisted cursor");
+    };
+    assert_eq!(cursor.decode().unwrap().anchor_height, 1);
+}
+
+#[test]
+fn missing_cursor_reconciles_every_existing_page_to_tip() {
+    let core = FakeCore::new(5);
+    core.reject_genesis_scan();
+    let adapter = core.adapter();
+    let mut sink = MemorySink::default();
+
+    adapter.reconcile_to_tip(&mut sink).unwrap();
+
+    let PersistedCoreCursorState::Valid(cursor) = sink.cursor else {
+        panic!("missing persisted cursor");
+    };
+    assert_eq!(cursor.decode().unwrap().anchor_height, 4);
+    assert_eq!(
+        sink.hashes.keys().copied().collect::<Vec<_>>(),
+        vec![1, 2, 3, 4]
+    );
 }
 
 #[test]

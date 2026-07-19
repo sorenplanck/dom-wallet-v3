@@ -112,7 +112,7 @@ impl ProductionWalletBackend {
         &self,
         sink: &mut S,
     ) -> Result<CoreReconcileResult, ProductionBackendError> {
-        Ok(self.chain.reconcile_once(sink)?)
+        Ok(self.chain.reconcile_to_tip(sink)?)
     }
 
     pub fn minimum_fee(

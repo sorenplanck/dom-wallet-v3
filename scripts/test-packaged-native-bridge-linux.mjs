@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, resolve } from "node:path";
 
@@ -13,6 +13,13 @@ if (!process.env.DISPLAY) throw new Error("DISPLAY is required (use xvfb-run in 
 const port = 9515 + (process.pid % 1000);
 const endpoint = `http://127.0.0.1:${port}`;
 const profile = await mkdtemp(`${tmpdir()}/dom-wallet-bridge-e2e-`);
+if (process.env.PACKAGED_NODE_FIXTURE) {
+  await cp(
+    resolve(process.env.PACKAGED_NODE_FIXTURE),
+    `${profile}/data/org.domprotocol.wallet.v3/mainnet/node`,
+    { recursive: true },
+  );
+}
 const driverPath = process.env.WEBKIT_WEBDRIVER
   ? `${dirname(process.env.WEBKIT_WEBDRIVER)}:${process.env.PATH}`
   : process.env.PATH;
@@ -100,7 +107,7 @@ try {
   await screenshot("initial-bridge-ready");
 
   const probe = await execute("return window.__TAURI_INTERNALS__.invoke('native_bridge_status')");
-  assert.deepEqual(probe, { bridge: "ready", app_version: "0.1.2" });
+  assert.deepEqual(probe, { bridge: "ready", app_version: "0.1.3" });
 
   const nativeResult = async (command, args) => execute(`
     return window.__TAURI_INTERNALS__.invoke(arguments[0], arguments[1])
@@ -230,23 +237,36 @@ try {
   }
   assert.ok(peerStatus.total_connected_peers > 0, "packaged node did not register a Mainnet peer");
 
-  const networkStatus = await nativeResult("node_network_status", {});
-  if (!networkStatus.ok) throw new Error("packaged network diagnostics failed");
+  let networkStatus;
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    networkStatus = await nativeResult("node_network_status", {});
+    if (!networkStatus.ok) throw new Error("packaged network diagnostics failed");
+    if (networkStatus.value.canonical_height >= 1) break;
+    await new Promise((done) => setTimeout(done, 500));
+  }
   assert.equal(networkStatus.value.network, "MAINNET");
-  assert.equal(networkStatus.value.canonical_height, 0);
+  assert.ok(networkStatus.value.canonical_height >= 1, "packaged node did not reach the Mainnet tip");
   const syncStart = await nativeResult("wallet_sync_start", {});
-  if (!syncStart.ok) throw new Error("packaged genesis-only synchronization failed");
+  if (!syncStart.ok) throw new Error("packaged missing-cursor synchronization failed");
   const syncStatus = await nativeResult("wallet_sync_status", {});
   if (!syncStatus.ok) throw new Error("packaged synchronization diagnostics failed");
   assert.equal(syncStatus.value.synchronized, true);
-  assert.equal(syncStatus.value.canonical_height, 0);
-  assert.equal(syncStatus.value.cursor_height, 0);
+  assert.equal(syncStatus.value.canonical_height, networkStatus.value.canonical_height);
+  assert.equal(syncStatus.value.cursor_height, networkStatus.value.canonical_height);
+  assert.equal(syncStatus.value.state, "READY");
   assert.equal(syncStatus.value.last_error, null);
 
+  const miningConfig = await nativeResult("mining_config_get", {});
+  if (!miningConfig.ok) throw new Error("packaged mining configuration failed");
+  const enabledMining = await nativeResult("mining_config_set", {
+    enabled: true,
+    cpuThreads: miningConfig.value.cpu_threads,
+  });
+  if (!enabledMining.ok) throw new Error("packaged mining controls remained blocked by the cursor");
   const miningStatus = await nativeResult("mining_status", {});
   if (!miningStatus.ok) throw new Error("packaged mining diagnostics failed");
-  assert.equal(miningStatus.value.status, "DISABLED");
-  assert.equal(miningStatus.value.enabled, false);
+  assert.equal(miningStatus.value.status, "READY");
+  assert.equal(miningStatus.value.enabled, true);
   assert.equal(miningStatus.value.running, false);
   assert.equal(miningStatus.value.hash_attempts, 0);
   assert.equal(miningStatus.value.accepted_blocks, 0);
@@ -273,6 +293,8 @@ try {
       canonicalHeight: networkStatus.value.canonical_height,
       cursorHeight: syncStatus.value.cursor_height,
       synchronized: syncStatus.value.synchronized,
+      applicationState: syncStatus.value.state,
+      lastError: syncStatus.value.last_error,
     },
     mining: {
       status: miningStatus.value.status,
