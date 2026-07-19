@@ -313,8 +313,11 @@ impl CoreScanError {
             WalletCoreError::NodeNotReady(_) | WalletCoreError::TemporaryFailure(_) => {
                 Self::CoreNotReady
             }
-            _ => Self::CoreContract {
-                code: "CORE_API_FAILURE",
+            WalletCoreError::InternalFailure(_) => Self::CoreContract {
+                code: "CORE_INTERNAL_FAILURE",
+            },
+            WalletCoreError::SubmissionRejected(_) => Self::CoreContract {
+                code: "UNEXPECTED_SUBMISSION_FAILURE",
             },
         }
     }
@@ -461,10 +464,20 @@ impl CoreChainAdapter {
         {
             PersistedCoreCursorState::Absent => {
                 let identity = self.current_identity()?;
+                let genesis_hash =
+                    self.canonical_hash_at_height(0)?
+                        .ok_or(CoreScanError::InvalidScan {
+                            code: "MISSING_CANONICAL_GENESIS",
+                        })?;
+                if genesis_hash != identity.genesis_hash {
+                    return Err(CoreScanError::InvalidScan {
+                        code: "GENESIS_HASH_DISAGREEMENT",
+                    });
+                }
                 let batch = if identity.current_tip.height == 0 {
-                    if self.canonical_hash_at_height(0)? != Some(identity.current_tip.hash) {
+                    if genesis_hash != identity.current_tip.hash {
                         return Err(CoreScanError::InvalidScan {
-                            code: "GENESIS_HASH_DISAGREEMENT",
+                            code: "TIP_GENESIS_DISAGREEMENT",
                         });
                     }
                     let cursor = WalletScanCursor::new(
@@ -484,7 +497,7 @@ impl CoreChainAdapter {
                         commit_cursor: Some(cursor),
                     }
                 } else {
-                    self.scan_from_height(0, self.maximum_batch_blocks)?
+                    self.scan_from_height(1, self.maximum_batch_blocks)?
                 };
                 self.commit_normal(sink, batch)
             }
@@ -502,6 +515,29 @@ impl CoreChainAdapter {
             PersistedCoreCursorState::Invalid => Err(CoreScanError::InvalidCursor {
                 code: "PERSISTED_CURSOR_INVALID",
             }),
+        }
+    }
+
+    /// Reconcile canonical pages until the committed cursor reaches the observed tip.
+    pub fn reconcile_to_tip<S: CoreScanTransactionSink>(
+        &self,
+        sink: &mut S,
+    ) -> Result<CoreReconcileResult, CoreScanError> {
+        let target_height = self.current_tip()?.height;
+        loop {
+            let result = self.reconcile_once(sink)?;
+            let cursor = match result {
+                CoreReconcileResult::Committed(cursor)
+                | CoreReconcileResult::ReorgCommitted { cursor, .. } => cursor,
+                CoreReconcileResult::NoChanges => {
+                    return Err(CoreScanError::InvalidScan {
+                        code: "SCAN_STALLED_BEFORE_TARGET",
+                    });
+                }
+            };
+            if cursor.decode()?.anchor_height >= target_height {
+                return Ok(result);
+            }
         }
     }
 

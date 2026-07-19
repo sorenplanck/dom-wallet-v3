@@ -808,13 +808,13 @@ impl DesktopApplication {
             return Err(CommandError::MiningDisabled);
         }
         let sync = self.wallet_sync_status()?;
-        if !sync.synchronized {
-            return Err(CommandError::CursorInitializationFailed);
-        }
         let peers = self.node_peer_status()?;
-        if peers.total_connected_peers == 0 {
-            return Err(CommandError::NoPeers);
-        }
+        require_mining_cursor_gate(
+            sync.cursor_height,
+            sync.canonical_height,
+            sync.last_error.as_deref(),
+            peers.total_connected_peers,
+        )?;
         let service = Arc::clone(&self.service);
         let node = service
             .lock()
@@ -1287,6 +1287,21 @@ fn mining_state_name(state: u64, enabled: bool) -> &'static str {
     }
 }
 
+fn require_mining_cursor_gate(
+    cursor_height: Option<u64>,
+    canonical_height: Option<u64>,
+    last_error: Option<&str>,
+    connected_peers: u64,
+) -> Result<(), CommandError> {
+    if cursor_height.is_none() || cursor_height != canonical_height || last_error.is_some() {
+        return Err(CommandError::CursorInitializationFailed);
+    }
+    if connected_peers == 0 {
+        return Err(CommandError::NoPeers);
+    }
+    Ok(())
+}
+
 fn domain_identity(identity: &dom_wallet_core_sync::CoreChainIdentity) -> NetworkIdentity {
     NetworkIdentity {
         network: match identity.network {
@@ -1564,9 +1579,18 @@ mod tests {
     fn native_bridge_probe_is_static_redacted_and_versioned() {
         let status = native_bridge_status();
         assert_eq!(status.bridge, "ready");
-        assert_eq!(status.app_version, "0.1.2");
+        assert_eq!(status.app_version, "0.1.3");
         fn assert_serializable<T: serde::Serialize>(_: &T) {}
         assert_serializable(&status);
+    }
+
+    #[test]
+    fn mining_gate_accepts_synchronized_height_one_cursor() {
+        assert!(require_mining_cursor_gate(Some(1), Some(1), None, 1).is_ok());
+        assert!(matches!(
+            require_mining_cursor_gate(None, Some(1), None, 1),
+            Err(CommandError::CursorInitializationFailed)
+        ));
     }
 
     #[test]

@@ -639,18 +639,20 @@ impl WalletService {
                 self.summary()
             }
             Err(error) => {
-                self.last_error = Some(match &error {
-                    ProductionBackendError::Scan(scan) => {
-                        format!("CURSOR_SYNCHRONIZATION_FAILED:{scan}")
-                    }
-                    _ => "CURSOR_SYNCHRONIZATION_FAILED".into(),
-                });
-                self.state = ApplicationState::Degraded {
-                    reason: "canonical Core synchronization failed".into(),
-                };
+                self.record_sync_failure(&error);
                 Err(error.into())
             }
         }
+    }
+
+    fn record_sync_failure(&mut self, error: &ProductionBackendError) {
+        self.last_error = Some(match error {
+            ProductionBackendError::Scan(scan) => {
+                format!("CURSOR_SYNCHRONIZATION_FAILED:{scan}")
+            }
+            _ => "CURSOR_SYNCHRONIZATION_FAILED".into(),
+        });
+        self.state = ApplicationState::Unlocked;
     }
 
     pub fn synchronize_live(&mut self) -> Result<WalletSummary, CoreError> {
@@ -1811,7 +1813,7 @@ fn application_state_name(state: &ApplicationState) -> &'static str {
         ApplicationState::Closed => "CLOSED",
         ApplicationState::Locked => "LOCKED",
         ApplicationState::Unlocking => "UNLOCKING",
-        ApplicationState::Unlocked => "UNLOCKED",
+        ApplicationState::Unlocked => "READY",
         ApplicationState::Synchronizing => "SYNCHRONIZING",
         ApplicationState::Degraded { .. } => "DEGRADED",
         ApplicationState::Error { .. } => "ERROR",
@@ -2069,6 +2071,30 @@ mod tests {
             require_mainnet_identity(&wrong_genesis),
             Err(CoreError::IdentityMismatch)
         ));
+    }
+
+    #[test]
+    fn cursor_failure_does_not_close_unlocked_wallet() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut service = test_service();
+        service
+            .create_recoverable(temp.path().join("wallet"), "password-1", backup_identity())
+            .unwrap();
+        service.unlock("password-1").unwrap();
+
+        service.record_sync_failure(&ProductionBackendError::Scan(
+            dom_wallet_core_sync::CoreScanError::CoreContract {
+                code: "CORE_INTERNAL_FAILURE",
+            },
+        ));
+
+        let diagnostics = service.diagnostics();
+        assert_eq!(diagnostics.application_state, "READY");
+        assert_eq!(
+            diagnostics.last_error.as_deref(),
+            Some("CURSOR_SYNCHRONIZATION_FAILED:Core scan contract failed (CORE_INTERNAL_FAILURE)")
+        );
+        assert!(service.summary().is_ok());
     }
 
     #[test]
