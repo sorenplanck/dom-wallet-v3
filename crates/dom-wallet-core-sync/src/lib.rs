@@ -463,42 +463,7 @@ impl CoreChainAdapter {
             .map_err(|_| CoreScanError::Persistence)?
         {
             PersistedCoreCursorState::Absent => {
-                let identity = self.current_identity()?;
-                let genesis_hash =
-                    self.canonical_hash_at_height(0)?
-                        .ok_or(CoreScanError::InvalidScan {
-                            code: "MISSING_CANONICAL_GENESIS",
-                        })?;
-                if genesis_hash != identity.genesis_hash {
-                    return Err(CoreScanError::InvalidScan {
-                        code: "GENESIS_HASH_DISAGREEMENT",
-                    });
-                }
-                let batch = if identity.current_tip.height == 0 {
-                    if genesis_hash != identity.current_tip.hash {
-                        return Err(CoreScanError::InvalidScan {
-                            code: "TIP_GENESIS_DISAGREEMENT",
-                        });
-                    }
-                    let cursor = WalletScanCursor::new(
-                        identity.network,
-                        identity.chain_id,
-                        1,
-                        BlockRef {
-                            height: 0,
-                            hash: identity.current_tip.hash,
-                        },
-                    );
-                    let cursor = CoreCursorBytes::from_cursor(cursor, &identity)?;
-                    self.validate_cursor(cursor)?;
-                    CoreScanBatch {
-                        observed_tip: identity.current_tip,
-                        blocks: Vec::new(),
-                        commit_cursor: Some(cursor),
-                    }
-                } else {
-                    self.scan_from_height(1, self.maximum_batch_blocks)?
-                };
+                let batch = self.scan_from_height(0, self.maximum_batch_blocks)?;
                 self.commit_normal(sink, batch)
             }
             PersistedCoreCursorState::Valid(cursor) => match self.validate_cursor(cursor) {
@@ -518,6 +483,57 @@ impl CoreChainAdapter {
         }
     }
 
+    /// Bootstrap a missing production Wallet cursor from the canonical genesis anchor.
+    pub fn reconcile_wallet_once<S: CoreScanTransactionSink>(
+        &self,
+        sink: &mut S,
+    ) -> Result<CoreReconcileResult, CoreScanError> {
+        if !matches!(
+            sink.core_cursor_state()
+                .map_err(|_| CoreScanError::Persistence)?,
+            PersistedCoreCursorState::Absent
+        ) {
+            return self.reconcile_once(sink);
+        }
+        let identity = self.current_identity()?;
+        let genesis_hash = self
+            .canonical_hash_at_height(0)?
+            .ok_or(CoreScanError::InvalidScan {
+                code: "MISSING_CANONICAL_GENESIS",
+            })?;
+        if identity.network == CoreNetwork::Mainnet && genesis_hash != identity.genesis_hash {
+            return Err(CoreScanError::InvalidScan {
+                code: "GENESIS_HASH_DISAGREEMENT",
+            });
+        }
+        let batch = if identity.current_tip.height == 0 {
+            if genesis_hash != identity.current_tip.hash {
+                return Err(CoreScanError::InvalidScan {
+                    code: "TIP_GENESIS_DISAGREEMENT",
+                });
+            }
+            let cursor = WalletScanCursor::new(
+                identity.network,
+                identity.chain_id,
+                1,
+                BlockRef {
+                    height: 0,
+                    hash: identity.current_tip.hash,
+                },
+            );
+            let cursor = CoreCursorBytes::from_cursor(cursor, &identity)?;
+            self.validate_cursor(cursor)?;
+            CoreScanBatch {
+                observed_tip: identity.current_tip,
+                blocks: Vec::new(),
+                commit_cursor: Some(cursor),
+            }
+        } else {
+            self.scan_from_height(1, self.maximum_batch_blocks)?
+        };
+        self.commit_normal(sink, batch)
+    }
+
     /// Reconcile canonical pages until the committed cursor reaches the observed tip.
     pub fn reconcile_to_tip<S: CoreScanTransactionSink>(
         &self,
@@ -525,7 +541,7 @@ impl CoreChainAdapter {
     ) -> Result<CoreReconcileResult, CoreScanError> {
         let target_height = self.current_tip()?.height;
         loop {
-            let result = self.reconcile_once(sink)?;
+            let result = self.reconcile_wallet_once(sink)?;
             let cursor = match result {
                 CoreReconcileResult::Committed(cursor)
                 | CoreReconcileResult::ReorgCommitted { cursor, .. } => cursor,

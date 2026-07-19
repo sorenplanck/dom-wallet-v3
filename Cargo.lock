@@ -1319,7 +1319,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-chain"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "dom-wallet-domain",
  "hex",
@@ -1332,7 +1332,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-core"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "dom-consensus",
  "dom-core",
@@ -1346,7 +1346,7 @@ dependencies = [
  "dom-wallet-core-restore",
  "dom-wallet-core-submit",
  "dom-wallet-core-sync",
- "dom-wallet-crypto 0.1.3",
+ "dom-wallet-crypto 0.1.4",
  "dom-wallet-domain",
  "dom-wallet-embedded-core",
  "dom-wallet-production-backend",
@@ -1375,7 +1375,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-core-protocol"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "base64 0.22.1",
  "dom-consensus",
@@ -1392,7 +1392,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-core-recovery"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "bip39",
  "dom-consensus",
@@ -1418,7 +1418,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-core-restore"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "dom-consensus",
  "dom-core",
@@ -1427,7 +1427,7 @@ dependencies = [
  "dom-wallet-core-api",
  "dom-wallet-core-recovery",
  "dom-wallet-core-sync",
- "dom-wallet-crypto 0.1.3",
+ "dom-wallet-crypto 0.1.4",
  "dom-wallet-domain",
  "dom-wallet-recovery",
  "dom-wallet-storage",
@@ -1439,7 +1439,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-core-submit"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "dom-consensus",
  "dom-core",
@@ -1453,7 +1453,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-core-sync"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "dom-consensus",
  "dom-core",
@@ -1482,7 +1482,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-crypto"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -1497,7 +1497,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-domain"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -1507,7 +1507,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-embedded-core"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "dom-chain",
  "dom-config",
@@ -1538,7 +1538,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-production-backend"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "dom-node",
  "dom-wallet-core-api",
@@ -1547,7 +1547,7 @@ dependencies = [
  "dom-wallet-core-restore",
  "dom-wallet-core-submit",
  "dom-wallet-core-sync",
- "dom-wallet-crypto 0.1.3",
+ "dom-wallet-crypto 0.1.4",
  "dom-wallet-embedded-core",
  "dom-wallet-storage",
  "tempfile",
@@ -1556,7 +1556,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-protocol"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "base64 0.22.1",
  "dom-consensus",
@@ -1584,9 +1584,9 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-storage"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
- "dom-wallet-crypto 0.1.3",
+ "dom-wallet-crypto 0.1.4",
  "dom-wallet-domain",
  "serde",
  "serde_json",
@@ -1597,7 +1597,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-tauri-shell"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "dom-wallet-core",
  "dom-wallet-core-api",

@@ -103,6 +103,13 @@ impl FakeCore {
         change(&mut self.state.lock().expect("fake state").identity);
     }
 
+    fn use_mainnet_identity(&self) {
+        self.mutate_identity(|identity| {
+            identity.network = CoreNetwork::Mainnet;
+            identity.network_magic = CoreNetwork::Mainnet.magic();
+        });
+    }
+
     fn replace_from(&self, height: u64, marker: u8) {
         let mut state = self.state.lock().expect("fake state");
         let previous = if height == 0 {
@@ -786,6 +793,23 @@ fn missing_cursor_scans_existing_height_one() {
     assert_eq!(cursor.anchor_height, 1);
     assert_eq!(cursor.anchor_hash, [2; 32]);
     assert_eq!(sink.hashes, BTreeMap::from([(1, [2; 32])]));
+}
+
+#[test]
+fn mainnet_missing_cursor_rejects_genesis_mismatch() {
+    let core = FakeCore::new(2);
+    core.use_mainnet_identity();
+    core.mutate_identity(|identity| identity.genesis_hash = [9; 32]);
+    let adapter = core.adapter();
+    let mut sink = MemorySink::default();
+
+    assert_eq!(
+        adapter.reconcile_to_tip(&mut sink),
+        Err(CoreScanError::InvalidScan {
+            code: "GENESIS_HASH_DISAGREEMENT"
+        })
+    );
+    assert_eq!(sink.cursor, PersistedCoreCursorState::Absent);
 }
 
 #[test]
