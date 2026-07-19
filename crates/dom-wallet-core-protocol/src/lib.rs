@@ -242,6 +242,16 @@ impl RecoverySlateBody {
     pub fn has_sender_change(&self) -> bool {
         self.inner.sender_change_output.is_some()
     }
+
+    /// Return the two public interaction keys already committed by the sender.
+    /// Manual Slate transport uses these as one-time Address v1 identities so
+    /// users never have to invent Bitcoin-style destination fields.
+    pub fn manual_interaction_public_keys(&self) -> ([u8; 33], [u8; 33]) {
+        (
+            self.inner.sender_public_excess.to_compressed_bytes(),
+            self.inner.sender_public_nonce.to_compressed_bytes(),
+        )
+    }
 }
 
 /// Durable replay identity to be recorded atomically by Wallet state.

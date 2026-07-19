@@ -562,8 +562,19 @@ pub struct WalletState {
     #[serde(default)]
     pub legacy_proof_only_outputs: u64,
     pub node_configuration: NodeConfiguration,
+    /// Non-secret local CPU mining preferences. Runtime mining state is never persisted.
+    #[serde(default)]
+    pub mining_preferences: MiningPreferences,
     #[serde(with = "serde_bytes_32")]
     pub root_material: [u8; 32],
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MiningPreferences {
+    pub enabled: bool,
+    /// Zero means not selected yet; the desktop maps it to its recommended count.
+    pub cpu_threads: usize,
 }
 
 impl WalletState {
@@ -602,6 +613,7 @@ impl WalletState {
             seed_restore_status: None,
             legacy_proof_only_outputs: 0,
             node_configuration,
+            mining_preferences: MiningPreferences::default(),
             root_material,
         }
     }
@@ -615,6 +627,7 @@ impl WalletState {
         if self.outputs.len() > MAX_OUTPUTS
             || self.default_account.label.is_empty()
             || self.default_account.label.len() > 128
+            || self.mining_preferences.cpu_threads > 4_096
         {
             return Err(DomainError::InvalidState);
         }

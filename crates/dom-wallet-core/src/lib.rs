@@ -24,12 +24,12 @@ use dom_wallet_core_sync::{
 };
 use dom_wallet_crypto::{KdfParameters, SecretBytes};
 use dom_wallet_domain::{
-    BalanceProjection, LocalTransactionIntent, Network, NetworkIdentity, NodeConfiguration,
-    OutputRecord, OutputState, PrivateTransactionContext, RecoveryMetadata, RecoveryOutputClass,
-    RedactedNodeConfiguration, TransactionLifecycle, TransactionRole, WalletState,
-    RECOVERY_SCHEME_BIP39_256_V1,
+    BalanceProjection, LocalTransactionIntent, MiningPreferences, Network, NetworkIdentity,
+    NodeConfiguration, OutputRecord, OutputState, PrivateTransactionContext, RecoveryMetadata,
+    RecoveryOutputClass, RedactedNodeConfiguration, TransactionLifecycle, TransactionRole,
+    WalletState, RECOVERY_SCHEME_BIP39_256_V1,
 };
-use dom_wallet_embedded_core::EmbeddedCoreConfiguration;
+use dom_wallet_embedded_core::{EmbeddedCoreConfiguration, EmbeddedPeerStatus};
 use dom_wallet_production_backend::{
     ProductionBackendError, ProductionWalletBackend, PRODUCTION_BACKEND_KIND,
 };
@@ -42,6 +42,11 @@ use std::{fmt, path::Path};
 use thiserror::Error;
 use uuid::Uuid;
 use zeroize::Zeroizing;
+
+pub const MAINNET_CHAIN_ID_HEX: &str =
+    "f9831fadabc8a4234beab35fbb6327e84581645f33e9f75ed2ea78e8bcf1165b";
+pub const MAINNET_GENESIS_HASH_HEX: &str =
+    "182e10af28e7ec072f462e6044f580dc9dd8c866cb78dfc293bbfaee4e9325ce";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ApplicationState {
@@ -253,7 +258,12 @@ impl WalletService {
     pub fn open(&mut self, path: impl AsRef<Path>) -> Result<WalletSummary, CoreError> {
         self.ensure_closed()?;
         let directory = WalletDirectory::open(path)?;
-        self.metadata = Some(directory.metadata()?);
+        let metadata = directory.metadata()?;
+        if let Some(backend) = &self.backend {
+            require_mainnet_identity(&metadata.identity)?;
+            require_domain_identity(&metadata.identity, backend.identity())?;
+        }
+        self.metadata = Some(metadata);
         self.location = Some(directory);
         self.state = ApplicationState::Locked;
         self.summary_locked()
@@ -272,6 +282,10 @@ impl WalletService {
                 .as_ref()
                 .ok_or(CoreError::WalletNotOpen)?
                 .load(password)?;
+            if let Some(backend) = &self.backend {
+                require_mainnet_identity(&state.identity)?;
+                require_domain_identity(&state.identity, backend.identity())?;
+            }
             self.password = Some(password_secret);
             self.unlocked = Some(state);
             self.state = ApplicationState::Unlocked;
@@ -321,6 +335,81 @@ impl WalletService {
             .ok_or(CoreError::EmbeddedCoreRequired)?
             .is_ready()
             .map_err(CoreError::from)
+    }
+
+    pub fn embedded_peer_status(&self) -> Result<EmbeddedPeerStatus, CoreError> {
+        self.backend
+            .as_ref()
+            .ok_or(CoreError::EmbeddedCoreRequired)?
+            .peer_status()
+            .map_err(CoreError::from)
+    }
+
+    pub fn embedded_node_handle(
+        &self,
+    ) -> Result<std::sync::Arc<dom_node::node::DomNode>, CoreError> {
+        self.backend
+            .as_ref()
+            .ok_or(CoreError::EmbeddedCoreRequired)?
+            .node_handle()
+            .map_err(CoreError::from)
+    }
+
+    /// Reserve a Coinbase recovery coordinate before creating public mining
+    /// material. Seed and blinding data never cross into the embedded node.
+    pub fn mining_coinbase_candidate(
+        &mut self,
+        height: u64,
+    ) -> Result<dom_consensus::CoinbaseTransaction, CoreError> {
+        self.backend
+            .as_ref()
+            .ok_or(CoreError::EmbeddedCoreRequired)?;
+        require_mainnet_identity(&self.unlocked.as_ref().ok_or(CoreError::Locked)?.identity)?;
+        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        let coordinate = state.reserve_recovery_coordinate(0, RecoveryOutputClass::Coinbase)?;
+        self.commit(state)?;
+        let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
+        let seed = CanonicalWalletSeed::from_entropy(&state.root_material)
+            .map_err(|_| CoreError::RecoveryPhraseInvalid)?;
+        let builder = self
+            .backend
+            .as_ref()
+            .ok_or(CoreError::EmbeddedCoreRequired)?
+            .output_builder(&seed)?;
+        builder
+            .build_coinbase(dom_core::BlockHeight(height), 0, coordinate)
+            .map_err(CoreError::from)
+    }
+
+    pub fn mining_preferences(&self) -> Result<MiningPreferences, CoreError> {
+        Ok(self
+            .unlocked
+            .as_ref()
+            .ok_or(CoreError::Locked)?
+            .mining_preferences
+            .clone())
+    }
+
+    pub fn set_mining_preferences(
+        &mut self,
+        enabled: bool,
+        cpu_threads: usize,
+    ) -> Result<MiningPreferences, CoreError> {
+        if cpu_threads == 0 || cpu_threads > 4_096 {
+            return Err(CoreError::InvalidTransactionInput);
+        }
+        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        state.mining_preferences = MiningPreferences {
+            enabled,
+            cpu_threads,
+        };
+        self.commit(state)?;
+        self.mining_preferences()
+    }
+
+    pub fn mining_reward_destination(&self) -> Result<String, CoreError> {
+        let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
+        Ok(format!("DOM-MAINNET-RECOVERY:{}", state.wallet_id))
     }
 
     pub fn validate_wallet_address(&self, address: &str) -> Result<String, CoreError> {
@@ -539,6 +628,7 @@ impl WalletService {
         self.unlocked = Some(sink.state);
         match result {
             Ok(_) => {
+                self.last_error = None;
                 self.metadata = Some(
                     self.location
                         .as_ref()
@@ -549,6 +639,12 @@ impl WalletService {
                 self.summary()
             }
             Err(error) => {
+                self.last_error = Some(match &error {
+                    ProductionBackendError::Scan(scan) => {
+                        format!("CURSOR_SYNCHRONIZATION_FAILED:{scan}")
+                    }
+                    _ => "CURSOR_SYNCHRONIZATION_FAILED".into(),
+                });
                 self.state = ApplicationState::Degraded {
                     reason: "canonical Core synchronization failed".into(),
                 };
@@ -558,6 +654,22 @@ impl WalletService {
     }
 
     pub fn synchronize_live(&mut self) -> Result<WalletSummary, CoreError> {
+        self.synchronize()
+    }
+
+    pub fn rescan_from_genesis(&mut self) -> Result<WalletSummary, CoreError> {
+        let tip = self
+            .backend
+            .as_ref()
+            .ok_or(CoreError::EmbeddedCoreRequired)?
+            .identity()
+            .current_tip
+            .height;
+        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        rewind_recovery_state(&mut state, 0, tip);
+        state.core_scan_cursor = None;
+        state.recovery_canonical_blocks.clear();
+        self.commit(state)?;
         self.synchronize()
     }
 
@@ -626,13 +738,21 @@ impl WalletService {
         })
     }
 
-    /// Old callers cannot create outputs; Slice I must supply canonical Address v1 identities.
+    /// Create a manual interactive Slate v4 request. Address v1 interaction
+    /// identities are derived from public one-time Slate participant keys.
     pub fn transaction_send_create(
         &mut self,
-        _amount: u64,
-        _requested_fee: Option<u64>,
+        amount: u64,
+        requested_fee: Option<u64>,
+        expires_at_height: u64,
     ) -> Result<TransactionSummary, CoreError> {
-        Err(CoreError::AddressIdentityRequired)
+        self.transaction_send_create_with_identities(
+            amount,
+            requested_fee,
+            None,
+            None,
+            expires_at_height,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -642,6 +762,24 @@ impl WalletService {
         requested_fee: Option<u64>,
         sender: &WalletAddress,
         receiver: &WalletAddress,
+        expires_at_height: u64,
+    ) -> Result<TransactionSummary, CoreError> {
+        self.transaction_send_create_with_identities(
+            amount,
+            requested_fee,
+            Some(sender),
+            Some(receiver),
+            expires_at_height,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn transaction_send_create_with_identities(
+        &mut self,
+        amount: u64,
+        requested_fee: Option<u64>,
+        sender: Option<&WalletAddress>,
+        receiver: Option<&WalletAddress>,
         expires_at_height: u64,
     ) -> Result<TransactionSummary, CoreError> {
         if amount == 0 {
@@ -757,6 +895,25 @@ impl WalletService {
         let sender_parts = builder
             .build_sender_offer(&inputs, change_value, amount, fee, coordinate)?
             .into_sender_parts()?;
+        let (automatic_sender, automatic_receiver);
+        let (sender, receiver) = match (sender, receiver) {
+            (Some(sender), Some(receiver)) => (sender, receiver),
+            (None, None) => {
+                let (sender_key, receiver_key) = sender_parts.body.manual_interaction_public_keys();
+                automatic_sender = WalletAddress::from_public_key(
+                    sender_key,
+                    identity.network,
+                    AddressIdentityPurpose::TransactionInteraction,
+                )?;
+                automatic_receiver = WalletAddress::from_public_key(
+                    receiver_key,
+                    identity.network,
+                    AddressIdentityPurpose::TransactionInteraction,
+                )?;
+                (&automatic_sender, &automatic_receiver)
+            }
+            _ => return Err(CoreError::AddressIdentityRequired),
+        };
         let envelope = CanonicalSlate::new_recoverable(
             &identity,
             slate_id,
@@ -1439,6 +1596,17 @@ fn require_domain_identity(
     }
 }
 
+fn require_mainnet_identity(identity: &NetworkIdentity) -> Result<(), CoreError> {
+    if identity.network != Network::Mainnet
+        || hex::encode(identity.chain_id) != MAINNET_CHAIN_ID_HEX
+        || hex::encode(identity.genesis_id) != MAINNET_GENESIS_HASH_HEX
+    {
+        Err(CoreError::IdentityMismatch)
+    } else {
+        Ok(())
+    }
+}
+
 fn map_network(network: dom_wallet_core_api::CoreNetwork) -> Network {
     match network {
         dom_wallet_core_api::CoreNetwork::Mainnet => Network::Mainnet,
@@ -1727,15 +1895,60 @@ pub enum CoreError {
 }
 
 impl CoreError {
-    pub fn redacted_message(&self) -> String {
+    pub fn redacted_code(&self) -> &'static str {
         match self {
-            Self::Locked => "wallet is locked".into(),
-            Self::IdentityMismatch => "embedded Core identity does not match wallet".into(),
-            Self::InsufficientFunds => "insufficient spendable funds".into(),
-            Self::FeeTooLow => "transaction fee is below the required Core policy floor".into(),
-            Self::NodeNotReady => "embedded Core is not ready".into(),
-            _ => "wallet operation failed".into(),
+            Self::WalletNotOpen => "WALLET_NOT_OPEN",
+            Self::Locked => "WALLET_LOCKED",
+            Self::InvalidLifecycleState => "INVALID_WALLET_STATE",
+            Self::InvalidPassword => "INVALID_PASSWORD",
+            Self::RandomnessUnavailable => "RANDOMNESS_UNAVAILABLE",
+            Self::RecoveryCeremonyRequired => "RECOVERY_CONFIRMATION_REQUIRED",
+            Self::RecoveryPhraseInvalid => "RECOVERY_PHRASE_INVALID",
+            Self::RecoveryUnavailable => "RECOVERY_UNAVAILABLE",
+            Self::InvalidBackupDestination => "BACKUP_DESTINATION_INVALID",
+            Self::EmbeddedCoreRequired => "EMBEDDED_NODE_REQUIRED",
+            Self::NodeNotReady => "EMBEDDED_NODE_NOT_READY",
+            Self::IdentityMismatch => "CHAIN_IDENTITY_MISMATCH",
+            Self::AddressIdentityRequired => "ADDRESS_IDENTITY_REQUIRED",
+            Self::InvalidTransactionInput => "TRANSACTION_INPUT_INVALID",
+            Self::InsufficientFunds => "INSUFFICIENT_FUNDS",
+            Self::UnsupportedSpendingEvidence => "SPENDING_EVIDENCE_UNSUPPORTED",
+            Self::FeeTooLow => "FEE_TOO_LOW",
+            Self::ArithmeticOverflow => "ARITHMETIC_OVERFLOW",
+            Self::ReservationConflict => "OUTPUT_RESERVATION_CONFLICT",
+            Self::InvalidSlateTransport => "SLATE_V4_TRANSPORT_INVALID",
+            Self::SlateReplayConflict => "SLATE_REPLAY_CONFLICT",
+            Self::InvalidTransactionTransition => "TRANSACTION_STATE_INVALID",
+            Self::MissingPrivateContext => "SLATE_PRIVATE_CONTEXT_MISSING",
+            Self::ProtocolRejected => "PROTOCOL_REJECTED",
+            Self::MixedOutputRegime => "MIXED_OUTPUT_REGIME",
+            Self::CannotCancelTransaction => "TRANSACTION_CANNOT_CANCEL",
+            Self::ConfirmationRequired => "CONFIRMATION_REQUIRED",
+            Self::TransactionNotFound => "TRANSACTION_NOT_FOUND",
+            Self::InvalidCoreCursor => "CURSOR_INVALID",
+            Self::Storage(_) => "WALLET_STORAGE_FAILED",
+            Self::Domain(_) => "WALLET_STATE_VALIDATION_FAILED",
+            Self::Backend(_) => "EMBEDDED_NODE_OPERATION_FAILED",
+            Self::Protocol(_) => "PROTOCOL_VALIDATION_FAILED",
+            Self::Recovery(_) => "RECOVERY_MATERIAL_FAILED",
+            Self::Restore(_) => "RESTORE_FAILED",
+            Self::Submission(_) => "TRANSACTION_SUBMISSION_FAILED",
         }
+    }
+
+    pub fn redacted_message(&self) -> String {
+        let description: &str = match self {
+            Self::Locked => "wallet is locked",
+            Self::IdentityMismatch => "embedded Core identity does not match wallet",
+            Self::InsufficientFunds => "insufficient spendable funds",
+            Self::FeeTooLow => "transaction fee is below the required Core policy floor",
+            Self::NodeNotReady => "embedded Core is not ready",
+            Self::InvalidCoreCursor => "wallet cursor is invalid",
+            Self::InvalidSlateTransport => "Slate v4 transport is invalid",
+            Self::MissingPrivateContext => "private Slate context is unavailable",
+            _ => "the requested wallet operation was rejected",
+        };
+        format!("{}:{description}", self.redacted_code())
     }
 }
 
@@ -1761,6 +1974,18 @@ mod tests {
             network: Network::PrivateTestnet,
             chain_id: [1; 32],
             genesis_id: [2; 32],
+        }
+    }
+
+    fn canonical_mainnet_identity() -> NetworkIdentity {
+        let mut chain_id = [0u8; 32];
+        let mut genesis_id = [0u8; 32];
+        hex::decode_to_slice(MAINNET_CHAIN_ID_HEX, &mut chain_id).unwrap();
+        hex::decode_to_slice(MAINNET_GENESIS_HASH_HEX, &mut genesis_id).unwrap();
+        NetworkIdentity {
+            network: Network::Mainnet,
+            chain_id,
+            genesis_id,
         }
     }
 
@@ -1810,6 +2035,39 @@ mod tests {
                 wrong_identity,
             ),
             Err(CoreError::Storage(StorageError::IdentityMismatch))
+        ));
+    }
+
+    #[test]
+    fn desktop_mainnet_identity_is_exact_and_every_mismatch_fails_closed() {
+        assert_eq!(
+            MAINNET_CHAIN_ID_HEX,
+            "f9831fadabc8a4234beab35fbb6327e84581645f33e9f75ed2ea78e8bcf1165b"
+        );
+        assert_eq!(
+            MAINNET_GENESIS_HASH_HEX,
+            "182e10af28e7ec072f462e6044f580dc9dd8c866cb78dfc293bbfaee4e9325ce"
+        );
+        let identity = canonical_mainnet_identity();
+        require_mainnet_identity(&identity).unwrap();
+
+        let mut wrong_network = identity.clone();
+        wrong_network.network = Network::PublicTestnet;
+        assert!(matches!(
+            require_mainnet_identity(&wrong_network),
+            Err(CoreError::IdentityMismatch)
+        ));
+        let mut wrong_chain = identity.clone();
+        wrong_chain.chain_id[0] ^= 1;
+        assert!(matches!(
+            require_mainnet_identity(&wrong_chain),
+            Err(CoreError::IdentityMismatch)
+        ));
+        let mut wrong_genesis = identity;
+        wrong_genesis.genesis_id[0] ^= 1;
+        assert!(matches!(
+            require_mainnet_identity(&wrong_genesis),
+            Err(CoreError::IdentityMismatch)
         ));
     }
 

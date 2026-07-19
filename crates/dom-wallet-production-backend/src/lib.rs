@@ -19,7 +19,7 @@ use dom_wallet_core_sync::{
 };
 use dom_wallet_crypto::KdfParameters;
 use dom_wallet_embedded_core::{
-    EmbeddedCoreAdapterError, EmbeddedCoreConfiguration, EmbeddedCoreLifecycle,
+    EmbeddedCoreAdapterError, EmbeddedCoreConfiguration, EmbeddedCoreLifecycle, EmbeddedPeerStatus,
 };
 use std::{fmt, path::Path, sync::Arc};
 use thiserror::Error;
@@ -98,6 +98,14 @@ impl ProductionWalletBackend {
 
     pub fn is_ready(&self) -> Result<bool, ProductionBackendError> {
         Ok(self.lifecycle.is_ready_for_wallet_operations()?)
+    }
+
+    pub fn peer_status(&self) -> Result<EmbeddedPeerStatus, ProductionBackendError> {
+        Ok(self.lifecycle.peer_status()?)
+    }
+
+    pub fn node_handle(&self) -> Result<Arc<dom_node::node::DomNode>, ProductionBackendError> {
+        Ok(self.lifecycle.node_handle()?)
     }
 
     pub fn reconcile_once<S: CoreScanTransactionSink>(

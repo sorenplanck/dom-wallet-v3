@@ -100,7 +100,7 @@ try {
   await screenshot("initial-bridge-ready");
 
   const probe = await execute("return window.__TAURI_INTERNALS__.invoke('native_bridge_status')");
-  assert.deepEqual(probe, { bridge: "ready", app_version: "0.1.1" });
+  assert.deepEqual(probe, { bridge: "ready", app_version: "0.1.2" });
 
   const nativeResult = async (command, args) => execute(`
     return window.__TAURI_INTERNALS__.invoke(arguments[0], arguments[1])
@@ -148,11 +148,138 @@ try {
   `);
   assert.deepEqual(panels, { create: true, restore: true, locate: true });
 
+  const walletPath = `${profile}/wallet`;
+  const testPassword = "packaged-mainnet-test-only";
+  await execute(`
+    document.querySelector('[data-gate-panel="create-form"]').click();
+    const form = document.getElementById("create-form");
+    form.querySelector('input[name="path"]').value = arguments[0];
+    form.querySelector('input[name="password"]').value = arguments[1];
+    form.requestSubmit();
+    return new Promise((resolve, reject) => {
+      let attempts = 0;
+      const poll = () => {
+        const ceremony = document.getElementById("recovery-ceremony");
+        if (!ceremony.hidden && document.getElementById("recovery-phrase").textContent.trim()) return resolve(true);
+        if (attempts++ > 1_000) return reject(new Error("wallet creation did not reach recovery confirmation"));
+        setTimeout(poll, 100);
+      };
+      poll();
+    });
+  `, [walletPath, testPassword]);
+
+  await execute(`
+    const confirmed = document.getElementById("recovery-confirmed");
+    confirmed.checked = true;
+    confirmed.dispatchEvent(new Event("change", { bubbles: true }));
+    document.getElementById("recovery-confirm-password").value = arguments[0];
+    document.getElementById("recovery-complete").click();
+    return new Promise((resolve, reject) => {
+      let attempts = 0;
+      const poll = () => {
+        const value = document.getElementById("status").textContent;
+        if (/Recovery phrase confirmed/i.test(value)) return resolve(value);
+        if (attempts++ > 300) return reject(new Error("recovery confirmation did not complete"));
+        setTimeout(poll, 100);
+      };
+      poll();
+    });
+  `, [testPassword]);
+  const phraseCleared = await execute("return document.getElementById('recovery-phrase').textContent === ''");
+  assert.equal(phraseCleared, true, "recovery phrase remained in the DOM after confirmation");
+
+  await execute(`
+    const form = document.getElementById("unlock-form");
+    form.querySelector('input[name="password"]').value = arguments[0];
+    form.requestSubmit();
+    return new Promise((resolve, reject) => {
+      let attempts = 0;
+      const poll = () => {
+        if (!document.getElementById("app").classList.contains("hidden")) return resolve(true);
+        if (attempts++ > 300) return reject(new Error("packaged wallet did not unlock"));
+        setTimeout(poll, 100);
+      };
+      poll();
+    });
+  `, [testPassword]);
+
+  const productSurface = await execute(`return {
+    networkSelectors: document.querySelectorAll('[name="network"], [name="chain"], [name="node_data"], [name="listen_address"], [name="remote_endpoint"], [name="server_address"], [name="seed"], [name="port"], [name="backend"]').length,
+    miningPage: Boolean(document.querySelector('[data-screen="mining"]') && document.getElementById("mining")),
+    senderAddressFields: document.querySelectorAll('[name="sender_address"], #sender-address').length,
+    receiverAddressFields: document.querySelectorAll('[name="receiver_address"], #receiver-address').length,
+    slateV4: document.getElementById("transactions").textContent.includes("Slate v4"),
+    settingsMainnet: document.getElementById("diagnostics").textContent.includes("Mainnet")
+  }`);
+  assert.deepEqual(productSurface, {
+    networkSelectors: 0,
+    miningPage: true,
+    senderAddressFields: 0,
+    receiverAddressFields: 0,
+    slateV4: true,
+    settingsMainnet: true,
+  });
+
+  let peerStatus;
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    const result = await nativeResult("node_peer_status", {});
+    if (!result.ok) throw new Error("packaged peer diagnostics failed");
+    peerStatus = result.value;
+    if (peerStatus.total_connected_peers > 0) break;
+    await new Promise((done) => setTimeout(done, 500));
+  }
+  assert.ok(peerStatus.total_connected_peers > 0, "packaged node did not register a Mainnet peer");
+
+  const networkStatus = await nativeResult("node_network_status", {});
+  if (!networkStatus.ok) throw new Error("packaged network diagnostics failed");
+  assert.equal(networkStatus.value.network, "MAINNET");
+  assert.equal(networkStatus.value.canonical_height, 0);
+  const syncStart = await nativeResult("wallet_sync_start", {});
+  if (!syncStart.ok) throw new Error("packaged genesis-only synchronization failed");
+  const syncStatus = await nativeResult("wallet_sync_status", {});
+  if (!syncStatus.ok) throw new Error("packaged synchronization diagnostics failed");
+  assert.equal(syncStatus.value.synchronized, true);
+  assert.equal(syncStatus.value.canonical_height, 0);
+  assert.equal(syncStatus.value.cursor_height, 0);
+  assert.equal(syncStatus.value.last_error, null);
+
+  const miningStatus = await nativeResult("mining_status", {});
+  if (!miningStatus.ok) throw new Error("packaged mining diagnostics failed");
+  assert.equal(miningStatus.value.status, "DISABLED");
+  assert.equal(miningStatus.value.enabled, false);
+  assert.equal(miningStatus.value.running, false);
+  assert.equal(miningStatus.value.hash_attempts, 0);
+  assert.equal(miningStatus.value.accepted_blocks, 0);
+  const unconfirmedStart = await nativeResult("mining_start", { confirmed: false });
+  assert.equal(unconfirmedStart.ok, false);
+  assert.equal(unconfirmedStart.error.code, "MINING_CONFIRMATION_REQUIRED");
+  const stoppedMining = await nativeResult("mining_stop", {});
+  if (!stoppedMining.ok) throw new Error("packaged mining stop control failed");
+  assert.equal(stoppedMining.value.running, false);
+  assert.equal(stoppedMining.value.hash_attempts, 0);
+  // Shutdown closes the native webview, so WebDriver may correctly lose the
+  // session before it can deliver the command reply.
+  await nativeResult("application_shutdown", {}).catch(() => undefined);
+
   process.stdout.write(`${JSON.stringify({
     packagedBinary: basename(binary),
     bridge: probe,
     runtime,
     actions: Object.fromEntries(Object.entries(actions).map(([name, value]) => [name, value.reachedNative])),
+    productSurface,
+    mainnet: {
+      connectedPeers: peerStatus.total_connected_peers,
+      bootstrapPhase: peerStatus.bootstrap_phase,
+      canonicalHeight: networkStatus.value.canonical_height,
+      cursorHeight: syncStatus.value.cursor_height,
+      synchronized: syncStatus.value.synchronized,
+    },
+    mining: {
+      status: miningStatus.value.status,
+      running: miningStatus.value.running,
+      hashAttempts: miningStatus.value.hash_attempts,
+      acceptedBlocks: miningStatus.value.accepted_blocks,
+    },
   }, null, 2)}\n`);
 } finally {
   if (sessionId) await request(`/session/${sessionId}`, undefined, { method: "DELETE" }).catch(() => {});

@@ -17,6 +17,7 @@ dom-slate.workspace = true
 dom-tx.workspace = true
 dom-wallet-core-api.workspace = true
 dom-wallet-recovery.workspace = true
+dom-node.workspace = true
 dom-wallet-core-protocol = { path = "../dom-wallet-core-protocol" }
 dom-wallet-core-sync = { path = "../dom-wallet-core-sync" }
 dom-wallet-domain = { path = "../dom-wallet-domain" }
@@ -28,3 +29,4 @@ zeroize.workspace = true
 dom-wallet-embedded-core = { path = "../dom-wallet-embedded-core" }
 serde_json.workspace = true
 tempfile.workspace = true
+tokio.workspace = true

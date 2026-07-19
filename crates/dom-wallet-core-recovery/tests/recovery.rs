@@ -19,12 +19,16 @@ use dom_wallet_domain::{
     WalletState, RECOVERY_SCHEME_BIP39_256_V1,
 };
 use dom_wallet_embedded_core::{
-    EmbeddedCoreConfiguration, EmbeddedCoreLifecycle, EmbeddedCoreNetwork,
+    mine_wallet_block, EmbeddedCoreConfiguration, EmbeddedCoreLifecycle, EmbeddedCoreNetwork,
+    WalletMiningOutcome,
 };
 use std::{
     collections::BTreeSet,
     net::{SocketAddr, TcpListener},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
 use tempfile::TempDir;
 
@@ -587,6 +591,116 @@ fn real_embedded_core_identity_builds_and_recovers_exact_output() {
         .unwrap()
         .unwrap()
         .matches_original(&output));
+    lifecycle.request_shutdown().unwrap();
+    lifecycle.wait_for_shutdown().unwrap();
+}
+
+#[test]
+fn wallet_owned_miner_counts_real_work_and_accepts_a_regtest_block() {
+    let directory = TempDir::new().unwrap();
+    let mut lifecycle = EmbeddedCoreLifecycle::new(EmbeddedCoreConfiguration::new(
+        EmbeddedCoreNetwork::Regtest,
+        directory.path(),
+        unused_loopback_address(),
+    ));
+    lifecycle.start().unwrap();
+    let core = lifecycle.wallet_api().unwrap().chain_identity().unwrap();
+    let identity = CoreChainIdentity {
+        network: core.network,
+        network_magic: core.network_magic,
+        chain_id: core.chain_id,
+        genesis_hash: core.genesis_hash,
+        protocol_version: core.protocol_version,
+        range_proof_serialization_version: core.range_proof_serialization_version,
+        coinbase_maturity: core.coinbase_maturity,
+        current_tip: CoreBlockReference {
+            height: core.current_tip.height,
+            hash: core.current_tip.hash,
+        },
+    };
+    let mut wallet = state();
+    let coordinate = wallet
+        .reserve_recovery_coordinate(0, RecoveryOutputClass::Coinbase)
+        .unwrap();
+    let coinbase = RecoverableOutputBuilder::new(&seed(41), &identity)
+        .unwrap()
+        .build_coinbase(dom_core::BlockHeight(1), 0, coordinate)
+        .unwrap();
+    let attempts = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let outcome = runtime
+        .block_on(mine_wallet_block(
+            lifecycle.node_handle().unwrap(),
+            coinbase,
+            1,
+            stop,
+            Arc::clone(&attempts),
+        ))
+        .unwrap();
+    assert_eq!(outcome, WalletMiningOutcome::Accepted { height: 1 });
+    assert!(attempts.load(Ordering::Relaxed) > 0);
+    assert_eq!(
+        lifecycle
+            .node_handle()
+            .unwrap()
+            .metrics
+            .blocks_mined
+            .load(Ordering::Relaxed),
+        1
+    );
+    lifecycle.request_shutdown().unwrap();
+    lifecycle.wait_for_shutdown().unwrap();
+}
+
+#[test]
+fn wallet_owned_miner_honors_stop_before_any_hash_attempt() {
+    let directory = TempDir::new().unwrap();
+    let mut lifecycle = EmbeddedCoreLifecycle::new(EmbeddedCoreConfiguration::new(
+        EmbeddedCoreNetwork::Regtest,
+        directory.path(),
+        unused_loopback_address(),
+    ));
+    lifecycle.start().unwrap();
+    let core = lifecycle.wallet_api().unwrap().chain_identity().unwrap();
+    let identity = CoreChainIdentity {
+        network: core.network,
+        network_magic: core.network_magic,
+        chain_id: core.chain_id,
+        genesis_hash: core.genesis_hash,
+        protocol_version: core.protocol_version,
+        range_proof_serialization_version: core.range_proof_serialization_version,
+        coinbase_maturity: core.coinbase_maturity,
+        current_tip: CoreBlockReference {
+            height: core.current_tip.height,
+            hash: core.current_tip.hash,
+        },
+    };
+    let mut wallet = state();
+    let coordinate = wallet
+        .reserve_recovery_coordinate(0, RecoveryOutputClass::Coinbase)
+        .unwrap();
+    let coinbase = RecoverableOutputBuilder::new(&seed(42), &identity)
+        .unwrap()
+        .build_coinbase(dom_core::BlockHeight(1), 0, coordinate)
+        .unwrap();
+    let attempts = Arc::new(AtomicU64::new(0));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let result = runtime.block_on(mine_wallet_block(
+        lifecycle.node_handle().unwrap(),
+        coinbase,
+        1,
+        Arc::new(AtomicBool::new(true)),
+        Arc::clone(&attempts),
+    ));
+    assert_eq!(result.unwrap(), WalletMiningOutcome::Stopped);
+    assert_eq!(attempts.load(Ordering::Relaxed), 0);
     lifecycle.request_shutdown().unwrap();
     lifecycle.wait_for_shutdown().unwrap();
 }
