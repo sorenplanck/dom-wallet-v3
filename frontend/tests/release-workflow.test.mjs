@@ -53,6 +53,7 @@ test("stabilization workflow validates and packages without a release path", asy
   for (const forbidden of ["git tag", "gh release", "contents: write", "tags:", "upload-artifact"]) {
     assert.equal(workflow.includes(forbidden), false, `release-capable token ${forbidden}`);
   }
+  assert.equal(workflow.includes("needs: validate"), false, "package feedback must run in parallel");
 });
 
 test("Tauri resolves the frontend build from both supported CLI contexts", async () => {

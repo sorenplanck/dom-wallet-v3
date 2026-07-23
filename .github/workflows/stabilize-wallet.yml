@@ -69,7 +69,6 @@ jobs:
           cargo deny check
 
   package:
-    needs: validate
     strategy:
       fail-fast: false
       matrix:
