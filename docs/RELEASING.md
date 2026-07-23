@@ -8,11 +8,21 @@ No independent security audit is claimed.
 
 ## Release identity
 
-- Wallet version: `0.2.0`
-- Recommended tag: `wallet-v0.2.0`
+- Wallet version: `0.2.1`
+- Recommended tag: `wallet-v0.2.1`
 - DOM Core revision: `28ba3cefc9fbc913f126336482662528c68a7d8c`
 - Final genesis revision: `6a8a6475b36ad68bb760d61cf323126d95cd7416`
 - Mainnet chain ID: `f9831fadabc8a4234beab35fbb6327e84581645f33e9f75ed2ea78e8bcf1165b`
+
+## Offline signing and publication
+
+Tag CI validates and packages the exact immutable revision, but never receives a
+private key and never publishes a release. Download the validated artifacts,
+sign each updater artifact locally with the offline Tauri key, verify every
+detached signature against the public key, and only then create the GitHub
+pre-release from the matching `wallet-v<version>` tag. Manual installers may be
+published without a live updater feed, but `latest.json` must not be published
+until every referenced artifact and signature is present and verified.
 
 Wallet V3 uses its embedded DOM Core through `WalletCoreApi`. It creates only
 Recovery Capsule v1 outputs, uses Address v1 and recovery Slate v4, and has no

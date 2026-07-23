@@ -169,14 +169,14 @@ control-plane revision that provides:
 - loopback-only authenticated `POST /shutdown` returning `202`;
 - graceful shutdown through `DomNode::request_shutdown()` and ordered task drain.
 
-The current `/build-info` response is `{"commit":"<sha>"}`. It does not yet
-report the complete compatibility identity required by the node-only update
-contract. The Wallet therefore records this revision as the control-plane
-baseline but does not replace the existing consensus crate pin or activate
-production node-only promotion. Promotion remains fail-closed until an immutable
-revision also proves node version, network, chain ID, genesis hash, RPC protocol,
-P2P protocol and storage schema through authenticated RPC. This avoids importing
-unreviewed miner/node changes into the Wallet merely to obtain the RPC routes.
+The embedded Wallet core is pinned to this exact mainnet release revision, which
+contains the reviewed ASERT rescue and equal-height fork-divergence fixes. The
+managed sidecar dependency is separately pinned to
+`ab45a2944f22fe00f9b12984354f0d5d7cdd229a`, whose authenticated
+`/build-info` and `/network-info` responses provide the complete compatibility
+identity required by the node-only update contract. Sidecar activation remains
+an explicit session-only experiment and the embedded core remains the default
+and fallback until the managed path has complete platform evidence.
 
 ## Recovery
 

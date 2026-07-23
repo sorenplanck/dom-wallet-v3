@@ -107,7 +107,7 @@ try {
   await screenshot("initial-bridge-ready");
 
   const probe = await execute("return window.__TAURI_INTERNALS__.invoke('native_bridge_status')");
-  assert.deepEqual(probe, { bridge: "ready", app_version: "0.2.0" });
+  assert.deepEqual(probe, { bridge: "ready", app_version: "0.2.1" });
 
   const nativeResult = async (command, args) => execute(`
     return window.__TAURI_INTERNALS__.invoke(arguments[0], arguments[1])

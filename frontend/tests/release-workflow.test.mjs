@@ -5,18 +5,12 @@ import { readFile } from "node:fs/promises";
 test("release workflow provides pinned experimental dry-run packaging", async () => {
   const workflow = await readFile(new URL("../../.github/workflows/release-wallet.yml", import.meta.url), "utf8");
   for (const required of [
-    "wallet-v*", "workflow_dispatch", "publish_release", "default: false",
+    "wallet-v*", "workflow_dispatch", "default: false",
     "ubuntu-24.04", "windows-2022", "macos-14", "x86_64-unknown-linux-gnu",
     "x86_64-pc-windows-msvc", "aarch64-apple-darwin", "appimage,deb,rpm",
     "nsis,msi", "dmg,app", "npm test --prefix frontend", "cargo metadata --locked",
     "--locked", "cargo audit", "cargo deny check", "actionlint_1.7.7_linux_amd64.tar.gz",
-    "SHA256SUMS", "needs: [validate, package]", "contents: write",
-    "git rev-parse \"${GITHUB_REF}^{commit}\"", "DOM initially has no monetary value",
-    "Do not use real funds", "experimental software", "Installers are unsigned",
-    "--prerelease", "DOM Wallet V3 ${GITHUB_REF_NAME#wallet-v} Experimental",
-    "24-word BIP-39 phrase", "Confirmed Recovery Capsule v1 funds are recoverable",
-    "backup remains additional", "No independent security audit is claimed",
-    "release-upload/SHA256SUMS.txt",
+    "git rev-parse \"${GITHUB_REF}^{commit}\"",
     "target/${{ matrix.target }}/release/bundle",
     "Install Linux validation dependencies",
     "Test native bridge in packaged Linux application", "webkit2gtk-driver", "xvfb-run -a",
@@ -25,9 +19,14 @@ test("release workflow provides pinned experimental dry-run packaging", async ()
   ]) assert.equal(workflow.includes(required), true, `missing ${required}`);
 
   const actionRefs = [...workflow.matchAll(/uses:\s+[^@\s]+@([^\s]+)/g)].map((match) => match[1]);
-  assert.ok(actionRefs.length >= 10);
+  assert.ok(actionRefs.length >= 8);
   assert.equal(actionRefs.every((ref) => /^[0-9a-f]{40}$/.test(ref)), true);
-  assert.equal(workflow.includes("github.event_name == 'push' && startsWith(github.ref, 'refs/tags/wallet-v')"), true);
+  for (const forbidden of [
+    "TAURI_SIGNING_PRIVATE_KEY",
+    "TAURI_SIGNING_PRIVATE_KEY_PASSWORD",
+    "gh release create",
+    "contents: write",
+  ]) assert.equal(workflow.includes(forbidden), false, `release secret or publisher leaked into CI: ${forbidden}`);
   assert.equal(workflow.includes("release: published"), false);
   assert.equal(workflow.includes("release: created"), false);
   assert.equal(workflow.includes("/home/"), false);
@@ -45,12 +44,13 @@ test("stabilization workflow validates and packages without a release path", asy
     "cargo audit", "cargo deny check", "appimage,deb", "nsis,msi", "dmg,app",
     "Smoke test installed Linux application", "scripts/test-packaged-native-bridge-linux.mjs",
     "contents: read", "Build unsigned installers without publishing",
+    "Preserve validated installers", "actions/upload-artifact@",
   ]) assert.equal(workflow.includes(required), true, `missing ${required}`);
 
   const actionRefs = [...workflow.matchAll(/uses:\s+[^@\s]+@([^\s]+)/g)].map((match) => match[1]);
   assert.ok(actionRefs.length >= 7);
   assert.equal(actionRefs.every((ref) => /^[0-9a-f]{40}$/.test(ref)), true);
-  for (const forbidden of ["git tag", "gh release", "contents: write", "tags:", "upload-artifact"]) {
+  for (const forbidden of ["git tag", "gh release", "contents: write", "tags:"]) {
     assert.equal(workflow.includes(forbidden), false, `release-capable token ${forbidden}`);
   }
   assert.equal(workflow.includes("needs: validate"), false, "package feedback must run in parallel");

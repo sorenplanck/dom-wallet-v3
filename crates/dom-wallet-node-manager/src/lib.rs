@@ -1310,6 +1310,34 @@ mod tests {
     }
 
     #[test]
+    fn production_signed_sidecar_manifest_fixture_verifies_locally() {
+        const MANIFEST: &[u8] = include_bytes!(
+            "../../../tests/fixtures/sidecar/ab45a2944f22fe00f9b12984354f0d5d7cdd229a/sidecar-manifest.json"
+        );
+        const SIGNATURE: &str = include_str!(
+            "../../../tests/fixtures/sidecar/ab45a2944f22fe00f9b12984354f0d5d7cdd229a/sidecar-manifest.json.minisig"
+        );
+
+        sidecar_keys::enforce_canonical_key_match().unwrap();
+        verify_minisign(MANIFEST, SIGNATURE)
+            .expect("production key must verify the exact local manifest bytes");
+        let manifest = verify_manifest(Some(MANIFEST), Some(SIGNATURE))
+            .expect("canonical sidecar parser must accept the signed fixture");
+        assert_eq!(
+            manifest.revision,
+            "ab45a2944f22fe00f9b12984354f0d5d7cdd229a"
+        );
+        assert_eq!(manifest.network, "mainnet");
+        assert!(
+            manifest
+                .artifacts
+                .iter()
+                .all(|artifact| artifact.url.starts_with("https://fixture.invalid/")),
+            "fixture verification must never dereference a release URL"
+        );
+    }
+
+    #[test]
     fn identity_mismatches_are_rejected() {
         let mut manifest = SidecarManifest {
             schema: 1,

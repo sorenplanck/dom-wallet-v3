@@ -7,12 +7,12 @@ test("native bridge initializes through the Rust probe and becomes ready", async
   const calls = [];
   const bridge = createNativeBridge(async (command, args) => {
     calls.push({ command, args });
-    if (command === "native_bridge_status") return { bridge: "ready", app_version: "0.2.0" };
+    if (command === "native_bridge_status") return { bridge: "ready", app_version: "0.2.1" };
     return { command };
   });
 
   assert.equal(bridge.state, BridgeState.INITIALIZING);
-  assert.deepEqual(await bridge.initialize(), { bridge: "ready", app_version: "0.2.0" });
+  assert.deepEqual(await bridge.initialize(), { bridge: "ready", app_version: "0.2.1" });
   assert.equal(bridge.state, BridgeState.READY);
   assert.deepEqual(calls, [{ command: "native_bridge_status", args: undefined }]);
 });
@@ -27,7 +27,7 @@ test("all four initial actions call the injected native invoke implementation", 
   const calls = [];
   const bridge = createNativeBridge(async (command, args) => {
     calls.push({ command, args });
-    if (command === "native_bridge_status") return { bridge: "ready", app_version: "0.2.0" };
+    if (command === "native_bridge_status") return { bridge: "ready", app_version: "0.2.1" };
     return { reached_native: true };
   });
 
