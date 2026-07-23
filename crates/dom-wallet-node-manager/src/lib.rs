@@ -230,6 +230,7 @@ impl NodeManager {
         runtime_root: impl Into<PathBuf>,
     ) -> Result<(), NodeManagerError> {
         let runtime_root = runtime_root.into();
+        let newly_created = !runtime_root.exists();
         if runtime_root.exists()
             && fs::symlink_metadata(&runtime_root)?
                 .file_type()
@@ -243,6 +244,11 @@ impl NodeManager {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o700))?;
         }
+        #[cfg(windows)]
+        if newly_created {
+            secure_new_windows_runtime_root(&runtime_root)?;
+        }
+        let _ = newly_created;
         validate_runtime_tree(&runtime_root)?;
         self.runtime_root = Some(runtime_root);
         Ok(())
@@ -772,8 +778,8 @@ fn start_process(
     let token = random_token();
     fs::create_dir_all(&configuration.data_directory)?;
     let mut command = Command::new(binary);
+    reset_child_environment(&mut command)?;
     command
-        .env_clear()
         .env("DOM_NETWORK", &configuration.network)
         .env("DOM_DATA_DIR", &configuration.data_directory)
         .env("DOM_RPC_LISTEN_ADDR", configuration.rpc_address.to_string())
@@ -955,6 +961,22 @@ fn random_token() -> String {
     let mut bytes = [0_u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn reset_child_environment(command: &mut Command) -> Result<(), NodeManagerError> {
+    #[cfg(windows)]
+    let system_root =
+        PathBuf::from(std::env::var_os("SystemRoot").ok_or(NodeManagerError::UnsafeBinary)?);
+    #[cfg(windows)]
+    if !system_root.is_absolute() {
+        return Err(NodeManagerError::UnsafeBinary);
+    }
+    command.env_clear();
+    #[cfg(windows)]
+    command
+        .env("SystemRoot", &system_root)
+        .env("WINDIR", system_root);
+    Ok(())
 }
 
 fn validate_binary(binary: &Path) -> Result<(), NodeManagerError> {
@@ -1144,6 +1166,50 @@ exit 0
         .ok_or(NodeManagerError::UnsafeBinary)
 }
 
+#[cfg(windows)]
+fn secure_new_windows_runtime_root(root: &Path) -> Result<(), NodeManagerError> {
+    let system_root =
+        PathBuf::from(std::env::var_os("SystemRoot").ok_or(NodeManagerError::UnsafeBinary)?);
+    if !system_root.is_absolute() {
+        return Err(NodeManagerError::UnsafeBinary);
+    }
+    let powershell = system_root.join("System32/WindowsPowerShell/v1.0/powershell.exe");
+    let script = r#"
+$ErrorActionPreference='Stop'
+$identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+$acl=Get-Acl -LiteralPath $args[0]
+$acl.SetAccessRuleProtection($true,$false)
+foreach($rule in @($acl.Access)){[void]$acl.RemoveAccessRuleSpecific($rule)}
+$acl.SetOwner($identity.User)
+$inherit=[Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit'
+$none=[Security.AccessControl.PropagationFlags]::None
+$allow=[Security.AccessControl.AccessControlType]::Allow
+foreach($sid in @($identity.User,[Security.Principal.SecurityIdentifier]'S-1-5-18',[Security.Principal.SecurityIdentifier]'S-1-5-32-544')){
+  $rule=[Security.AccessControl.FileSystemAccessRule]::new($sid,[Security.AccessControl.FileSystemRights]::FullControl,$inherit,$none,$allow)
+  [void]$acl.AddAccessRule($rule)
+}
+Set-Acl -LiteralPath $args[0] -AclObject $acl
+"#;
+    let status = Command::new(powershell)
+        .env_clear()
+        .arg("-NoLogo")
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-Command")
+        .arg(script)
+        .arg(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    status
+        .success()
+        .then_some(())
+        .ok_or(NodeManagerError::UnsafeBinary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1152,7 +1218,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::{
-        io::{BufRead, BufReader},
+        io::{BufRead, BufReader, Read},
         process::Stdio,
     };
     use tempfile::tempdir;
@@ -1605,17 +1671,29 @@ mod tests {
     }
 
     fn probe_fixture_revision(binary: &Path) -> String {
-        let mut child = Command::new(binary)
+        let mut command = Command::new(binary);
+        reset_child_environment(&mut command).unwrap();
+        let mut child = command
             .arg("--probe")
-            .env_clear()
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap();
         let mut line = String::new();
         BufReader::new(child.stdout.take().unwrap())
             .read_line(&mut line)
             .unwrap();
+        if line.trim().is_empty() {
+            let mut error = String::new();
+            child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut error)
+                .unwrap();
+            let status = child.wait().unwrap();
+            panic!("sidecar probe exited before readiness ({status}): {error}");
+        }
         let probe: serde_json::Value = serde_json::from_str(&line).unwrap();
         let address: SocketAddr = probe["rpc_addr"].as_str().unwrap().parse().unwrap();
         let token = probe["token"].as_str().unwrap();

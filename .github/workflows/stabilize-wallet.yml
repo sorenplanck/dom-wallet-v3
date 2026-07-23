@@ -8,6 +8,12 @@ on:
     branches:
       - stabilize/wallet-v0.2.0
   workflow_dispatch:
+    inputs:
+      windows_only:
+        description: Run only the Windows package and lifecycle gate
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -24,6 +30,7 @@ env:
 
 jobs:
   validate:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.windows_only != true }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -72,16 +79,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            bundles: appimage,deb
-          - os: windows-2022
-            target: x86_64-pc-windows-msvc
-            bundles: nsis,msi
-          - os: macos-14
-            target: aarch64-apple-darwin
-            bundles: dmg,app
+        include: ${{ fromJSON(inputs.windows_only && '[{"os":"windows-2022","target":"x86_64-pc-windows-msvc","bundles":"nsis,msi"}]' || '[{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","bundles":"appimage,deb"},{"os":"windows-2022","target":"x86_64-pc-windows-msvc","bundles":"nsis,msi"},{"os":"macos-14","target":"aarch64-apple-darwin","bundles":"dmg,app"}]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -113,6 +111,9 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          npm run build --prefix frontend
           cargo build --manifest-path dom-protocol-sidecar/Cargo.toml --locked -p dom-node --bin dom-node
           $env:DOM_TEST_SIDECAR_BINARY = (Resolve-Path "dom-protocol-sidecar/target/debug/dom-node.exe").Path
           cargo test --locked -p dom-wallet-node-manager persisted_node_sequence_rejects_equal_and_lower_feeds_at_runtime_boundary -- --test-threads=1
