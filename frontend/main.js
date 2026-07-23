@@ -3,7 +3,8 @@ import QrScanner from "qr-scanner";
 import { nativeBridge } from "./bridge.js";
 
 export const COMMANDS = Object.freeze([
-  "native_bridge_status", "application_status", "wallet_create_recoverable", "wallet_restore_from_mnemonic",
+  "native_bridge_status", "get_build_info", "update_status", "check_updates_now", "check_node_now",
+  "application_status", "wallet_create_recoverable", "wallet_restore_from_mnemonic",
   "wallet_backup_export", "wallet_backup_import", "wallet_recovery_phrase_confirm",
   "wallet_open", "wallet_unlock", "wallet_lock", "wallet_close", "wallet_summary",
   "account_list", "account_summary", "embedded_node_start", "embedded_node_stop", "embedded_node_status",
@@ -79,6 +80,7 @@ document.querySelectorAll("[data-screen]").forEach((button) => button.addEventLi
   selectScreen(button.dataset.screen);
   if (button.dataset.screen === "mining") refreshMining().catch((error) => show(redactedError(error), true));
   if (button.dataset.screen === "dashboard" || button.dataset.screen === "diagnostics") refreshSummary().catch((error) => show(redactedError(error), true));
+  if (button.dataset.screen === "diagnostics") refreshUpdates().catch((error) => show(redactedError(error), true));
 }));
 document.querySelectorAll("[data-gate-panel]").forEach((button) => button.addEventListener("click", () => {
   clearSecretForms();
@@ -162,6 +164,26 @@ const refreshSummary = async () => {
   byId("settings-heights").textContent = `${synchronization.cursor_height ?? "—"} / ${network.canonical_height}`;
 };
 const refreshNode = async () => redactJson(byId("node-status"), await invoke("embedded_node_status"));
+const refreshUpdates = async () => {
+  const [build, updates] = await Promise.all([invoke("get_build_info"), invoke("update_status")]);
+  byId("update-wallet-version").textContent = build.wallet_version;
+  byId("update-wallet-revision").textContent = build.wallet_revision;
+  byId("update-wallet-state").textContent = updates.wallet.state;
+  byId("update-wallet-available").textContent = updates.wallet.available_version ?? "None";
+  byId("update-wallet-last-check").textContent = updates.wallet.last_check_unix_seconds
+    ? new Date(updates.wallet.last_check_unix_seconds * 1000).toLocaleString()
+    : "Never";
+  byId("update-node-version").textContent = updates.node.active_version;
+  byId("update-node-revision").textContent = updates.node.active_revision;
+  byId("update-node-previous").textContent = updates.node.previous_revision ?? "None";
+  byId("update-node-state").textContent = updates.node.state;
+  byId("update-node-compatibility").textContent = updates.node.compatibility;
+  byId("update-peer-state").textContent = updates.peers.state;
+  byId("update-channel").textContent = updates.channel;
+  byId("update-signing-state").textContent = updates.signature_key_configured ? "Configured" : "Unavailable — updates fail closed";
+  const error = updates.wallet.sanitized_error ?? updates.node.sanitized_error ?? updates.peers.sanitized_error;
+  byId("update-error").textContent = error ?? "No updater error.";
+};
 const renderMining = (value) => {
   byId("mining-status").textContent = value.status;
   byId("mining-enabled").checked = value.enabled;
@@ -217,6 +239,16 @@ for (const [id, command] of [["pause", "wallet_sync_pause"], ["resume", "wallet_
 }
 byId("rescan").addEventListener("click", () => { if (window.confirm("Rescan from canonical Mainnet genesis?")) run(() => invoke("wallet_rescan")).catch((error) => show(redactedError(error), true)); });
 byId("diagnostics-refresh").addEventListener("click", () => run(async () => { await refreshSummary(); redactJson(byId("diagnostics-output"), await invoke("diagnostics_redacted")); }).catch((error) => show(redactedError(error), true)));
+byId("updates-check").addEventListener("click", () => run(async () => {
+  await invoke("check_updates_now");
+  await refreshUpdates();
+  show("Signed Wallet, node and peer update check completed.");
+}).catch((error) => show(redactedError(error), true)));
+byId("node-updates-check").addEventListener("click", () => run(async () => {
+  await invoke("check_node_now");
+  await refreshUpdates();
+  show("Signed node update check completed.");
+}).catch((error) => show(redactedError(error), true)));
 byId("lock").addEventListener("click", () => run(async () => { await stopScanner(); await invoke("wallet_lock"); enterGate(); }).catch((error) => show(redactedError(error), true)));
 byId("close").addEventListener("click", () => run(async () => { await stopScanner(); await invoke("wallet_close"); enterGate(); }).catch((error) => show(redactedError(error), true)));
 

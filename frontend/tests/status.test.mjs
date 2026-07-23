@@ -8,6 +8,29 @@ test("frontend source contains no durable browser storage access", async () => {
   assert.equal(source.includes("indexedDB"), false);
 });
 
+test("settings expose separate fail-closed Wallet and node update states", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const [html, js] = await Promise.all([
+    readFile(new URL("../index.html", import.meta.url), "utf8"),
+    readFile(new URL("../main.js", import.meta.url), "utf8"),
+  ]);
+  for (const marker of [
+    "update-wallet-state",
+    "update-node-state",
+    "update-peer-state",
+    "update-signing-state",
+    "Check node now",
+  ]) assert.equal(html.includes(marker), true);
+  for (const command of [
+    '"get_build_info"',
+    '"update_status"',
+    '"check_updates_now"',
+    '"check_node_now"',
+  ]) assert.equal(js.includes(command), true);
+  assert.equal(js.includes("localStorage"), false);
+  assert.equal(js.includes("sessionStorage"), false);
+});
+
 test("production adapter maps each recovery and backup command without a mock", async () => {
   const { readFile } = await import("node:fs/promises");
   const [source, bridge] = await Promise.all([
