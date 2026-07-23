@@ -111,6 +111,8 @@ adding updater control endpoints.
 - `e450f45` `feat(network): cache signed Mainnet peer manifests`
 - `394d82f` `ci(release): gate signed update feed publication`
 - `0da7bb0` `docs(updater): document signing and recovery procedure`
+- `c9291ea` `docs(stabilization): record signed updater evidence`
+- `4d851ea` `fix(updater): keep unsigned packages fail-closed and runnable`
 
 Every listed commit was pushed to
 `origin/stabilize/wallet-v0.2.0` after focused validation.
@@ -148,6 +150,17 @@ Every listed commit was pushed to
   compatible node-only and coordinated Wallet changes. The implementation now
   has three independent signed decisions and two unambiguous binary update state
   machines.
+- The official updater plugin required a `pubkey` member while deserializing its
+  Tauri configuration, before the protected build-time key override runs.
+  Omitting the member let packaging succeed but made the installed application
+  exit before opening a window. Stabilization config now supplies a parseable
+  empty value; production still overrides it from `DOM_UPDATE_PUBLIC_KEY`, and
+  an empty value cannot check or install an update.
+- The installed smoke waited for a live peer before persisting the absent
+  genesis cursor, allowing IBD lock contention to race the height-zero gate. It
+  now proves canonical height-plus-hash at genesis first, then connects and
+  reconciles peers. Only explicitly retryable responses are retried and the
+  bounded test still requires synchronized state.
 - Replacing a running node executable could leave the old process active or
   claim success before compatibility was proven. The managed runtime contract
   requires old-PID exit, port release, atomic promotion, a different PID,
@@ -177,6 +190,14 @@ Passed:
 - `cargo fmt --all --check`.
 - Frontend test suite: 20 passed, 0 failed.
 - Frontend typecheck and production build.
+- Extracted-package Linux WebDriver smoke passed after the updater configuration
+  repair:
+  - native bridge `READY`;
+  - invalid onboarding actions reached native Rust and were rejected;
+  - Wallet create, recovery confirmation and unlock succeeded;
+  - one Mainnet peer connected;
+  - canonical height and cursor were both `0`, with equal hashes;
+  - application and mining state were `READY`, with no worker running.
 - `cargo audit` completed without a blocking vulnerability. It reported 15
   allowed warnings from transitive GTK3/GLib and legacy macro/Unicode crates;
   these remain tracked dependency risks rather than hidden failures.
@@ -187,9 +208,9 @@ Passed:
   `cargo tauri build --bundles deb -- --locked`.
 - Current-tree Debian package:
   `target/release/bundle/deb/DOM Wallet V3_0.2.0_amd64.deb`.
-  - size: 9,272,028 bytes;
+  - size: 9,271,478 bytes;
   - SHA-256:
-    `a5ea7f0db2fb8d66ae62345feae4a9c327fc678f2c056c62b5104d7c65715baf`;
+    `e0d750b9ecf710a2f588881cfbfc4059d45630b5ee7a9ccd9bd7ba9817503d36`;
   - metadata: package `dom-wallet-v3`, version `0.2.0`, architecture `amd64`.
   - no `.sig` was generated, as required for a non-publishing stabilization
     build.
