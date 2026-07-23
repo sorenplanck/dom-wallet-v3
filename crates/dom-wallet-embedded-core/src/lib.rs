@@ -13,7 +13,7 @@ use dom_wallet_core_api::{
 };
 use std::{
     fmt,
-    net::{SocketAddr, TcpListener},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
     path::PathBuf,
     sync::{
         atomic::{AtomicU8, Ordering},
@@ -106,9 +106,10 @@ impl EmbeddedCoreConfiguration {
             p2p_listen_address,
         )
         .with_maximum_inbound_peers(1)
-        .with_seed_peers(vec![MAINNET_BOOTSTRAP_FALLBACK
-            .parse()
-            .expect("fixed Mainnet bootstrap address is valid")])
+        .with_seed_peers(vec![SocketAddr::from((
+            [168, 100, 9, 70],
+            MAINNET_P2P_PORT,
+        ))])
     }
 
     /// Set the maximum inbound peer count.
@@ -139,9 +140,18 @@ impl EmbeddedCoreConfiguration {
                 code: "ZERO_INBOUND_LIMIT",
             });
         }
+        if self.seed_peers.iter().any(|peer| peer.port() == 0) {
+            return Err(EmbeddedCoreAdapterError::InvalidConfiguration {
+                code: "ZERO_SEED_PORT",
+            });
+        }
         if self.network == EmbeddedCoreNetwork::Mainnet
             && (!self.p2p_listen_address.ip().is_loopback()
-                || self.seed_peers.contains(&self.p2p_listen_address))
+                || self.seed_peers.contains(&self.p2p_listen_address)
+                || self
+                    .seed_peers
+                    .iter()
+                    .any(|peer| !is_public_routable_peer(*peer)))
         {
             return Err(EmbeddedCoreAdapterError::InvalidConfiguration {
                 code: "UNSAFE_MAINNET_LISTENER_OR_SELF_PEER",
@@ -583,6 +593,58 @@ impl EmbeddedCoreLifecycle {
     }
 }
 
+fn is_public_routable_peer(address: SocketAddr) -> bool {
+    if address.port() == 0 {
+        return false;
+    }
+    match address.ip() {
+        IpAddr::V4(ip) => is_public_ipv4(ip),
+        IpAddr::V6(ip) => is_public_ipv6(ip),
+    }
+}
+
+fn is_public_ipv4(ip: Ipv4Addr) -> bool {
+    let [a, b, c, d] = ip.octets();
+    if a == 0
+        || a == 10
+        || a == 127
+        || a >= 224
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 169 && b == 254)
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 192 && b == 0 && c == 2)
+        || (a == 192 && b == 88 && c == 99)
+        || (a == 192 && b == 168)
+        || (a == 198 && (b == 18 || b == 19))
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
+    {
+        return false;
+    }
+    !(a == 255 && b == 255 && c == 255 && d == 255)
+}
+
+fn is_public_ipv6(ip: Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    if ip.is_unspecified()
+        || ip.is_loopback()
+        || ip.is_multicast()
+        || ip.to_ipv4().is_some()
+        || (segments[0] & 0xfe00) == 0xfc00
+        || (segments[0] & 0xffc0) == 0xfe80
+        || (segments[0] & 0xffc0) == 0xfec0
+    {
+        return false;
+    }
+    let is_discard_only =
+        segments[0] == 0x0100 && segments[1..].iter().all(|segment| *segment == 0);
+    let is_documentation = segments[0] == 0x2001 && segments[1] == 0x0db8;
+    let is_benchmark = segments[0] == 0x2001 && segments[1] == 0x0002;
+    let is_orchid = segments[0] == 0x2001 && (segments[1] & 0xfff0) == 0x0020;
+    !(is_discard_only || is_documentation || is_benchmark || is_orchid)
+}
+
 fn redact_peer_address(address: SocketAddr) -> String {
     match address.ip() {
         std::net::IpAddr::V4(ip) => {
@@ -712,6 +774,7 @@ async fn run_wallet_dns_discovery(
                 Ok(Ok(addresses)) => {
                     let addresses = addresses
                         .filter(|address| *address != local_address)
+                        .filter(|address| is_public_routable_peer(*address))
                         .map(|address| address.to_string())
                         .collect::<Vec<_>>();
                     if !addresses.is_empty() {
@@ -809,6 +872,68 @@ mod tests {
         let self_peer = EmbeddedCoreConfiguration::mainnet(directory.path(), address)
             .with_seed_peers(vec![address]);
         assert!(self_peer.validate().is_err());
+    }
+
+    #[test]
+    fn mainnet_rejects_non_routable_seed_addresses() {
+        let rejected = [
+            "0.0.0.0:33369",
+            "127.0.0.1:33369",
+            "10.0.0.1:33369",
+            "100.64.0.1:33369",
+            "169.254.1.1:33369",
+            "172.16.0.1:33369",
+            "192.168.0.1:33369",
+            "192.0.2.1:33369",
+            "198.18.0.1:33369",
+            "198.51.100.1:33369",
+            "203.0.113.1:33369",
+            "224.0.0.1:33369",
+            "255.255.255.255:33369",
+            "[::]:33369",
+            "[::1]:33369",
+            "[::8.8.8.8]:33369",
+            "[::ffff:8.8.8.8]:33369",
+            "[fc00::1]:33369",
+            "[fe80::1]:33369",
+            "[ff02::1]:33369",
+            "[2001:db8::1]:33369",
+            "[2001:2::1]:33369",
+        ];
+        let directory = TempDir::new().expect("temporary directory");
+        for value in rejected {
+            let seed = value.parse().expect("test socket address");
+            let configuration =
+                EmbeddedCoreConfiguration::mainnet(directory.path(), unused_loopback_address())
+                    .with_seed_peers(vec![seed]);
+            assert!(
+                configuration.validate().is_err(),
+                "accepted non-routable seed {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_local_peers_remain_available_for_regtest() {
+        let directory = TempDir::new().expect("temporary directory");
+        for value in ["127.0.0.1:33369", "10.0.0.2:33369", "[::1]:33369"] {
+            let configuration = regtest_configuration(directory.path())
+                .with_seed_peers(vec![value.parse().expect("test socket address")]);
+            assert!(configuration.validate().is_ok(), "rejected {value}");
+        }
+    }
+
+    #[test]
+    fn public_peer_policy_accepts_global_ipv4_and_ipv6() {
+        assert!(is_public_routable_peer(
+            "8.8.8.8:33369".parse().expect("public IPv4")
+        ));
+        assert!(is_public_routable_peer(
+            "[2606:4700:4700::1111]:33369".parse().expect("public IPv6")
+        ));
+        assert!(!is_public_routable_peer(
+            "8.8.8.8:0".parse().expect("zero port")
+        ));
     }
 
     #[test]
