@@ -511,6 +511,60 @@ pub fn validate_peer_manifest(
     Ok(prioritize_mainnet_relay(peers))
 }
 
+pub fn persist_peer_manifest_cache(
+    path: &Path,
+    manifest: &SignedPeerManifest,
+) -> Result<(), UpdateError> {
+    let parent = path.parent().ok_or(UpdateError::StateIo)?;
+    fs::create_dir_all(parent).map_err(|_| UpdateError::StateIo)?;
+    let bytes = serde_json::to_vec(manifest).map_err(|_| UpdateError::PeerManifestInvalid)?;
+    let temporary = parent.join(format!(
+        ".peer-manifest.{}.{}.tmp",
+        std::process::id(),
+        TEMPORARY_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary).map_err(|_| UpdateError::StateIo)?;
+    let result = (|| {
+        file.write_all(&bytes).map_err(|_| UpdateError::StateIo)?;
+        file.sync_all().map_err(|_| UpdateError::StateIo)?;
+        fs::rename(&temporary, path).map_err(|_| UpdateError::StateIo)?;
+        sync_directory(parent)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+pub fn load_valid_peer_manifest_cache(
+    path: &Path,
+    verifier: &dyn SignatureVerifier,
+    expected_chain_id: &str,
+    expected_genesis_hash: &str,
+    previous_sequence: u64,
+    now: OffsetDateTime,
+) -> Result<(u64, Vec<SocketAddr>), UpdateError> {
+    let bytes = fs::read(path).map_err(|_| UpdateError::StateIo)?;
+    let manifest: SignedPeerManifest =
+        serde_json::from_slice(&bytes).map_err(|_| UpdateError::PeerManifestInvalid)?;
+    let peers = validate_peer_manifest(
+        &manifest,
+        verifier,
+        expected_chain_id,
+        expected_genesis_hash,
+        previous_sequence,
+        now,
+    )?;
+    Ok((manifest.payload.sequence, peers))
+}
+
 fn prioritize_mainnet_relay(mut peers: Vec<SocketAddr>) -> Vec<SocketAddr> {
     const PRIORITY: [&str; 2] = ["168.100.9.70:8443", "168.100.9.70:33369"];
     peers.sort_by_key(|peer| {
@@ -1396,6 +1450,30 @@ mod tests {
         assert_eq!(
             validate_peer_manifest(&manifest, &AcceptSignature, "chain", "genesis", 1, now()),
             Err(UpdateError::PeerManifestInvalid)
+        );
+    }
+
+    #[test]
+    fn authenticated_peer_cache_works_offline_and_rejects_tampering() {
+        let directory = TempDir::new().expect("tempdir");
+        let path = directory.path().join("mainnet-peers.json");
+        let manifest = peers();
+        persist_peer_manifest_cache(&path, &manifest).expect("cache signed manifest");
+        let (sequence, loaded) =
+            load_valid_peer_manifest_cache(&path, &AcceptSignature, "chain", "genesis", 1, now())
+                .expect("load authenticated cache");
+        assert_eq!(sequence, 2);
+        assert_eq!(
+            loaded.first().map(ToString::to_string).as_deref(),
+            Some("168.100.9.70:8443")
+        );
+
+        let mut tampered = manifest;
+        tampered.payload.chain_id = "other-chain".into();
+        persist_peer_manifest_cache(&path, &tampered).expect("write tampered envelope");
+        assert_eq!(
+            load_valid_peer_manifest_cache(&path, &AcceptSignature, "chain", "genesis", 1, now()),
+            Err(UpdateError::PeerManifestIdentityMismatch)
         );
     }
 
