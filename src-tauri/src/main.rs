@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![forbid(unsafe_code)]
 
+use dom_wallet_node_manager::ManagedNodeConfig;
 use dom_wallet_tauri_shell::{DesktopApplication, UpdateControl};
 use dom_wallet_updater::{
     validate_download, validate_wallet_manifest, verify_wallet_manifest_signature,
@@ -388,6 +389,81 @@ fn embedded_node_status(
     app.embedded_node_status().map_err(Into::into)
 }
 #[tauri::command]
+fn experimental_sidecar_status(
+    app: tauri::State<'_, DesktopApplication>,
+) -> Result<dom_wallet_node_manager::SidecarStatus, dom_wallet_tauri_shell::CommandErrorDto> {
+    app.experimental_sidecar_status().map_err(Into::into)
+}
+#[tauri::command]
+fn experimental_sidecar_enable(
+    app: tauri::State<'_, DesktopApplication>,
+    confirmation: String,
+) -> Result<dom_wallet_node_manager::SidecarStatus, dom_wallet_tauri_shell::CommandErrorDto> {
+    app.experimental_sidecar_enable(&confirmation)
+        .map_err(Into::into)
+}
+#[tauri::command]
+fn experimental_sidecar_disable(
+    app: tauri::State<'_, DesktopApplication>,
+) -> Result<dom_wallet_node_manager::SidecarStatus, dom_wallet_tauri_shell::CommandErrorDto> {
+    app.experimental_sidecar_disable().map_err(Into::into)
+}
+#[tauri::command]
+fn experimental_sidecar_start(
+    handle: tauri::AppHandle,
+    app: tauri::State<'_, DesktopApplication>,
+) -> Result<dom_wallet_node_manager::SidecarStatus, dom_wallet_tauri_shell::CommandErrorDto> {
+    let data_directory = handle
+        .path()
+        .app_data_dir()
+        .map_err(|_| dom_wallet_tauri_shell::CommandErrorDto {
+            code: "APP_DATA_DIRECTORY_UNAVAILABLE".into(),
+            category: "PLATFORM".into(),
+            message: "The platform application data directory is unavailable.".into(),
+            retryable: false,
+        })?
+        .join("mainnet")
+        .join("sidecar-node");
+    let rpc_address = reserve_loopback_address()?;
+    let p2p_address = reserve_loopback_address()?;
+    app.experimental_sidecar_start(ManagedNodeConfig {
+        network: "mainnet".into(),
+        data_directory,
+        rpc_address,
+        p2p_address,
+        seed_peers: dom_wallet_embedded_core::MAINNET_BOOTSTRAP_PEERS
+            .iter()
+            .filter_map(|peer| peer.parse().ok())
+            .collect(),
+    })
+    .map_err(Into::into)
+}
+#[tauri::command]
+fn experimental_sidecar_stop(
+    app: tauri::State<'_, DesktopApplication>,
+) -> Result<dom_wallet_node_manager::SidecarStatus, dom_wallet_tauri_shell::CommandErrorDto> {
+    app.experimental_sidecar_stop().map_err(Into::into)
+}
+
+fn reserve_loopback_address(
+) -> Result<std::net::SocketAddr, dom_wallet_tauri_shell::CommandErrorDto> {
+    let listener =
+        TcpListener::bind("127.0.0.1:0").map_err(|_| dom_wallet_tauri_shell::CommandErrorDto {
+            code: "LOCAL_LISTENER_UNAVAILABLE".into(),
+            category: "NODE".into(),
+            message: "A private local node listener could not be reserved.".into(),
+            retryable: true,
+        })?;
+    listener
+        .local_addr()
+        .map_err(|_| dom_wallet_tauri_shell::CommandErrorDto {
+            code: "LOCAL_LISTENER_UNAVAILABLE".into(),
+            category: "NODE".into(),
+            message: "A private local node listener could not be reserved.".into(),
+            retryable: true,
+        })
+}
+#[tauri::command]
 fn node_network_status(
     app: tauri::State<'_, DesktopApplication>,
 ) -> Result<dom_wallet_tauri_shell::NodeNetworkStatusDto, dom_wallet_tauri_shell::CommandErrorDto> {
@@ -678,6 +754,14 @@ fn application_builder() -> tauri::Builder<tauri::Wry> {
         .manage(DesktopApplication::default())
         .setup(|app| {
             initialize_file_logging(app);
+            let runtime_root = app
+                .path()
+                .app_local_data_dir()?
+                .join("runtime")
+                .join("managed-sidecar");
+            app.state::<DesktopApplication>()
+                .configure_sidecar_runtime(runtime_root)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let jitter = unix_seconds() % (MAX_INITIAL_JITTER_SECONDS + 1);
@@ -711,6 +795,11 @@ fn application_builder() -> tauri::Builder<tauri::Wry> {
             embedded_node_start,
             embedded_node_stop,
             embedded_node_status,
+            experimental_sidecar_status,
+            experimental_sidecar_enable,
+            experimental_sidecar_disable,
+            experimental_sidecar_start,
+            experimental_sidecar_stop,
             node_network_status,
             node_peer_status,
             wallet_sync_status,
@@ -758,13 +847,17 @@ fn main() {
     let Ok(app) = application_builder().build(tauri::generate_context!()) else {
         std::process::exit(1);
     };
-    app.run(|handle, event| {
-        if matches!(event, tauri::RunEvent::Resumed) {
+    app.run(|handle, event| match event {
+        tauri::RunEvent::Resumed => {
             let handle = handle.clone();
             tauri::async_runtime::spawn(async move {
                 let _ = perform_update_cycle(handle, true).await;
             });
         }
+        tauri::RunEvent::Exit | tauri::RunEvent::ExitRequested { .. } => {
+            let _ = handle.state::<DesktopApplication>().application_shutdown();
+        }
+        _ => {}
     });
 }
 
@@ -775,7 +868,7 @@ mod tests {
     #[test]
     fn packaged_entrypoint_constructs_the_registered_builder() {
         let _builder = application_builder();
-        assert_eq!(dom_wallet_tauri_shell::COMMAND_NAMES.len(), 61);
+        assert_eq!(dom_wallet_tauri_shell::COMMAND_NAMES.len(), 66);
         assert!(dom_wallet_tauri_shell::COMMAND_NAMES.contains(&"native_bridge_status"));
         assert!(dom_wallet_tauri_shell::COMMAND_NAMES.contains(&"check_updates_now"));
         assert!(dom_wallet_tauri_shell::COMMAND_NAMES.contains(&"embedded_node_stop"));

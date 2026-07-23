@@ -13,6 +13,7 @@ dom-wallet-core-sync = { path = "../crates/dom-wallet-core-sync" }
 dom-wallet-domain = { path = "../crates/dom-wallet-domain" }
 dom-wallet-embedded-core = { path = "../crates/dom-wallet-embedded-core" }
 dom-wallet-updater = { path = "../crates/dom-wallet-updater" }
+dom-wallet-node-manager = { path = "../crates/dom-wallet-node-manager" }
 hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true

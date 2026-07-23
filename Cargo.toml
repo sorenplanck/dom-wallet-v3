@@ -12,6 +12,7 @@ members = [
     "crates/dom-wallet-core-recovery",
     "crates/dom-wallet-core-restore",
     "crates/dom-wallet-updater",
+    "crates/dom-wallet-node-manager",
     "crates/dom-wallet-production-backend",
     "src-tauri",
 ]
@@ -68,3 +69,8 @@ dom-node = { git = "https://github.com/sorenplanck/dom-protocol", rev = "6c58b03
 dom-pow = { git = "https://github.com/sorenplanck/dom-protocol", rev = "6c58b0383c095384cd0150cabf074aa00fb57b17" }
 dom-wallet-core-api = { git = "https://github.com/sorenplanck/dom-protocol", rev = "6c58b0383c095384cd0150cabf074aa00fb57b17" }
 dom-wallet-recovery = { git = "https://github.com/sorenplanck/dom-protocol", rev = "6c58b0383c095384cd0150cabf074aa00fb57b17" }
+
+# Sidecar release authentication and atomic pointer handling are deliberately
+# consumed from their reviewed protocol commit. This does not move the wallet's
+# consensus crates away from the independent immutable revision above.
+dom-sidecar = { git = "https://github.com/sorenplanck/dom-protocol", rev = "ab45a2944f22fe00f9b12984354f0d5d7cdd229a" }

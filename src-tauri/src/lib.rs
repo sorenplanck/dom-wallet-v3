@@ -16,6 +16,9 @@ use dom_wallet_embedded_core::{
     mine_wallet_block, EmbeddedCoreConfiguration, WalletMiningOutcome, MAINNET_BOOTSTRAP_FALLBACK,
     MAINNET_BOOTSTRAP_PEERS, MAINNET_DNS_SEEDS,
 };
+use dom_wallet_node_manager::{
+    ManagedNodeConfig, NodeManager, SidecarStatus, EXPERIMENTAL_ENABLE_CONFIRMATION,
+};
 use dom_wallet_updater::{
     NodeUpdaterState, WalletUpdaterState, EMBEDDED_NODE_REVISION, UPDATE_CHANNEL,
     UPDATE_INTERVAL_SECONDS,
@@ -36,10 +39,11 @@ pub struct DesktopApplication {
     last_peer_connected_unix_seconds: AtomicU64,
     synchronization_paused: AtomicBool,
     mining: Mutex<MiningRuntime>,
+    sidecar: Mutex<NodeManager>,
     shutdown: AtomicBool,
 }
 
-pub const COMMAND_NAMES: [&str; 61] = [
+pub const COMMAND_NAMES: [&str; 66] = [
     "native_bridge_status",
     "get_build_info",
     "update_status",
@@ -61,6 +65,11 @@ pub const COMMAND_NAMES: [&str; 61] = [
     "embedded_node_start",
     "embedded_node_stop",
     "embedded_node_status",
+    "experimental_sidecar_status",
+    "experimental_sidecar_enable",
+    "experimental_sidecar_disable",
+    "experimental_sidecar_start",
+    "experimental_sidecar_stop",
     "node_network_status",
     "node_peer_status",
     "wallet_sync_status",
@@ -375,6 +384,7 @@ impl Default for DesktopApplication {
             last_peer_connected_unix_seconds: AtomicU64::new(0),
             synchronization_paused: AtomicBool::new(false),
             mining: Mutex::new(MiningRuntime::default()),
+            sidecar: Mutex::new(NodeManager::default()),
             shutdown: AtomicBool::new(false),
         }
     }
@@ -615,6 +625,73 @@ pub struct SlateQrReassemblyDto {
 }
 
 impl DesktopApplication {
+    pub fn configure_sidecar_runtime(
+        &self,
+        runtime_root: impl Into<std::path::PathBuf>,
+    ) -> Result<(), CommandError> {
+        self.sidecar
+            .lock()
+            .map_err(|_| CommandError::Unavailable)?
+            .configure_runtime(runtime_root)
+            .map_err(|_| CommandError::Unavailable)?;
+        Ok(())
+    }
+
+    pub fn experimental_sidecar_status(&self) -> Result<SidecarStatus, CommandError> {
+        self.sidecar
+            .lock()
+            .map_err(|_| CommandError::Unavailable)
+            .map(|mut manager| manager.status())
+    }
+
+    pub fn experimental_sidecar_enable(
+        &self,
+        confirmation: &str,
+    ) -> Result<SidecarStatus, CommandError> {
+        self.ensure_running()?;
+        let unlocked = self
+            .service
+            .lock()
+            .map_err(|_| CommandError::Unavailable)?
+            .summary()
+            .is_ok();
+        let mut manager = self.sidecar.lock().map_err(|_| CommandError::Unavailable)?;
+        manager
+            .enable_for_session(confirmation, unlocked)
+            .map_err(|_| {
+                CommandError::InvalidInput(format!(
+                    "sidecar activation requires an unlocked wallet and exact confirmation: {EXPERIMENTAL_ENABLE_CONFIRMATION}"
+                ))
+            })?;
+        Ok(manager.status())
+    }
+
+    pub fn experimental_sidecar_disable(&self) -> Result<SidecarStatus, CommandError> {
+        let mut manager = self.sidecar.lock().map_err(|_| CommandError::Unavailable)?;
+        manager
+            .disable_for_session()
+            .map_err(|_| CommandError::Unavailable)?;
+        Ok(manager.status())
+    }
+
+    pub fn experimental_sidecar_start(
+        &self,
+        configuration: ManagedNodeConfig,
+    ) -> Result<SidecarStatus, CommandError> {
+        self.ensure_running()?;
+        let mut manager = self.sidecar.lock().map_err(|_| CommandError::Unavailable)?;
+        manager
+            .start_active(configuration)
+            .map_err(|_| CommandError::NodeNotReady)?;
+        Ok(manager.status())
+    }
+
+    pub fn experimental_sidecar_stop(&self) -> Result<SidecarStatus, CommandError> {
+        let mut manager = self.sidecar.lock().map_err(|_| CommandError::Unavailable)?;
+        manager.shutdown().map_err(|_| CommandError::Unavailable)?;
+        Ok(manager.status())
+    }
+
     pub fn update_safe_point_available(&self) -> Result<bool, CommandError> {
         let service = self.service.lock().map_err(|_| CommandError::Unavailable)?;
         let transactions = match service.transaction_list() {
@@ -1304,6 +1381,11 @@ impl DesktopApplication {
         }
         let result = (|| {
             self.stop_mining_worker()?;
+            self.sidecar
+                .lock()
+                .map_err(|_| CommandError::Unavailable)?
+                .shutdown()
+                .map_err(|_| CommandError::Unavailable)?;
             self.clear_qr_buffers()?;
             let mut service = self.service.lock().map_err(|_| CommandError::Unavailable)?;
             service.close().map_err(CommandError::from)?;
@@ -1998,6 +2080,23 @@ mod tests {
         assert!(DesktopApplication::default()
             .update_safe_point_available()
             .expect("closed Wallet is safe"));
+    }
+
+    #[test]
+    fn sidecar_cannot_be_enabled_without_an_unlocked_wallet_session() {
+        let runtime = tempfile::tempdir().expect("temporary runtime");
+        let app = DesktopApplication::default();
+        app.configure_sidecar_runtime(runtime.path())
+            .expect("configure isolated runtime");
+        assert!(matches!(
+            app.experimental_sidecar_enable(EXPERIMENTAL_ENABLE_CONFIRMATION),
+            Err(CommandError::InvalidInput(_))
+        ));
+        assert!(
+            !app.experimental_sidecar_status()
+                .expect("sidecar status")
+                .enabled_for_session
+        );
     }
 
     #[test]
