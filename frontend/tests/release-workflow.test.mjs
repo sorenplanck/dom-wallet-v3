@@ -68,3 +68,11 @@ test("Tauri resolves the frontend build from both supported CLI contexts", async
   const ico = await readFile(new URL("../../src-tauri/icons/icon.ico", import.meta.url));
   assert.deepEqual([...ico.subarray(0, 4)], [0, 0, 1, 0]);
 });
+
+test("release builds use the Windows GUI subsystem without a console window", async () => {
+  const entrypoint = await readFile(new URL("../../src-tauri/src/main.rs", import.meta.url), "utf8");
+  assert.match(
+    entrypoint,
+    /^#!\[cfg_attr\(not\(debug_assertions\), windows_subsystem = "windows"\)\]/,
+  );
+});
