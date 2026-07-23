@@ -148,6 +148,14 @@ pub enum NodeManagerError {
     InvalidConfiguration,
     #[error("sidecar binary path or permissions are unsafe")]
     UnsafeBinary,
+    #[error("Windows runtime ACL setup failed (status {0})")]
+    WindowsAclSetupFailed(i32),
+    #[error("Windows runtime directory owner is unsafe")]
+    WindowsAclOwnerUnsafe,
+    #[error("Windows runtime directory grants write access to an untrusted principal")]
+    WindowsAclWritablePrincipalUnsafe,
+    #[error("Windows runtime ACL validation failed (status {0})")]
+    WindowsAclValidationFailed(i32),
     #[error("sidecar process exited before it became ready")]
     StartupFailed,
     #[error("sidecar RPC did not become ready before timeout")]
@@ -721,7 +729,11 @@ impl NodeManagerError {
             Self::StartupFailed | Self::StartupTimeout => "NODE_START_FAILED",
             Self::IdentityMismatch => "NODE_IDENTITY_MISMATCH",
             Self::ShutdownFailed => "NODE_SHUTDOWN_FAILED",
-            Self::UnsafeBinary => "NODE_BINARY_UNSAFE",
+            Self::UnsafeBinary
+            | Self::WindowsAclSetupFailed(_)
+            | Self::WindowsAclOwnerUnsafe
+            | Self::WindowsAclWritablePrincipalUnsafe
+            | Self::WindowsAclValidationFailed(_) => "NODE_BINARY_UNSAFE",
             Self::TrustRootMismatch => "NODE_TRUST_ROOT_MISMATCH",
             Self::MissingNodeFeed | Self::NodeFeedMismatch => "NODE_FEED_INVALID",
             Self::NodeUpdateNotAvailable => "NODE_UPDATE_NOT_AVAILABLE",
@@ -1162,10 +1174,13 @@ exit 0
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()?;
-    status
-        .success()
-        .then_some(())
-        .ok_or(NodeManagerError::UnsafeBinary)
+    match status.code() {
+        Some(0) => Ok(()),
+        Some(41) => Err(NodeManagerError::WindowsAclOwnerUnsafe),
+        Some(42) => Err(NodeManagerError::WindowsAclWritablePrincipalUnsafe),
+        Some(code) => Err(NodeManagerError::WindowsAclValidationFailed(code)),
+        None => Err(NodeManagerError::WindowsAclValidationFailed(-1)),
+    }
 }
 
 #[cfg(windows)]
@@ -1208,10 +1223,11 @@ Set-Acl -LiteralPath $args[0] -AclObject $acl
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()?;
-    status
-        .success()
-        .then_some(())
-        .ok_or(NodeManagerError::UnsafeBinary)
+    match status.code() {
+        Some(0) => Ok(()),
+        Some(code) => Err(NodeManagerError::WindowsAclSetupFailed(code)),
+        None => Err(NodeManagerError::WindowsAclSetupFailed(-1)),
+    }
 }
 
 #[cfg(test)]
@@ -1508,7 +1524,10 @@ mod tests {
             assert!(grant.success());
             assert!(matches!(
                 manager.configure_runtime(&runtime),
-                Err(NodeManagerError::UnsafeBinary)
+                Err(NodeManagerError::UnsafeBinary
+                    | NodeManagerError::WindowsAclOwnerUnsafe
+                    | NodeManagerError::WindowsAclWritablePrincipalUnsafe
+                    | NodeManagerError::WindowsAclValidationFailed(_))
             ));
             let remove = Command::new("icacls.exe")
                 .arg(&unsafe_child)
