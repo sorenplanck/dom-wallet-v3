@@ -93,11 +93,14 @@ genesis hash, RPC protocol version, P2P protocol version and storage schema
 version. Until then, `NodeRpcIdentityCapabilities::permits_node_only_update()`
 returns false.
 
-The Wallet's consensus crate pin remains
-`6c58b0383c095384cd0150cabf074aa00fb57b17`. It was not blindly changed to
-`release/mainnet`, because the diff also contains extensive miner/node changes.
-This preserves the instruction not to change consensus as a side effect of
-adding updater control endpoints.
+The Wallet's consensus and embedded-node crates are pinned to the immutable
+published Mainnet revision
+`28ba3cefc9fbc913f126336482662528c68a7d8c`. Direct ancestry checks prove that
+this revision includes `065e484` (the Mainnet ASERT rescue at height 4849) and
+`5fad708` (equal-height fork divergence recovery). The complete workspace,
+embedded-node lifecycle tests and wallet integration tests pass against this
+exact revision. The embedded path uses `EmbeddedWalletCoreApi` directly and
+does not call the newly Bearer-protected HTTP wallet endpoints.
 
 ## Commits and push
 

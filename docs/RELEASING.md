@@ -8,9 +8,9 @@ No independent security audit is claimed.
 
 ## Release identity
 
-- Wallet version: `0.1.2`
-- Recommended tag: `wallet-v0.1.2`
-- DOM Core revision: `6c58b0383c095384cd0150cabf074aa00fb57b17`
+- Wallet version: `0.2.0`
+- Recommended tag: `wallet-v0.2.0`
+- DOM Core revision: `28ba3cefc9fbc913f126336482662528c68a7d8c`
 - Final genesis revision: `6a8a6475b36ad68bb760d61cf323126d95cd7416`
 - Mainnet chain ID: `f9831fadabc8a4234beab35fbb6327e84581645f33e9f75ed2ea78e8bcf1165b`
 

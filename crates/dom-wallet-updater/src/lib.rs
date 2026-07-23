@@ -32,7 +32,7 @@ pub const NODE_UPDATE_ENDPOINT: &str =
 pub const PEER_UPDATE_ENDPOINT: &str =
     "https://github.com/sorenplanck/dom-wallet-v3/releases/latest/download/mainnet-peers.json";
 /// Pinned DOM Protocol revision compiled into this Wallet.
-pub const EMBEDDED_NODE_REVISION: &str = "6c58b0383c095384cd0150cabf074aa00fb57b17";
+pub const EMBEDDED_NODE_REVISION: &str = "28ba3cefc9fbc913f126336482662528c68a7d8c";
 /// First immutable DOM Protocol revision with authenticated build-info and shutdown.
 pub const MANAGED_NODE_CONTROL_REVISION: &str = "28ba3cefc9fbc913f126336482662528c68a7d8c";
 /// Stable update channel.
@@ -1766,7 +1766,7 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_build_info_is_pinned_but_partial_identity_fails_closed() {
+    fn authenticated_build_info_matches_embedded_pin_but_partial_identity_fails_closed() {
         let response = NodeBuildInfoResponse {
             commit: MANAGED_NODE_CONTROL_REVISION.into(),
         };
@@ -1776,6 +1776,10 @@ mod tests {
         );
         assert_eq!(
             validate_node_build_info(&response, EMBEDDED_NODE_REVISION),
+            Ok(())
+        );
+        assert_eq!(
+            validate_node_build_info(&response, "0000000000000000000000000000000000000000"),
             Err(UpdateError::NodeIdentityMismatch)
         );
         let current_rpc = NodeRpcIdentityCapabilities {
