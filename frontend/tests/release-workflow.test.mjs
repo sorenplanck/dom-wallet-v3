@@ -35,6 +35,26 @@ test("release workflow provides pinned experimental dry-run packaging", async ()
   assert.equal(workflow.includes("dom-wallet-v2"), false);
 });
 
+test("stabilization workflow validates and packages without a release path", async () => {
+  const workflow = await readFile(new URL("../../.github/workflows/stabilize-wallet.yml", import.meta.url), "utf8");
+  for (const required of [
+    "stabilize/wallet-v0.2.0", "cargo fmt --all --check",
+    "cargo check --workspace --all-targets --locked",
+    "cargo clippy --workspace --all-targets --locked -- -D warnings",
+    "cargo test --workspace --all-targets --locked -- --test-threads=1",
+    "cargo audit", "cargo deny check", "appimage,deb", "nsis,msi", "dmg,app",
+    "Smoke test installed Linux application", "scripts/test-packaged-native-bridge-linux.mjs",
+    "contents: read", "Build unsigned installers without publishing",
+  ]) assert.equal(workflow.includes(required), true, `missing ${required}`);
+
+  const actionRefs = [...workflow.matchAll(/uses:\s+[^@\s]+@([^\s]+)/g)].map((match) => match[1]);
+  assert.ok(actionRefs.length >= 7);
+  assert.equal(actionRefs.every((ref) => /^[0-9a-f]{40}$/.test(ref)), true);
+  for (const forbidden of ["git tag", "gh release", "contents: write", "tags:", "upload-artifact"]) {
+    assert.equal(workflow.includes(forbidden), false, `release-capable token ${forbidden}`);
+  }
+});
+
 test("Tauri resolves the frontend build from the workspace root", async () => {
   const config = JSON.parse(await readFile(new URL("../../src-tauri/tauri.conf.json", import.meta.url), "utf8"));
   assert.equal(config.build.beforeBuildCommand, "npm --prefix frontend run build");
