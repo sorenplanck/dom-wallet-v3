@@ -85,6 +85,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Check out pinned DOM sidecar source
+        if: runner.os == 'Windows'
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: sorenplanck/dom-protocol
+          ref: ab45a2944f22fe00f9b12984354f0d5d7cdd229a
+          path: dom-protocol-sidecar
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "22"
@@ -102,6 +109,15 @@ jobs:
         run: cargo install --locked tauri-driver --version 2.0.6
       - name: Install locked frontend dependencies
         run: npm ci --prefix frontend
+      - name: Exercise managed sidecar promotion and rollback on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --manifest-path dom-protocol-sidecar/Cargo.toml --locked -p dom-node --bin dom-node
+          $env:DOM_TEST_SIDECAR_BINARY = (Resolve-Path "dom-protocol-sidecar/target/debug/dom-node.exe").Path
+          cargo test --locked -p dom-wallet-node-manager persisted_node_sequence_rejects_equal_and_lower_feeds_at_runtime_boundary -- --test-threads=1
+          cargo test --locked -p dom-wallet-node-manager pinned_sidecar_process_reports_identity_and_rolls_back -- --ignored --test-threads=1
+          cargo test --locked -p dom-wallet-node-manager pointer_promotion_rollback_and_data_backup_are_atomic -- --test-threads=1
       - name: Build unsigned installers without publishing
         uses: tauri-apps/tauri-action@fce9c6108b31ea247710505d3aaaa893ee6768d4
         with:
@@ -117,6 +133,10 @@ jobs:
             Windows) for ext in exe msi; do find "$ROOT" -type f -name "*.${ext}" -print -quit | grep -q .; done ;;
             macOS) find "$ROOT" -type f -name '*.dmg' -print -quit | grep -q .; find "$ROOT" -type d -name '*.app' -print -quit | grep -q . ;;
           esac
+      - name: Install, launch and uninstall MSI and NSIS
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/test-windows-installers.ps1 -BundleRoot "target/${{ matrix.target }}/release/bundle"
       - name: Smoke test installed Linux application
         if: runner.os == 'Linux'
         shell: bash
