@@ -155,3 +155,10 @@ jobs:
           BINARY="$(find "$PACKAGE_ROOT/usr/bin" -maxdepth 1 -type f -name 'dom-wallet*' -print -quit)"
           test -x "$BINARY"
           xvfb-run -a node scripts/test-packaged-native-bridge-linux.mjs "$BINARY"
+      - name: Preserve validated installers
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: dom-wallet-v0.2.0-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/bundle
+          if-no-files-found: error
+          retention-days: 7
