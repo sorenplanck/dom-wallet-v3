@@ -11,7 +11,7 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    path::{Component, Path},
+    path::{Component, Path, PathBuf},
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use thiserror::Error;
@@ -33,6 +33,8 @@ pub const PEER_UPDATE_ENDPOINT: &str =
     "https://github.com/sorenplanck/dom-wallet-v3/releases/latest/download/mainnet-peers.json";
 /// Pinned DOM Protocol revision compiled into this Wallet.
 pub const EMBEDDED_NODE_REVISION: &str = "6c58b0383c095384cd0150cabf074aa00fb57b17";
+/// First immutable DOM Protocol revision with authenticated build-info and shutdown.
+pub const MANAGED_NODE_CONTROL_REVISION: &str = "28ba3cefc9fbc913f126336482662528c68a7d8c";
 /// Stable update channel.
 pub const UPDATE_CHANNEL: &str = "stable";
 
@@ -339,6 +341,53 @@ pub struct NodeIdentity {
     pub rpc_protocol_version: u32,
     pub p2p_protocol_version: u32,
     pub storage_schema_version: u32,
+}
+
+/// Response currently provided by authenticated `GET /build-info`.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeBuildInfoResponse {
+    pub commit: String,
+}
+
+/// Capabilities required before node-only promotion can be enabled.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct NodeRpcIdentityCapabilities {
+    pub build_revision: bool,
+    pub network: bool,
+    pub chain_id: bool,
+    pub genesis_hash: bool,
+    pub rpc_protocol_version: bool,
+    pub p2p_protocol_version: bool,
+    pub storage_schema_version: bool,
+    pub graceful_shutdown: bool,
+}
+
+impl NodeRpcIdentityCapabilities {
+    pub fn permits_node_only_update(self) -> bool {
+        self.build_revision
+            && self.network
+            && self.chain_id
+            && self.genesis_hash
+            && self.rpc_protocol_version
+            && self.p2p_protocol_version
+            && self.storage_schema_version
+            && self.graceful_shutdown
+    }
+}
+
+/// Validate the revision returned by the authenticated control plane.
+pub fn validate_node_build_info(
+    response: &NodeBuildInfoResponse,
+    expected_revision: &str,
+) -> Result<(), UpdateError> {
+    if response.commit.len() != 40
+        || !response.commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !response.commit.eq_ignore_ascii_case(expected_revision)
+    {
+        return Err(UpdateError::NodeIdentityMismatch);
+    }
+    Ok(())
 }
 
 /// Validate the process-reported identity rather than trusting its path or manifest.
@@ -708,6 +757,167 @@ pub struct NodeRuntimeState {
     pub compatibility: NodeCompatibility,
     pub update_sequence: u64,
     pub temporarily_denied_revision: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct NodeRuntimeLayout {
+    root: PathBuf,
+}
+
+impl NodeRuntimeLayout {
+    pub fn initialize(root: &Path) -> Result<Self, UpdateError> {
+        if root
+            .symlink_metadata()
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(UpdateError::UnsafePath);
+        }
+        fs::create_dir_all(root.join("staging")).map_err(|_| UpdateError::StateIo)?;
+        fs::create_dir_all(root.join("nodes")).map_err(|_| UpdateError::StateIo)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(root, fs::Permissions::from_mode(0o700))
+                .map_err(|_| UpdateError::StateIo)?;
+            fs::set_permissions(root.join("staging"), fs::Permissions::from_mode(0o700))
+                .map_err(|_| UpdateError::StateIo)?;
+            fs::set_permissions(root.join("nodes"), fs::Permissions::from_mode(0o700))
+                .map_err(|_| UpdateError::StateIo)?;
+        }
+        Ok(Self {
+            root: root.to_path_buf(),
+        })
+    }
+
+    pub fn stage_verified_node(
+        &self,
+        version: &str,
+        revision: &str,
+        bytes: &[u8],
+        artifact: &ArtifactDescriptor,
+    ) -> Result<PathBuf, UpdateError> {
+        validate_download(bytes, artifact)?;
+        let directory_name = validated_node_directory_name(version, revision)?;
+        let sequence = TEMPORARY_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let stage = self.root.join("staging").join(format!(
+            "{directory_name}.{}.{}",
+            std::process::id(),
+            sequence
+        ));
+        validate_runtime_destination(
+            &self.root,
+            stage
+                .strip_prefix(&self.root)
+                .map_err(|_| UpdateError::UnsafePath)?,
+        )?;
+        fs::create_dir(&stage).map_err(|_| UpdateError::StateIo)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&stage, fs::Permissions::from_mode(0o700))
+                .map_err(|_| UpdateError::StateIo)?;
+        }
+        let binary = stage.join(node_binary_name());
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o700);
+        }
+        let mut file = options.open(&binary).map_err(|_| UpdateError::StateIo)?;
+        if let Err(error) = file
+            .write_all(bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|_| UpdateError::StateIo)
+        {
+            let _ = fs::remove_file(&binary);
+            let _ = fs::remove_dir(&stage);
+            return Err(error);
+        }
+        sync_directory(&stage)?;
+        Ok(stage)
+    }
+
+    pub fn promote_staged_node(
+        &self,
+        stage: &Path,
+        version: &str,
+        revision: &str,
+    ) -> Result<PathBuf, UpdateError> {
+        let directory_name = validated_node_directory_name(version, revision)?;
+        let staging_root = self.root.join("staging");
+        if stage.parent() != Some(staging_root.as_path())
+            || stage
+                .symlink_metadata()
+                .map(|metadata| metadata.file_type().is_symlink())
+                .unwrap_or(true)
+            || !stage.join(node_binary_name()).is_file()
+        {
+            return Err(UpdateError::UnsafePath);
+        }
+        let destination = self.root.join("nodes").join(directory_name);
+        if destination.exists() {
+            return Err(UpdateError::UnsafePath);
+        }
+        fs::rename(stage, &destination).map_err(|_| UpdateError::StateIo)?;
+        sync_directory(&self.root.join("nodes"))?;
+        Ok(destination)
+    }
+
+    pub fn state_path(&self) -> PathBuf {
+        self.root.join("node-state.json")
+    }
+}
+
+fn validated_node_directory_name(version: &str, revision: &str) -> Result<String, UpdateError> {
+    Version::parse(version).map_err(|_| UpdateError::ManifestInvalid)?;
+    if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(UpdateError::ManifestInvalid);
+    }
+    Ok(format!("{version}-{}", revision.to_ascii_lowercase()))
+}
+
+fn node_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "dom-node.exe"
+    } else {
+        "dom-node"
+    }
+}
+
+pub fn persist_node_runtime_state(
+    layout: &NodeRuntimeLayout,
+    state: &NodeRuntimeState,
+) -> Result<(), UpdateError> {
+    let state_path = layout.state_path();
+    let metadata = serde_json::to_vec(state).map_err(|_| UpdateError::StateIo)?;
+    let parent = state_path.parent().ok_or(UpdateError::StateIo)?;
+    let temporary = parent.join(format!(
+        ".node-state.{}.{}.tmp",
+        std::process::id(),
+        TEMPORARY_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary).map_err(|_| UpdateError::StateIo)?;
+    let result = (|| {
+        file.write_all(&metadata)
+            .map_err(|_| UpdateError::StateIo)?;
+        file.sync_all().map_err(|_| UpdateError::StateIo)?;
+        fs::rename(&temporary, &state_path).map_err(|_| UpdateError::StateIo)?;
+        sync_directory(parent)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 /// Reject traversal and existing symlink/reparse-like paths before promotion.
@@ -1258,6 +1468,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn managed_runtime_stages_and_promotes_without_overwriting() {
+        let directory = TempDir::new().expect("tempdir");
+        let layout = NodeRuntimeLayout::initialize(directory.path()).expect("runtime layout");
+        let bytes = b"signed node";
+        let mut descriptor = artifact();
+        descriptor.size = bytes.len() as u64;
+        descriptor.sha256 = format!("{:x}", Sha256::digest(bytes));
+        let revision = "d".repeat(40);
+        let stage = layout
+            .stage_verified_node("0.1.2", &revision, bytes, &descriptor)
+            .expect("stage");
+        assert!(stage.join(node_binary_name()).is_file());
+        let active = layout
+            .promote_staged_node(&stage, "0.1.2", &revision)
+            .expect("promote");
+        assert!(active.join(node_binary_name()).is_file());
+        assert_eq!(
+            layout.promote_staged_node(&active, "0.1.2", &revision),
+            Err(UpdateError::UnsafePath)
+        );
+    }
+
+    #[test]
+    fn runtime_rejects_invalid_revision_and_binary_digest() {
+        let directory = TempDir::new().expect("tempdir");
+        let layout = NodeRuntimeLayout::initialize(directory.path()).expect("runtime layout");
+        assert_eq!(
+            layout.stage_verified_node("0.1.2", "../bad", b"signed update", &artifact()),
+            Err(UpdateError::ManifestInvalid)
+        );
+        assert_eq!(
+            layout.stage_verified_node("0.1.2", &"a".repeat(40), b"tampered", &artifact()),
+            Err(UpdateError::SizeMismatch)
+        );
+    }
+
     #[derive(Clone)]
     struct FakeNodeBackend {
         critical: bool,
@@ -1438,5 +1685,31 @@ mod tests {
             apply_node_update(&mut backend, &node_manifest()),
             Ok(NodeUpdaterState::RolledBack)
         );
+    }
+
+    #[test]
+    fn authenticated_build_info_is_pinned_but_partial_identity_fails_closed() {
+        let response = NodeBuildInfoResponse {
+            commit: MANAGED_NODE_CONTROL_REVISION.into(),
+        };
+        assert_eq!(
+            validate_node_build_info(&response, MANAGED_NODE_CONTROL_REVISION),
+            Ok(())
+        );
+        assert_eq!(
+            validate_node_build_info(&response, EMBEDDED_NODE_REVISION),
+            Err(UpdateError::NodeIdentityMismatch)
+        );
+        let current_rpc = NodeRpcIdentityCapabilities {
+            build_revision: true,
+            network: true,
+            chain_id: false,
+            genesis_hash: false,
+            rpc_protocol_version: false,
+            p2p_protocol_version: false,
+            storage_schema_version: false,
+            graceful_shutdown: true,
+        };
+        assert!(!current_rpc.permits_node_only_update());
     }
 }
