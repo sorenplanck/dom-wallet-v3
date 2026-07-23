@@ -731,6 +731,17 @@ mod tests {
     use super::*;
     use dom_wallet_domain::{Network, NetworkIdentity, WalletState};
 
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct HistoricalSchemaFixture {
+        fixture_version: u16,
+        releases: Vec<String>,
+        metadata_version: u16,
+        schema_version: u16,
+        secret_profile_version: u16,
+        migration_required: bool,
+    }
+
     fn identity() -> NetworkIdentity {
         NetworkIdentity {
             network: Network::PrivateTestnet,
@@ -805,6 +816,78 @@ mod tests {
         let reopened = WalletDirectory::open(&root).unwrap();
         assert_eq!(reopened.load("correct").unwrap().wallet_id, state.wallet_id);
         assert!(root.join(WRITER_LOCK_FILE).is_file());
+    }
+
+    #[test]
+    fn v01_schema_fixture_opens_without_mutating_wallet_data() {
+        let fixture: HistoricalSchemaFixture =
+            serde_json::from_str(include_str!("../fixtures/v0.1.x-schema-v1.json")).unwrap();
+        assert_eq!(fixture.fixture_version, 1);
+        assert_eq!(
+            fixture
+                .releases
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["0.1.0", "0.1.1", "0.1.2", "0.1.3", "0.1.4", "0.1.5"]
+        );
+        assert_eq!(fixture.metadata_version, 1);
+        assert_eq!(fixture.schema_version, MODEL_VERSION);
+        assert_eq!(fixture.secret_profile_version, SECRET_PROFILE_VERSION);
+        assert!(!fixture.migration_required);
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("v0.1.x-wallet");
+        let state = WalletState::new(identity(), [6; 32], default_node_configuration(identity()));
+        let wallet =
+            WalletDirectory::create(&root, &state, "correct", KdfParameters::TEST).unwrap();
+        let metadata_before = fs::read(root.join(METADATA_FILE)).unwrap();
+        let generation_path = root
+            .join(GENERATIONS_DIR)
+            .join(generation_name(0))
+            .join(STATE_FILE);
+        let generation_before = fs::read(&generation_path).unwrap();
+        drop(wallet);
+
+        let reopened = WalletDirectory::open(&root).unwrap();
+        let loaded = reopened.load("correct").unwrap();
+        assert_eq!(loaded, state);
+        drop(reopened);
+        assert_eq!(fs::read(root.join(METADATA_FILE)).unwrap(), metadata_before);
+        assert_eq!(fs::read(generation_path).unwrap(), generation_before);
+    }
+
+    #[test]
+    fn unknown_schema_fails_without_overwriting_original_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("unknown-schema-wallet");
+        let state = WalletState::new(identity(), [6; 32], default_node_configuration(identity()));
+        let wallet =
+            WalletDirectory::create(&root, &state, "correct", KdfParameters::TEST).unwrap();
+        let mut metadata: WalletMetadata =
+            serde_json::from_slice(&fs::read(root.join(METADATA_FILE)).unwrap()).unwrap();
+        metadata.schema_version = u16::MAX;
+        let unsupported = serde_json::to_vec(&metadata).unwrap();
+        atomic_write(&root.join(METADATA_FILE), &unsupported).unwrap();
+        let generation_path = root
+            .join(GENERATIONS_DIR)
+            .join(generation_name(0))
+            .join(STATE_FILE);
+        let generation_before = fs::read(&generation_path).unwrap();
+        drop(wallet);
+
+        let reopened = WalletDirectory::open(&root).unwrap();
+        assert!(matches!(
+            reopened.metadata(),
+            Err(StorageError::UnsupportedVersion)
+        ));
+        assert!(matches!(
+            reopened.load("correct"),
+            Err(StorageError::UnsupportedVersion)
+        ));
+        drop(reopened);
+        assert_eq!(fs::read(root.join(METADATA_FILE)).unwrap(), unsupported);
+        assert_eq!(fs::read(generation_path).unwrap(), generation_before);
     }
 
     #[test]
