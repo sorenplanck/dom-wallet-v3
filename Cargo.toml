@@ -34,6 +34,7 @@ hkdf = "0.12"
 minisign-verify = "0.2.5"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+reqwest13 = { package = "reqwest", version = "=0.13.4", default-features = false }
 semver = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -49,6 +50,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = { version = "1", features = ["derive"] }
 tauri = { version = "2.11.2", default-features = false, features = ["wry"] }
 tauri-build = "2.6.2"
+tauri-plugin-updater = "=2.10.1"
 
 # The transaction engine uses the immutable DOM protocol implementation as the
 # sole authority for slate construction, transaction serialization, proof and

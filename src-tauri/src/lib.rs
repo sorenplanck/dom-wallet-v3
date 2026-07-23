@@ -14,7 +14,11 @@ use dom_wallet_core_api::CoreNetwork;
 use dom_wallet_domain::{BalanceProjection, Network, NetworkIdentity};
 use dom_wallet_embedded_core::{
     mine_wallet_block, EmbeddedCoreConfiguration, WalletMiningOutcome, MAINNET_BOOTSTRAP_FALLBACK,
-    MAINNET_DNS_SEEDS,
+    MAINNET_BOOTSTRAP_PEERS, MAINNET_DNS_SEEDS,
+};
+use dom_wallet_updater::{
+    NodeUpdaterState, WalletUpdaterState, EMBEDDED_NODE_REVISION, UPDATE_CHANNEL,
+    UPDATE_INTERVAL_SECONDS,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -35,8 +39,12 @@ pub struct DesktopApplication {
     shutdown: AtomicBool,
 }
 
-pub const COMMAND_NAMES: [&str; 57] = [
+pub const COMMAND_NAMES: [&str; 61] = [
     "native_bridge_status",
+    "get_build_info",
+    "update_status",
+    "check_updates_now",
+    "check_node_now",
     "application_status",
     "wallet_create_recoverable",
     "wallet_restore_from_mnemonic",
@@ -94,6 +102,255 @@ pub const COMMAND_NAMES: [&str; 57] = [
     "slate_qr_reassembly_status",
     "slate_qr_reassembly_clear",
 ];
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildInfoDto {
+    pub wallet_version: &'static str,
+    pub wallet_revision: &'static str,
+    pub embedded_node_version: &'static str,
+    pub embedded_node_revision: &'static str,
+    pub update_channel: &'static str,
+}
+
+pub fn get_build_info() -> BuildInfoDto {
+    BuildInfoDto {
+        wallet_version: env!("CARGO_PKG_VERSION"),
+        wallet_revision: option_env!("DOM_WALLET_REVISION").unwrap_or("UNAVAILABLE"),
+        embedded_node_version: option_env!("DOM_NODE_VERSION").unwrap_or("0.1.0"),
+        embedded_node_revision: EMBEDDED_NODE_REVISION,
+        update_channel: UPDATE_CHANNEL,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateStatusDto {
+    pub automatic_updates: bool,
+    pub signature_key_configured: bool,
+    pub channel: &'static str,
+    pub wallet: WalletUpdaterStatusDto,
+    pub node: NodeUpdaterStatusDto,
+    pub peers: PeerUpdaterStatusDto,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WalletUpdaterStatusDto {
+    pub installed_version: &'static str,
+    pub installed_revision: &'static str,
+    pub available_version: Option<String>,
+    pub state: WalletUpdaterState,
+    pub last_check_unix_seconds: Option<u64>,
+    pub next_check_unix_seconds: Option<u64>,
+    pub progress_percent: Option<u8>,
+    pub sanitized_error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeUpdaterStatusDto {
+    pub active_version: &'static str,
+    pub active_revision: &'static str,
+    pub previous_version: Option<String>,
+    pub previous_revision: Option<String>,
+    pub available_version: Option<String>,
+    pub available_revision: Option<String>,
+    pub compatibility: String,
+    pub state: NodeUpdaterState,
+    pub last_check_unix_seconds: Option<u64>,
+    pub progress_percent: Option<u8>,
+    pub sanitized_error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerUpdaterStatusDto {
+    pub state: String,
+    pub sequence: u64,
+    pub last_check_unix_seconds: Option<u64>,
+    pub active_peers: Vec<String>,
+    pub sanitized_error: Option<String>,
+}
+
+pub struct UpdateControl {
+    status: Mutex<UpdateStatusDto>,
+    check_in_progress: AtomicBool,
+}
+
+impl UpdateControl {
+    pub fn new(signature_key_configured: bool) -> Self {
+        let build = get_build_info();
+        Self {
+            status: Mutex::new(UpdateStatusDto {
+                automatic_updates: true,
+                signature_key_configured,
+                channel: UPDATE_CHANNEL,
+                wallet: WalletUpdaterStatusDto {
+                    installed_version: build.wallet_version,
+                    installed_revision: build.wallet_revision,
+                    available_version: None,
+                    state: WalletUpdaterState::Idle,
+                    last_check_unix_seconds: None,
+                    next_check_unix_seconds: None,
+                    progress_percent: None,
+                    sanitized_error: None,
+                },
+                node: NodeUpdaterStatusDto {
+                    active_version: build.embedded_node_version,
+                    active_revision: build.embedded_node_revision,
+                    previous_version: None,
+                    previous_revision: None,
+                    available_version: None,
+                    available_revision: None,
+                    compatibility: "RPC_BUILD_INFO_PENDING".into(),
+                    state: NodeUpdaterState::Idle,
+                    last_check_unix_seconds: None,
+                    progress_percent: None,
+                    sanitized_error: None,
+                },
+                peers: PeerUpdaterStatusDto {
+                    state: "IDLE".into(),
+                    sequence: 0,
+                    last_check_unix_seconds: None,
+                    active_peers: MAINNET_BOOTSTRAP_PEERS
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                    sanitized_error: None,
+                },
+            }),
+            check_in_progress: AtomicBool::new(false),
+        }
+    }
+
+    pub fn snapshot(&self) -> UpdateStatusDto {
+        self.status
+            .lock()
+            .map(|status| status.clone())
+            .unwrap_or_else(|_| UpdateStatusDto {
+                automatic_updates: true,
+                signature_key_configured: false,
+                channel: UPDATE_CHANNEL,
+                wallet: WalletUpdaterStatusDto {
+                    installed_version: env!("CARGO_PKG_VERSION"),
+                    installed_revision: "UNAVAILABLE",
+                    available_version: None,
+                    state: WalletUpdaterState::Failed,
+                    last_check_unix_seconds: None,
+                    next_check_unix_seconds: None,
+                    progress_percent: None,
+                    sanitized_error: Some("UPDATE_STATE_UNAVAILABLE".into()),
+                },
+                node: NodeUpdaterStatusDto {
+                    active_version: "UNAVAILABLE",
+                    active_revision: "UNAVAILABLE",
+                    previous_version: None,
+                    previous_revision: None,
+                    available_version: None,
+                    available_revision: None,
+                    compatibility: "UNKNOWN".into(),
+                    state: NodeUpdaterState::Failed,
+                    last_check_unix_seconds: None,
+                    progress_percent: None,
+                    sanitized_error: Some("UPDATE_STATE_UNAVAILABLE".into()),
+                },
+                peers: PeerUpdaterStatusDto {
+                    state: "FAILED".into(),
+                    sequence: 0,
+                    last_check_unix_seconds: None,
+                    active_peers: Vec::new(),
+                    sanitized_error: Some("UPDATE_STATE_UNAVAILABLE".into()),
+                },
+            })
+    }
+
+    pub fn begin_check(&self, now: u64) -> bool {
+        if self
+            .check_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        if let Ok(mut status) = self.status.lock() {
+            status.wallet.state = WalletUpdaterState::Checking;
+            status.node.state = NodeUpdaterState::Checking;
+            status.peers.state = "CHECKING".into();
+            status.wallet.last_check_unix_seconds = Some(now);
+            status.wallet.next_check_unix_seconds = Some(now + UPDATE_INTERVAL_SECONDS);
+            status.node.last_check_unix_seconds = Some(now);
+            status.peers.last_check_unix_seconds = Some(now);
+            status.wallet.sanitized_error = None;
+            status.node.sanitized_error = None;
+            status.peers.sanitized_error = None;
+        }
+        true
+    }
+
+    pub fn finish_check_without_key(&self) {
+        if let Ok(mut status) = self.status.lock() {
+            status.wallet.state = WalletUpdaterState::Failed;
+            status.wallet.sanitized_error = Some("UPDATE_SIGNATURE_KEY_UNAVAILABLE".into());
+            status.node.state = NodeUpdaterState::Failed;
+            status.node.sanitized_error = Some("UPDATE_SIGNATURE_KEY_UNAVAILABLE".into());
+            status.peers.state = "FAILED".into();
+            status.peers.sanitized_error = Some("PEER_SIGNATURE_KEY_UNAVAILABLE".into());
+        }
+        self.check_in_progress.store(false, Ordering::Release);
+    }
+
+    pub fn finish_network_check(
+        &self,
+        wallet_available: Option<String>,
+        wallet_error: Option<&'static str>,
+    ) {
+        if let Ok(mut status) = self.status.lock() {
+            status.wallet.available_version = wallet_available;
+            status.wallet.state = if status.wallet.available_version.is_some() {
+                WalletUpdaterState::WalletUpdateAvailable
+            } else if wallet_error.is_some() {
+                WalletUpdaterState::Failed
+            } else {
+                WalletUpdaterState::UpToDate
+            };
+            status.wallet.sanitized_error = wallet_error.map(str::to_owned);
+            status.node.state = NodeUpdaterState::Failed;
+            status.node.sanitized_error = Some("NODE_RPC_BUILD_INFO_PENDING".into());
+            status.peers.state = "FALLBACK_ACTIVE".into();
+            status.peers.sanitized_error = Some("PEER_MANIFEST_NOT_ACTIVATED".into());
+        }
+        self.check_in_progress.store(false, Ordering::Release);
+    }
+
+    pub fn set_wallet_download_state(&self, state: WalletUpdaterState, progress: Option<u8>) {
+        if let Ok(mut status) = self.status.lock() {
+            status.wallet.state = state;
+            status.wallet.progress_percent = progress;
+        }
+    }
+
+    pub fn fail_wallet_check(&self, error: &'static str) {
+        if let Ok(mut status) = self.status.lock() {
+            status.wallet.state = WalletUpdaterState::Failed;
+            status.wallet.sanitized_error = Some(error.into());
+            status.node.state = NodeUpdaterState::Failed;
+            status.node.sanitized_error = Some("NODE_RPC_BUILD_INFO_PENDING".into());
+            status.peers.state = "FALLBACK_ACTIVE".into();
+            status.peers.sanitized_error = Some("PEER_MANIFEST_NOT_ACTIVATED".into());
+        }
+        self.check_in_progress.store(false, Ordering::Release);
+    }
+
+    pub fn defer_wallet_install(&self, version: String) {
+        if let Ok(mut status) = self.status.lock() {
+            status.wallet.available_version = Some(version);
+            status.wallet.state = WalletUpdaterState::WaitingForSafePoint;
+            status.wallet.sanitized_error = Some("UPDATE_BUSY_CRITICAL_OPERATION".into());
+        }
+        self.check_in_progress.store(false, Ordering::Release);
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -358,6 +615,28 @@ pub struct SlateQrReassemblyDto {
 }
 
 impl DesktopApplication {
+    pub fn update_safe_point_available(&self) -> Result<bool, CommandError> {
+        let service = self.service.lock().map_err(|_| CommandError::Unavailable)?;
+        let transactions = match service.transaction_list() {
+            Ok(transactions) => transactions,
+            Err(CoreError::WalletNotOpen) | Err(CoreError::Locked) => return Ok(true),
+            Err(error) => return Err(CommandError::from(error)),
+        };
+        const CRITICAL_STATES: [&str; 8] = [
+            "INPUTS_RESERVED",
+            "REQUEST_EXPORTED",
+            "REQUEST_IMPORTED",
+            "RESPONSE_PREPARED",
+            "RESPONSE_EXPORTED",
+            "RESPONSE_IMPORTED",
+            "FINALIZED",
+            "SUBMITTING",
+        ];
+        Ok(!transactions
+            .iter()
+            .any(|transaction| CRITICAL_STATES.contains(&transaction.state.as_str())))
+    }
+
     pub fn application_status(&self) -> ApplicationStatusDto {
         match self.service.lock() {
             Ok(service) => {
@@ -1687,6 +1966,38 @@ mod tests {
         assert_eq!(status.app_version, "0.2.0");
         fn assert_serializable<T: serde::Serialize>(_: &T) {}
         assert_serializable(&status);
+    }
+
+    #[test]
+    fn build_and_update_status_are_separate_redacted_channels() {
+        let build = get_build_info();
+        assert_eq!(build.wallet_version, "0.2.0");
+        assert_eq!(build.embedded_node_revision, EMBEDDED_NODE_REVISION);
+        assert_eq!(build.update_channel, "stable");
+
+        let updates = UpdateControl::new(false);
+        assert!(updates.begin_check(100));
+        assert!(!updates.begin_check(100));
+        updates.finish_check_without_key();
+        let status = updates.snapshot();
+        assert_eq!(status.wallet.state, WalletUpdaterState::Failed);
+        assert_eq!(status.node.state, NodeUpdaterState::Failed);
+        assert_eq!(status.peers.state, "FAILED");
+        assert_eq!(
+            status.wallet.sanitized_error.as_deref(),
+            Some("UPDATE_SIGNATURE_KEY_UNAVAILABLE")
+        );
+        let encoded = serde_json::to_string(&status).expect("serialize update status");
+        for forbidden in ["seed", "mnemonic", "password", "private_key", "rpc_token"] {
+            assert!(!encoded.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn closed_wallet_is_a_safe_update_point() {
+        assert!(DesktopApplication::default()
+            .update_safe_point_available()
+            .expect("closed Wallet is safe"));
     }
 
     #[test]

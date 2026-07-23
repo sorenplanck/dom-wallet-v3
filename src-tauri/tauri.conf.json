@@ -8,5 +8,15 @@
     "frontendDist": "../frontend/dist"
   },
   "app": { "windows": [{ "label": "main", "title": "DOM Wallet V3", "width": 1100, "height": 760 }] },
-  "bundle": { "icon": ["../frontend/assets/dom-coin.png", "icons/icon.ico"] }
+  "bundle": {
+    "createUpdaterArtifacts": true,
+    "icon": ["../frontend/assets/dom-coin.png", "icons/icon.ico"]
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/sorenplanck/dom-wallet-v3/releases/latest/download/latest.json"
+      ]
+    }
+  }
 }

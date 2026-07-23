@@ -12,14 +12,20 @@ dom-wallet-core-restore = { path = "../crates/dom-wallet-core-restore" }
 dom-wallet-core-sync = { path = "../crates/dom-wallet-core-sync" }
 dom-wallet-domain = { path = "../crates/dom-wallet-domain" }
 dom-wallet-embedded-core = { path = "../crates/dom-wallet-embedded-core" }
+dom-wallet-updater = { path = "../crates/dom-wallet-updater" }
 hex.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+reqwest13.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+time.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
+tracing.workspace = true
 uuid.workspace = true
 tauri.workspace = true
+tauri-plugin-updater.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
