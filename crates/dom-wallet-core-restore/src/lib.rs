@@ -275,11 +275,11 @@ impl SeedRestoreSession {
             kdf: self.kdf,
             last_error: None,
         };
-        let reconciliation = self.adapter.reconcile_once(&mut sink);
-        if let Err(error) = reconciliation {
-            return Err(sink.last_error.unwrap_or_else(|| map_scan_error(error)));
-        }
-        match reconciliation.expect("checked above") {
+        let reconciliation = self
+            .adapter
+            .reconcile_once(&mut sink)
+            .map_err(|error| sink.last_error.unwrap_or_else(|| map_scan_error(error)))?;
+        match reconciliation {
             CoreReconcileResult::NoChanges => {
                 self.ready_to_publish = true;
                 Ok(SeedRestoreProgress::ReadyToPublish)

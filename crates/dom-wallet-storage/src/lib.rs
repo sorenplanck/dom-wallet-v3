@@ -121,7 +121,11 @@ impl WalletDirectory {
     pub fn load(&self, password: &str) -> Result<WalletState, StorageError> {
         let metadata = self.metadata()?;
         let active = self.active_generation()?;
-        if active != metadata.active_generation {
+        let interrupted_publication = metadata
+            .active_generation
+            .checked_add(1)
+            .is_some_and(|next| next == active);
+        if active != metadata.active_generation && !interrupted_publication {
             return Err(StorageError::GenerationConflict);
         }
         let state = self.load_generation(active, password, &metadata)?;
@@ -132,6 +136,12 @@ impl WalletDirectory {
             return Err(StorageError::GenerationConflict);
         }
         state.validate().map_err(StorageError::Domain)?;
+        if interrupted_publication {
+            let repaired = serde_json::to_vec(&WalletMetadata::from_state(&state))
+                .map_err(|_| StorageError::CanonicalEncoding)?;
+            atomic_write(&self.root.join(METADATA_FILE), &repaired)?;
+            sync_directory(&self.root)?;
+        }
         Ok(state)
     }
 
@@ -759,6 +769,39 @@ mod tests {
         )
         .unwrap();
         assert!(wallet.load("correct").is_err());
+    }
+
+    #[test]
+    fn authenticated_adjacent_generation_repairs_interrupted_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let wallet = WalletDirectory::create(
+            temp.path().join("wallet"),
+            &WalletState::new(identity(), [6; 32], default_node_configuration(identity())),
+            "correct",
+            KdfParameters::TEST,
+        )
+        .unwrap();
+        let mut changed = wallet.load("correct").unwrap();
+        changed.allocate().unwrap();
+        let staged = wallet
+            .stage_generation(0, changed, "correct", KdfParameters::TEST)
+            .unwrap();
+        atomic_write(
+            &wallet.root().join(ACTIVE_FILE),
+            generation_name(staged.generation).as_bytes(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            wallet.load("wrong"),
+            Err(StorageError::Crypto(CryptoError::AuthenticationFailed))
+        ));
+        assert_eq!(wallet.metadata().unwrap().active_generation, 0);
+
+        let reopened = wallet.load("correct").unwrap();
+        assert_eq!(reopened.generation, 1);
+        assert_eq!(wallet.metadata().unwrap().active_generation, 1);
+        assert_eq!(wallet.load("correct").unwrap(), reopened);
     }
 
     #[test]

@@ -355,15 +355,20 @@ pub struct SlateQrReassemblyDto {
 
 impl DesktopApplication {
     pub fn application_status(&self) -> ApplicationStatusDto {
-        let diagnostic = self
-            .service
-            .lock()
-            .expect("application mutex poisoned")
-            .diagnostics();
-        ApplicationStatusDto {
-            state: diagnostic.application_state,
-            experimental: true,
-            unaudited: true,
+        match self.service.lock() {
+            Ok(service) => {
+                let diagnostic = service.diagnostics();
+                ApplicationStatusDto {
+                    state: diagnostic.application_state,
+                    experimental: true,
+                    unaudited: true,
+                }
+            }
+            Err(_) => ApplicationStatusDto {
+                state: "ERROR".into(),
+                experimental: true,
+                unaudited: true,
+            },
         }
     }
 
@@ -512,7 +517,7 @@ impl DesktopApplication {
 
     pub fn wallet_lock(&self) -> Result<(), CommandError> {
         self.ensure_running()?;
-        let _ = self.mining_stop();
+        self.stop_mining_worker()?;
         self.clear_qr_buffers()?;
         self.service
             .lock()
@@ -522,7 +527,7 @@ impl DesktopApplication {
     }
     pub fn wallet_close(&self) -> Result<(), CommandError> {
         self.ensure_running()?;
-        let _ = self.mining_stop();
+        self.stop_mining_worker()?;
         self.clear_qr_buffers()?;
         self.service
             .lock()
@@ -934,6 +939,11 @@ impl DesktopApplication {
     }
 
     pub fn mining_stop(&self) -> Result<MiningStatusDto, CommandError> {
+        self.stop_mining_worker()?;
+        self.mining_status()
+    }
+
+    fn stop_mining_worker(&self) -> Result<(), CommandError> {
         let worker = {
             let mut mining = self.mining.lock().map_err(|_| CommandError::Unavailable)?;
             if mining.worker.is_some() {
@@ -945,24 +955,37 @@ impl DesktopApplication {
         if let Some(worker) = worker {
             worker.join().map_err(|_| CommandError::Unavailable)?;
         }
-        self.mining_status()
+        Ok(())
     }
     pub fn diagnostics_redacted(&self) -> DiagnosticSnapshot {
-        self.service
-            .lock()
-            .expect("application mutex poisoned")
-            .diagnostics()
+        match self.service.lock() {
+            Ok(service) => service.diagnostics(),
+            Err(_) => DiagnosticSnapshot {
+                application_state: "ERROR".into(),
+                connection_state: "UNAVAILABLE".into(),
+                generation: None,
+                cursor_height: None,
+                cursor_hash: None,
+                last_error: Some("APPLICATION_STATE_UNAVAILABLE".into()),
+            },
+        }
     }
     pub fn application_shutdown(&self) -> Result<(), CommandError> {
         if self.shutdown.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        let _ = self.mining_stop();
-        self.clear_qr_buffers()?;
-        let mut service = self.service.lock().map_err(|_| CommandError::Unavailable)?;
-        let _ = service.close();
-        self.node_started.store(false, Ordering::Release);
-        Ok(())
+        let result = (|| {
+            self.stop_mining_worker()?;
+            self.clear_qr_buffers()?;
+            let mut service = self.service.lock().map_err(|_| CommandError::Unavailable)?;
+            service.close().map_err(CommandError::from)?;
+            self.node_started.store(false, Ordering::Release);
+            Ok(())
+        })();
+        if result.is_err() {
+            self.shutdown.store(false, Ordering::Release);
+        }
+        result
     }
     pub fn synchronization_pause(&self) -> Result<(), CommandError> {
         self.synchronization_paused.store(true, Ordering::Release);
@@ -1636,6 +1659,25 @@ mod tests {
             Err(CommandError::Unavailable)
         ));
         assert!(!format!("{:?}", app.diagnostics_redacted()).contains("password"));
+    }
+
+    #[test]
+    fn poisoned_application_state_is_reported_without_panicking() {
+        let app = DesktopApplication::default();
+        let service = Arc::clone(&app.service);
+        let _ = std::thread::spawn(move || {
+            let _guard = service.lock().expect("test acquires service");
+            panic!("poison test mutex");
+        })
+        .join();
+
+        assert_eq!(app.application_status().state, "ERROR");
+        let diagnostic = app.diagnostics_redacted();
+        assert_eq!(diagnostic.application_state, "ERROR");
+        assert_eq!(
+            diagnostic.last_error.as_deref(),
+            Some("APPLICATION_STATE_UNAVAILABLE")
+        );
     }
 
     #[test]
