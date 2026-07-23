@@ -4,7 +4,7 @@
   "version": "0.2.0",
   "identifier": "org.domprotocol.wallet.v3",
   "build": {
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "node -e \"const fs=require('node:fs'),path=require('node:path'),child=require('node:child_process');const cwd=['.','frontend','../frontend'].find(candidate=>fs.existsSync(path.join(candidate,'package.json'))&&fs.existsSync(path.join(candidate,'build.mjs')));if(!cwd)throw new Error('DOM Wallet frontend directory not found');const result=child.spawnSync(process.platform==='win32'?'npm.cmd':'npm',['run','build'],{cwd,stdio:'inherit'});process.exit(result.status??1)\"",
     "frontendDist": "../frontend/dist"
   },
   "app": { "windows": [{ "label": "main", "title": "DOM Wallet V3", "width": 1100, "height": 760 }] },
