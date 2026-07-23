@@ -53,9 +53,14 @@ pub const MAINNET_P2P_PORT: u16 = 33_369;
 pub const MAINNET_BOOTSTRAP_ALTERNATE: &str = "168.100.9.70:8443";
 /// Canonical direct P2P bootstrap fallback. This is never used as a Wallet backend.
 pub const MAINNET_BOOTSTRAP_FALLBACK: &str = "168.100.9.70:33369";
+/// Independent Mainnet emergency relay.
+pub const MAINNET_BOOTSTRAP_SECONDARY: &str = "168.100.8.144:33369";
 /// Ordered Mainnet direct bootstrap endpoints. The alternate endpoint is tried first.
-pub const MAINNET_BOOTSTRAP_PEERS: [&str; 2] =
-    [MAINNET_BOOTSTRAP_ALTERNATE, MAINNET_BOOTSTRAP_FALLBACK];
+pub const MAINNET_BOOTSTRAP_PEERS: [&str; 3] = [
+    MAINNET_BOOTSTRAP_ALTERNATE,
+    MAINNET_BOOTSTRAP_FALLBACK,
+    MAINNET_BOOTSTRAP_SECONDARY,
+];
 
 /// Network selected for the embedded node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
