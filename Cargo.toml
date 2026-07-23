@@ -11,6 +11,7 @@ members = [
     "crates/dom-wallet-core-protocol",
     "crates/dom-wallet-core-recovery",
     "crates/dom-wallet-core-restore",
+    "crates/dom-wallet-updater",
     "crates/dom-wallet-production-backend",
     "src-tauri",
 ]
@@ -30,16 +31,20 @@ chacha20poly1305 = "0.10"
 fs2 = "0.4"
 hex = "0.4"
 hkdf = "0.12"
+minisign-verify = "0.2.5"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+semver = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
 thiserror = "2"
+time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
 tokio = { version = "1", features = ["rt", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
+url = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = { version = "1", features = ["derive"] }
 tauri = { version = "2.11.2", default-features = false, features = ["wry"] }
