@@ -29,6 +29,7 @@ tauri.workspace = true
 tauri-plugin-updater.workspace = true
 
 [dev-dependencies]
+dom-wallet-node-manager = { path = "../crates/dom-wallet-node-manager", features = ["app-test-support"] }
 tempfile.workspace = true
 
 [build-dependencies]

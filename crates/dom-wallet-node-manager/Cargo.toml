@@ -5,6 +5,9 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+app-test-support = []
+
 [dependencies]
 dom-sidecar.workspace = true
 dom-wallet-updater = { path = "../dom-wallet-updater" }

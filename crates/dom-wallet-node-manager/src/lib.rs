@@ -8,8 +8,8 @@
 pub mod sidecar_keys;
 
 use dom_sidecar::{
-    verify_minisign, verify_promotion_identity, verify_release, RunningIdentity, SidecarError,
-    SidecarManifest, SidecarStore,
+    verify_manifest, verify_minisign, verify_promotion_identity, verify_release, RunningIdentity,
+    SidecarError, SidecarManifest, SidecarStore,
 };
 use dom_wallet_updater::{
     persist_node_runtime_state, validate_download, validate_node_manifest, NodeCompatibility,
@@ -66,6 +66,13 @@ pub struct SidecarStatus {
 /// construction from untrusted deserialized data.
 pub struct ValidatedNodeFeed {
     manifest: NodeManifest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct NodeReleaseMetadata {
+    pub node_version: String,
+    pub node_revision: String,
+    pub sequence: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -236,6 +243,7 @@ impl NodeManager {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o700))?;
         }
+        validate_runtime_tree(&runtime_root)?;
         self.runtime_root = Some(runtime_root);
         Ok(())
     }
@@ -321,7 +329,12 @@ impl NodeManager {
             .ok_or(NodeManagerError::NoActiveSidecar)?;
         let binary = store.binary_path(&revision)?;
         self.lifecycle = SidecarLifecycle::Starting;
-        let result = start_process(&binary, configuration, Some(&revision));
+        let result = start_process(
+            self.runtime_root_path()?,
+            &binary,
+            configuration,
+            Some(&revision),
+        );
         match result {
             Ok(running) => {
                 let identity = running.identity.clone();
@@ -423,6 +436,59 @@ impl NodeManager {
         self.promote_verified(manifest, artifact, configuration, Some(runtime_state))
     }
 
+    pub fn evaluate_running_signed_release_metadata(
+        &self,
+        node_feed_bytes: Option<&[u8]>,
+        manifest_bytes: Option<&[u8]>,
+        manifest_signature: Option<&str>,
+        platform: &str,
+    ) -> Result<NodeReleaseMetadata, NodeManagerError> {
+        let sidecar = verify_manifest(manifest_bytes, manifest_signature)?;
+        let current = self
+            .running
+            .as_ref()
+            .map(|running| &running.identity)
+            .ok_or(NodeManagerError::NoActiveSidecar)?;
+        let feed = self.evaluate_signed_node_feed(node_feed_bytes, current)?;
+        bind_node_feed_to_sidecar(
+            &feed.manifest,
+            &sidecar,
+            platform,
+            &feed.manifest.artifact.signature,
+        )?;
+        Ok(NodeReleaseMetadata {
+            node_version: feed.manifest.node_version,
+            node_revision: feed.manifest.node_revision,
+            sequence: feed.manifest.sequence,
+        })
+    }
+
+    #[cfg(feature = "app-test-support")]
+    pub fn app_test_persist_state(
+        &self,
+        feed: &NodeManifest,
+        current: &NodeIdentity,
+        installed_at: time::OffsetDateTime,
+    ) -> Result<(), NodeManagerError> {
+        let state = self.next_runtime_state(feed, current, installed_at)?;
+        persist_node_runtime_state(&self.runtime_layout()?, &state).map_err(Into::into)
+    }
+
+    #[cfg(feature = "app-test-support")]
+    pub fn app_test_evaluate_verified_feed(
+        &self,
+        feed: NodeManifest,
+        current: &NodeIdentity,
+        now: time::OffsetDateTime,
+    ) -> Result<NodeReleaseMetadata, NodeManagerError> {
+        self.validate_node_feed_policy(feed, current, now)
+            .map(|feed| NodeReleaseMetadata {
+                node_version: feed.node_version,
+                node_revision: feed.node_revision,
+                sequence: feed.sequence,
+            })
+    }
+
     fn promote_verified(
         &mut self,
         manifest: SidecarManifest,
@@ -444,7 +510,9 @@ impl NodeManager {
         self.lifecycle = SidecarLifecycle::Promoting;
         self.previous_revision = previous.clone();
         store.promote(&manifest.revision)?;
+        harden_runtime_permissions(self.runtime_root_path()?)?;
         let candidate = start_process(
+            self.runtime_root_path()?,
             &store.binary_path(&manifest.revision)?,
             configuration.clone(),
             Some(&manifest.revision),
@@ -486,10 +554,12 @@ impl NodeManager {
                 }
                 if let Some(previous) = previous {
                     store.rollback(&previous)?;
+                    harden_runtime_permissions(self.runtime_root_path()?)?;
                     if let Some(backup) = backup.as_deref() {
                         store.restore_data_dir(backup, &configuration.data_directory)?;
                     }
                     let restored = start_process(
+                        self.runtime_root_path()?,
                         &store.binary_path(&previous)?,
                         configuration,
                         Some(&previous),
@@ -614,9 +684,14 @@ impl NodeManager {
     }
 
     fn store(&self) -> Result<SidecarStore, NodeManagerError> {
+        let root = self.runtime_root_path()?;
+        validate_runtime_tree(root)?;
+        Ok(SidecarStore::new(root))
+    }
+
+    fn runtime_root_path(&self) -> Result<&Path, NodeManagerError> {
         self.runtime_root
-            .clone()
-            .map(SidecarStore::new)
+            .as_deref()
             .ok_or(NodeManagerError::RuntimeNotConfigured)
     }
 
@@ -629,6 +704,7 @@ impl NodeManager {
         let store = self.store()?;
         store.install(revision, bytes)?;
         store.promote(revision)?;
+        harden_runtime_permissions(self.runtime_root_path()?)?;
         Ok(())
     }
 }
@@ -683,10 +759,15 @@ fn bind_node_feed_to_sidecar(
 }
 
 fn start_process(
+    runtime_root: &Path,
     binary: &Path,
     configuration: ManagedNodeConfig,
     expected_revision: Option<&str>,
 ) -> Result<RunningNode, NodeManagerError> {
+    validate_runtime_tree(runtime_root)?;
+    if !binary.starts_with(runtime_root) {
+        return Err(NodeManagerError::UnsafeBinary);
+    }
     validate_binary(binary)?;
     let token = random_token();
     fs::create_dir_all(&configuration.data_directory)?;
@@ -892,6 +973,175 @@ fn validate_binary(binary: &Path) -> Result<(), NodeManagerError> {
         }
     }
     Ok(())
+}
+
+fn validate_runtime_tree(root: &Path) -> Result<(), NodeManagerError> {
+    let root_metadata = fs::symlink_metadata(root)?;
+    if !root_metadata.is_dir() || unsafe_path_kind(&root_metadata) {
+        return Err(NodeManagerError::UnsafeBinary);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let owner = root_metadata.uid();
+        if process_file_owner(root)? != owner || root_metadata.permissions().mode() & 0o022 != 0 {
+            return Err(NodeManagerError::UnsafeBinary);
+        }
+        validate_runtime_entries(root, Some(owner))?;
+    }
+    #[cfg(windows)]
+    {
+        validate_runtime_entries(root, None)?;
+        validate_windows_acl(root)?;
+    }
+    #[cfg(not(any(unix, windows)))]
+    validate_runtime_entries(root, None)?;
+    Ok(())
+}
+
+fn harden_runtime_permissions(root: &Path) -> Result<(), NodeManagerError> {
+    if unsafe_path_kind(&fs::symlink_metadata(root)?) {
+        return Err(NodeManagerError::UnsafeBinary);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
+    }
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if unsafe_path_kind(&metadata) {
+            return Err(NodeManagerError::UnsafeBinary);
+        }
+        if metadata.is_dir() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(entry.path(), fs::Permissions::from_mode(0o700))?;
+            }
+            harden_runtime_permissions(&entry.path())?;
+        } else {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let executable = entry.file_name().to_string_lossy().starts_with("dom-node-");
+                fs::set_permissions(
+                    entry.path(),
+                    fs::Permissions::from_mode(if executable { 0o700 } else { 0o600 }),
+                )?;
+            }
+        }
+    }
+    validate_runtime_tree(root)
+}
+
+#[cfg(unix)]
+fn process_file_owner(root: &Path) -> Result<u32, NodeManagerError> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let probe = root.join(format!(
+        ".owner-probe-{}-{}",
+        std::process::id(),
+        random_token()
+    ));
+    let result = (|| {
+        let file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&probe)?;
+        file.sync_all()?;
+        Ok::<u32, std::io::Error>(file.metadata()?.uid())
+    })();
+    let _ = fs::remove_file(probe);
+    result.map_err(Into::into)
+}
+
+fn validate_runtime_entries(
+    path: &Path,
+    expected_owner: Option<u32>,
+) -> Result<(), NodeManagerError> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if unsafe_path_kind(&metadata) {
+            return Err(NodeManagerError::UnsafeBinary);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            if expected_owner.is_some_and(|owner| metadata.uid() != owner)
+                || metadata.permissions().mode() & 0o022 != 0
+            {
+                return Err(NodeManagerError::UnsafeBinary);
+            }
+        }
+        let _ = expected_owner;
+        if metadata.is_dir() {
+            validate_runtime_entries(&entry.path(), expected_owner)?;
+        }
+    }
+    Ok(())
+}
+
+fn unsafe_path_kind(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(windows)]
+fn validate_windows_acl(root: &Path) -> Result<(), NodeManagerError> {
+    let system_root =
+        PathBuf::from(std::env::var_os("SystemRoot").ok_or(NodeManagerError::UnsafeBinary)?);
+    if !system_root.is_absolute() {
+        return Err(NodeManagerError::UnsafeBinary);
+    }
+    let powershell = system_root.join("System32/WindowsPowerShell/v1.0/powershell.exe");
+    let script = r#"
+$ErrorActionPreference='Stop'
+$current=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$allowed=@($current,'S-1-5-18','S-1-5-32-544')
+$write=[Security.AccessControl.FileSystemRights]::Write -bor [Security.AccessControl.FileSystemRights]::Modify -bor [Security.AccessControl.FileSystemRights]::FullControl -bor [Security.AccessControl.FileSystemRights]::ChangePermissions -bor [Security.AccessControl.FileSystemRights]::TakeOwnership
+$items=@(Get-Item -LiteralPath $args[0] -Force)+@(Get-ChildItem -LiteralPath $args[0] -Force -Recurse)
+foreach($item in $items){
+  $acl=Get-Acl -LiteralPath $item.FullName
+  $owner=([Security.Principal.NTAccount]$acl.Owner).Translate([Security.Principal.SecurityIdentifier]).Value
+  if($allowed -notcontains $owner){exit 41}
+  foreach($rule in $acl.Access){
+    $sid=$rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+    if($rule.AccessControlType -eq 'Allow' -and $allowed -notcontains $sid -and (($rule.FileSystemRights -band $write) -ne 0)){exit 42}
+  }
+}
+exit 0
+"#;
+    let status = Command::new(powershell)
+        .env_clear()
+        .arg("-NoLogo")
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-Command")
+        .arg(script)
+        .arg(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    status
+        .success()
+        .then_some(())
+        .ok_or(NodeManagerError::UnsafeBinary)
 }
 
 #[cfg(test)]
@@ -1125,6 +1375,67 @@ mod tests {
     }
 
     #[test]
+    fn runtime_security_rejects_writable_or_redirected_subdirectories() {
+        let temporary = tempdir().unwrap();
+        let runtime = temporary.path().join("runtime");
+        fs::create_dir(&runtime).unwrap();
+        let unsafe_child = runtime.join("unsafe");
+        fs::create_dir(&unsafe_child).unwrap();
+
+        #[cfg(unix)]
+        {
+            fs::set_permissions(&unsafe_child, fs::Permissions::from_mode(0o777)).unwrap();
+            let mut manager = NodeManager::default();
+            assert!(matches!(
+                manager.configure_runtime(&runtime),
+                Err(NodeManagerError::UnsafeBinary)
+            ));
+            fs::set_permissions(&unsafe_child, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::remove_dir(&unsafe_child).unwrap();
+            std::os::unix::fs::symlink(temporary.path(), &unsafe_child).unwrap();
+            assert!(matches!(
+                manager.configure_runtime(&runtime),
+                Err(NodeManagerError::UnsafeBinary)
+            ));
+        }
+
+        #[cfg(windows)]
+        {
+            let mut manager = NodeManager::default();
+            let grant = Command::new("icacls.exe")
+                .arg(&unsafe_child)
+                .args(["/grant", "*S-1-1-0:(OI)(CI)M", "/Q"])
+                .status()
+                .unwrap();
+            assert!(grant.success());
+            assert!(matches!(
+                manager.configure_runtime(&runtime),
+                Err(NodeManagerError::UnsafeBinary)
+            ));
+            let remove = Command::new("icacls.exe")
+                .arg(&unsafe_child)
+                .args(["/remove:g", "*S-1-1-0", "/Q"])
+                .status()
+                .unwrap();
+            assert!(remove.success());
+            fs::remove_dir(&unsafe_child).unwrap();
+            let target = temporary.path().join("target");
+            fs::create_dir(&target).unwrap();
+            let junction = Command::new("cmd.exe")
+                .args(["/C", "mklink", "/J"])
+                .arg(&unsafe_child)
+                .arg(&target)
+                .status()
+                .unwrap();
+            assert!(junction.success());
+            assert!(matches!(
+                manager.configure_runtime(&runtime),
+                Err(NodeManagerError::UnsafeBinary)
+            ));
+        }
+    }
+
+    #[test]
     #[ignore = "downloads the published v0.1.2 production artifact"]
     fn published_v012_uses_real_pins_but_has_no_promotable_manifest() {
         const BINARY_URL: &str = "https://github.com/sorenplanck/dom-protocol/releases/download/v0.1.2/dom-node-linux-x86_64";
@@ -1200,6 +1511,10 @@ mod tests {
         manager
             .install_verified_fixture(&revision, &artifact)
             .unwrap();
+        validate_runtime_tree(manager.runtime_root_path().unwrap())
+            .expect("installed runtime tree remains secure");
+        validate_binary(&manager.store().unwrap().binary_path(&revision).unwrap())
+            .expect("installed runtime binary remains secure");
         let config = test_config(root.path());
         let identity = manager.start_active(config.clone()).unwrap();
         assert_eq!(identity.node_revision, revision);

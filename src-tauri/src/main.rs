@@ -444,6 +444,22 @@ fn experimental_sidecar_stop(
 ) -> Result<dom_wallet_node_manager::SidecarStatus, dom_wallet_tauri_shell::CommandErrorDto> {
     app.experimental_sidecar_stop().map_err(Into::into)
 }
+#[tauri::command]
+fn experimental_sidecar_evaluate_release(
+    app: tauri::State<'_, DesktopApplication>,
+    node_feed_json: Option<String>,
+    sidecar_manifest_json: Option<String>,
+    sidecar_manifest_signature: Option<String>,
+    platform: String,
+) -> Result<dom_wallet_node_manager::NodeReleaseMetadata, dom_wallet_tauri_shell::CommandErrorDto> {
+    app.experimental_sidecar_evaluate_release(
+        node_feed_json.as_deref(),
+        sidecar_manifest_json.as_deref(),
+        sidecar_manifest_signature.as_deref(),
+        &platform,
+    )
+    .map_err(Into::into)
+}
 
 fn reserve_loopback_address(
 ) -> Result<std::net::SocketAddr, dom_wallet_tauri_shell::CommandErrorDto> {
@@ -800,6 +816,7 @@ fn application_builder() -> tauri::Builder<tauri::Wry> {
             experimental_sidecar_disable,
             experimental_sidecar_start,
             experimental_sidecar_stop,
+            experimental_sidecar_evaluate_release,
             node_network_status,
             node_peer_status,
             wallet_sync_status,
@@ -868,7 +885,7 @@ mod tests {
     #[test]
     fn packaged_entrypoint_constructs_the_registered_builder() {
         let _builder = application_builder();
-        assert_eq!(dom_wallet_tauri_shell::COMMAND_NAMES.len(), 66);
+        assert_eq!(dom_wallet_tauri_shell::COMMAND_NAMES.len(), 67);
         assert!(dom_wallet_tauri_shell::COMMAND_NAMES.contains(&"native_bridge_status"));
         assert!(dom_wallet_tauri_shell::COMMAND_NAMES.contains(&"check_updates_now"));
         assert!(dom_wallet_tauri_shell::COMMAND_NAMES.contains(&"embedded_node_stop"));

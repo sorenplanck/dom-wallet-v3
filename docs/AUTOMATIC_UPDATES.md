@@ -75,17 +75,17 @@ there is no unsigned or sequence-free production promotion path.
   receives the real socket `ConnectInfo`, rejects non-loopback peers, then
   requests the existing coordinated shutdown. The Wallet also binds its
   management RPC address to loopback.
-- **Runtime directory ownership, permissions and reparse traversal — NOT
-  CONNECTED.** The current manager rejects a symlink runtime root and a symlink
-  binary, applies restrictive Unix modes, and checks Unix binary ownership.
-  It does not yet validate every existing parent/subdirectory or prove the
-  equivalent Windows reparse-point and ACL policy. Treat this requirement as
-  not implemented.
-- **Application refusal of a release without `sidecar-manifest.json` — NOT
-  CONNECTED.** The canonical library and NodeManager production entry reject
-  missing signed metadata, but automatic node promotion is not exposed by the
-  Tauri application while the sidecar is experimental. Treat the application
-  requirement as not implemented until that command path is wired and tested.
+- **Runtime directory ownership, permissions and reparse traversal —
+  CONFIRMED.** Validation runs when the runtime is configured, whenever its
+  store is opened and immediately before process execution. Unix requires one
+  owner throughout and rejects group/world-writable entries. Windows rejects
+  every reparse-point entry and uses a non-interactive ACL audit to reject an
+  unexpected owner or write-capable untrusted principal.
+- **Application refusal of a release without `sidecar-manifest.json` —
+  CONFIRMED.** The registered Tauri metadata-evaluation command reaches the
+  canonical manifest verifier before download or promotion. Missing metadata
+  fails closed. Automatic installation remains experimental, but the app
+  boundary no longer has a metadata-free acceptance path.
 
 ## Node manifest generation is part of the build
 

@@ -17,7 +17,8 @@ use dom_wallet_embedded_core::{
     MAINNET_BOOTSTRAP_PEERS, MAINNET_DNS_SEEDS,
 };
 use dom_wallet_node_manager::{
-    ManagedNodeConfig, NodeManager, SidecarStatus, EXPERIMENTAL_ENABLE_CONFIRMATION,
+    ManagedNodeConfig, NodeManager, NodeReleaseMetadata, SidecarStatus,
+    EXPERIMENTAL_ENABLE_CONFIRMATION,
 };
 use dom_wallet_updater::{
     NodeUpdaterState, WalletUpdaterState, EMBEDDED_NODE_REVISION, UPDATE_CHANNEL,
@@ -43,7 +44,7 @@ pub struct DesktopApplication {
     shutdown: AtomicBool,
 }
 
-pub const COMMAND_NAMES: [&str; 66] = [
+pub const COMMAND_NAMES: [&str; 67] = [
     "native_bridge_status",
     "get_build_info",
     "update_status",
@@ -70,6 +71,7 @@ pub const COMMAND_NAMES: [&str; 66] = [
     "experimental_sidecar_disable",
     "experimental_sidecar_start",
     "experimental_sidecar_stop",
+    "experimental_sidecar_evaluate_release",
     "node_network_status",
     "node_peer_status",
     "wallet_sync_status",
@@ -690,6 +692,26 @@ impl DesktopApplication {
         let mut manager = self.sidecar.lock().map_err(|_| CommandError::Unavailable)?;
         manager.shutdown().map_err(|_| CommandError::Unavailable)?;
         Ok(manager.status())
+    }
+
+    pub fn experimental_sidecar_evaluate_release(
+        &self,
+        node_feed_json: Option<&str>,
+        sidecar_manifest_json: Option<&str>,
+        sidecar_manifest_signature: Option<&str>,
+        platform: &str,
+    ) -> Result<NodeReleaseMetadata, CommandError> {
+        self.ensure_running()?;
+        self.sidecar
+            .lock()
+            .map_err(|_| CommandError::Unavailable)?
+            .evaluate_running_signed_release_metadata(
+                node_feed_json.map(str::as_bytes),
+                sidecar_manifest_json.map(str::as_bytes),
+                sidecar_manifest_signature,
+                platform,
+            )
+            .map_err(|error| CommandError::InvalidInput(error.to_string()))
     }
 
     pub fn update_safe_point_available(&self) -> Result<bool, CommandError> {
@@ -2097,6 +2119,102 @@ mod tests {
                 .expect("sidecar status")
                 .enabled_for_session
         );
+    }
+
+    #[test]
+    fn app_runtime_rejects_equal_and_lower_node_sequences_and_missing_manifest() {
+        use dom_wallet_node_manager::NodeIdentity;
+        use dom_wallet_updater::{ArtifactDescriptor, NodeManifest, UpdateError};
+
+        let runtime = tempfile::tempdir().expect("temporary runtime");
+        let app = DesktopApplication::default();
+        app.configure_sidecar_runtime(runtime.path().join("managed"))
+            .expect("configure isolated runtime");
+        let artifact = b"app-level node fixture";
+        let identity = |version: &str, revision: &str| NodeIdentity {
+            node_version: version.into(),
+            node_revision: revision.into(),
+            network: "mainnet".into(),
+            chain_id: "chain".into(),
+            genesis_hash: "genesis".into(),
+            rpc_protocol_version: 1,
+            p2p_protocol_version: 1,
+            storage_schema_version_supported: 1,
+            storage_schema_version_on_disk: 1,
+            height: 1,
+        };
+        let feed = |sequence: u64, version: &str, revision: &str| {
+            NodeManifest {
+            schema_version: 1,
+            channel: "stable".into(),
+            node_version: version.into(),
+            node_revision: revision.into(),
+            sequence,
+            published_at: "2026-07-23T12:00:00Z".into(),
+            expires_at: "2099-08-23T12:00:00Z".into(),
+            network: "mainnet".into(),
+            chain_id: "chain".into(),
+            genesis_hash: "genesis".into(),
+            rpc_protocol_version: 1,
+            p2p_protocol_version: 1,
+            storage_schema_version: 1,
+            compatible_wallet_versions: ">=0.2.0, <0.3.0".into(),
+            requires_wallet_update: false,
+            node_only_compatible: true,
+            critical_update: false,
+            artifact: ArtifactDescriptor {
+                target: std::env::consts::OS.into(),
+                architecture: std::env::consts::ARCH.into(),
+                url: "https://github.com/sorenplanck/dom-protocol/releases/download/node-test/dom-node"
+                    .parse()
+                    .unwrap(),
+                sha256: format!("{:x}", Sha256::digest(artifact)),
+                size: artifact.len() as u64,
+                signature: "test-only-detached-signature".into(),
+            },
+            manifest_signature: "test-only-feed-signature".into(),
+        }
+        };
+        let installed_at = time::OffsetDateTime::parse(
+            "2026-07-23T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        let now = time::OffsetDateTime::parse(
+            "2026-07-23T13:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        let old = identity("0.1.0", &"b".repeat(40));
+        let active = identity("0.1.1", &"c".repeat(40));
+        let manager = app.sidecar.lock().unwrap();
+        manager
+            .app_test_persist_state(&feed(8, "0.1.1", &"c".repeat(40)), &old, installed_at)
+            .unwrap();
+        for sequence in [8, 7] {
+            assert!(matches!(
+                manager.app_test_evaluate_verified_feed(
+                    feed(sequence, "0.1.2", &"d".repeat(40)),
+                    &active,
+                    now
+                ),
+                Err(dom_wallet_node_manager::NodeManagerError::Update(
+                    UpdateError::DowngradeRejected
+                ))
+            ));
+        }
+        assert_eq!(
+            manager
+                .app_test_evaluate_verified_feed(feed(9, "0.1.2", &"d".repeat(40)), &active, now)
+                .unwrap()
+                .sequence,
+            9
+        );
+        drop(manager);
+        assert!(matches!(
+            app.experimental_sidecar_evaluate_release(None, None, None, std::env::consts::OS),
+            Err(CommandError::InvalidInput(_))
+        ));
     }
 
     #[test]
