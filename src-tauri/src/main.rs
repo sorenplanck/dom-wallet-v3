@@ -10,7 +10,7 @@ fn ensure_mainnet_node(
 ) -> Result<dom_wallet_tauri_shell::EmbeddedNodeStatusDto, dom_wallet_tauri_shell::CommandErrorDto>
 {
     if let Ok(status) = app.embedded_node_status() {
-        if status.ready {
+        if status.network.is_some() {
             return Ok(status);
         }
     }
@@ -162,6 +162,13 @@ fn embedded_node_start(
 ) -> Result<dom_wallet_tauri_shell::EmbeddedNodeStatusDto, dom_wallet_tauri_shell::CommandErrorDto>
 {
     ensure_mainnet_node(&handle, &app)
+}
+#[tauri::command]
+fn embedded_node_stop(
+    app: tauri::State<'_, DesktopApplication>,
+) -> Result<dom_wallet_tauri_shell::EmbeddedNodeStatusDto, dom_wallet_tauri_shell::CommandErrorDto>
+{
+    app.embedded_node_stop().map_err(Into::into)
 }
 #[tauri::command]
 fn embedded_node_status(
@@ -467,6 +474,7 @@ fn application_builder() -> tauri::Builder<tauri::Wry> {
             account_list,
             account_summary,
             embedded_node_start,
+            embedded_node_stop,
             embedded_node_status,
             node_network_status,
             node_peer_status,
@@ -524,7 +532,8 @@ mod tests {
     #[test]
     fn packaged_entrypoint_constructs_the_registered_builder() {
         let _builder = application_builder();
-        assert_eq!(dom_wallet_tauri_shell::COMMAND_NAMES.len(), 56);
+        assert_eq!(dom_wallet_tauri_shell::COMMAND_NAMES.len(), 57);
         assert!(dom_wallet_tauri_shell::COMMAND_NAMES.contains(&"native_bridge_status"));
+        assert!(dom_wallet_tauri_shell::COMMAND_NAMES.contains(&"embedded_node_stop"));
     }
 }

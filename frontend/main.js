@@ -6,7 +6,7 @@ export const COMMANDS = Object.freeze([
   "native_bridge_status", "application_status", "wallet_create_recoverable", "wallet_restore_from_mnemonic",
   "wallet_backup_export", "wallet_backup_import", "wallet_recovery_phrase_confirm",
   "wallet_open", "wallet_unlock", "wallet_lock", "wallet_close", "wallet_summary",
-  "account_list", "account_summary", "embedded_node_start", "embedded_node_status",
+  "account_list", "account_summary", "embedded_node_start", "embedded_node_stop", "embedded_node_status",
   "node_network_status", "node_peer_status", "wallet_sync_status", "wallet_sync_start",
   "wallet_sync_pause", "wallet_sync_resume", "wallet_sync_retry", "wallet_rescan",
   "mining_status", "mining_config_get", "mining_config_set", "mining_start", "mining_stop",
@@ -210,6 +210,8 @@ byId("mining-stop").addEventListener("click", async () => {
 byId("sync").addEventListener("click", () => run(async () => { await invoke("wallet_sync_start"); await refreshSummary(); }).catch((error) => show(redactedError(error), true)));
 byId("node-sync").addEventListener("click", () => run(async () => { await invoke("wallet_sync_start"); await refreshNode(); }).catch((error) => show(redactedError(error), true)));
 byId("node-refresh").addEventListener("click", () => run(refreshNode).catch((error) => show(redactedError(error), true)));
+byId("node-start").addEventListener("click", () => run(async () => { await invoke("embedded_node_start"); await refreshNode(); show("Embedded node started."); }).catch((error) => show(redactedError(error), true)));
+byId("node-stop").addEventListener("click", () => run(async () => { await invoke("embedded_node_stop"); await refreshNode(); show("Embedded node stopped. The wallet remains open."); }).catch((error) => show(redactedError(error), true)));
 for (const [id, command] of [["pause", "wallet_sync_pause"], ["resume", "wallet_sync_resume"], ["retry", "wallet_sync_retry"]]) {
   byId(id).addEventListener("click", () => run(() => invoke(command)).catch((error) => show(redactedError(error), true)));
 }

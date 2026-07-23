@@ -35,7 +35,7 @@ pub struct DesktopApplication {
     shutdown: AtomicBool,
 }
 
-pub const COMMAND_NAMES: [&str; 56] = [
+pub const COMMAND_NAMES: [&str; 57] = [
     "native_bridge_status",
     "application_status",
     "wallet_create_recoverable",
@@ -51,6 +51,7 @@ pub const COMMAND_NAMES: [&str; 56] = [
     "account_list",
     "account_summary",
     "embedded_node_start",
+    "embedded_node_stop",
     "embedded_node_status",
     "node_network_status",
     "node_peer_status",
@@ -614,6 +615,20 @@ impl DesktopApplication {
             connected_peers: peers.connected_total,
             bootstrap_phase: peers.bootstrap_phase.into(),
         })
+    }
+
+    pub fn embedded_node_stop(&self) -> Result<EmbeddedNodeStatusDto, CommandError> {
+        self.ensure_running()?;
+        self.stop_mining_worker()?;
+        self.service
+            .lock()
+            .map_err(|_| CommandError::Unavailable)?
+            .stop_embedded_core()
+            .map_err(CommandError::from)?;
+        self.node_started.store(false, Ordering::Release);
+        self.last_peer_connected_unix_seconds
+            .store(0, Ordering::Release);
+        Ok(stopped_node_status())
     }
 
     pub fn node_network_status(&self) -> Result<NodeNetworkStatusDto, CommandError> {
@@ -1634,6 +1649,7 @@ mod tests {
             "wallet_backup_import",
             "wallet_recovery_phrase_confirm",
             "embedded_node_start",
+            "embedded_node_stop",
             "embedded_node_status",
             "wallet_address_validate",
             "application_shutdown",

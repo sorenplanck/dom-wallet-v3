@@ -356,6 +356,14 @@ impl WalletService {
             .map_err(CoreError::from)
     }
 
+    /// Stop the embedded node without changing the open or unlocked wallet state.
+    pub fn stop_embedded_core(&mut self) -> Result<(), CoreError> {
+        if let Some(mut backend) = self.backend.take() {
+            backend.shutdown()?;
+        }
+        Ok(())
+    }
+
     /// Reserve a Coinbase recovery coordinate before creating public mining
     /// material. Seed and blinding data never cross into the embedded node.
     pub fn mining_coinbase_candidate(
@@ -2116,5 +2124,40 @@ mod tests {
         assert!(dom_wallet_core_recovery::PRODUCTION_OUTPUT_PATHS
             .iter()
             .all(|path| path.recovery_required));
+    }
+
+    #[test]
+    fn embedded_core_can_stop_and_restart_without_closing_the_service() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let first_address = first_listener.local_addr().unwrap();
+        drop(first_listener);
+        let second_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let second_address = second_listener.local_addr().unwrap();
+        drop(second_listener);
+        let mut service = test_service();
+
+        service
+            .start_embedded_core(EmbeddedCoreConfiguration::new(
+                dom_wallet_embedded_core::EmbeddedCoreNetwork::Regtest,
+                directory.path(),
+                first_address,
+            ))
+            .unwrap();
+        assert!(service.embedded_core_identity().is_ok());
+        service.stop_embedded_core().unwrap();
+        assert!(matches!(
+            service.embedded_core_identity(),
+            Err(CoreError::EmbeddedCoreRequired)
+        ));
+        service
+            .start_embedded_core(EmbeddedCoreConfiguration::new(
+                dom_wallet_embedded_core::EmbeddedCoreNetwork::Regtest,
+                directory.path(),
+                second_address,
+            ))
+            .unwrap();
+        assert!(service.embedded_core_identity().is_ok());
+        service.stop_embedded_core().unwrap();
     }
 }
