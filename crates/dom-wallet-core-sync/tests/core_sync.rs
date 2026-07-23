@@ -136,6 +136,16 @@ impl FakeCore {
             hash: state.blocks.last().expect("block").block_hash,
         };
     }
+
+    fn truncate_to_height(&self, height: u64) {
+        let mut state = self.state.lock().expect("fake state");
+        state.blocks.truncate(height as usize + 1);
+        let tip = state.blocks.last().expect("genesis remains");
+        state.identity.current_tip = BlockRef {
+            height: tip.height,
+            hash: tip.block_hash,
+        };
+    }
 }
 
 impl WalletCoreApi for FakeCore {
@@ -731,6 +741,51 @@ fn reorg_beyond_bound_fails_closed() {
         adapter.reconcile_once(&mut sink),
         Err(CoreScanError::ReorgBeyondBound)
     );
+}
+
+#[test]
+fn cursor_ahead_of_tip_rewinds_atomically_to_the_common_ancestor() {
+    let core = FakeCore::new(5);
+    let adapter = core.adapter();
+    let mut sink = MemorySink::default();
+    adapter.reconcile_to_tip(&mut sink).unwrap();
+    core.truncate_to_height(2);
+
+    let result = adapter.reconcile_to_tip(&mut sink).unwrap();
+
+    assert!(matches!(
+        result,
+        CoreReconcileResult::ReorgCommitted {
+            safe_anchor: CoreBlockReference { height: 2, .. },
+            ..
+        }
+    ));
+    let PersistedCoreCursorState::Valid(cursor) = sink.cursor else {
+        panic!("missing rewound cursor");
+    };
+    let cursor = cursor.decode().unwrap();
+    assert_eq!(cursor.anchor_height, 2);
+    assert_eq!(cursor.anchor_hash, [3; 32]);
+    assert_eq!(sink.hashes.keys().copied().collect::<Vec<_>>(), vec![1, 2]);
+}
+
+#[test]
+fn second_sync_at_the_same_height_and_hash_is_idempotent() {
+    let core = FakeCore::new(5);
+    let adapter = core.adapter();
+    let mut sink = MemorySink::default();
+    adapter.reconcile_to_tip(&mut sink).unwrap();
+    let cursor = sink.cursor.clone();
+    let hashes = sink.hashes.clone();
+    let normal_commits = sink.normal_commits;
+
+    assert_eq!(
+        adapter.reconcile_to_tip(&mut sink),
+        Ok(CoreReconcileResult::NoChanges)
+    );
+    assert_eq!(sink.cursor, cursor);
+    assert_eq!(sink.hashes, hashes);
+    assert_eq!(sink.normal_commits, normal_commits);
 }
 
 #[test]

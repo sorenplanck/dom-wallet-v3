@@ -198,7 +198,9 @@ pub struct NodeNetworkStatusDto {
 pub struct WalletSyncStatusDto {
     pub state: String,
     pub cursor_height: Option<u64>,
+    pub cursor_hash: Option<String>,
     pub canonical_height: Option<u64>,
+    pub canonical_hash: Option<String>,
     pub synchronized: bool,
     pub paused: bool,
     pub last_result: String,
@@ -672,13 +674,21 @@ impl DesktopApplication {
             .embedded_core_identity()
             .ok()
             .map(|identity| identity.current_tip.height);
+        let canonical_hash = service
+            .embedded_core_identity()
+            .ok()
+            .map(|identity| hex::encode(identity.current_tip.hash));
         let synchronized = diagnostic.cursor_height.is_some()
             && diagnostic.cursor_height == canonical_height
+            && diagnostic.cursor_hash.is_some()
+            && diagnostic.cursor_hash == canonical_hash
             && diagnostic.last_error.is_none();
         Ok(WalletSyncStatusDto {
             state: diagnostic.application_state,
             cursor_height: diagnostic.cursor_height,
+            cursor_hash: diagnostic.cursor_hash,
             canonical_height,
+            canonical_hash,
             synchronized,
             paused: self.synchronization_paused.load(Ordering::Acquire),
             last_result: if synchronized {
@@ -811,7 +821,9 @@ impl DesktopApplication {
         let peers = self.node_peer_status()?;
         require_mining_cursor_gate(
             sync.cursor_height,
+            sync.cursor_hash.as_deref(),
             sync.canonical_height,
+            sync.canonical_hash.as_deref(),
             sync.last_error.as_deref(),
             peers.total_connected_peers,
         )?;
@@ -1289,11 +1301,18 @@ fn mining_state_name(state: u64, enabled: bool) -> &'static str {
 
 fn require_mining_cursor_gate(
     cursor_height: Option<u64>,
+    cursor_hash: Option<&str>,
     canonical_height: Option<u64>,
+    canonical_hash: Option<&str>,
     last_error: Option<&str>,
     connected_peers: u64,
 ) -> Result<(), CommandError> {
-    if cursor_height.is_none() || cursor_height != canonical_height || last_error.is_some() {
+    if cursor_height.is_none()
+        || cursor_height != canonical_height
+        || cursor_hash.is_none()
+        || cursor_hash != canonical_hash
+        || last_error.is_some()
+    {
         return Err(CommandError::CursorInitializationFailed);
     }
     if connected_peers == 0 {
@@ -1586,9 +1605,23 @@ mod tests {
 
     #[test]
     fn mining_gate_accepts_synchronized_height_one_cursor() {
-        assert!(require_mining_cursor_gate(Some(1), Some(1), None, 1).is_ok());
+        let hash = "11".repeat(32);
+        assert!(
+            require_mining_cursor_gate(Some(1), Some(&hash), Some(1), Some(&hash), None, 1).is_ok()
+        );
         assert!(matches!(
-            require_mining_cursor_gate(None, Some(1), None, 1),
+            require_mining_cursor_gate(None, None, Some(1), Some(&hash), None, 1),
+            Err(CommandError::CursorInitializationFailed)
+        ));
+        assert!(matches!(
+            require_mining_cursor_gate(
+                Some(1),
+                Some(&hash),
+                Some(1),
+                Some(&"22".repeat(32)),
+                None,
+                1
+            ),
             Err(CommandError::CursorInitializationFailed)
         ));
     }

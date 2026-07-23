@@ -79,6 +79,7 @@ pub struct DiagnosticSnapshot {
     pub connection_state: String,
     pub generation: Option<u64>,
     pub cursor_height: Option<u64>,
+    pub cursor_hash: Option<String>,
     pub last_error: Option<String>,
 }
 
@@ -1405,6 +1406,11 @@ impl WalletService {
     }
 
     pub fn diagnostics(&self) -> DiagnosticSnapshot {
+        let cursor = self
+            .unlocked
+            .as_ref()
+            .and_then(|state| state.core_scan_cursor.as_deref())
+            .and_then(|bytes| WalletScanCursor::from_bytes(bytes).ok());
         DiagnosticSnapshot {
             application_state: application_state_name(&self.state).into(),
             connection_state: if self.backend.is_some() {
@@ -1413,12 +1419,8 @@ impl WalletService {
                 "EMBEDDED_CORE_STOPPED".into()
             },
             generation: self.unlocked.as_ref().map(|state| state.generation),
-            cursor_height: self
-                .unlocked
-                .as_ref()
-                .and_then(|state| state.core_scan_cursor.as_deref())
-                .and_then(|bytes| WalletScanCursor::from_bytes(bytes).ok())
-                .map(|cursor| cursor.anchor_height),
+            cursor_height: cursor.as_ref().map(|cursor| cursor.anchor_height),
+            cursor_hash: cursor.map(|cursor| hex::encode(cursor.anchor_hash)),
             last_error: self.last_error.clone(),
         }
     }

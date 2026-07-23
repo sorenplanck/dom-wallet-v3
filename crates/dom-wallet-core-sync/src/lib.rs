@@ -539,20 +539,36 @@ impl CoreChainAdapter {
         &self,
         sink: &mut S,
     ) -> Result<CoreReconcileResult, CoreScanError> {
-        let target_height = self.current_tip()?.height;
         loop {
             let result = self.reconcile_wallet_once(sink)?;
-            let cursor = match result {
-                CoreReconcileResult::Committed(cursor)
-                | CoreReconcileResult::ReorgCommitted { cursor, .. } => cursor,
-                CoreReconcileResult::NoChanges => {
+            let cursor = match sink
+                .core_cursor_state()
+                .map_err(|_| CoreScanError::Persistence)?
+            {
+                PersistedCoreCursorState::Valid(cursor) => cursor,
+                PersistedCoreCursorState::Absent => {
                     return Err(CoreScanError::InvalidScan {
-                        code: "SCAN_STALLED_BEFORE_TARGET",
+                        code: "SCAN_STALLED_WITHOUT_CURSOR",
                     });
                 }
+                PersistedCoreCursorState::Invalid => {
+                    return Err(CoreScanError::InvalidCursor {
+                        code: "PERSISTED_CURSOR_INVALID",
+                    });
+                }
+                PersistedCoreCursorState::ReorgInvalidated(_) => {
+                    return Err(CoreScanError::ReorgDetected);
+                }
             };
-            if cursor.decode()?.anchor_height >= target_height {
+            let anchor = self.validate_cursor(cursor)?;
+            let current_tip = self.current_tip()?;
+            if anchor == current_tip {
                 return Ok(result);
+            }
+            if matches!(result, CoreReconcileResult::NoChanges) {
+                return Err(CoreScanError::InvalidScan {
+                    code: "SCAN_STALLED_BEFORE_TARGET",
+                });
             }
         }
     }
@@ -585,10 +601,32 @@ impl CoreChainAdapter {
                     code: "ANCHOR_HEIGHT_OVERFLOW",
                 })?;
         let batch = self.scan_from_height(start_height, self.maximum_batch_blocks)?;
-        let Some(replacement) = batch.commit_cursor else {
-            return Err(CoreScanError::InvalidScan {
-                code: "REORG_REPLACEMENT_EMPTY",
-            });
+        let replacement = match batch.commit_cursor {
+            Some(replacement) => replacement,
+            None if batch.observed_tip == safe_anchor => {
+                let cursor = WalletScanCursor::new(
+                    self.identity.network,
+                    self.identity.chain_id,
+                    safe_anchor
+                        .height
+                        .checked_add(1)
+                        .ok_or(CoreScanError::InvalidCursor {
+                            code: "ANCHOR_HEIGHT_OVERFLOW",
+                        })?,
+                    BlockRef {
+                        height: safe_anchor.height,
+                        hash: safe_anchor.hash,
+                    },
+                );
+                let replacement = CoreCursorBytes::from_cursor(cursor, &self.identity)?;
+                self.validate_cursor(replacement)?;
+                replacement
+            }
+            None => {
+                return Err(CoreScanError::InvalidScan {
+                    code: "REORG_REPLACEMENT_EMPTY",
+                });
+            }
         };
         sink.commit_core_reorg(safe_anchor, &batch, replacement)
             .map_err(|_| CoreScanError::Persistence)?;
