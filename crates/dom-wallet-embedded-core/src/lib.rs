@@ -12,6 +12,7 @@ use dom_wallet_core_api::{
     WalletCoreApi, WalletCoreError, WalletScanCursor,
 };
 use std::{
+    collections::HashSet,
     fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
     path::PathBuf,
@@ -48,8 +49,13 @@ pub const MAINNET_DNS_SEEDS: [&str; 3] = [
 ];
 /// Canonical Mainnet P2P port.
 pub const MAINNET_P2P_PORT: u16 = 33_369;
-/// Direct P2P bootstrap fallback. This is never used as a Wallet backend.
+/// Alternate direct P2P bootstrap endpoint for networks blocking the canonical port.
+pub const MAINNET_BOOTSTRAP_ALTERNATE: &str = "168.100.9.70:8443";
+/// Canonical direct P2P bootstrap fallback. This is never used as a Wallet backend.
 pub const MAINNET_BOOTSTRAP_FALLBACK: &str = "168.100.9.70:33369";
+/// Ordered Mainnet direct bootstrap endpoints. The alternate endpoint is tried first.
+pub const MAINNET_BOOTSTRAP_PEERS: [&str; 2] =
+    [MAINNET_BOOTSTRAP_ALTERNATE, MAINNET_BOOTSTRAP_FALLBACK];
 
 /// Network selected for the embedded node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,10 +112,15 @@ impl EmbeddedCoreConfiguration {
             p2p_listen_address,
         )
         .with_maximum_inbound_peers(1)
-        .with_seed_peers(vec![SocketAddr::from((
-            [168, 100, 9, 70],
-            MAINNET_P2P_PORT,
-        ))])
+        .with_seed_peers(
+            MAINNET_BOOTSTRAP_PEERS
+                .iter()
+                .map(|peer| {
+                    peer.parse()
+                        .expect("hard-coded Mainnet bootstrap peer must be a SocketAddr")
+                })
+                .collect(),
+        )
     }
 
     /// Set the maximum inbound peer count.
@@ -120,7 +131,7 @@ impl EmbeddedCoreConfiguration {
 
     /// Set explicit bootstrap peers. DNS discovery remains disabled.
     pub fn with_seed_peers(mut self, peers: Vec<SocketAddr>) -> Self {
-        self.seed_peers = peers;
+        self.seed_peers = deduplicate_socket_addresses(peers);
         self
     }
 
@@ -175,7 +186,18 @@ impl EmbeddedCoreConfiguration {
         // pass and is therefore deliberately disabled here.
         config.dns_seeds.clear();
         config.disable_dns_seeds = true;
-        config.seed_peers = self.seed_peers.iter().map(ToString::to_string).collect();
+        // Mainnet fallbacks are staged by the Wallet after an observed failure.
+        // Supplying every endpoint here would let Core's canonical address sort
+        // override Wallet priority and could reserve more than one relay endpoint.
+        config.seed_peers = if self.network == EmbeddedCoreNetwork::Mainnet {
+            self.seed_peers
+                .first()
+                .map(ToString::to_string)
+                .into_iter()
+                .collect()
+        } else {
+            self.seed_peers.iter().map(ToString::to_string).collect()
+        };
         config.mine = false;
         config.miner_address = None;
         config.wallet_path = None;
@@ -268,6 +290,12 @@ pub enum EmbeddedCoreAdapterError {
 
 enum LifecycleCommand {
     Shutdown,
+}
+
+struct MainnetDiscoveryConfiguration {
+    enabled: bool,
+    bootstrap_peers: Vec<SocketAddr>,
+    seed_resolution: Arc<[AtomicU8; MAINNET_DNS_SEEDS.len()]>,
 }
 
 /// Lifecycle-gated implementation of the frozen Wallet-facing Core contract.
@@ -393,8 +421,11 @@ impl EmbeddedCoreLifecycle {
         let lifecycle = self.lifecycle.clone();
         let listen_address = self.configuration.p2p_listen_address;
         let runtime_node = node.clone();
-        let discover_mainnet = self.configuration.network == EmbeddedCoreNetwork::Mainnet;
-        let seed_resolution = Arc::clone(&self.seed_resolution);
+        let discovery = MainnetDiscoveryConfiguration {
+            enabled: self.configuration.network == EmbeddedCoreNetwork::Mainnet,
+            bootstrap_peers: self.configuration.seed_peers.clone(),
+            seed_resolution: Arc::clone(&self.seed_resolution),
+        };
 
         let runtime_thread = thread::Builder::new()
             .name("dom-wallet-embedded-core".to_owned())
@@ -405,8 +436,7 @@ impl EmbeddedCoreLifecycle {
                     lifecycle,
                     command_receiver,
                     startup_sender,
-                    discover_mainnet,
-                    seed_resolution,
+                    discovery,
                 );
             })
             .map_err(|_| {
@@ -511,11 +541,7 @@ impl EmbeddedCoreLifecycle {
             connected_outbound,
             connected_total,
             known_peers,
-            bootstrap_phase: if connected_total > 0 {
-                "CONNECTED"
-            } else {
-                "DISCOVERING_PEERS"
-            },
+            bootstrap_phase: bootstrap_phase(connected_total),
             peer_addresses,
             canonical_height,
             seed_resolution_states: self
@@ -603,6 +629,63 @@ fn is_public_routable_peer(address: SocketAddr) -> bool {
     }
 }
 
+fn deduplicate_socket_addresses(peers: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let mut seen = HashSet::with_capacity(peers.len());
+    peers
+        .into_iter()
+        .filter(|peer| seen.insert(*peer))
+        .collect()
+}
+
+#[derive(Debug)]
+struct BootstrapFallbackSequence {
+    endpoints: Vec<SocketAddr>,
+    active_index: Option<usize>,
+    observed_failure_count: u8,
+}
+
+impl BootstrapFallbackSequence {
+    fn new(endpoints: Vec<SocketAddr>) -> Self {
+        let endpoints = deduplicate_socket_addresses(endpoints);
+        Self {
+            active_index: (!endpoints.is_empty()).then_some(0),
+            endpoints,
+            observed_failure_count: 0,
+        }
+    }
+
+    fn active(&self) -> Option<SocketAddr> {
+        self.active_index.map(|index| self.endpoints[index])
+    }
+
+    fn has_untried_endpoint(&self) -> bool {
+        self.active_index
+            .is_some_and(|index| index + 1 < self.endpoints.len())
+    }
+
+    fn observe_failure(&mut self, endpoint: SocketAddr, failure_count: u8) -> Option<SocketAddr> {
+        if self.active() != Some(endpoint) || failure_count <= self.observed_failure_count {
+            return None;
+        }
+        self.observed_failure_count = failure_count;
+        let next_index = self.active_index? + 1;
+        if next_index >= self.endpoints.len() {
+            return None;
+        }
+        self.active_index = Some(next_index);
+        self.observed_failure_count = 0;
+        self.active()
+    }
+}
+
+fn bootstrap_phase(connected_peers: u64) -> &'static str {
+    if connected_peers > 0 {
+        "CONNECTED"
+    } else {
+        "DISCOVERING_PEERS"
+    }
+}
+
 fn is_public_ipv4(ip: Ipv4Addr) -> bool {
     let [a, b, c, d] = ip.octets();
     if a == 0
@@ -668,8 +751,7 @@ fn run_node_thread(
     lifecycle: Arc<AtomicU8>,
     mut command_receiver: tokio::sync::mpsc::UnboundedReceiver<LifecycleCommand>,
     startup_sender: mpsc::SyncSender<Result<(), ()>>,
-    discover_mainnet: bool,
-    seed_resolution: Arc<[AtomicU8; MAINNET_DNS_SEEDS.len()]>,
+    discovery: MainnetDiscoveryConfiguration,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -684,7 +766,7 @@ fn run_node_thread(
     };
 
     runtime.block_on(async move {
-        let discovery_task = if discover_mainnet {
+        let discovery_task = if discovery.enabled {
             let discovery_shutdown = node.task_supervisor.shutdown_token();
             let discovery_node = Arc::clone(&node);
             Some(tokio::spawn(async move {
@@ -692,7 +774,8 @@ fn run_node_thread(
                     discovery_node,
                     listen_address,
                     discovery_shutdown,
-                    seed_resolution,
+                    discovery.bootstrap_peers,
+                    discovery.seed_resolution,
                 )
                 .await;
             }))
@@ -748,6 +831,7 @@ async fn run_wallet_dns_discovery(
     node: Arc<DomNode>,
     local_address: SocketAddr,
     shutdown: dom_node::task_supervisor::ShutdownToken,
+    bootstrap_peers: Vec<SocketAddr>,
     seed_resolution: Arc<[AtomicU8; MAINNET_DNS_SEEDS.len()]>,
 ) {
     const INITIAL_BACKOFF: Duration = Duration::from_secs(5);
@@ -755,9 +839,81 @@ async fn run_wallet_dns_discovery(
     const SUCCESS_REFRESH: Duration = Duration::from_secs(30 * 60);
     let mut failures = [0u8; MAINNET_DNS_SEEDS.len()];
     let mut next_attempt = [Instant::now(); MAINNET_DNS_SEEDS.len()];
+    let mut bootstrap = BootstrapFallbackSequence::new(bootstrap_peers);
+    let mut observed_connected = HashSet::new();
+    let mut last_connected_count = usize::MAX;
+    if let Some(peer) = bootstrap.active() {
+        tracing::info!(
+            event = "wallet_bootstrap_peer_attempted",
+            peer = %peer,
+            fallback = false,
+            "attempting prioritized Mainnet bootstrap peer"
+        );
+    }
     loop {
         if shutdown.is_shutdown() {
             return;
+        }
+        let (connected, active_failure_count) = {
+            let peers = node.peers.lock().await;
+            let connected = peers
+                .connected_peers()
+                .into_iter()
+                .filter_map(|peer| peer.parse::<SocketAddr>().ok())
+                .collect::<HashSet<_>>();
+            let active_failure_count = bootstrap
+                .active()
+                .map(|peer| peers.outbound_failure_count(&peer.to_string()))
+                .unwrap_or(0);
+            (connected, active_failure_count)
+        };
+        for peer in connected.difference(&observed_connected) {
+            tracing::info!(
+                event = "wallet_bootstrap_connection_accepted",
+                peer = %peer,
+                connected_peers = connected.len(),
+                "Mainnet peer connection accepted"
+            );
+        }
+        if connected.len() != last_connected_count {
+            tracing::info!(
+                event = "wallet_bootstrap_connected_peers_final",
+                connected_peers = connected.len(),
+                "Mainnet bootstrap connected peer count updated"
+            );
+            last_connected_count = connected.len();
+        }
+        observed_connected = connected;
+
+        if let Some(active) = bootstrap.active() {
+            if active_failure_count > bootstrap.observed_failure_count {
+                let has_untried_endpoint = bootstrap.has_untried_endpoint();
+                tracing::warn!(
+                    event = "wallet_bootstrap_connection_refused",
+                    peer = %active,
+                    failure_count = active_failure_count,
+                    has_untried_endpoint,
+                    "Mainnet bootstrap peer connection refused"
+                );
+                if let Some(fallback) = bootstrap.observe_failure(active, active_failure_count) {
+                    node.pex
+                        .lock()
+                        .await
+                        .seed_from_config(&[fallback.to_string()]);
+                    tracing::info!(
+                        event = "wallet_bootstrap_fallback_activated",
+                        failed_peer = %active,
+                        peer = %fallback,
+                        "attempting next Mainnet bootstrap fallback"
+                    );
+                    tracing::info!(
+                        event = "wallet_bootstrap_peer_attempted",
+                        peer = %fallback,
+                        fallback = true,
+                        "attempting Mainnet bootstrap fallback peer"
+                    );
+                }
+            }
         }
         let now = Instant::now();
         for (index, seed) in MAINNET_DNS_SEEDS.iter().enumerate() {
@@ -853,7 +1009,14 @@ mod tests {
         assert_eq!(node.max_inbound, 1);
         assert!(node.disable_dns_seeds);
         assert!(node.dns_seeds.is_empty());
-        assert_eq!(node.seed_peers, vec![MAINNET_BOOTSTRAP_FALLBACK]);
+        assert_eq!(
+            configuration.seed_peers,
+            MAINNET_BOOTSTRAP_PEERS
+                .iter()
+                .map(|peer| peer.parse().expect("bootstrap address"))
+                .collect::<Vec<SocketAddr>>()
+        );
+        assert_eq!(node.seed_peers, vec![MAINNET_BOOTSTRAP_ALTERNATE]);
         assert!(!node.mine);
         assert!(node.wallet_path.is_none());
         assert!(node.wallet_password.is_none());
@@ -934,6 +1097,61 @@ mod tests {
         assert!(!is_public_routable_peer(
             "8.8.8.8:0".parse().expect("zero port")
         ));
+    }
+
+    #[test]
+    fn mainnet_accepts_alternate_and_canonical_relay_ports() {
+        let alternate: SocketAddr = MAINNET_BOOTSTRAP_ALTERNATE
+            .parse()
+            .expect("alternate Mainnet bootstrap address");
+        let canonical: SocketAddr = MAINNET_BOOTSTRAP_FALLBACK
+            .parse()
+            .expect("canonical Mainnet bootstrap address");
+        assert_eq!(alternate.ip(), canonical.ip());
+        assert_eq!(alternate.port(), 8_443);
+        assert_eq!(canonical.port(), MAINNET_P2P_PORT);
+        assert!(is_public_routable_peer(alternate));
+        assert!(is_public_routable_peer(canonical));
+    }
+
+    #[test]
+    fn bootstrap_failure_advances_to_the_next_untried_endpoint() {
+        let canonical: SocketAddr = MAINNET_BOOTSTRAP_FALLBACK
+            .parse()
+            .expect("canonical Mainnet bootstrap address");
+        let alternate: SocketAddr = MAINNET_BOOTSTRAP_ALTERNATE
+            .parse()
+            .expect("alternate Mainnet bootstrap address");
+        let mut bootstrap = BootstrapFallbackSequence::new(vec![canonical, alternate]);
+
+        assert_eq!(bootstrap.active(), Some(canonical));
+        assert!(bootstrap.has_untried_endpoint());
+        assert_eq!(bootstrap.observe_failure(canonical, 1), Some(alternate));
+        assert_eq!(bootstrap.active(), Some(alternate));
+    }
+
+    #[test]
+    fn bootstrap_endpoints_are_deduplicated_by_socket_address() {
+        let alternate: SocketAddr = MAINNET_BOOTSTRAP_ALTERNATE
+            .parse()
+            .expect("alternate Mainnet bootstrap address");
+        let canonical: SocketAddr = MAINNET_BOOTSTRAP_FALLBACK
+            .parse()
+            .expect("canonical Mainnet bootstrap address");
+        let bootstrap =
+            BootstrapFallbackSequence::new(vec![alternate, alternate, canonical, canonical]);
+
+        assert_eq!(bootstrap.endpoints, vec![alternate, canonical]);
+    }
+
+    #[test]
+    fn any_connected_bootstrap_endpoint_reports_connected() {
+        for endpoint in MAINNET_BOOTSTRAP_PEERS {
+            let connected: SocketAddr = endpoint.parse().expect("Mainnet bootstrap address");
+            assert!(is_public_routable_peer(connected));
+            assert_eq!(bootstrap_phase(1), "CONNECTED");
+        }
+        assert_eq!(bootstrap_phase(0), "DISCOVERING_PEERS");
     }
 
     #[test]

@@ -1,8 +1,36 @@
 #![forbid(unsafe_code)]
 
 use dom_wallet_tauri_shell::DesktopApplication;
-use std::net::TcpListener;
+use std::{
+    fs::{self, OpenOptions},
+    net::TcpListener,
+    sync::Mutex,
+};
 use tauri::Manager;
+
+fn initialize_file_logging(app: &tauri::App) {
+    let file = app.path().app_log_dir().ok().and_then(|directory| {
+        fs::create_dir_all(&directory).ok()?;
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(directory.join("dom-wallet-v3.log"))
+            .ok()
+    });
+    if let Some(file) = file {
+        let _ = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing_subscriber::filter::LevelFilter::INFO)
+            .with_writer(Mutex::new(file))
+            .try_init();
+    } else {
+        let _ = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing_subscriber::filter::LevelFilter::INFO)
+            .try_init();
+    }
+}
 
 fn ensure_mainnet_node(
     handle: &tauri::AppHandle,
@@ -457,6 +485,10 @@ fn slate_qr_reassembly_clear(
 
 fn application_builder() -> tauri::Builder<tauri::Wry> {
     tauri::Builder::default()
+        .setup(|app| {
+            initialize_file_logging(app);
+            Ok(())
+        })
         .manage(DesktopApplication::default())
         .invoke_handler(tauri::generate_handler![
             native_bridge_status,
