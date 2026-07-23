@@ -1588,6 +1588,7 @@ version = "0.2.0"
 dependencies = [
  "dom-wallet-crypto 0.2.0",
  "dom-wallet-domain",
+ "fs2",
  "serde",
  "serde_json",
  "tempfile",

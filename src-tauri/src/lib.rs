@@ -1612,12 +1612,25 @@ impl From<CoreError> for CommandError {
                 message: "The embedded Mainnet node could not complete the requested operation.",
                 retryable: true,
             },
-            other => Self::Wallet {
-                code: other.redacted_code(),
-                message:
-                    "The wallet rejected the requested operation. Review its typed error code.",
-                retryable: false,
-            },
+            other => {
+                let code = other.redacted_code();
+                let (message, retryable) = if code == "WALLET_WRITER_ACTIVE" {
+                    (
+                        "Close the other running wallet process before opening this wallet.",
+                        true,
+                    )
+                } else {
+                    (
+                        "The wallet rejected the requested operation. Review its typed error code.",
+                        false,
+                    )
+                };
+                Self::Wallet {
+                    code,
+                    message,
+                    retryable,
+                }
+            }
         }
     }
 }

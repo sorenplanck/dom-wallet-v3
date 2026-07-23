@@ -1938,6 +1938,7 @@ impl CoreError {
             Self::ConfirmationRequired => "CONFIRMATION_REQUIRED",
             Self::TransactionNotFound => "TRANSACTION_NOT_FOUND",
             Self::InvalidCoreCursor => "CURSOR_INVALID",
+            Self::Storage(StorageError::WriterActive) => "WALLET_WRITER_ACTIVE",
             Self::Storage(_) => "WALLET_STORAGE_FAILED",
             Self::Domain(_) => "WALLET_STATE_VALIDATION_FAILED",
             Self::Backend(_) => "EMBEDDED_NODE_OPERATION_FAILED",
@@ -1958,6 +1959,7 @@ impl CoreError {
             Self::InvalidCoreCursor => "wallet cursor is invalid",
             Self::InvalidSlateTransport => "Slate v4 transport is invalid",
             Self::MissingPrivateContext => "private Slate context is unavailable",
+            Self::Storage(StorageError::WriterActive) => "wallet is already open by another writer",
             _ => "the requested wallet operation was rejected",
         };
         format!("{}:{description}", self.redacted_code())
@@ -2105,6 +2107,16 @@ mod tests {
             Some("CURSOR_SYNCHRONIZATION_FAILED:Core scan contract failed (CORE_INTERNAL_FAILURE)")
         );
         assert!(service.summary().is_ok());
+    }
+
+    #[test]
+    fn active_writer_has_a_distinct_redacted_error_code() {
+        let error = CoreError::Storage(StorageError::WriterActive);
+        assert_eq!(error.redacted_code(), "WALLET_WRITER_ACTIVE");
+        assert_eq!(
+            error.redacted_message(),
+            "WALLET_WRITER_ACTIVE:wallet is already open by another writer"
+        );
     }
 
     #[test]
