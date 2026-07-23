@@ -1148,6 +1148,8 @@ exit 0
 "#;
     let status = Command::new(powershell)
         .env_clear()
+        .env("SystemRoot", &system_root)
+        .env("WINDIR", &system_root)
         .arg("-NoLogo")
         .arg("-NoProfile")
         .arg("-NonInteractive")
@@ -1192,6 +1194,8 @@ Set-Acl -LiteralPath $args[0] -AclObject $acl
 "#;
     let status = Command::new(powershell)
         .env_clear()
+        .env("SystemRoot", &system_root)
+        .env("WINDIR", &system_root)
         .arg("-NoLogo")
         .arg("-NoProfile")
         .arg("-NonInteractive")
