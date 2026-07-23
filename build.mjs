@@ -1,7 +1,15 @@
 import { spawnSync } from "node:child_process";
 
-const npm = process.platform === "win32" ? "npm.cmd" : "npm";
-const result = spawnSync(npm, ["--prefix", "frontend", "run", "build"], {
+const command = process.platform === "win32"
+  ? {
+      file: process.env.ComSpec ?? "cmd.exe",
+      args: ["/d", "/s", "/c", "npm --prefix frontend run build"],
+    }
+  : {
+      file: "npm",
+      args: ["--prefix", "frontend", "run", "build"],
+    };
+const result = spawnSync(command.file, command.args, {
   stdio: "inherit",
 });
 
