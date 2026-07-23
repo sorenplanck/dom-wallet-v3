@@ -65,6 +65,13 @@ test("Tauri resolves the frontend build from both supported CLI contexts", async
   assert.match(workspaceBuild, /\["--prefix", "frontend", "run", "build"\]/);
   assert.equal(config.build.frontendDist, "../frontend/dist");
   assert.deepEqual(config.bundle.icon, ["../frontend/assets/dom-coin.png", "icons/icon.ico"]);
+  assert.equal(
+    config.plugins.updater.pubkey,
+    "",
+    "stabilization packages need a parseable empty updater key that fails closed",
+  );
+  assert.equal(config.plugins.updater.endpoints.every((endpoint) => endpoint.startsWith("https://")), true);
+  assert.equal(config.bundle.createUpdaterArtifacts, false);
   const ico = await readFile(new URL("../../src-tauri/icons/icon.ico", import.meta.url));
   assert.deepEqual([...ico.subarray(0, 4)], [0, 0, 1, 0]);
 });

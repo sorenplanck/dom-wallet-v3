@@ -227,6 +227,30 @@ try {
     settingsMainnet: true,
   });
 
+  let genesisSyncStatus;
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    const syncStart = await nativeResult("wallet_sync_start", {});
+    if (!syncStart.ok && syncStart.error?.retryable !== true) {
+      throw new Error(`packaged genesis synchronization failed: ${JSON.stringify(syncStart.error)}`);
+    }
+    genesisSyncStatus = await nativeResult("wallet_sync_status", {});
+    if (!genesisSyncStatus.ok) throw new Error("packaged genesis synchronization diagnostics failed");
+    if (
+      genesisSyncStatus.value.synchronized
+      && genesisSyncStatus.value.cursor_height === 0
+      && genesisSyncStatus.value.cursor_hash === genesisSyncStatus.value.canonical_hash
+    ) break;
+    await new Promise((done) => setTimeout(done, 100));
+  }
+  assert.ok(genesisSyncStatus, "packaged genesis synchronization status was not observed");
+  assert.equal(
+    genesisSyncStatus.value.synchronized,
+    true,
+    `packaged genesis synchronization did not reach READY: ${JSON.stringify(genesisSyncStatus.value)}`,
+  );
+  assert.equal(genesisSyncStatus.value.cursor_height, 0);
+  assert.equal(genesisSyncStatus.value.cursor_hash, genesisSyncStatus.value.canonical_hash);
+
   let peerStatus;
   for (let attempt = 0; attempt < 120; attempt += 1) {
     const result = await nativeResult("node_peer_status", {});
@@ -248,7 +272,7 @@ try {
   let syncStatus;
   for (let attempt = 0; attempt < 120; attempt += 1) {
     const syncStart = await nativeResult("wallet_sync_start", {});
-    if (!syncStart.ok && syncStart.error?.code !== "EMBEDDED_NODE_NOT_READY") {
+    if (!syncStart.ok && syncStart.error?.retryable !== true) {
       throw new Error(`packaged missing-cursor synchronization failed: ${JSON.stringify(syncStart.error)}`);
     }
     syncStatus = await nativeResult("wallet_sync_status", {});
@@ -257,7 +281,11 @@ try {
     await new Promise((done) => setTimeout(done, 500));
   }
   assert.ok(syncStatus, "packaged synchronization status was not observed");
-  assert.equal(syncStatus.value.synchronized, true);
+  assert.equal(
+    syncStatus.value.synchronized,
+    true,
+    `packaged synchronization did not reach READY: ${JSON.stringify(syncStatus.value)}`,
+  );
   assert.equal(syncStatus.value.cursor_height, syncStatus.value.canonical_height);
   assert.equal(syncStatus.value.state, "READY");
   assert.equal(syncStatus.value.last_error, null);

@@ -14,6 +14,7 @@
   },
   "plugins": {
     "updater": {
+      "pubkey": "",
       "endpoints": [
         "https://github.com/sorenplanck/dom-wallet-v3/releases/latest/download/latest.json"
       ]
