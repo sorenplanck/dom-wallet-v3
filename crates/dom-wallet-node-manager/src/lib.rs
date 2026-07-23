@@ -1270,7 +1270,7 @@ mod tests {
     #[test]
     fn missing_manifest_is_rejected_before_promotion() {
         let root = tempdir().unwrap();
-        let manager = enabled_manager(root.path());
+        let manager = enabled_manager(root.path().join("runtime").as_path());
         let current = NodeIdentity {
             node_version: "0.1.2".into(),
             node_revision: "a".repeat(40),
@@ -1380,7 +1380,7 @@ mod tests {
     #[test]
     fn pointer_promotion_rollback_and_data_backup_are_atomic() {
         let root = tempdir().unwrap();
-        let manager = enabled_manager(root.path());
+        let manager = enabled_manager(root.path().join("runtime").as_path());
         let store = manager.store().unwrap();
         store.install("aaaa1111", b"old node fixture").unwrap();
         store.promote("aaaa1111").unwrap();
@@ -1415,7 +1415,7 @@ mod tests {
     #[test]
     fn persisted_node_sequence_rejects_equal_and_lower_feeds_at_runtime_boundary() {
         let root = tempdir().unwrap();
-        let manager = enabled_manager(root.path());
+        let manager = enabled_manager(root.path().join("runtime").as_path());
         let artifact = b"signed node fixture";
         let old_identity = policy_identity("0.1.0", &"b".repeat(40));
         let accepted = policy_feed(8, "0.1.1", &"c".repeat(40), artifact);
