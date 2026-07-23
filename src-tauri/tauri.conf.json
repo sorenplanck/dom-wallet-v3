@@ -9,7 +9,7 @@
   },
   "app": { "windows": [{ "label": "main", "title": "DOM Wallet V3", "width": 1100, "height": 760 }] },
   "bundle": {
-    "createUpdaterArtifacts": true,
+    "createUpdaterArtifacts": false,
     "icon": ["../frontend/assets/dom-coin.png", "icons/icon.ico"]
   },
   "plugins": {
