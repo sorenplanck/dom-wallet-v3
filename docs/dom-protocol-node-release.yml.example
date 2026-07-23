@@ -29,10 +29,12 @@ jobs:
           cargo clippy --workspace --all-targets --locked -- -D warnings
           cargo test --workspace --all-targets --locked
 
-  # Production implementation must add a protected environment, pinned
-  # multi-platform builders, TAURI_SIGNING_PRIVATE_KEY (or the reviewed
-  # node-specific Minisign equivalent), detached signatures, SHA-256 and byte
-  # lengths, offline manifest verification and atomic draft-to-public promotion.
-  # node-latest.json must bind the immutable commit, compatibility fields,
-  # platform artifacts and monotonic sequence. A commit or branch build is never
-  # an update source, and this workflow must never publish a Wallet release.
+  # Production implementation must add pinned multi-platform builders, generate
+  # each sidecar manifest from the exact final binary, and consume detached
+  # signatures produced offline by the release operator. No private signing key
+  # may enter GitHub Actions or repository secrets: CI verifies with compiled
+  # public keys and never signs. SHA-256, byte lengths and signatures must pass
+  # before atomic draft-to-public promotion. node-latest.json must bind the
+  # immutable commit, compatibility fields, platform artifacts and monotonic
+  # sequence. A commit or branch build is never an update source, and this
+  # workflow must never publish a Wallet release.
