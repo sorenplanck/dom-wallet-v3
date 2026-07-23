@@ -220,6 +220,7 @@ struct MiningRuntime {
     hash_attempts: Arc<AtomicU64>,
     accepted_blocks: Arc<AtomicU64>,
     rejected_work: Arc<AtomicU64>,
+    template_refreshes: Arc<AtomicU64>,
     last_candidate_time: Arc<AtomicU64>,
     last_accepted_height: Arc<AtomicU64>,
     started_at: Arc<AtomicU64>,
@@ -235,6 +236,7 @@ impl Default for MiningRuntime {
             hash_attempts: Arc::new(AtomicU64::new(0)),
             accepted_blocks: Arc::new(AtomicU64::new(0)),
             rejected_work: Arc::new(AtomicU64::new(0)),
+            template_refreshes: Arc::new(AtomicU64::new(0)),
             last_candidate_time: Arc::new(AtomicU64::new(0)),
             last_accepted_height: Arc::new(AtomicU64::new(u64::MAX)),
             started_at: Arc::new(AtomicU64::new(0)),
@@ -268,6 +270,7 @@ pub struct MiningStatusDto {
     pub connected_peers: u64,
     pub accepted_blocks: u64,
     pub rejected_work: u64,
+    pub template_refreshes: u64,
     pub last_block_candidate_time: Option<u64>,
     pub last_accepted_block_height: Option<u64>,
     pub uptime_seconds: u64,
@@ -803,6 +806,7 @@ impl DesktopApplication {
             connected_peers: peer_status.connected_total,
             accepted_blocks: mining.accepted_blocks.load(Ordering::Relaxed),
             rejected_work: mining.rejected_work.load(Ordering::Relaxed),
+            template_refreshes: mining.template_refreshes.load(Ordering::Relaxed),
             last_block_candidate_time: (last_candidate > 0).then_some(last_candidate),
             last_accepted_block_height: (last_height != u64::MAX).then_some(last_height),
             uptime_seconds: uptime,
@@ -838,6 +842,11 @@ impl DesktopApplication {
             .map_err(|_| CommandError::Unavailable)?
             .embedded_node_handle()
             .map_err(CommandError::from)?;
+        if node.metrics.peer_count.load(Ordering::Acquire) == 0
+            || node.metrics.ibd_progress_percent.load(Ordering::Acquire) < 100
+        {
+            return Err(CommandError::NodeNotReady);
+        }
         let mut mining = self.mining.lock().map_err(|_| CommandError::Unavailable)?;
         if mining.worker.is_some()
             || matches!(
@@ -851,6 +860,7 @@ impl DesktopApplication {
         mining.hash_attempts.store(0, Ordering::Release);
         mining.accepted_blocks.store(0, Ordering::Release);
         mining.rejected_work.store(0, Ordering::Release);
+        mining.template_refreshes.store(0, Ordering::Release);
         mining.last_candidate_time.store(0, Ordering::Release);
         mining
             .last_accepted_height
@@ -864,6 +874,7 @@ impl DesktopApplication {
         let attempts = Arc::clone(&mining.hash_attempts);
         let accepted = Arc::clone(&mining.accepted_blocks);
         let rejected = Arc::clone(&mining.rejected_work);
+        let refreshes = Arc::clone(&mining.template_refreshes);
         let candidate_time = Arc::clone(&mining.last_candidate_time);
         let accepted_height = Arc::clone(&mining.last_accepted_height);
         let state = Arc::clone(&mining.state);
@@ -885,6 +896,7 @@ impl DesktopApplication {
                     };
                     node.metrics.mining_active.store(1, Ordering::Release);
                     state.store(MINING_RUNNING, Ordering::Release);
+                    let mut coinbase_candidate = None;
                     while !stop.load(Ordering::Acquire) {
                         let height = node
                             .metrics
@@ -892,10 +904,23 @@ impl DesktopApplication {
                             .load(Ordering::Acquire)
                             .saturating_add(1);
                         candidate_time.store(unix_seconds(), Ordering::Release);
-                        let coinbase = service.lock().map_err(|_| ()).and_then(|mut wallet| {
-                            wallet.mining_coinbase_candidate(height).map_err(|_| ())
-                        });
-                        let Ok(coinbase) = coinbase else {
+                        if coinbase_candidate
+                            .as_ref()
+                            .is_none_or(|(candidate_height, _)| *candidate_height != height)
+                        {
+                            let coinbase = service.lock().map_err(|_| ()).and_then(|mut wallet| {
+                                wallet.mining_coinbase_candidate(height).map_err(|_| ())
+                            });
+                            let Ok(coinbase) = coinbase else {
+                                state.store(MINING_ERROR, Ordering::Release);
+                                if let Ok(mut error) = error_code.lock() {
+                                    *error = Some("MINING_COINBASE_PREPARATION_FAILED".into());
+                                }
+                                break;
+                            };
+                            coinbase_candidate = Some((height, coinbase));
+                        }
+                        let Some((_, coinbase)) = coinbase_candidate.as_ref() else {
                             state.store(MINING_ERROR, Ordering::Release);
                             if let Ok(mut error) = error_code.lock() {
                                 *error = Some("MINING_COINBASE_PREPARATION_FAILED".into());
@@ -912,9 +937,18 @@ impl DesktopApplication {
                             Ok(WalletMiningOutcome::Accepted { height }) => {
                                 accepted.fetch_add(1, Ordering::Relaxed);
                                 accepted_height.store(height, Ordering::Release);
+                                coinbase_candidate = None;
                             }
                             Ok(WalletMiningOutcome::Rejected { .. }) => {
                                 rejected.fetch_add(1, Ordering::Relaxed);
+                                coinbase_candidate = None;
+                            }
+                            Ok(WalletMiningOutcome::Stale { .. }) => {
+                                rejected.fetch_add(1, Ordering::Relaxed);
+                                coinbase_candidate = None;
+                            }
+                            Ok(WalletMiningOutcome::TemplateExpired { .. }) => {
+                                refreshes.fetch_add(1, Ordering::Relaxed);
                             }
                             Ok(WalletMiningOutcome::Stopped) => break,
                             Err(_) => {

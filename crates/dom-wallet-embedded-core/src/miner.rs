@@ -16,13 +16,17 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc, Arc,
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+
+const TEMPLATE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WalletMiningOutcome {
     Accepted { height: u64 },
     Rejected { height: u64 },
+    Stale { height: u64 },
+    TemplateExpired { height: u64 },
     Stopped,
 }
 
@@ -42,7 +46,7 @@ pub enum WalletMiningError {
 /// the exact point real RandomX work is performed.
 pub async fn mine_wallet_block(
     node: Arc<DomNode>,
-    coinbase: CoinbaseTransaction,
+    coinbase: &CoinbaseTransaction,
     threads: usize,
     stop_requested: Arc<AtomicBool>,
     hash_attempts: Arc<AtomicU64>,
@@ -90,7 +94,7 @@ pub async fn mine_wallet_block(
         .map_err(|_| WalletMiningError::Preparation("DIFFICULTY"))?;
     let transactions = Vec::new();
     let (output_root, kernel_root, rangeproof_root) =
-        compute_block_pmmr_roots(BlockHeight(height), &coinbase, &transactions)
+        compute_block_pmmr_roots(BlockHeight(height), coinbase, &transactions)
             .map_err(|_| WalletMiningError::Preparation("PMMR_ROOTS"))?;
     let template = BlockHeader {
         version: dom_core::PROTOCOL_VERSION,
@@ -110,6 +114,8 @@ pub async fn mine_wallet_block(
     };
 
     let round_stop = Arc::new(AtomicBool::new(false));
+    let template_started = Instant::now();
+    let require_network_ready = node.config.network == dom_config::Network::Mainnet;
     let (sender, receiver) = mpsc::channel();
     let mut workers = Vec::with_capacity(threads);
     for worker_id in 0..threads {
@@ -121,6 +127,7 @@ pub async fn mine_wallet_block(
         let external_stop = Arc::clone(&stop_requested);
         let attempts = Arc::clone(&hash_attempts);
         let result_sender = sender.clone();
+        let worker_node = Arc::clone(&node);
         workers.push(
             std::thread::Builder::new()
                 .name(format!("dom-wallet-miner-{worker_id}"))
@@ -130,6 +137,17 @@ pub async fn mine_wallet_block(
                     let stride = threads as u64;
                     while !worker_stop.load(Ordering::Acquire)
                         && !external_stop.load(Ordering::Acquire)
+                        && template_is_current(
+                            tip_height.0,
+                            worker_node.metrics.chain_height.load(Ordering::Acquire),
+                            worker_node.metrics.peer_count.load(Ordering::Acquire),
+                            worker_node
+                                .metrics
+                                .ibd_progress_percent
+                                .load(Ordering::Acquire),
+                            require_network_ready,
+                            template_started.elapsed(),
+                        )
                     {
                         header.pow.nonce = nonce;
                         let preimage = header.pow_preimage();
@@ -181,6 +199,15 @@ pub async fn mine_wallet_block(
     let Some(header) = winning_header else {
         return if stop_requested.load(Ordering::Acquire) {
             Ok(WalletMiningOutcome::Stopped)
+        } else if require_network_ready
+            && (node.metrics.peer_count.load(Ordering::Acquire) == 0
+                || node.metrics.ibd_progress_percent.load(Ordering::Acquire) < 100)
+        {
+            Err(WalletMiningError::Preparation("NODE_NOT_SYNCHRONIZED"))
+        } else if node.metrics.chain_height.load(Ordering::Acquire) != tip_height.0 {
+            Ok(WalletMiningOutcome::Stale { height })
+        } else if template_started.elapsed() >= TEMPLATE_REFRESH_INTERVAL {
+            Ok(WalletMiningOutcome::TemplateExpired { height })
         } else {
             Err(WalletMiningError::Worker)
         };
@@ -188,7 +215,7 @@ pub async fn mine_wallet_block(
 
     let block = Block {
         header,
-        coinbase,
+        coinbase: coinbase.clone(),
         transactions,
     };
     let outcome = {
@@ -215,9 +242,51 @@ pub async fn mine_wallet_block(
     }
 }
 
+fn template_is_current(
+    tip_height: u64,
+    current_height: u64,
+    peer_count: u64,
+    ibd_progress_percent: u64,
+    require_network_ready: bool,
+    elapsed: Duration,
+) -> bool {
+    tip_height == current_height
+        && elapsed < TEMPLATE_REFRESH_INTERVAL
+        && (!require_network_ready || (peer_count > 0 && ibd_progress_percent >= 100))
+}
+
 fn now_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn template_lifecycle_rejects_stale_unsynced_and_expired_work() {
+        assert!(template_is_current(
+            7,
+            7,
+            1,
+            100,
+            true,
+            Duration::from_secs(29)
+        ));
+        assert!(!template_is_current(7, 8, 1, 100, true, Duration::ZERO));
+        assert!(!template_is_current(7, 7, 0, 100, true, Duration::ZERO));
+        assert!(!template_is_current(7, 7, 1, 99, true, Duration::ZERO));
+        assert!(!template_is_current(
+            7,
+            7,
+            1,
+            100,
+            true,
+            TEMPLATE_REFRESH_INTERVAL
+        ));
+        assert!(template_is_current(7, 7, 0, 0, false, Duration::ZERO));
+    }
 }

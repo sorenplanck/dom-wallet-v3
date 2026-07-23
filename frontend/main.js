@@ -173,6 +173,7 @@ const renderMining = (value) => {
   byId("mining-peers").textContent = value.connected_peers;
   byId("mining-accepted").textContent = value.accepted_blocks;
   byId("mining-rejected").textContent = value.rejected_work;
+  byId("mining-template-refreshes").textContent = value.template_refreshes;
   byId("mining-candidate").textContent = value.last_block_candidate_time ? new Date(value.last_block_candidate_time * 1000).toLocaleString() : "Never";
   byId("mining-last-height").textContent = value.last_accepted_block_height ?? "—";
   byId("mining-uptime").textContent = `${value.uptime_seconds}s`;
