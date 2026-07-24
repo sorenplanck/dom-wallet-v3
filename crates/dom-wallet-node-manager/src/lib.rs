@@ -1149,7 +1149,7 @@ try {
 $current=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $allowed=@($current,'S-1-5-18','S-1-5-32-544')
 $write=[Security.AccessControl.FileSystemRights]::Write -bor [Security.AccessControl.FileSystemRights]::Modify -bor [Security.AccessControl.FileSystemRights]::FullControl -bor [Security.AccessControl.FileSystemRights]::ChangePermissions -bor [Security.AccessControl.FileSystemRights]::TakeOwnership
-$items=@(Get-Item -LiteralPath $args[0] -Force)+@(Get-ChildItem -LiteralPath $args[0] -Force -Recurse)
+$items=@(Get-Item -LiteralPath $env:DOM_RUNTIME_ACL_PATH -Force)+@(Get-ChildItem -LiteralPath $env:DOM_RUNTIME_ACL_PATH -Force -Recurse)
 foreach($item in $items){
   $acl=Get-Acl -LiteralPath $item.FullName
   $owner=([Security.Principal.NTAccount]$acl.Owner).Translate([Security.Principal.SecurityIdentifier]).Value
@@ -1165,6 +1165,7 @@ exit 0
         .env_clear()
         .env("SystemRoot", &system_root)
         .env("WINDIR", &system_root)
+        .env("DOM_RUNTIME_ACL_PATH", root)
         .arg("-NoLogo")
         .arg("-NoProfile")
         .arg("-NonInteractive")
@@ -1172,7 +1173,6 @@ exit 0
         .arg("Bypass")
         .arg("-Command")
         .arg(script)
-        .arg(root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1200,7 +1200,7 @@ try {
   Import-Module -Name "$env:SystemRoot\System32\WindowsPowerShell\v1.0\Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1" -ErrorAction Stop
 } catch { exit 50 }
 try { $identity=[Security.Principal.WindowsIdentity]::GetCurrent() } catch { exit 51 }
-try { $acl=Get-Acl -LiteralPath $args[0] } catch { exit 52 }
+try { $acl=Get-Acl -LiteralPath $env:DOM_RUNTIME_ACL_PATH } catch { exit 52 }
 try {
   $acl.SetAccessRuleProtection($true,$false)
   foreach($rule in @($acl.Access)){[void]$acl.RemoveAccessRuleSpecific($rule)}
@@ -1215,13 +1215,14 @@ try {
     [void]$acl.AddAccessRule($rule)
   }
 } catch { exit 55 }
-try { Set-Acl -LiteralPath $args[0] -AclObject $acl } catch { exit 56 }
+try { Set-Acl -LiteralPath $env:DOM_RUNTIME_ACL_PATH -AclObject $acl } catch { exit 56 }
 exit 0
 "#;
     let status = Command::new(powershell)
         .env_clear()
         .env("SystemRoot", &system_root)
         .env("WINDIR", &system_root)
+        .env("DOM_RUNTIME_ACL_PATH", root)
         .arg("-NoLogo")
         .arg("-NoProfile")
         .arg("-NonInteractive")
@@ -1229,7 +1230,6 @@ exit 0
         .arg("Bypass")
         .arg("-Command")
         .arg(script)
-        .arg(root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
