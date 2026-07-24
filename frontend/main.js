@@ -153,9 +153,15 @@ const refreshSummary = async () => {
     : "No peers found";
   byId("canonical-height").textContent = network.canonical_height;
   byId("cursor-height").textContent = synchronization.cursor_height ?? "Not initialized";
-  byId("sync-status").textContent = synchronization.synchronized
-    ? `Wallet synchronized at height ${synchronization.cursor_height}`
-    : synchronization.last_error ?? "Not synchronized";
+  const peerHeight = peers.highest_known_peer_height ?? network.canonical_height;
+  const progress = peerHeight > 0
+    ? Math.min(100, Math.floor((network.canonical_height * 100) / peerHeight))
+    : 0;
+  byId("sync-status").textContent = peerHeight > network.canonical_height
+    ? `Synchronizing ${network.canonical_height} / ${peerHeight} (${progress}%)`
+    : synchronization.synchronized
+      ? `Wallet synchronized at height ${synchronization.cursor_height}`
+      : synchronization.last_error ?? "Preparing wallet synchronization";
   byId("settings-chain-id").textContent = network.chain_id;
   byId("settings-genesis").textContent = network.genesis_hash;
   byId("settings-node-data").textContent = network.data_directory;
@@ -357,6 +363,9 @@ nativeBridge.initialize()
     document.documentElement.dataset.nativeBridge = nativeBridge.state;
     show(redactedError(error), true);
   });
-const refresh = async () => { try { await refreshNode(); await refreshMining(); } catch { /* wallet or node may not be open */ } refreshTimer = setTimeout(refresh, 15000); };
+const refresh = async () => {
+  await Promise.allSettled([refreshSummary(), refreshNode(), refreshMining()]);
+  refreshTimer = setTimeout(refresh, 15000);
+};
 refreshTimer = setTimeout(refresh, 15000);
 window.addEventListener("beforeunload", () => { clearTimeout(refreshTimer); clearPhrase(); clearSecretForms(); stopScanner(); }, { once: true });

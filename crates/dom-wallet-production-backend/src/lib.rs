@@ -96,6 +96,12 @@ impl ProductionWalletBackend {
         &self.identity
     }
 
+    /// Refresh the canonical tip while requiring every immutable chain identity
+    /// field to remain equal to the identity validated at startup.
+    pub fn current_identity(&self) -> Result<CoreChainIdentity, ProductionBackendError> {
+        Ok(self.chain.current_identity()?)
+    }
+
     pub fn is_ready(&self) -> Result<bool, ProductionBackendError> {
         Ok(self.lifecycle.is_ready_for_wallet_operations()?)
     }

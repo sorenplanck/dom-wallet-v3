@@ -326,8 +326,9 @@ impl WalletService {
     pub fn embedded_core_identity(&self) -> Result<CoreChainIdentity, CoreError> {
         self.backend
             .as_ref()
-            .map(|backend| backend.identity().clone())
-            .ok_or(CoreError::EmbeddedCoreRequired)
+            .ok_or(CoreError::EmbeddedCoreRequired)?
+            .current_identity()
+            .map_err(CoreError::from)
     }
 
     pub fn embedded_core_ready(&self) -> Result<bool, CoreError> {

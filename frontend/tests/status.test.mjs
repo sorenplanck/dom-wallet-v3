@@ -8,6 +8,14 @@ test("frontend source contains no durable browser storage access", async () => {
   assert.equal(source.includes("indexedDB"), false);
 });
 
+test("dashboard refreshes live IBD progress every fifteen seconds", async () => {
+  const source = await (await import("node:fs/promises")).readFile(new URL("../main.js", import.meta.url), "utf8");
+  assert.equal(source.includes("peers.highest_known_peer_height ?? network.canonical_height"), true);
+  assert.equal(source.includes("`Synchronizing ${network.canonical_height} / ${peerHeight} (${progress}%)`"), true);
+  assert.equal(source.includes("Promise.allSettled([refreshSummary(), refreshNode(), refreshMining()])"), true);
+  assert.equal(source.includes("setTimeout(refresh, 15000)"), true);
+});
+
 test("settings expose separate fail-closed Wallet and node update states", async () => {
   const { readFile } = await import("node:fs/promises");
   const [html, js] = await Promise.all([

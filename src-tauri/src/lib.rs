@@ -426,6 +426,9 @@ pub struct EmbeddedNodeStatusDto {
     pub error_code: Option<String>,
     pub connected_peers: u64,
     pub bootstrap_phase: String,
+    pub highest_known_peer_height: Option<u64>,
+    pub synchronization_progress_percent: Option<u64>,
+    pub status_message: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -972,15 +975,15 @@ impl DesktopApplication {
         let ready = service.embedded_core_ready().unwrap_or(false);
         let diagnostic = service.diagnostics();
         let peers = service.embedded_peer_status().map_err(CommandError::from)?;
-        let lifecycle = if ready {
-            WalletReadinessDto::Ready
-        } else if diagnostic.application_state == "SYNCHRONIZING" {
-            WalletReadinessDto::Synchronizing
-        } else {
-            WalletReadinessDto::Starting
-        };
+        let synchronization = node_synchronization_status(
+            identity.current_tip.height,
+            peers.highest_known_peer_height,
+            peers.connected_total,
+            ready,
+        );
+        let expected_initial_sync = synchronization.lifecycle == WalletReadinessDto::Synchronizing;
         Ok(EmbeddedNodeStatusDto {
-            lifecycle,
+            lifecycle: synchronization.lifecycle,
             network: Some(core_network_name(identity.network).into()),
             chain_id: Some(hex::encode(identity.chain_id)),
             genesis_hash: Some(hex::encode(identity.genesis_hash)),
@@ -989,9 +992,14 @@ impl DesktopApplication {
             protocol_version: Some(identity.protocol_version),
             range_proof_version: Some(identity.range_proof_serialization_version),
             ready,
-            error_code: diagnostic.last_error.map(|_| "CORE_NOT_READY".into()),
+            error_code: (!ready && !expected_initial_sync)
+                .then(|| diagnostic.last_error.map(|_| "CORE_NOT_READY".into()))
+                .flatten(),
             connected_peers: peers.connected_total,
             bootstrap_phase: peers.bootstrap_phase.into(),
+            highest_known_peer_height: synchronization.highest_known_peer_height,
+            synchronization_progress_percent: synchronization.progress_percent,
+            status_message: synchronization.message,
         })
     }
 
@@ -1063,7 +1071,7 @@ impl DesktopApplication {
                 .collect(),
             canonical_height: status.canonical_height,
             highest_known_peer_height: (status.connected_total > 0)
-                .then_some(status.canonical_height),
+                .then_some(status.highest_known_peer_height),
             peer_addresses: status.peer_addresses,
         })
     }
@@ -1718,6 +1726,54 @@ fn stopped_node_status() -> EmbeddedNodeStatusDto {
         error_code: None,
         connected_peers: 0,
         bootstrap_phase: "STOPPED".into(),
+        highest_known_peer_height: None,
+        synchronization_progress_percent: None,
+        status_message: "Node stopped".into(),
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct NodeSynchronizationStatus {
+    lifecycle: WalletReadinessDto,
+    highest_known_peer_height: Option<u64>,
+    progress_percent: Option<u64>,
+    message: String,
+}
+
+fn node_synchronization_status(
+    local_height: u64,
+    peer_height: u64,
+    connected_peers: u64,
+    ready: bool,
+) -> NodeSynchronizationStatus {
+    let observed_peer_height = (connected_peers > 0).then_some(peer_height);
+    if connected_peers > 0 && peer_height > local_height {
+        let progress_percent = ((u128::from(local_height) * 100) / u128::from(peer_height)) as u64;
+        return NodeSynchronizationStatus {
+            lifecycle: WalletReadinessDto::Synchronizing,
+            highest_known_peer_height: observed_peer_height,
+            progress_percent: Some(progress_percent),
+            message: format!("Synchronizing {local_height} / {peer_height} ({progress_percent}%)"),
+        };
+    }
+    if ready {
+        return NodeSynchronizationStatus {
+            lifecycle: WalletReadinessDto::Ready,
+            highest_known_peer_height: observed_peer_height,
+            progress_percent: observed_peer_height.map(|_| 100),
+            message: format!("Ready at height {local_height}"),
+        };
+    }
+    let message = if connected_peers > 0 {
+        format!("Connected; waiting for synchronization status at height {local_height}")
+    } else {
+        "Discovering peers".into()
+    };
+    NodeSynchronizationStatus {
+        lifecycle: WalletReadinessDto::Starting,
+        highest_known_peer_height: observed_peer_height,
+        progress_percent: None,
+        message,
     }
 }
 
@@ -2067,7 +2123,7 @@ mod tests {
     fn native_bridge_probe_is_static_redacted_and_versioned() {
         let status = native_bridge_status();
         assert_eq!(status.bridge, "ready");
-        assert_eq!(status.app_version, "0.2.1");
+        assert_eq!(status.app_version, "0.2.2");
         fn assert_serializable<T: serde::Serialize>(_: &T) {}
         assert_serializable(&status);
     }
@@ -2075,7 +2131,7 @@ mod tests {
     #[test]
     fn build_and_update_status_are_separate_redacted_channels() {
         let build = get_build_info();
-        assert_eq!(build.wallet_version, "0.2.1");
+        assert_eq!(build.wallet_version, "0.2.2");
         assert_eq!(build.embedded_node_revision, EMBEDDED_NODE_REVISION);
         assert_eq!(build.update_channel, "stable");
 
@@ -2278,6 +2334,34 @@ mod tests {
         let rendered = error.to_string();
         assert!(!rendered.contains("password-contains-secret"));
         assert!(!rendered.contains("secret"));
+    }
+
+    #[test]
+    fn node_status_reports_live_initial_block_download_progress() {
+        let status = node_synchronization_status(1_008, 6_622, 1, false);
+
+        assert_eq!(status.lifecycle, WalletReadinessDto::Synchronizing);
+        assert_eq!(status.highest_known_peer_height, Some(6_622));
+        assert_eq!(status.progress_percent, Some(15));
+        assert_eq!(status.message, "Synchronizing 1008 / 6622 (15%)");
+    }
+
+    #[test]
+    fn node_status_never_claims_ready_while_peer_tip_is_ahead() {
+        let status = node_synchronization_status(50, 100, 1, true);
+
+        assert_eq!(status.lifecycle, WalletReadinessDto::Synchronizing);
+        assert_eq!(status.progress_percent, Some(50));
+    }
+
+    #[test]
+    fn node_status_is_readable_while_discovering_peers() {
+        let status = node_synchronization_status(0, 0, 0, false);
+
+        assert_eq!(status.lifecycle, WalletReadinessDto::Starting);
+        assert_eq!(status.highest_known_peer_height, None);
+        assert_eq!(status.progress_percent, None);
+        assert_eq!(status.message, "Discovering peers");
     }
 
     #[test]

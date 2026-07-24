@@ -224,6 +224,7 @@ pub struct EmbeddedPeerStatus {
     pub bootstrap_phase: &'static str,
     pub peer_addresses: Vec<String>,
     pub canonical_height: u64,
+    pub highest_known_peer_height: u64,
     pub seed_resolution_states: Vec<&'static str>,
 }
 
@@ -524,6 +525,7 @@ impl EmbeddedCoreLifecycle {
         let connected_outbound = node.metrics.outbound_peers.load(Ordering::Relaxed);
         let connected_total = node.metrics.peer_count.load(Ordering::Relaxed);
         let canonical_height = node.metrics.chain_height.load(Ordering::Relaxed);
+        let highest_known_peer_height = node.metrics.best_known_peer_height.load(Ordering::Relaxed);
         let known_peers = node
             .pex
             .try_lock()
@@ -549,6 +551,7 @@ impl EmbeddedCoreLifecycle {
             bootstrap_phase: bootstrap_phase(connected_total),
             peer_addresses,
             canonical_height,
+            highest_known_peer_height,
             seed_resolution_states: self
                 .seed_resolution
                 .iter()
@@ -1157,6 +1160,25 @@ mod tests {
             assert_eq!(bootstrap_phase(1), "CONNECTED");
         }
         assert_eq!(bootstrap_phase(0), "DISCOVERING_PEERS");
+    }
+
+    #[test]
+    fn peer_status_reads_live_chain_and_peer_height_metrics() {
+        let directory = TempDir::new().expect("temporary directory");
+        let mut lifecycle = EmbeddedCoreLifecycle::new(regtest_configuration(directory.path()));
+        lifecycle.start().expect("Regtest embedded node starts");
+        let node = lifecycle.node_handle().expect("node handle");
+
+        node.metrics.chain_height.store(1_008, Ordering::Release);
+        node.metrics
+            .best_known_peer_height
+            .store(6_622, Ordering::Release);
+        let status = lifecycle.peer_status().expect("live peer status");
+
+        assert_eq!(status.canonical_height, 1_008);
+        assert_eq!(status.highest_known_peer_height, 6_622);
+        lifecycle.request_shutdown().expect("shutdown request");
+        lifecycle.wait_for_shutdown().expect("shutdown");
     }
 
     #[test]
