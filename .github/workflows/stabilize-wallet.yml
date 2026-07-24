@@ -121,7 +121,16 @@ jobs:
           cargo test --locked -p dom-wallet-node-manager release_build_has_no_runtime_key_or_environment_activation_seam -- --test-threads=1
           cargo test --locked -p dom-wallet-node-manager runtime_security_rejects_writable_or_redirected_subdirectories -- --test-threads=1
           cargo test --locked -p dom-wallet-node-manager pointer_promotion_rollback_and_data_backup_are_atomic -- --test-threads=1
-          cargo build --manifest-path dom-protocol-sidecar/Cargo.toml --locked -p dom-node --bin dom-node
+          $previousRustflags = $env:RUSTFLAGS
+          try {
+            # Windows PE executables default to a 1 MiB stack. The canonical
+            # dom-node async entry point requires the same 8 MiB stack budget
+            # it receives by default on Linux.
+            $env:RUSTFLAGS = "-C link-arg=/STACK:8388608"
+            cargo build --manifest-path dom-protocol-sidecar/Cargo.toml --locked -p dom-node --bin dom-node
+          } finally {
+            $env:RUSTFLAGS = $previousRustflags
+          }
           $env:DOM_TEST_SIDECAR_BINARY = (Resolve-Path "dom-protocol-sidecar/target/debug/dom-node.exe").Path
           cargo test --locked -p dom-wallet-node-manager pinned_sidecar_process_reports_identity_and_rolls_back -- --ignored --test-threads=1
       - name: Build unsigned installers without publishing

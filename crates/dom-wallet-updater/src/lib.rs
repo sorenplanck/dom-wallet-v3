@@ -746,6 +746,9 @@ pub fn persist_update_state(path: &Path, state: &UpdateMetadataState) -> Result<
 }
 
 fn sync_directory(path: &Path) -> Result<(), UpdateError> {
+    #[cfg(not(unix))]
+    let _ = path;
+
     #[cfg(unix)]
     {
         fs::File::open(path)
