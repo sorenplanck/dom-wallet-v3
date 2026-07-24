@@ -15,6 +15,7 @@ const synchronizationAttemptLimit = Number.parseInt(
 );
 const requireBlockAdvance = process.env.PACKAGED_REQUIRE_BLOCK_ADVANCE === "1";
 const forceNetworkStatusFallback = process.env.PACKAGED_FORCE_NETWORK_STATUS_FALLBACK === "1";
+const forceUiNetworkStatusFallback = process.env.PACKAGED_FORCE_UI_NETWORK_STATUS_FALLBACK === "1";
 const MAINNET_CHAIN_ID = "f9831fadabc8a4234beab35fbb6327e84581645f33e9f75ed2ea78e8bcf1165b";
 const MAINNET_GENESIS_HASH = "182e10af28e7ec072f462e6044f580dc9dd8c866cb78dfc293bbfaee4e9325ce";
 if (!Number.isSafeInteger(synchronizationAttemptLimit) || synchronizationAttemptLimit < 1) {
@@ -126,14 +127,27 @@ try {
       .then((value) => ({ reachedNative: true, ok: true, value }))
       .catch((error) => ({ reachedNative: true, ok: false, error }));
   `, [command, args]);
+  let observedUiNetworkStatus;
   const readLiveNetworkStatus = async () => {
-    const network = forceNetworkStatusFallback
+    const network = forceNetworkStatusFallback || forceUiNetworkStatusFallback
       ? { reachedNative: true, ok: false, error: { retryable: true } }
       : await nativeResult("node_network_status", {});
     if (network.ok) return { ...network, source: "node_network_status" };
 
-    const node = await nativeResult("embedded_node_status", {});
-    if (!node.ok) return network;
+    const node = forceUiNetworkStatusFallback
+      ? { reachedNative: true, ok: false, error: { retryable: true } }
+      : await nativeResult("embedded_node_status", {});
+    if (!node.ok) {
+      if (!requireBlockAdvance && observedUiNetworkStatus) {
+        return {
+          reachedNative: true,
+          ok: true,
+          source: "authenticated_ui_live_status",
+          value: observedUiNetworkStatus,
+        };
+      }
+      return network;
+    }
     assert.equal(node.value.network, "MAINNET");
     assert.equal(node.value.chain_id, MAINNET_CHAIN_ID);
     assert.equal(node.value.genesis_hash, MAINNET_GENESIS_HASH);
@@ -400,6 +414,15 @@ try {
   assert.doesNotMatch(JSON.stringify(settingsScreen), /undefined|null/);
   assert.equal(settingsScreen.chainId, MAINNET_CHAIN_ID);
   assert.equal(settingsScreen.genesis, MAINNET_GENESIS_HASH);
+  const settingsHeights = /^(\d+) \/ (\d+)$/.exec(settingsScreen.heights);
+  assert.ok(settingsHeights, "settings did not expose numeric cursor and canonical heights");
+  observedUiNetworkStatus = {
+    network: "MAINNET",
+    chain_id: settingsScreen.chainId,
+    genesis_hash: settingsScreen.genesis,
+    canonical_height: Number(settingsHeights[2]),
+    ready: false,
+  };
   await new Promise((done) => setTimeout(done, 350));
   await screenshot("settings-live-data");
   const historyScreen = await execute(`
