@@ -3,6 +3,7 @@ import QrScanner from "qr-scanner";
 import { nativeBridge } from "./bridge.js";
 import {
   formatDomFromNoms,
+  liveStatusProjection,
   miningPresentation,
   nodeStatusText,
   synchronizationPresentation,
@@ -151,33 +152,24 @@ byId("unlock-form").addEventListener("submit", async (event) => {
 });
 
 const refreshSummary = async () => {
-  const [summaryResult, networkResult, peersResult, synchronizationResult] = await Promise.allSettled([
-    invoke("wallet_summary"), invoke("node_network_status"), invoke("node_peer_status"), invoke("wallet_sync_status")
+  const [summaryResult, nodeResult, networkResult, peersResult, synchronizationResult] = await Promise.allSettled([
+    invoke("wallet_summary"), invoke("embedded_node_status"), invoke("node_network_status"),
+    invoke("node_peer_status"), invoke("wallet_sync_status")
   ]);
   if (summaryResult.status !== "fulfilled") throw summaryResult.reason;
   const summary = summaryResult.value;
-  const nodeAvailable = networkResult.status === "fulfilled"
-    && peersResult.status === "fulfilled"
-    && synchronizationResult.status === "fulfilled";
-  if (!nodeAvailable) {
-    byId("network-identity").textContent = `${summary.network} · NODE UNAVAILABLE`;
-    byId("connection-status").textContent = "Node unavailable";
-    byId("canonical-height").textContent = "—";
-    byId("cursor-height").textContent = "—";
-    byId("sync-status").textContent = "Waiting for the embedded node";
-    byId("settings-chain-id").textContent = "—";
-    byId("settings-genesis").textContent = "—";
-    byId("settings-peer-count").textContent = "0";
-    byId("settings-bootstrap").textContent = "UNAVAILABLE";
-    byId("settings-heights").textContent = "— / —";
-  }
-  const network = nodeAvailable ? networkResult.value : undefined;
-  const peers = nodeAvailable ? peersResult.value : undefined;
-  const synchronization = nodeAvailable ? synchronizationResult.value : undefined;
-  const syncPresentation = nodeAvailable
-    ? synchronizationPresentation(network, peers, synchronization)
+  const node = nodeResult.status === "fulfilled" ? nodeResult.value : undefined;
+  const network = networkResult.status === "fulfilled" ? networkResult.value : undefined;
+  const peers = peersResult.status === "fulfilled" ? peersResult.value : undefined;
+  const synchronization = synchronizationResult.status === "fulfilled"
+    ? synchronizationResult.value
     : undefined;
-  latestSynchronizationPresentation = syncPresentation;
+  const liveStatus = liveStatusProjection(summary, node, network, peers, synchronization);
+  if (liveStatus.synchronizationState) {
+    latestSynchronizationPresentation = liveStatus.synchronizationState;
+  } else if (liveStatus.canonicalHeight == null) {
+    latestSynchronizationPresentation = undefined;
+  }
   const balanceLabels = {
     confirmed: "Confirmed",
     immature: "Immature",
@@ -196,20 +188,21 @@ const refreshSummary = async () => {
       : `${label}: unavailable`;
     return card;
   }));
-  if (!nodeAvailable) return;
-  byId("network-identity").textContent = `${summary.network} · ${syncPresentation.badgeState}`;
-  byId("connection-status").textContent = peers.total_connected_peers > 0
-    ? `Connected to ${peers.total_connected_peers} peer${peers.total_connected_peers === 1 ? "" : "s"}`
-    : "No peers found";
-  byId("canonical-height").textContent = network.canonical_height;
-  byId("cursor-height").textContent = synchronization.cursor_height ?? "Not initialized";
-  byId("sync-status").textContent = syncPresentation.message;
-  byId("settings-chain-id").textContent = network.chain_id;
-  byId("settings-genesis").textContent = network.genesis_hash;
-  byId("settings-node-data").textContent = network.data_directory;
-  byId("settings-peer-count").textContent = peers.total_connected_peers;
-  byId("settings-bootstrap").textContent = peers.bootstrap_phase;
-  byId("settings-heights").textContent = `${synchronization.cursor_height ?? "—"} / ${network.canonical_height}`;
+  byId("network-identity").textContent = `${summary.network} · ${liveStatus.badgeState}`;
+  byId("connection-status").textContent = liveStatus.connectedPeers == null
+    ? "Peer status unavailable"
+    : liveStatus.connectedPeers > 0
+      ? `Connected to ${liveStatus.connectedPeers} peer${liveStatus.connectedPeers === 1 ? "" : "s"}`
+      : "No peers found";
+  byId("canonical-height").textContent = liveStatus.canonicalHeight ?? "—";
+  byId("cursor-height").textContent = liveStatus.cursorHeight ?? "Not initialized";
+  byId("sync-status").textContent = liveStatus.message;
+  byId("settings-chain-id").textContent = liveStatus.chainId ?? "—";
+  byId("settings-genesis").textContent = liveStatus.genesisHash ?? "—";
+  if (liveStatus.dataDirectory) byId("settings-node-data").textContent = liveStatus.dataDirectory;
+  byId("settings-peer-count").textContent = liveStatus.connectedPeers ?? "—";
+  byId("settings-bootstrap").textContent = liveStatus.bootstrapPhase ?? "UNAVAILABLE";
+  byId("settings-heights").textContent = `${liveStatus.cursorHeight ?? "—"} / ${liveStatus.canonicalHeight ?? "—"}`;
 };
 const refreshNode = async () => {
   const value = await invoke("embedded_node_status");

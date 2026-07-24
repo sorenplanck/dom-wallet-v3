@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   formatDomFromNoms,
+  liveStatusProjection,
   miningPresentation,
   nodeStatusText,
   synchronizationPresentation,
@@ -16,7 +17,8 @@ test("frontend source contains no durable browser storage access", async () => {
 
 test("dashboard refreshes live IBD progress every fifteen seconds", async () => {
   const source = await (await import("node:fs/promises")).readFile(new URL("../main.js", import.meta.url), "utf8");
-  assert.equal(source.includes("synchronizationPresentation(network, peers, synchronization)"), true);
+  assert.equal(source.includes('invoke("embedded_node_status")'), true);
+  assert.equal(source.includes("liveStatusProjection(summary, node, network, peers, synchronization)"), true);
   assert.equal(source.includes("const tasks = [refreshSummary(), refreshNode(), refreshMining()]"), true);
   assert.equal(source.includes("await Promise.allSettled(tasks)"), true);
   assert.equal(source.includes("setTimeout(refresh, 15000)"), true);
@@ -55,6 +57,29 @@ test("dashboard exposes a synchronization error instead of READY", () => {
   );
   assert.equal(result.badgeState, "ATTENTION");
   assert.equal(result.message, "CURSOR_HASH_MISMATCH");
+});
+
+test("dashboard preserves live node identity when peer or wallet status is transiently unavailable", () => {
+  const result = liveStatusProjection(
+    { cursor_height: 0 },
+    {
+      canonical_tip_height: 1,
+      connected_peers: 1,
+      highest_known_peer_height: 6_706,
+      chain_id: "chain",
+      genesis_hash: "genesis",
+      bootstrap_phase: "CONNECTED",
+    },
+    undefined,
+    undefined,
+    undefined,
+  );
+  assert.equal(result.chainId, "chain");
+  assert.equal(result.genesisHash, "genesis");
+  assert.equal(result.canonicalHeight, 1);
+  assert.equal(result.connectedPeers, 1);
+  assert.equal(result.badgeState, "SYNCHRONIZING");
+  assert.equal(result.message, "Synchronizing 1 / 6706 (0%)");
 });
 
 test("mining controls remain disabled until the real node is ready", () => {

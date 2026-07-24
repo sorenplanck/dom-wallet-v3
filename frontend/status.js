@@ -46,6 +46,69 @@ export function synchronizationPresentation(network, peers, synchronization) {
   };
 }
 
+export function liveStatusProjection(summary, node, network, peers, synchronization) {
+  const nodeHeight = Number.isSafeInteger(node?.canonical_tip_height)
+    ? node.canonical_tip_height
+    : undefined;
+  const networkHeight = Number.isSafeInteger(network?.canonical_height)
+    ? network.canonical_height
+    : undefined;
+  const canonicalHeight = nodeHeight ?? networkHeight;
+  const connectedPeers = Number.isSafeInteger(node?.connected_peers)
+    ? node.connected_peers
+    : Number.isSafeInteger(peers?.total_connected_peers)
+      ? peers.total_connected_peers
+      : undefined;
+  const highestPeerHeight = Number.isSafeInteger(node?.highest_known_peer_height)
+    ? node.highest_known_peer_height
+    : Number.isSafeInteger(peers?.highest_known_peer_height)
+      ? peers.highest_known_peer_height
+      : canonicalHeight;
+  const cursorHeight = synchronization?.cursor_height ?? summary?.cursor_height ?? null;
+
+  const effectiveNetwork = canonicalHeight == null
+    ? undefined
+    : { canonical_height: canonicalHeight };
+  const effectivePeers = canonicalHeight == null
+    ? undefined
+    : {
+        highest_known_peer_height: highestPeerHeight,
+        total_connected_peers: connectedPeers,
+      };
+  const effectiveSynchronization = canonicalHeight == null
+    ? undefined
+    : synchronization ?? {
+        cursor_height: cursorHeight,
+        synchronized: false,
+        last_error: null,
+      };
+  const synchronizationState = effectiveNetwork && effectivePeers && effectiveSynchronization
+    ? synchronizationPresentation(
+        effectiveNetwork,
+        effectivePeers,
+        effectiveSynchronization,
+      )
+    : undefined;
+
+  return {
+    badgeState: synchronizationState?.badgeState
+      ?? (canonicalHeight == null ? "NODE UNAVAILABLE" : "PREPARING"),
+    message: synchronizationState?.message
+      ?? (canonicalHeight == null
+        ? "Waiting for the embedded node"
+        : "Waiting for wallet synchronization status"),
+    synchronizationState,
+    canonicalHeight,
+    cursorHeight,
+    connectedPeers,
+    highestPeerHeight,
+    chainId: node?.chain_id ?? network?.chain_id,
+    genesisHash: node?.genesis_hash ?? network?.genesis_hash,
+    dataDirectory: network?.data_directory,
+    bootstrapPhase: node?.bootstrap_phase ?? peers?.bootstrap_phase,
+  };
+}
+
 export function miningPresentation(mining, node) {
   const lifecycle = node?.lifecycle ?? "NOT_READY";
   const nodeReady = lifecycle === "READY" && node?.ready === true;
