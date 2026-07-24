@@ -52,7 +52,7 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
-          test "$VERSION" = "0.2.2"
+          test "$VERSION" = "0.2.3"
           test "$VERSION" = "$(node -p 'require("./frontend/package.json").version')"
           test "$VERSION" = "$(node -p 'require("./src-tauri/tauri.conf.json").version')"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
