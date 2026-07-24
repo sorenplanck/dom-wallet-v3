@@ -19,6 +19,8 @@ test("dashboard refreshes live IBD progress every fifteen seconds", async () => 
   const source = await (await import("node:fs/promises")).readFile(new URL("../main.js", import.meta.url), "utf8");
   assert.equal(source.includes('invoke("embedded_node_status")'), true);
   assert.equal(source.includes("liveStatusProjection(summary, node, network, peers, synchronization)"), true);
+  assert.equal(source.includes("let latestEmbeddedNodeStatus;"), true);
+  assert.equal(source.includes(": latestEmbeddedNodeStatus;"), true);
   assert.equal(source.includes("const tasks = [refreshSummary(), refreshNode(), refreshMining()]"), true);
   assert.equal(source.includes("await Promise.allSettled(tasks)"), true);
   assert.equal(source.includes("setTimeout(refresh, 15000)"), true);

@@ -44,6 +44,7 @@ let qrFrames = [];
 let qrIndex = 0;
 let phrasePending = false;
 let latestSynchronizationPresentation;
+let latestEmbeddedNodeStatus;
 
 export const clearPasswords = (form) => form?.querySelectorAll('input[type="password"]').forEach((input) => { input.value = ""; });
 export const redactedError = (error) => error?.message && !/password|mnemonic|seed|secret|key|token|credential|:\/\//i.test(error.message)
@@ -158,7 +159,10 @@ const refreshSummary = async () => {
   ]);
   if (summaryResult.status !== "fulfilled") throw summaryResult.reason;
   const summary = summaryResult.value;
-  const node = nodeResult.status === "fulfilled" ? nodeResult.value : undefined;
+  if (nodeResult.status === "fulfilled") latestEmbeddedNodeStatus = nodeResult.value;
+  const node = nodeResult.status === "fulfilled"
+    ? nodeResult.value
+    : latestEmbeddedNodeStatus;
   const network = networkResult.status === "fulfilled" ? networkResult.value : undefined;
   const peers = peersResult.status === "fulfilled" ? peersResult.value : undefined;
   const synchronization = synchronizationResult.status === "fulfilled"
@@ -206,6 +210,7 @@ const refreshSummary = async () => {
 };
 const refreshNode = async () => {
   const value = await invoke("embedded_node_status");
+  latestEmbeddedNodeStatus = value;
   byId("node-status").textContent = nodeStatusText(value);
   return value;
 };
