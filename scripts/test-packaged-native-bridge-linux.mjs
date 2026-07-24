@@ -14,6 +14,9 @@ const synchronizationAttemptLimit = Number.parseInt(
   10,
 );
 const requireBlockAdvance = process.env.PACKAGED_REQUIRE_BLOCK_ADVANCE === "1";
+const forceNetworkStatusFallback = process.env.PACKAGED_FORCE_NETWORK_STATUS_FALLBACK === "1";
+const MAINNET_CHAIN_ID = "f9831fadabc8a4234beab35fbb6327e84581645f33e9f75ed2ea78e8bcf1165b";
+const MAINNET_GENESIS_HASH = "182e10af28e7ec072f462e6044f580dc9dd8c866cb78dfc293bbfaee4e9325ce";
 if (!Number.isSafeInteger(synchronizationAttemptLimit) || synchronizationAttemptLimit < 1) {
   throw new Error("PACKAGED_SYNC_ATTEMPTS must be a positive integer");
 }
@@ -123,6 +126,36 @@ try {
       .then((value) => ({ reachedNative: true, ok: true, value }))
       .catch((error) => ({ reachedNative: true, ok: false, error }));
   `, [command, args]);
+  const readLiveNetworkStatus = async () => {
+    const network = forceNetworkStatusFallback
+      ? { reachedNative: true, ok: false, error: { retryable: true } }
+      : await nativeResult("node_network_status", {});
+    if (network.ok) return { ...network, source: "node_network_status" };
+
+    const node = await nativeResult("embedded_node_status", {});
+    if (!node.ok) return network;
+    assert.equal(node.value.network, "MAINNET");
+    assert.equal(node.value.chain_id, MAINNET_CHAIN_ID);
+    assert.equal(node.value.genesis_hash, MAINNET_GENESIS_HASH);
+    assert.match(node.value.canonical_tip_hash, /^[0-9a-f]{64}$/i);
+    assert.ok(
+      Number.isSafeInteger(node.value.canonical_tip_height)
+        && node.value.canonical_tip_height >= 0,
+      "embedded node returned an invalid live Mainnet tip",
+    );
+    return {
+      reachedNative: true,
+      ok: true,
+      source: "embedded_node_status",
+      value: {
+        network: node.value.network,
+        chain_id: node.value.chain_id,
+        genesis_hash: node.value.genesis_hash,
+        canonical_height: node.value.canonical_tip_height,
+        ready: node.value.ready,
+      },
+    };
+  };
   const actions = {
     create: await nativeResult("wallet_create_recoverable", { path: "", password: "" }),
     restore: await nativeResult("wallet_restore_from_mnemonic", { path: "", password: "", mnemonic: "" }),
@@ -365,6 +398,8 @@ try {
     });
   `);
   assert.doesNotMatch(JSON.stringify(settingsScreen), /undefined|null/);
+  assert.equal(settingsScreen.chainId, MAINNET_CHAIN_ID);
+  assert.equal(settingsScreen.genesis, MAINNET_GENESIS_HASH);
   await new Promise((done) => setTimeout(done, 350));
   await screenshot("settings-live-data");
   const historyScreen = await execute(`
@@ -387,7 +422,7 @@ try {
 
   let networkStatus;
   for (let attempt = 0; attempt < synchronizationAttemptLimit; attempt += 1) {
-    networkStatus = await nativeResult("node_network_status", {});
+    networkStatus = await readLiveNetworkStatus();
     if (networkStatus.ok) break;
     await new Promise((done) => setTimeout(done, 250));
   }
@@ -397,7 +432,7 @@ try {
   let advancedDashboard;
   if (requireBlockAdvance) {
     for (let attempt = 0; attempt < synchronizationAttemptLimit; attempt += 1) {
-      networkStatus = await nativeResult("node_network_status", {});
+      networkStatus = await readLiveNetworkStatus();
       if (networkStatus.ok && networkStatus.value.canonical_height > 0) break;
       await new Promise((done) => setTimeout(done, 500));
     }
@@ -601,6 +636,7 @@ try {
     historyScreen,
     advancedDashboard,
     mainnet: {
+      networkStatusSource: networkStatus.source,
       connectedPeers: peerStatus.total_connected_peers,
       bootstrapPhase: peerStatus.bootstrap_phase,
       canonicalHeight: syncStatus.value.canonical_height,
