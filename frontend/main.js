@@ -1,6 +1,12 @@
 import QRCode from "qrcode";
 import QrScanner from "qr-scanner";
 import { nativeBridge } from "./bridge.js";
+import {
+  formatDomFromNoms,
+  miningPresentation,
+  nodeStatusText,
+  synchronizationPresentation,
+} from "./status.js";
 
 export const COMMANDS = Object.freeze([
   "native_bridge_status", "get_build_info", "update_status", "check_updates_now", "check_node_now",
@@ -36,6 +42,7 @@ let scanner;
 let qrFrames = [];
 let qrIndex = 0;
 let phrasePending = false;
+let latestSynchronizationPresentation;
 
 export const clearPasswords = (form) => form?.querySelectorAll('input[type="password"]').forEach((input) => { input.value = ""; });
 export const redactedError = (error) => error?.message && !/password|mnemonic|seed|secret|key|token|credential|:\/\//i.test(error.message)
@@ -52,10 +59,12 @@ const show = (message, failed = false) => {
 const run = async (action) => {
   if (pending) return undefined;
   pending = true;
-  document.querySelectorAll("button").forEach((button) => { button.disabled = true; });
+  const buttons = [...document.querySelectorAll("button")];
+  const disabledState = buttons.map((button) => button.disabled);
+  buttons.forEach((button) => { button.disabled = true; });
   try { return await action(); } finally {
     pending = false;
-    document.querySelectorAll("button").forEach((button) => { button.disabled = false; });
+    buttons.forEach((button, index) => { button.disabled = disabledState[index]; });
   }
 };
 const redactJson = (target, value) => { target.textContent = JSON.stringify(value, null, 2); };
@@ -79,6 +88,8 @@ export function selectScreen(name) {
 document.querySelectorAll("[data-screen]").forEach((button) => button.addEventListener("click", () => {
   selectScreen(button.dataset.screen);
   if (button.dataset.screen === "mining") refreshMining().catch((error) => show(redactedError(error), true));
+  if (button.dataset.screen === "node") refreshNode().catch((error) => show(redactedError(error), true));
+  if (button.dataset.screen === "history") run(renderHistory).catch((error) => show(redactedError(error), true));
   if (button.dataset.screen === "dashboard" || button.dataset.screen === "diagnostics") refreshSummary().catch((error) => show(redactedError(error), true));
   if (button.dataset.screen === "diagnostics") refreshUpdates().catch((error) => show(redactedError(error), true));
 }));
@@ -125,7 +136,7 @@ byId("restore-form").addEventListener("submit", async (event) => {
     show("Restore: initializing Mainnet node.");
     const result = await run(() => invoke("wallet_restore_from_mnemonic", { path: data.get("path"), password: data.get("password"), mnemonic: data.get("mnemonic") }));
     form.querySelector('textarea[name="mnemonic"]').value = ""; clearPasswords(form);
-    show(`Restore completed: ${result.owned_output_count} owned outputs, ${result.confirmed_balance} confirmed noms.`);
+    show(`Restore completed: ${result.owned_outputs} owned outputs, ${result.balance.confirmed} confirmed noms.`);
   } catch (error) { form.querySelector('textarea[name="mnemonic"]').value = ""; clearPasswords(form); show(redactedError(error), true); }
 });
 byId("open-form").addEventListener("submit", async (event) => {
@@ -140,28 +151,59 @@ byId("unlock-form").addEventListener("submit", async (event) => {
 });
 
 const refreshSummary = async () => {
-  const [summary, network, peers, synchronization] = await Promise.all([
+  const [summaryResult, networkResult, peersResult, synchronizationResult] = await Promise.allSettled([
     invoke("wallet_summary"), invoke("node_network_status"), invoke("node_peer_status"), invoke("wallet_sync_status")
   ]);
-  byId("network-identity").textContent = `${summary.network} · ${summary.state}`;
-  byId("balance-total").firstChild.textContent = `${summary.balance.total ?? 0} `;
-  byId("balance-cards").replaceChildren(...Object.entries(summary.balance).map(([key, value]) => {
-    const card = document.createElement("div"); card.className = "card"; card.textContent = `${key}: ${value} noms`; return card;
+  if (summaryResult.status !== "fulfilled") throw summaryResult.reason;
+  const summary = summaryResult.value;
+  const nodeAvailable = networkResult.status === "fulfilled"
+    && peersResult.status === "fulfilled"
+    && synchronizationResult.status === "fulfilled";
+  if (!nodeAvailable) {
+    byId("network-identity").textContent = `${summary.network} · NODE UNAVAILABLE`;
+    byId("connection-status").textContent = "Node unavailable";
+    byId("canonical-height").textContent = "—";
+    byId("cursor-height").textContent = "—";
+    byId("sync-status").textContent = "Waiting for the embedded node";
+    byId("settings-chain-id").textContent = "—";
+    byId("settings-genesis").textContent = "—";
+    byId("settings-peer-count").textContent = "0";
+    byId("settings-bootstrap").textContent = "UNAVAILABLE";
+    byId("settings-heights").textContent = "— / —";
+  }
+  const network = nodeAvailable ? networkResult.value : undefined;
+  const peers = nodeAvailable ? peersResult.value : undefined;
+  const synchronization = nodeAvailable ? synchronizationResult.value : undefined;
+  const syncPresentation = nodeAvailable
+    ? synchronizationPresentation(network, peers, synchronization)
+    : undefined;
+  latestSynchronizationPresentation = syncPresentation;
+  const balanceLabels = {
+    confirmed: "Confirmed",
+    immature: "Immature",
+    pending_incoming: "Pending incoming",
+    pending_outgoing: "Pending outgoing",
+    locked: "Locked",
+    spendable: "Spendable",
+  };
+  byId("balance-total").firstChild.textContent = `${formatDomFromNoms(summary.balance.total ?? 0).replace(/ DOM$/, "")} `;
+  byId("balance-cards").replaceChildren(...Object.entries(balanceLabels).map(([key, label]) => {
+    const value = summary.balance[key];
+    const card = document.createElement("div");
+    card.className = "card";
+    card.textContent = Number.isSafeInteger(value) && value >= 0
+      ? `${label}: ${value} noms · ${formatDomFromNoms(value)}`
+      : `${label}: unavailable`;
+    return card;
   }));
+  if (!nodeAvailable) return;
+  byId("network-identity").textContent = `${summary.network} · ${syncPresentation.badgeState}`;
   byId("connection-status").textContent = peers.total_connected_peers > 0
     ? `Connected to ${peers.total_connected_peers} peer${peers.total_connected_peers === 1 ? "" : "s"}`
     : "No peers found";
   byId("canonical-height").textContent = network.canonical_height;
   byId("cursor-height").textContent = synchronization.cursor_height ?? "Not initialized";
-  const peerHeight = peers.highest_known_peer_height ?? network.canonical_height;
-  const progress = peerHeight > 0
-    ? Math.min(100, Math.floor((network.canonical_height * 100) / peerHeight))
-    : 0;
-  byId("sync-status").textContent = peerHeight > network.canonical_height
-    ? `Synchronizing ${network.canonical_height} / ${peerHeight} (${progress}%)`
-    : synchronization.synchronized
-      ? `Wallet synchronized at height ${synchronization.cursor_height}`
-      : synchronization.last_error ?? "Preparing wallet synchronization";
+  byId("sync-status").textContent = syncPresentation.message;
   byId("settings-chain-id").textContent = network.chain_id;
   byId("settings-genesis").textContent = network.genesis_hash;
   byId("settings-node-data").textContent = network.data_directory;
@@ -169,7 +211,11 @@ const refreshSummary = async () => {
   byId("settings-bootstrap").textContent = peers.bootstrap_phase;
   byId("settings-heights").textContent = `${synchronization.cursor_height ?? "—"} / ${network.canonical_height}`;
 };
-const refreshNode = async () => redactJson(byId("node-status"), await invoke("embedded_node_status"));
+const refreshNode = async () => {
+  const value = await invoke("embedded_node_status");
+  byId("node-status").textContent = nodeStatusText(value);
+  return value;
+};
 const refreshUpdates = async () => {
   const [build, updates] = await Promise.all([invoke("get_build_info"), invoke("update_status")]);
   byId("update-wallet-version").textContent = build.wallet_version;
@@ -186,12 +232,18 @@ const refreshUpdates = async () => {
   byId("update-node-compatibility").textContent = updates.node.compatibility;
   byId("update-peer-state").textContent = updates.peers.state;
   byId("update-channel").textContent = updates.channel;
+  byId("update-mode").textContent = updates.automatic_updates && updates.signature_key_configured
+    ? "Enabled · Stable"
+    : updates.automatic_updates
+      ? "Scheduled · signing unavailable"
+      : "Unavailable · fail closed";
   byId("update-signing-state").textContent = updates.signature_key_configured ? "Configured" : "Unavailable — updates fail closed";
   const error = updates.wallet.sanitized_error ?? updates.node.sanitized_error ?? updates.peers.sanitized_error;
   byId("update-error").textContent = error ?? "No updater error.";
 };
-const renderMining = (value) => {
-  byId("mining-status").textContent = value.status;
+const renderMining = (value, node) => {
+  const presentation = miningPresentation(value, node);
+  byId("mining-status").textContent = presentation.status;
   byId("mining-enabled").checked = value.enabled;
   byId("mining-threads").value = value.cpu_threads;
   byId("mining-threads").disabled = !value.enabled || value.running;
@@ -205,11 +257,52 @@ const renderMining = (value) => {
   byId("mining-candidate").textContent = value.last_block_candidate_time ? new Date(value.last_block_candidate_time * 1000).toLocaleString() : "Never";
   byId("mining-last-height").textContent = value.last_accepted_block_height ?? "—";
   byId("mining-uptime").textContent = `${value.uptime_seconds}s`;
-  byId("mining-warning").hidden = value.current_height !== 0;
-  byId("mining-start").disabled = !value.enabled || value.running;
+  byId("mining-warning").hidden = presentation.warning == null;
+  byId("mining-warning").textContent = presentation.warning ?? "";
+  byId("mining-start").disabled = !presentation.canStart;
   byId("mining-stop").disabled = !value.running && value.status !== "ERROR";
 };
-const refreshMining = async () => renderMining(await invoke("mining_status"));
+const renderMiningUnavailable = (node) => {
+  byId("mining-status").textContent = node?.lifecycle === "SYNCHRONIZING"
+    ? "SYNCHRONIZING"
+    : "NODE NOT READY";
+  byId("mining-enabled").checked = false;
+  byId("mining-enabled").disabled = true;
+  byId("mining-threads").value = "";
+  byId("mining-threads").disabled = true;
+  byId("mining-address").value = "";
+  for (const id of [
+    "mining-hashrate", "mining-height", "mining-peers", "mining-accepted",
+    "mining-rejected", "mining-template-refreshes", "mining-candidate",
+    "mining-last-height", "mining-uptime",
+  ]) byId(id).textContent = "—";
+  byId("mining-warning").hidden = false;
+  byId("mining-warning").textContent = node?.status_message ?? "The embedded node is unavailable.";
+  byId("mining-start").disabled = true;
+  byId("mining-stop").disabled = true;
+};
+const refreshMining = async () => {
+  const [nodeResult, miningResult] = await Promise.allSettled([
+    invoke("embedded_node_status"),
+    invoke("mining_status"),
+  ]);
+  let node = nodeResult.status === "fulfilled" ? nodeResult.value : undefined;
+  const mining = miningResult.status === "fulfilled" ? miningResult.value : undefined;
+  if (latestSynchronizationPresentation?.badgeState === "SYNCHRONIZING") {
+    node = {
+      ...node,
+      lifecycle: "SYNCHRONIZING",
+      ready: false,
+      status_message: latestSynchronizationPresentation.message,
+    };
+  }
+  if (!mining) {
+    renderMiningUnavailable(node);
+    return;
+  }
+  byId("mining-enabled").disabled = false;
+  renderMining(mining, node);
+};
 byId("mining-enabled").addEventListener("change", async (event) => {
   try {
     const config = await invoke("mining_config_get");
@@ -223,37 +316,67 @@ byId("mining-threads").addEventListener("change", async (event) => {
   catch (error) { show(redactedError(error), true); }
 });
 byId("mining-start").addEventListener("click", async () => {
-  const current = await invoke("mining_status");
+  const [current, node] = await Promise.all([invoke("mining_status"), invoke("embedded_node_status")]);
+  if (!miningPresentation(current, node).canStart) {
+    show(node.status_message ?? "The node is not ready for mining.", true);
+    return;
+  }
   const message = current.current_height === 0
     ? "Starting mining may produce the first post-genesis Mainnet block. Continue?"
     : "Start local CPU mining on DOM Mainnet?";
   if (!window.confirm(message)) return;
-  try { renderMining(await run(() => invoke("mining_start", { confirmed: true }))); }
+  try { renderMining(await run(() => invoke("mining_start", { confirmed: true })), node); }
   catch (error) { show(redactedError(error), true); }
 });
 byId("mining-stop").addEventListener("click", async () => {
-  try { renderMining(await run(() => invoke("mining_stop"))); }
+  try {
+    const value = await run(() => invoke("mining_stop"));
+    renderMining(value, await invoke("embedded_node_status"));
+  }
   catch (error) { show(redactedError(error), true); }
 });
 byId("sync").addEventListener("click", () => run(async () => { await invoke("wallet_sync_start"); await refreshSummary(); }).catch((error) => show(redactedError(error), true)));
-byId("node-sync").addEventListener("click", () => run(async () => { await invoke("wallet_sync_start"); await refreshNode(); }).catch((error) => show(redactedError(error), true)));
+byId("node-sync").addEventListener("click", () => run(async () => {
+  await invoke("wallet_sync_start");
+  await Promise.all([refreshNode(), refreshSummary()]);
+}).catch((error) => show(redactedError(error), true)));
 byId("node-refresh").addEventListener("click", () => run(refreshNode).catch((error) => show(redactedError(error), true)));
-byId("node-start").addEventListener("click", () => run(async () => { await invoke("embedded_node_start"); await refreshNode(); show("Embedded node started."); }).catch((error) => show(redactedError(error), true)));
-byId("node-stop").addEventListener("click", () => run(async () => { await invoke("embedded_node_stop"); await refreshNode(); show("Embedded node stopped. The wallet remains open."); }).catch((error) => show(redactedError(error), true)));
+byId("node-start").addEventListener("click", () => run(async () => {
+  await invoke("embedded_node_start");
+  await Promise.allSettled([refreshNode(), refreshSummary(), refreshMining()]);
+  show("Embedded node started.");
+}).catch((error) => show(redactedError(error), true)));
+byId("node-stop").addEventListener("click", () => run(async () => {
+  await invoke("embedded_node_stop");
+  await Promise.allSettled([refreshNode(), refreshSummary()]);
+  show("Embedded node stopped. The wallet remains open.");
+}).catch((error) => show(redactedError(error), true)));
 for (const [id, command] of [["pause", "wallet_sync_pause"], ["resume", "wallet_sync_resume"], ["retry", "wallet_sync_retry"]]) {
-  byId(id).addEventListener("click", () => run(() => invoke(command)).catch((error) => show(redactedError(error), true)));
+  byId(id).addEventListener("click", () => run(async () => {
+    await invoke(command);
+    await refreshSummary();
+  }).catch((error) => show(redactedError(error), true)));
 }
-byId("rescan").addEventListener("click", () => { if (window.confirm("Rescan from canonical Mainnet genesis?")) run(() => invoke("wallet_rescan")).catch((error) => show(redactedError(error), true)); });
+byId("rescan").addEventListener("click", () => {
+  if (window.confirm("Rescan from canonical Mainnet genesis?")) {
+    run(async () => {
+      await invoke("wallet_rescan");
+      await refreshSummary();
+    }).catch((error) => show(redactedError(error), true));
+  }
+});
 byId("diagnostics-refresh").addEventListener("click", () => run(async () => { await refreshSummary(); redactJson(byId("diagnostics-output"), await invoke("diagnostics_redacted")); }).catch((error) => show(redactedError(error), true)));
 byId("updates-check").addEventListener("click", () => run(async () => {
-  await invoke("check_updates_now");
+  const updates = await invoke("check_updates_now");
   await refreshUpdates();
-  show("Signed Wallet, node and peer update check completed.");
+  const error = updates.wallet.sanitized_error ?? updates.node.sanitized_error ?? updates.peers.sanitized_error;
+  show(error ? `Update check failed closed (${error}).` : "Signed Wallet, node and peer update check completed.", Boolean(error));
 }).catch((error) => show(redactedError(error), true)));
 byId("node-updates-check").addEventListener("click", () => run(async () => {
-  await invoke("check_node_now");
+  const updates = await invoke("check_node_now");
   await refreshUpdates();
-  show("Signed node update check completed.");
+  const error = updates.node.sanitized_error;
+  show(error ? `Node update check failed closed (${error}).` : "Signed node update check completed.", Boolean(error));
 }).catch((error) => show(redactedError(error), true)));
 byId("lock").addEventListener("click", () => run(async () => { await stopScanner(); await invoke("wallet_lock"); enterGate(); }).catch((error) => show(redactedError(error), true)));
 byId("close").addEventListener("click", () => run(async () => { await stopScanner(); await invoke("wallet_close"); enterGate(); }).catch((error) => show(redactedError(error), true)));
@@ -265,8 +388,26 @@ byId("backup-export-form").addEventListener("submit", async (event) => {
 });
 byId("backup-import-form").addEventListener("submit", async (event) => {
   event.preventDefault(); const form = event.currentTarget; const data = new FormData(form);
-  try { await run(() => invoke("wallet_backup_import", { destination: data.get("destination"), backupPath: data.get("backup_path"), backupPassword: data.get("backup_password"), password: data.get("password") })); enterGate(); show("Encrypted backup imported in locked state."); }
-  catch (error) { show(redactedError(error), true); } finally { clearPasswords(form); }
+  if (!window.confirm("Close the current wallet and import this backup into a new folder?")) {
+    clearPasswords(form);
+    return;
+  }
+  try {
+    await run(async () => {
+      await invoke("wallet_close");
+      await invoke("wallet_backup_import", {
+        destination: data.get("destination"),
+        backupPath: data.get("backup_path"),
+        backupPassword: data.get("backup_password"),
+        password: data.get("password"),
+      });
+    });
+    enterGate();
+    show("Encrypted backup imported in locked state.");
+  } catch (error) {
+    enterGate();
+    show(redactedError(error), true);
+  } finally { clearPasswords(form); }
 });
 
 const output = byId("transaction-output");
@@ -325,7 +466,18 @@ byId("response-export").addEventListener("click", async () => {
 
 const renderHistory = async () => {
   const transactions = await invoke("transaction_list");
-  const nodes = transactions.map((transaction) => { const node = document.createElement("article"); node.className = "history-item"; node.textContent = `${transaction.state} · ${transaction.amount} noms · ${transaction.slate_id}`; return node; });
+  const nodes = transactions.map((transaction) => {
+    const node = document.createElement("article");
+    node.className = "history-item";
+    node.textContent = `${transaction.state} · ${transaction.amount} noms · ${transaction.slate_id ?? transaction.id}`;
+    return node;
+  });
+  if (!nodes.length) {
+    const empty = document.createElement("p");
+    empty.className = "muted";
+    empty.textContent = "No transactions recorded.";
+    nodes.push(empty);
+  }
   byId("history-output").replaceChildren(...nodes);
   renderTransaction(transactions);
 };
@@ -364,7 +516,9 @@ nativeBridge.initialize()
     show(redactedError(error), true);
   });
 const refresh = async () => {
-  await Promise.allSettled([refreshSummary(), refreshNode(), refreshMining()]);
+  const tasks = [refreshSummary(), refreshNode(), refreshMining()];
+  if (!byId("diagnostics").hidden) tasks.push(refreshUpdates());
+  await Promise.allSettled(tasks);
   refreshTimer = setTimeout(refresh, 15000);
 };
 refreshTimer = setTimeout(refresh, 15000);

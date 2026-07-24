@@ -1,5 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import {
+  formatDomFromNoms,
+  miningPresentation,
+  nodeStatusText,
+  synchronizationPresentation,
+} from "../status.js";
 
 test("frontend source contains no durable browser storage access", async () => {
   const source = await (await import("node:fs/promises")).readFile(new URL("../main.js", import.meta.url), "utf8");
@@ -10,10 +16,83 @@ test("frontend source contains no durable browser storage access", async () => {
 
 test("dashboard refreshes live IBD progress every fifteen seconds", async () => {
   const source = await (await import("node:fs/promises")).readFile(new URL("../main.js", import.meta.url), "utf8");
-  assert.equal(source.includes("peers.highest_known_peer_height ?? network.canonical_height"), true);
-  assert.equal(source.includes("`Synchronizing ${network.canonical_height} / ${peerHeight} (${progress}%)`"), true);
-  assert.equal(source.includes("Promise.allSettled([refreshSummary(), refreshNode(), refreshMining()])"), true);
+  assert.equal(source.includes("synchronizationPresentation(network, peers, synchronization)"), true);
+  assert.equal(source.includes("const tasks = [refreshSummary(), refreshNode(), refreshMining()]"), true);
+  assert.equal(source.includes("await Promise.allSettled(tasks)"), true);
   assert.equal(source.includes("setTimeout(refresh, 15000)"), true);
+});
+
+test("dashboard badge cannot report READY while a peer is ahead", () => {
+  const result = synchronizationPresentation(
+    { canonical_height: 1_008 },
+    { highest_known_peer_height: 6_684 },
+    { synchronized: false, cursor_height: 1_008, last_error: null },
+  );
+  assert.deepEqual(result, {
+    badgeState: "SYNCHRONIZING",
+    message: "Synchronizing 1008 / 6684 (15%)",
+    localHeight: 1_008,
+    peerHeight: 6_684,
+    progress: 15,
+  });
+});
+
+test("dashboard reports READY only when canonical height and cursor are synchronized", () => {
+  const result = synchronizationPresentation(
+    { canonical_height: 6_684 },
+    { highest_known_peer_height: 6_684 },
+    { synchronized: true, cursor_height: 6_684, last_error: null },
+  );
+  assert.equal(result.badgeState, "READY");
+  assert.equal(result.message, "Wallet synchronized at height 6684");
+});
+
+test("dashboard exposes a synchronization error instead of READY", () => {
+  const result = synchronizationPresentation(
+    { canonical_height: 20 },
+    { highest_known_peer_height: 20 },
+    { synchronized: false, cursor_height: 19, last_error: "CURSOR_HASH_MISMATCH" },
+  );
+  assert.equal(result.badgeState, "ATTENTION");
+  assert.equal(result.message, "CURSOR_HASH_MISMATCH");
+});
+
+test("mining controls remain disabled until the real node is ready", () => {
+  const result = miningPresentation(
+    { status: "READY", enabled: true, running: false, current_height: 0 },
+    { lifecycle: "SYNCHRONIZING", ready: false, status_message: "Synchronizing 0 / 6684 (0%)" },
+  );
+  assert.deepEqual(result, {
+    status: "SYNCHRONIZING",
+    canStart: false,
+    warning: "Synchronizing 0 / 6684 (0%)",
+  });
+});
+
+test("node status text exposes live heights and progress", () => {
+  const text = nodeStatusText({
+    status_message: "Synchronizing 1008 / 6684 (15%)",
+    lifecycle: "SYNCHRONIZING",
+    network: "MAINNET",
+    canonical_tip_height: 1_008,
+    highest_known_peer_height: 6_684,
+    synchronization_progress_percent: 15,
+    connected_peers: 1,
+    bootstrap_phase: "CONNECTED",
+    canonical_tip_hash: "abcd",
+    error_code: null,
+  });
+  assert.match(text, /Local height: 1008/);
+  assert.match(text, /Highest peer height: 6684/);
+  assert.match(text, /Synchronization: 15%/);
+  assert.doesNotMatch(text, /CORE_NOT_READY/);
+});
+
+test("DOM balances use the canonical 100,000,000 noms denomination", () => {
+  assert.equal(formatDomFromNoms(0), "0.00000000 DOM");
+  assert.equal(formatDomFromNoms(100_000_000), "1.00000000 DOM");
+  assert.equal(formatDomFromNoms(3_300_000_000), "33.00000000 DOM");
+  assert.equal(formatDomFromNoms(Number.MAX_SAFE_INTEGER + 1), "Unavailable");
 });
 
 test("settings expose separate fail-closed Wallet and node update states", async () => {
@@ -29,6 +108,7 @@ test("settings expose separate fail-closed Wallet and node update states", async
     "update-signing-state",
     "Check node now",
   ]) assert.equal(html.includes(marker), true);
+  assert.equal(js.includes('"Scheduled · signing unavailable"'), true);
   for (const command of [
     '"get_build_info"',
     '"update_status"',
