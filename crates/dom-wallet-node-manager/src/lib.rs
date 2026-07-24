@@ -1143,6 +1143,9 @@ fn validate_windows_acl(root: &Path) -> Result<(), NodeManagerError> {
     let powershell = system_root.join("System32/WindowsPowerShell/v1.0/powershell.exe");
     let script = r#"
 $ErrorActionPreference='Stop'
+try {
+  Import-Module -Name "$env:SystemRoot\System32\WindowsPowerShell\v1.0\Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1" -ErrorAction Stop
+} catch { exit 40 }
 $current=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $allowed=@($current,'S-1-5-18','S-1-5-32-544')
 $write=[Security.AccessControl.FileSystemRights]::Write -bor [Security.AccessControl.FileSystemRights]::Modify -bor [Security.AccessControl.FileSystemRights]::FullControl -bor [Security.AccessControl.FileSystemRights]::ChangePermissions -bor [Security.AccessControl.FileSystemRights]::TakeOwnership
@@ -1193,19 +1196,27 @@ fn secure_new_windows_runtime_root(root: &Path) -> Result<(), NodeManagerError> 
     let powershell = system_root.join("System32/WindowsPowerShell/v1.0/powershell.exe");
     let script = r#"
 $ErrorActionPreference='Stop'
-$identity=[Security.Principal.WindowsIdentity]::GetCurrent()
-$acl=Get-Acl -LiteralPath $args[0]
-$acl.SetAccessRuleProtection($true,$false)
-foreach($rule in @($acl.Access)){[void]$acl.RemoveAccessRuleSpecific($rule)}
-$acl.SetOwner($identity.User)
+try {
+  Import-Module -Name "$env:SystemRoot\System32\WindowsPowerShell\v1.0\Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1" -ErrorAction Stop
+} catch { exit 50 }
+try { $identity=[Security.Principal.WindowsIdentity]::GetCurrent() } catch { exit 51 }
+try { $acl=Get-Acl -LiteralPath $args[0] } catch { exit 52 }
+try {
+  $acl.SetAccessRuleProtection($true,$false)
+  foreach($rule in @($acl.Access)){[void]$acl.RemoveAccessRuleSpecific($rule)}
+} catch { exit 53 }
+try { $acl.SetOwner($identity.User) } catch { exit 54 }
 $inherit=[Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit'
 $none=[Security.AccessControl.PropagationFlags]::None
 $allow=[Security.AccessControl.AccessControlType]::Allow
-foreach($sid in @($identity.User,[Security.Principal.SecurityIdentifier]'S-1-5-18',[Security.Principal.SecurityIdentifier]'S-1-5-32-544')){
-  $rule=[Security.AccessControl.FileSystemAccessRule]::new($sid,[Security.AccessControl.FileSystemRights]::FullControl,$inherit,$none,$allow)
-  [void]$acl.AddAccessRule($rule)
-}
-Set-Acl -LiteralPath $args[0] -AclObject $acl
+try {
+  foreach($sid in @($identity.User,[Security.Principal.SecurityIdentifier]'S-1-5-18',[Security.Principal.SecurityIdentifier]'S-1-5-32-544')){
+    $rule=[Security.AccessControl.FileSystemAccessRule]::new($sid,[Security.AccessControl.FileSystemRights]::FullControl,$inherit,$none,$allow)
+    [void]$acl.AddAccessRule($rule)
+  }
+} catch { exit 55 }
+try { Set-Acl -LiteralPath $args[0] -AclObject $acl } catch { exit 56 }
+exit 0
 "#;
     let status = Command::new(powershell)
         .env_clear()
