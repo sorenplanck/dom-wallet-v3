@@ -6,6 +6,7 @@ import {
   liveStatusProjection,
   miningPresentation,
   nodeStatusText,
+  restoreReadinessPresentation,
   synchronizationPresentation,
 } from "./status.js";
 
@@ -99,9 +100,31 @@ document.querySelectorAll("[data-gate-panel]").forEach((button) => button.addEve
   clearSecretForms();
   const panel = button.dataset.gatePanel;
   document.querySelectorAll(".gate-panel").forEach((node) => { node.hidden = node.id !== panel; });
+  if (panel === "restore-form") refreshOnboardingNode().catch((error) => show(redactedError(error), true));
 }));
 const enterApp = () => { byId("gate").classList.add("hidden"); byId("app").classList.remove("hidden"); selectScreen("dashboard"); };
 const enterGate = () => { byId("app").classList.add("hidden"); byId("gate").classList.remove("hidden"); clearSecretForms(); };
+
+const renderOnboardingNode = (node) => {
+  const presentation = restoreReadinessPresentation(node);
+  byId("onboarding-node-badge").textContent = presentation.badge;
+  byId("onboarding-node-message").textContent = presentation.message;
+  byId("onboarding-node-progress").value = presentation.progress;
+  byId("onboarding-node-local").textContent = presentation.localHeight;
+  byId("onboarding-node-peer").textContent = presentation.peerHeight ?? "—";
+  byId("onboarding-node-peers").textContent = presentation.connectedPeers;
+  byId("restore-submit").disabled = !presentation.ready;
+  byId("restore-readiness-note").textContent = presentation.ready
+    ? "The synchronized canonical Mainnet chain will be scanned from genesis."
+    : "Restore unlocks automatically after the Mainnet node reaches the peer tip.";
+  return presentation;
+};
+const refreshOnboardingNode = async () => {
+  const node = await invoke("embedded_node_status");
+  latestEmbeddedNodeStatus = node;
+  renderOnboardingNode(node);
+  return node;
+};
 
 const clearPhrase = () => {
   byId("recovery-phrase").textContent = "";
@@ -140,6 +163,11 @@ byId("restore-form").addEventListener("submit", async (event) => {
     form.querySelector('textarea[name="mnemonic"]').value = ""; clearPasswords(form);
     show(`Restore completed: ${result.owned_outputs} owned outputs, ${result.balance.confirmed} confirmed noms.`);
   } catch (error) { form.querySelector('textarea[name="mnemonic"]').value = ""; clearPasswords(form); show(redactedError(error), true); }
+});
+byId("onboarding-node-retry").addEventListener("click", () => {
+  run(() => invoke("embedded_node_start"))
+    .then(() => refreshOnboardingNode())
+    .catch((error) => show(redactedError(error), true));
 });
 byId("open-form").addEventListener("submit", async (event) => {
   event.preventDefault(); const form = event.currentTarget;
@@ -506,18 +534,21 @@ document.documentElement.dataset.nativeBridge = nativeBridge.state;
 nativeBridge.initialize()
   .then(() => {
     document.documentElement.dataset.nativeBridge = nativeBridge.state;
-    return invoke("application_status");
+    return Promise.all([invoke("application_status"), refreshOnboardingNode()]);
   })
-  .then((result) => show(`Application state: ${result.state}.`))
+  .then(([result]) => show(`Application state: ${result.state}.`))
   .catch((error) => {
     document.documentElement.dataset.nativeBridge = nativeBridge.state;
     show(redactedError(error), true);
   });
 const refresh = async () => {
-  const tasks = [refreshSummary(), refreshNode(), refreshMining()];
-  if (!byId("diagnostics").hidden) tasks.push(refreshUpdates());
+  const gateVisible = !byId("gate").classList.contains("hidden");
+  const tasks = gateVisible
+    ? [refreshOnboardingNode()]
+    : [refreshSummary(), refreshNode(), refreshMining()];
+  if (!gateVisible && !byId("diagnostics").hidden) tasks.push(refreshUpdates());
   await Promise.allSettled(tasks);
-  refreshTimer = setTimeout(refresh, 15000);
+  refreshTimer = setTimeout(refresh, gateVisible ? 5000 : 15000);
 };
 refreshTimer = setTimeout(refresh, 15000);
 window.addEventListener("beforeunload", () => { clearTimeout(refreshTimer); clearPhrase(); clearSecretForms(); stopScanner(); }, { once: true });

@@ -449,7 +449,12 @@ impl WalletService {
             .backend
             .as_ref()
             .ok_or(CoreError::EmbeddedCoreRequired)?;
-        let recovery = backend.restore(phrase, password, &path, self.kdf)?;
+        let recovery = backend
+            .restore(phrase, password, &path, self.kdf)
+            .map_err(|error| match error {
+                ProductionBackendError::Restore(error) => CoreError::Restore(error),
+                other => CoreError::Backend(other),
+            })?;
         let directory = WalletDirectory::open(path)?;
         self.metadata = Some(directory.metadata()?);
         self.location = Some(directory);

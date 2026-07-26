@@ -11,6 +11,7 @@ use dom_wallet_core::{
     RecoveryRestoreResult, SlateExport, TransactionSummary, WalletService, WalletSummary,
 };
 use dom_wallet_core_api::CoreNetwork;
+use dom_wallet_core_restore::SeedRestoreError;
 use dom_wallet_domain::{BalanceProjection, Network, NetworkIdentity};
 use dom_wallet_embedded_core::{
     mine_wallet_block, EmbeddedCoreConfiguration, WalletMiningOutcome, MAINNET_BOOTSTRAP_FALLBACK,
@@ -789,6 +790,12 @@ impl DesktopApplication {
                 "recovery phrase is invalid".into(),
             ));
         }
+        let path = path.as_ref();
+        if path.exists() {
+            return Err(CommandError::RestoreDestinationExists);
+        }
+        let node_status = self.embedded_node_status()?;
+        ensure_seed_restore_node_ready(&node_status)?;
         let result: RecoveryRestoreResult = self
             .service
             .lock()
@@ -1777,6 +1784,22 @@ fn node_synchronization_status(
     }
 }
 
+fn ensure_seed_restore_node_ready(status: &EmbeddedNodeStatusDto) -> Result<(), CommandError> {
+    let local_height = status.canonical_tip_height.unwrap_or(0);
+    let peer_height = status.highest_known_peer_height.unwrap_or(0);
+    let mainnet = status.network.as_deref() == Some("MAINNET");
+    let synchronized = status.lifecycle == WalletReadinessDto::Ready
+        && status.ready
+        && status.connected_peers > 0
+        && peer_height > 0
+        && local_height >= peer_height;
+    if mainnet && synchronized {
+        Ok(())
+    } else {
+        Err(CommandError::RestoreNodeSynchronizing)
+    }
+}
+
 fn core_network_name(network: CoreNetwork) -> &'static str {
     match network {
         CoreNetwork::Mainnet => "MAINNET",
@@ -1903,6 +1926,10 @@ pub enum CommandError {
     IdentityMismatch,
     #[error("embedded node is not ready")]
     NodeNotReady,
+    #[error("seed restore requires a synchronized Mainnet node")]
+    RestoreNodeSynchronizing,
+    #[error("restore destination already exists")]
+    RestoreDestinationExists,
     #[error("wallet synchronization is paused")]
     SynchronizationPaused,
     #[error("wallet cursor initialization failed")]
@@ -1958,6 +1985,20 @@ impl From<CommandError> for CommandErrorDto {
                 category: "NODE".into(),
                 message: "The embedded Mainnet node is still starting.".into(),
                 retryable: true,
+            },
+            CommandError::RestoreNodeSynchronizing => Self {
+                code: "RESTORE_NODE_SYNCHRONIZING".into(),
+                category: "SYNCHRONIZATION".into(),
+                message:
+                    "Wait for the embedded Mainnet node to finish synchronizing, then retry restore."
+                        .into(),
+                retryable: true,
+            },
+            CommandError::RestoreDestinationExists => Self {
+                code: "RESTORE_DESTINATION_EXISTS".into(),
+                category: "STORAGE".into(),
+                message: "Choose a new empty wallet folder for seed restore.".into(),
+                retryable: false,
             },
             CommandError::SynchronizationPaused => Self {
                 code: "WALLET_SYNC_PAUSED".into(),
@@ -2016,6 +2057,7 @@ impl From<CoreError> for CommandError {
             CoreError::IdentityMismatch => Self::IdentityMismatch,
             CoreError::NodeNotReady | CoreError::EmbeddedCoreRequired => Self::NodeNotReady,
             CoreError::InvalidCoreCursor => Self::CursorInitializationFailed,
+            CoreError::Restore(error) => command_error_from_restore(error),
             CoreError::WalletNotOpen => Self::Wallet {
                 code: "WALLET_NOT_OPEN",
                 message: "Open a Mainnet wallet before using this operation.",
@@ -2071,6 +2113,44 @@ impl From<CoreError> for CommandError {
                 }
             }
         }
+    }
+}
+
+fn command_error_from_restore(error: SeedRestoreError) -> CommandError {
+    match error {
+        SeedRestoreError::InvalidDestination => CommandError::RestoreDestinationExists,
+        SeedRestoreError::CoreBusy => CommandError::RestoreNodeSynchronizing,
+        SeedRestoreError::InvalidMnemonic => CommandError::Wallet {
+            code: "RECOVERY_PHRASE_INVALID",
+            message: "The recovery phrase is invalid.",
+            retryable: false,
+        },
+        SeedRestoreError::InvalidPassword => CommandError::Wallet {
+            code: "INVALID_PASSWORD",
+            message: "The local wallet password is invalid.",
+            retryable: false,
+        },
+        SeedRestoreError::ChainIdentityMismatch => CommandError::IdentityMismatch,
+        SeedRestoreError::Storage | SeedRestoreError::IncompatibleCheckpoint => {
+            CommandError::Wallet {
+                code: "RESTORE_STORAGE_FAILED",
+                message: "The encrypted restore state could not be resumed safely.",
+                retryable: true,
+            }
+        }
+        SeedRestoreError::CanonicalScan => CommandError::Wallet {
+            code: "RESTORE_CANONICAL_SCAN_FAILED",
+            message: "The canonical chain scan failed. Check node synchronization and retry.",
+            retryable: true,
+        },
+        SeedRestoreError::MalformedRecovery
+        | SeedRestoreError::ConflictingOutput
+        | SeedRestoreError::CoordinateOverflow
+        | SeedRestoreError::Incomplete => CommandError::Wallet {
+            code: "RESTORE_VALIDATION_FAILED",
+            message: "The restored wallet state failed canonical validation.",
+            retryable: false,
+        },
     }
 }
 
@@ -2362,6 +2442,85 @@ mod tests {
         assert_eq!(status.highest_known_peer_height, None);
         assert_eq!(status.progress_percent, None);
         assert_eq!(status.message, "Discovering peers");
+    }
+
+    fn restore_node_status(
+        lifecycle: WalletReadinessDto,
+        local_height: u64,
+        peer_height: Option<u64>,
+        connected_peers: u64,
+        ready: bool,
+    ) -> EmbeddedNodeStatusDto {
+        EmbeddedNodeStatusDto {
+            lifecycle,
+            network: Some("MAINNET".into()),
+            chain_id: Some("11".repeat(32)),
+            genesis_hash: Some("22".repeat(32)),
+            canonical_tip_height: Some(local_height),
+            canonical_tip_hash: Some("33".repeat(32)),
+            protocol_version: Some(1),
+            range_proof_version: Some(1),
+            ready,
+            error_code: None,
+            connected_peers,
+            bootstrap_phase: "CONNECTED".into(),
+            highest_known_peer_height: peer_height,
+            synchronization_progress_percent: None,
+            status_message: "test-only".into(),
+        }
+    }
+
+    #[test]
+    fn seed_restore_app_gate_requires_a_confirmed_synchronized_peer_tip() {
+        let discovering = restore_node_status(WalletReadinessDto::Ready, 5_241, None, 0, true);
+        assert!(matches!(
+            ensure_seed_restore_node_ready(&discovering),
+            Err(CommandError::RestoreNodeSynchronizing)
+        ));
+
+        let behind = restore_node_status(
+            WalletReadinessDto::Synchronizing,
+            5_241,
+            Some(8_009),
+            2,
+            false,
+        );
+        assert!(matches!(
+            ensure_seed_restore_node_ready(&behind),
+            Err(CommandError::RestoreNodeSynchronizing)
+        ));
+
+        let synchronized =
+            restore_node_status(WalletReadinessDto::Ready, 8_009, Some(8_009), 2, true);
+        assert!(ensure_seed_restore_node_ready(&synchronized).is_ok());
+    }
+
+    #[test]
+    fn seed_restore_app_reports_destination_and_sync_errors_without_node_mislabeling() {
+        let app = DesktopApplication::default();
+        let parent = tempfile::tempdir().unwrap();
+        let existing = parent.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        assert!(matches!(
+            app.wallet_restore_from_mnemonic(&existing, "correct-horse", "test-only"),
+            Err(CommandError::RestoreDestinationExists)
+        ));
+
+        let not_yet_created = parent.path().join("new-wallet");
+        assert!(matches!(
+            app.wallet_restore_from_mnemonic(&not_yet_created, "correct-horse", "test-only"),
+            Err(CommandError::RestoreNodeSynchronizing)
+        ));
+
+        let destination: CommandErrorDto =
+            CommandError::from(CoreError::Restore(SeedRestoreError::InvalidDestination)).into();
+        assert_eq!(destination.code, "RESTORE_DESTINATION_EXISTS");
+        assert_eq!(destination.category, "STORAGE");
+
+        let busy: CommandErrorDto =
+            CommandError::from(CoreError::Restore(SeedRestoreError::CoreBusy)).into();
+        assert_eq!(busy.code, "RESTORE_NODE_SYNCHRONIZING");
+        assert!(busy.retryable);
     }
 
     #[test]

@@ -46,6 +46,70 @@ export function synchronizationPresentation(network, peers, synchronization) {
   };
 }
 
+export function restoreReadinessPresentation(node) {
+  const localHeight = Number.isSafeInteger(node?.canonical_tip_height)
+    ? node.canonical_tip_height
+    : 0;
+  const peerHeight = Number.isSafeInteger(node?.highest_known_peer_height)
+    ? node.highest_known_peer_height
+    : 0;
+  const connectedPeers = Number.isSafeInteger(node?.connected_peers)
+    ? node.connected_peers
+    : 0;
+  const progress = peerHeight > 0
+    ? Math.min(100, Math.floor((localHeight * 100) / peerHeight))
+    : 0;
+  const ready = node?.network === "MAINNET"
+    && node?.lifecycle === "READY"
+    && node?.ready === true
+    && connectedPeers > 0
+    && peerHeight > 0
+    && localHeight >= peerHeight;
+
+  if (ready) {
+    return {
+      ready: true,
+      badge: "READY",
+      message: `Mainnet synchronized at height ${localHeight}. Seed restore is available.`,
+      localHeight,
+      peerHeight,
+      connectedPeers,
+      progress: 100,
+    };
+  }
+  if (connectedPeers === 0) {
+    return {
+      ready: false,
+      badge: "DISCOVERING",
+      message: `Discovering Mainnet peers at local height ${localHeight}.`,
+      localHeight,
+      peerHeight: null,
+      connectedPeers,
+      progress: 0,
+    };
+  }
+  if (peerHeight > localHeight) {
+    return {
+      ready: false,
+      badge: "SYNCHRONIZING",
+      message: `Synchronizing ${localHeight} / ${peerHeight} (${progress}%).`,
+      localHeight,
+      peerHeight,
+      connectedPeers,
+      progress,
+    };
+  }
+  return {
+    ready: false,
+    badge: "FINALIZING",
+    message: `Validating Mainnet state at height ${localHeight}.`,
+    localHeight,
+    peerHeight: peerHeight || null,
+    connectedPeers,
+    progress,
+  };
+}
+
 export function liveStatusProjection(summary, node, network, peers, synchronization) {
   const nodeHeight = Number.isSafeInteger(node?.canonical_tip_height)
     ? node.canonical_tip_height

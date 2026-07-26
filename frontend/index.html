@@ -13,6 +13,17 @@
         <header class="gate-title" data-screen-contract="welcome"><h1>DOM Wallet</h1><p class="sub">Secure desktop wallet</p></header>
         <p id="status" class="status" role="status" aria-live="polite">Initializing native desktop bridge…</p>
         <section id="onboarding" class="screen card">
+          <section id="onboarding-node" class="onboarding-node" aria-labelledby="onboarding-node-title">
+            <div class="section-row"><h2 id="onboarding-node-title">Mainnet node</h2><span id="onboarding-node-badge" class="pill">STARTING</span></div>
+            <p id="onboarding-node-message" class="muted" role="status" aria-live="polite">Starting the embedded node…</p>
+            <progress id="onboarding-node-progress" max="100" value="0" aria-label="Mainnet synchronization progress"></progress>
+            <div class="onboarding-node-metrics">
+              <span>Local <strong id="onboarding-node-local">—</strong></span>
+              <span>Peer <strong id="onboarding-node-peer">—</strong></span>
+              <span>Peers <strong id="onboarding-node-peers">0</strong></span>
+            </div>
+            <button id="onboarding-node-retry" class="btn ghost" type="button">Retry node</button>
+          </section>
           <div class="access-grid">
             <form id="unlock-form" class="access-primary" data-screen-contract="unlock">
               <h2>Unlock wallet</h2><p class="muted">Enter your password to access this wallet.</p>
@@ -43,8 +54,8 @@
             <label>Recovery phrase <textarea name="mnemonic" rows="4" autocomplete="off" autocapitalize="none" spellcheck="false" required></textarea></label>
             <label>New wallet folder <input name="path" autocomplete="off" required></label>
             <label>New password <input name="password" type="password" autocomplete="new-password" required></label>
-            <p class="readonly-note">Recovery scans the canonical Mainnet chain from genesis.</p>
-            <div class="btn-row"><button class="btn" type="submit">Restore wallet</button><button class="btn ghost" type="button" data-gate-panel="">Back</button></div>
+            <p id="restore-readiness-note" class="readonly-note">Wait for the Mainnet node above to synchronize before restoring.</p>
+            <div class="btn-row"><button id="restore-submit" class="btn" type="submit" disabled>Restore wallet</button><button class="btn ghost" type="button" data-gate-panel="">Back</button></div>
           </form>
           <section id="recovery-ceremony" class="gate-panel" hidden aria-labelledby="recovery-ceremony-title">
             <h2 id="recovery-ceremony-title">Write down your recovery phrase</h2><p class="sub">Keep these words offline. DOM Wallet will not show this phrase again.</p>

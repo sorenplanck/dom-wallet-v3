@@ -5,6 +5,7 @@ import {
   liveStatusProjection,
   miningPresentation,
   nodeStatusText,
+  restoreReadinessPresentation,
   synchronizationPresentation,
 } from "../status.js";
 
@@ -21,9 +22,10 @@ test("dashboard refreshes live IBD progress every fifteen seconds", async () => 
   assert.equal(source.includes("liveStatusProjection(summary, node, network, peers, synchronization)"), true);
   assert.equal(source.includes("let latestEmbeddedNodeStatus;"), true);
   assert.equal(source.includes(": latestEmbeddedNodeStatus;"), true);
-  assert.equal(source.includes("const tasks = [refreshSummary(), refreshNode(), refreshMining()]"), true);
+  assert.equal(source.includes(": [refreshSummary(), refreshNode(), refreshMining()]"), true);
+  assert.equal(source.includes("? [refreshOnboardingNode()]"), true);
   assert.equal(source.includes("await Promise.allSettled(tasks)"), true);
-  assert.equal(source.includes("setTimeout(refresh, 15000)"), true);
+  assert.equal(source.includes("setTimeout(refresh, gateVisible ? 5000 : 15000)"), true);
 });
 
 test("dashboard badge cannot report READY while a peer is ahead", () => {
@@ -115,6 +117,52 @@ test("node status text exposes live heights and progress", () => {
   assert.doesNotMatch(text, /CORE_NOT_READY/);
 });
 
+test("onboarding restore gate exposes live Mainnet synchronization and unlocks only at tip", () => {
+  assert.deepEqual(
+    restoreReadinessPresentation({
+      network: "MAINNET",
+      lifecycle: "READY",
+      ready: true,
+      canonical_tip_height: 5_241,
+      highest_known_peer_height: 0,
+      connected_peers: 0,
+    }),
+    {
+      ready: false,
+      badge: "DISCOVERING",
+      message: "Discovering Mainnet peers at local height 5241.",
+      localHeight: 5_241,
+      peerHeight: null,
+      connectedPeers: 0,
+      progress: 0,
+    },
+  );
+
+  const syncing = restoreReadinessPresentation({
+    network: "MAINNET",
+    lifecycle: "SYNCHRONIZING",
+    ready: false,
+    canonical_tip_height: 5_241,
+    highest_known_peer_height: 8_009,
+    connected_peers: 2,
+  });
+  assert.equal(syncing.ready, false);
+  assert.equal(syncing.badge, "SYNCHRONIZING");
+  assert.equal(syncing.message, "Synchronizing 5241 / 8009 (65%).");
+
+  const ready = restoreReadinessPresentation({
+    network: "MAINNET",
+    lifecycle: "READY",
+    ready: true,
+    canonical_tip_height: 8_009,
+    highest_known_peer_height: 8_009,
+    connected_peers: 2,
+  });
+  assert.equal(ready.ready, true);
+  assert.equal(ready.badge, "READY");
+  assert.equal(ready.progress, 100);
+});
+
 test("DOM balances use the canonical 100,000,000 noms denomination", () => {
   assert.equal(formatDomFromNoms(0), "0.00000000 DOM");
   assert.equal(formatDomFromNoms(100_000_000), "1.00000000 DOM");
@@ -170,10 +218,15 @@ test("recovery and backup inputs are transient and use no browser persistence", 
     readFile(new URL("../index.html", import.meta.url), "utf8"),
     readFile(new URL("../main.js", import.meta.url), "utf8")
   ]);
-  for (const id of ["restore-form", "backup-export-form", "backup-import-form", "recovery-ceremony"]) assert.equal(html.includes(`id="${id}"`), true);
+  for (const id of [
+    "restore-form", "restore-submit", "onboarding-node-message", "onboarding-node-progress",
+    "backup-export-form", "backup-import-form", "recovery-ceremony"
+  ]) assert.equal(html.includes(`id="${id}"`), true);
   assert.equal(html.includes('name="mnemonic"'), true);
   assert.equal(js.includes("clearPhrase"), true);
   assert.equal(js.includes("textarea[name=\"mnemonic\"]"), true);
+  assert.equal(js.includes('byId("restore-submit").disabled = !presentation.ready'), true);
+  assert.equal(js.includes('invoke("embedded_node_status")'), true);
   assert.equal(js.includes("localStorage"), false);
 });
 

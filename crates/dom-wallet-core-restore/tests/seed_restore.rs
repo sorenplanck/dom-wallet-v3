@@ -26,6 +26,7 @@ use dom_wallet_storage::{default_node_configuration, WalletDirectory};
 use std::{
     fs,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use tempfile::TempDir;
 use zeroize::Zeroizing;
@@ -38,6 +39,7 @@ struct FakeCore {
 struct FakeState {
     identity: ChainIdentity,
     blocks: Vec<ScanBlock>,
+    scan_busy_remaining: u32,
 }
 
 impl FakeCore {
@@ -58,8 +60,13 @@ impl FakeCore {
                     },
                 },
                 blocks,
+                scan_busy_remaining: 0,
             })),
         }
+    }
+
+    fn fail_next_scan_attempts(&self, attempts: u32) {
+        self.state.lock().unwrap().scan_busy_remaining = attempts;
     }
 
     fn replace_from(&self, height: u64, marker: u8, clear_inputs: bool) {
@@ -101,7 +108,13 @@ impl WalletCoreApi for FakeCore {
     }
 
     fn scan_range(&self, request: ScanRequest) -> Result<ScanResult, WalletCoreError> {
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
+        if state.scan_busy_remaining > 0 {
+            state.scan_busy_remaining -= 1;
+            return Err(WalletCoreError::NodeNotReady(
+                "test-only transient chain lock".into(),
+            ));
+        }
         if request.network != state.identity.network
             || request.chain_id != state.identity.chain_id
             || !request.commitment_filters.is_empty()
@@ -748,6 +761,31 @@ fn interrupted_restore_resumes_exact_cursor_without_false_completion() {
         service.restore(&fixture.phrase, &password, &destination),
         Err(SeedRestoreError::InvalidDestination)
     ));
+}
+
+#[test]
+fn transient_core_busy_is_bounded_and_restore_remains_resumable() {
+    let fixture = fixture();
+    let fake = FakeCore::new(fixture.blocks.clone(), fixture.identity.clone());
+    let temp = TempDir::new().unwrap();
+    let destination = temp.path().join("busy-resume");
+    let password = password();
+    fake.fail_next_scan_attempts(3);
+    let bounded =
+        service(&fake, &fixture.identity).with_busy_retry_policy(2, Duration::ZERO, Duration::ZERO);
+
+    assert!(matches!(
+        bounded.restore(&fixture.phrase, &password, &destination),
+        Err(SeedRestoreError::CoreBusy)
+    ));
+    assert!(!destination.exists());
+    assert!(temp.path().join(".busy-resume.seed-restore").exists());
+
+    let restored = service(&fake, &fixture.identity)
+        .restore(&fixture.phrase, &password, &destination)
+        .unwrap();
+    assert_eq!(restored.owned_outputs, 5);
+    assert!(!temp.path().join(".busy-resume.seed-restore").exists());
 }
 
 #[test]
