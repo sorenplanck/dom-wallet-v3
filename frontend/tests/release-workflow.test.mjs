@@ -67,8 +67,13 @@ test("Tauri resolves the frontend build from both supported CLI contexts", async
   assert.deepEqual(config.bundle.icon, ["../frontend/assets/dom-coin.png", "icons/icon.ico"]);
   assert.equal(
     config.plugins.updater.pubkey,
-    "",
-    "stabilization packages need a parseable empty updater key that fails closed",
+    "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXkgNzQxOTdBOTVDQTMwOUNGMApSV1R3bkRES2xYb1pkRzNvYlZSaUxQZlZSSHIxN0UwRmoyR044SVoyckJraXBSWnZJSVc2UExKMwo=",
+    "updater must pin the primary DOM release key (Minisign ID 74197A95CA309CF0)",
+  );
+  assert.equal(
+    Buffer.from(config.plugins.updater.pubkey, "base64").toString("utf8"),
+    "untrusted comment: minisign public key 74197A95CA309CF0\nRWTwnDDKlXoZdG3obVRiLPfVRHr17E0Fj2GN8IZ2rBkipRZvIIW6PLJ3\n",
+    "pinned updater key must decode to the canonical Minisign public key file",
   );
   assert.equal(config.plugins.updater.endpoints.every((endpoint) => endpoint.startsWith("https://")), true);
   assert.equal(config.bundle.createUpdaterArtifacts, false);

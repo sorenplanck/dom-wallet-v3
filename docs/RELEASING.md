@@ -8,8 +8,8 @@ No independent security audit is claimed.
 
 ## Release identity
 
-- Wallet version: `0.2.4`
-- Recommended tag: `wallet-v0.2.4`
+- Wallet version: `0.2.5`
+- Recommended tag: `wallet-v0.2.5`
 - DOM Core revision: `28ba3cefc9fbc913f126336482662528c68a7d8c`
 - Final genesis revision: `6a8a6475b36ad68bb760d61cf323126d95cd7416`
 - Mainnet chain ID: `f9831fadabc8a4234beab35fbb6327e84581645f33e9f75ed2ea78e8bcf1165b`
@@ -18,11 +18,32 @@ No independent security audit is claimed.
 
 Tag CI validates and packages the exact immutable revision, but never receives a
 private key and never publishes a release. Download the validated artifacts,
-sign each updater artifact locally with the offline Tauri key, verify every
-detached signature against the public key, and only then create the GitHub
-pre-release from the matching `wallet-v<version>` tag. Manual installers may be
-published without a live updater feed, but `latest.json` must not be published
-until every referenced artifact and signature is present and verified.
+sign each updater artifact locally with the offline Minisign release key
+(ID `74197A95CA309CF0`, the key pinned in `tauri.conf.json` and `main.rs`),
+verify every detached signature against the public key, and only then create
+the GitHub release from the matching `wallet-v<version>` tag. Manual installers
+may be published without a live updater feed, but `latest.json` must not be
+published until every referenced artifact and signature is present and
+verified.
+
+The updater consumes the regular bundles (`.AppImage`, NSIS `-setup.exe`,
+`.app.tar.gz`), so `createUpdaterArtifacts` stays `false` and CI never needs a
+signing key. The offline feed flow, per release:
+
+1. `cargo run -p dom-wallet-updater --example feed_tool -- draft <artifacts-dir>
+   <version> <wallet-revision>` builds the draft feed with per-platform URLs,
+   sizes and SHA-256 digests, plus the unsigned `dom_manifest`.
+2. `minisign -Sm <artifact>` for each of the three updater artifacts, then
+   `feed_tool finalize` — the first pass injects the artifact signatures and
+   emits `dom-manifest-canonical.bin` (the manifest signature covers the
+   artifact signatures, so these bytes exist only now).
+3. `minisign -Sm dom-manifest-canonical.bin`, then `feed_tool finalize` again
+   to produce `latest.json`; `feed_tool verify` re-checks every signature,
+   digest, origin and platform against the pinned public key before anything
+   is uploaded.
+4. Publish the release as **latest** (not a pre-release): the endpoints under
+   `releases/latest/download/` only resolve when a non-prerelease release
+   exists.
 
 Wallet V3 uses its embedded DOM Core through `WalletCoreApi`. It creates only
 Recovery Capsule v1 outputs, uses Address v1 and recovery Slate v4, and has no
@@ -43,11 +64,11 @@ tag and without creating a GitHub Release.
 ## Later release authorization
 
 After all local and CI gates pass and explicit authorization is given, verify
-that the clean release commit reports version `0.2.4`, then run:
+that the clean release commit reports version `0.2.5`, then run:
 
 ```bash
-git tag -a wallet-v0.2.4 -m "DOM Wallet V3 0.2.4 experimental"
-git push origin wallet-v0.2.4
+git tag -a wallet-v0.2.5 -m "DOM Wallet V3 0.2.5 experimental"
+git push origin wallet-v0.2.5
 ```
 
 Do not run these commands as part of validation. The tag workflow verifies

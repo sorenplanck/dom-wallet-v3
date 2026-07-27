@@ -18,7 +18,21 @@ use std::{
 use tauri::Manager;
 use tauri_plugin_updater::UpdaterExt;
 
-const UPDATE_PUBLIC_KEY: Option<&str> = option_env!("DOM_UPDATE_PUBLIC_KEY");
+/// Pinned primary DOM release signing key (Minisign key ID 74197A95CA309CF0).
+/// The backup key 1BD5CDF20DACC151 stays offline until an explicit rotation
+/// release; the Tauri updater plugin accepts a single key, so pinning the
+/// backup here would create a verification path that can never succeed.
+const UPDATE_PUBLIC_KEY: Option<&str> =
+    Some("RWTwnDDKlXoZdG3obVRiLPfVRHr17E0Fj2GN8IZ2rBkipRZvIIW6PLJ3");
+
+/// The Tauri updater plugin expects the base64 encoding of a complete
+/// Minisign public-key file, while [`MinisignVerifier::from_base64`] takes the
+/// raw base64 key line. Both derive from the same pinned key.
+fn plugin_pubkey(raw_key: &str) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .encode(format!("untrusted comment: minisign public key\n{raw_key}\n"))
+}
 
 fn unix_seconds() -> u64 {
     SystemTime::now()
@@ -149,7 +163,7 @@ async fn check_wallet_update(
         .map_err(|_| UpdateError::ManifestInvalid)?;
     let updater = handle
         .updater_builder()
-        .pubkey(public_key)
+        .pubkey(plugin_pubkey(public_key))
         .endpoints(vec![endpoint])
         .map_err(|_| UpdateError::CheckFailed)?
         .timeout(Duration::from_secs(20))
@@ -195,9 +209,12 @@ async fn check_wallet_update(
         wallet_schema: 2,
     };
     let decision = validate_wallet_manifest(&manifest, &policy, time::OffsetDateTime::now_utc())?;
+    let artifact =
+        dom_wallet_updater::select_artifact(&manifest, policy.target, policy.architecture)
+            .ok_or(UpdateError::ManifestInvalid)?;
     if manifest.version != update.version
-        || manifest.artifact.url.as_str() != update.download_url.as_str()
-        || manifest.artifact.signature != update.signature
+        || artifact.url.as_str() != update.download_url.as_str()
+        || artifact.signature != update.signature
     {
         return Err(UpdateError::ManifestInvalid);
     }
@@ -223,7 +240,7 @@ async fn check_wallet_update(
         .await
         .map_err(|_| UpdateError::SignatureInvalid)?;
     state.set_wallet_download_state(WalletUpdaterState::Verifying, Some(100));
-    validate_download(&bytes, &manifest.artifact)?;
+    validate_download(&bytes, artifact)?;
     let application = handle.state::<DesktopApplication>();
     if !application
         .update_safe_point_available()
@@ -761,7 +778,7 @@ fn application_builder() -> tauri::Builder<tauri::Wry> {
     tauri::Builder::default()
         .plugin(
             tauri_plugin_updater::Builder::new()
-                .pubkey(UPDATE_PUBLIC_KEY.unwrap_or(""))
+                .pubkey(UPDATE_PUBLIC_KEY.map(plugin_pubkey).unwrap_or_default())
                 .build(),
         )
         .manage(UpdateControl::new(

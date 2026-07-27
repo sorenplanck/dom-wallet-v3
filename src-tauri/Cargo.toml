@@ -6,6 +6,7 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+base64.workspace = true
 dom-wallet-core = { path = "../crates/dom-wallet-core" }
 dom-wallet-core-api.workspace = true
 dom-wallet-core-restore = { path = "../crates/dom-wallet-core-restore" }

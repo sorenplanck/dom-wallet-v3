@@ -131,8 +131,25 @@ pub struct WalletManifest {
     pub embedded_node_revision: String,
     pub network: String,
     pub minimum_wallet_schema: u32,
-    pub artifact: ArtifactDescriptor,
+    pub artifacts: Vec<ArtifactDescriptor>,
     pub manifest_signature: String,
+}
+
+/// Find the unique artifact for one platform.
+///
+/// Returns `None` when the platform is absent or ambiguously listed more than
+/// once; both cases must fail closed at the caller.
+pub fn select_artifact<'a>(
+    manifest: &'a WalletManifest,
+    target: &str,
+    architecture: &str,
+) -> Option<&'a ArtifactDescriptor> {
+    let mut matches = manifest
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.target == target && artifact.architecture == architecture);
+    let selected = matches.next()?;
+    matches.next().is_none().then_some(selected)
 }
 
 /// Installed Wallet constraints used to validate a remote manifest.
@@ -179,7 +196,15 @@ pub fn validate_wallet_manifest(
         return Err(UpdateError::ManifestInvalid);
     }
     validate_release_url(&manifest.release_url)?;
-    validate_artifact(&manifest.artifact, policy.target, policy.architecture)?;
+    if manifest.artifacts.is_empty() {
+        return Err(UpdateError::ManifestInvalid);
+    }
+    for artifact in &manifest.artifacts {
+        validate_release_url(&artifact.url)?;
+    }
+    let artifact = select_artifact(manifest, policy.target, policy.architecture)
+        .ok_or(UpdateError::UnsupportedPlatform)?;
+    validate_artifact(artifact, policy.target, policy.architecture)?;
     let installed =
         Version::parse(policy.installed_version).map_err(|_| UpdateError::ManifestInvalid)?;
     let available = Version::parse(&manifest.version).map_err(|_| UpdateError::ManifestInvalid)?;
@@ -1164,7 +1189,7 @@ mod tests {
             embedded_node_revision: "b".repeat(40),
             network: "mainnet".into(),
             minimum_wallet_schema: 2,
-            artifact: artifact(),
+            artifacts: vec![artifact()],
             manifest_signature: "manifest-signature".into(),
         }
     }
@@ -1306,18 +1331,18 @@ mod tests {
     #[test]
     fn origins_platform_hash_and_size_fail_closed() {
         let mut manifest = wallet_manifest("0.2.1");
-        manifest.artifact.url = Url::parse("http://github.com/file").expect("URL");
+        manifest.artifacts[0].url = Url::parse("http://github.com/file").expect("URL");
         assert_eq!(
             validate_wallet_manifest(&manifest, &wallet_policy(), now()),
             Err(UpdateError::OriginRejected)
         );
-        manifest.artifact.url = Url::parse("https://evil.example/file").expect("URL");
+        manifest.artifacts[0].url = Url::parse("https://evil.example/file").expect("URL");
         assert_eq!(
             validate_wallet_manifest(&manifest, &wallet_policy(), now()),
             Err(UpdateError::OriginRejected)
         );
         manifest = wallet_manifest("0.2.1");
-        manifest.artifact.target = "windows".into();
+        manifest.artifacts[0].target = "windows".into();
         assert_eq!(
             validate_wallet_manifest(&manifest, &wallet_policy(), now()),
             Err(UpdateError::UnsupportedPlatform)
@@ -1333,6 +1358,60 @@ mod tests {
         assert_eq!(
             validate_download(b"signed update", &wrong_hash),
             Err(UpdateError::HashMismatch)
+        );
+    }
+
+    #[test]
+    fn multi_platform_manifest_selects_unique_artifact_per_platform() {
+        let mut windows = artifact();
+        windows.target = "windows".into();
+        let mut macos = artifact();
+        macos.target = "macos".into();
+        macos.architecture = "aarch64".into();
+        let mut manifest = wallet_manifest("0.2.1");
+        manifest.artifacts = vec![artifact(), windows, macos];
+
+        assert_eq!(
+            validate_wallet_manifest(&manifest, &wallet_policy(), now()),
+            Ok(WalletDecision::Available(
+                Version::parse("0.2.1").expect("version")
+            ))
+        );
+        assert_eq!(
+            select_artifact(&manifest, "windows", "x86_64").map(|found| found.target.as_str()),
+            Some("windows")
+        );
+        assert_eq!(
+            select_artifact(&manifest, "macos", "aarch64").map(|found| found.target.as_str()),
+            Some("macos")
+        );
+        assert!(select_artifact(&manifest, "macos", "x86_64").is_none());
+
+        // A duplicated platform entry is ambiguous and must fail closed.
+        manifest.artifacts.push(artifact());
+        assert!(select_artifact(&manifest, "linux", "x86_64").is_none());
+        assert_eq!(
+            validate_wallet_manifest(&manifest, &wallet_policy(), now()),
+            Err(UpdateError::UnsupportedPlatform)
+        );
+
+        // One rejected origin poisons the whole manifest, not just its platform.
+        let mut foreign = wallet_manifest("0.2.1");
+        foreign.artifacts.push({
+            let mut poisoned = artifact();
+            poisoned.target = "windows".into();
+            poisoned.url = Url::parse("https://evil.example/file").expect("URL");
+            poisoned
+        });
+        assert_eq!(
+            validate_wallet_manifest(&foreign, &wallet_policy(), now()),
+            Err(UpdateError::OriginRejected)
+        );
+
+        manifest.artifacts.clear();
+        assert_eq!(
+            validate_wallet_manifest(&manifest, &wallet_policy(), now()),
+            Err(UpdateError::ManifestInvalid)
         );
     }
 
