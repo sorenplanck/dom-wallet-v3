@@ -30,8 +30,9 @@ const UPDATE_PUBLIC_KEY: Option<&str> =
 /// raw base64 key line. Both derive from the same pinned key.
 fn plugin_pubkey(raw_key: &str) -> String {
     use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD
-        .encode(format!("untrusted comment: minisign public key\n{raw_key}\n"))
+    base64::engine::general_purpose::STANDARD.encode(format!(
+        "untrusted comment: minisign public key\n{raw_key}\n"
+    ))
 }
 
 fn unix_seconds() -> u64 {
