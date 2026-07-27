@@ -285,13 +285,48 @@ fn application_status(
 ) -> dom_wallet_tauri_shell::ApplicationStatusDto {
     app.application_status()
 }
+/// Root of the managed per-name wallet layout: `<app_data>/mainnet/wallets`.
+fn managed_wallets_root(
+    handle: &tauri::AppHandle,
+) -> Result<std::path::PathBuf, dom_wallet_tauri_shell::CommandErrorDto> {
+    Ok(handle
+        .path()
+        .app_data_dir()
+        .map_err(|_| dom_wallet_tauri_shell::CommandErrorDto {
+            code: "APP_DATA_DIRECTORY_UNAVAILABLE".into(),
+            category: "PLATFORM".into(),
+            message: "The platform application data directory is unavailable.".into(),
+            retryable: false,
+        })?
+        .join("mainnet")
+        .join("wallets"))
+}
+
+/// Resolve a validated wallet name inside the managed root, which must exist
+/// before restore can stage next to its destination.
+fn managed_wallet_path(
+    handle: &tauri::AppHandle,
+    name: &str,
+) -> Result<std::path::PathBuf, dom_wallet_tauri_shell::CommandErrorDto> {
+    let root = managed_wallets_root(handle)?;
+    let path = dom_wallet_tauri_shell::resolve_wallet_directory(&root, name)?;
+    fs::create_dir_all(&root).map_err(|_| dom_wallet_tauri_shell::CommandErrorDto {
+        code: "APP_DATA_DIRECTORY_UNAVAILABLE".into(),
+        category: "PLATFORM".into(),
+        message: "The managed wallets directory could not be prepared.".into(),
+        retryable: true,
+    })?;
+    Ok(path)
+}
+
 #[tauri::command]
 fn wallet_create_recoverable(
     handle: tauri::AppHandle,
     app: tauri::State<'_, DesktopApplication>,
-    path: String,
+    name: String,
     password: String,
 ) -> Result<dom_wallet_tauri_shell::RecoveryCreateDto, dom_wallet_tauri_shell::CommandErrorDto> {
+    let path = managed_wallet_path(&handle, &name)?;
     ensure_mainnet_node(&handle, &app)?;
     app.wallet_create_recoverable(path, &password)
         .map_err(Into::into)
@@ -300,10 +335,11 @@ fn wallet_create_recoverable(
 fn wallet_restore_from_mnemonic(
     handle: tauri::AppHandle,
     app: tauri::State<'_, DesktopApplication>,
-    path: String,
+    name: String,
     password: String,
     mnemonic: String,
 ) -> Result<dom_wallet_tauri_shell::RecoveryResultDto, dom_wallet_tauri_shell::CommandErrorDto> {
+    let path = managed_wallet_path(&handle, &name)?;
     ensure_mainnet_node(&handle, &app)?;
     app.wallet_restore_from_mnemonic(path, &password, &mnemonic)
         .map_err(Into::into)
@@ -321,11 +357,12 @@ fn wallet_backup_export(
 fn wallet_backup_import(
     handle: tauri::AppHandle,
     app: tauri::State<'_, DesktopApplication>,
-    destination: String,
+    name: String,
     backup_path: String,
     backup_password: String,
     password: String,
 ) -> Result<dom_wallet_core::WalletSummary, dom_wallet_tauri_shell::CommandErrorDto> {
+    let destination = managed_wallet_path(&handle, &name)?;
     ensure_mainnet_node(&handle, &app)?;
     app.wallet_backup_import(destination, backup_path, &backup_password, &password)
         .map_err(Into::into)
@@ -346,6 +383,24 @@ fn wallet_open(
 ) -> Result<dom_wallet_core::WalletSummary, dom_wallet_tauri_shell::CommandErrorDto> {
     ensure_mainnet_node(&handle, &app)?;
     app.wallet_open(path).map_err(Into::into)
+}
+#[tauri::command]
+fn wallet_open_named(
+    handle: tauri::AppHandle,
+    app: tauri::State<'_, DesktopApplication>,
+    name: String,
+) -> Result<dom_wallet_core::WalletSummary, dom_wallet_tauri_shell::CommandErrorDto> {
+    let path = managed_wallet_path(&handle, &name)?;
+    ensure_mainnet_node(&handle, &app)?;
+    app.wallet_open(path).map_err(Into::into)
+}
+#[tauri::command]
+fn wallet_list(
+    handle: tauri::AppHandle,
+) -> Result<Vec<String>, dom_wallet_tauri_shell::CommandErrorDto> {
+    Ok(dom_wallet_tauri_shell::list_wallet_names(
+        &managed_wallets_root(&handle)?,
+    ))
 }
 #[tauri::command]
 fn wallet_unlock(
@@ -820,6 +875,8 @@ fn application_builder() -> tauri::Builder<tauri::Wry> {
             wallet_backup_import,
             wallet_recovery_phrase_confirm,
             wallet_open,
+            wallet_open_named,
+            wallet_list,
             wallet_unlock,
             wallet_lock,
             wallet_close,

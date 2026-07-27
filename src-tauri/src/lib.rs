@@ -31,7 +31,11 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
-use std::{net::SocketAddr, path::Path, thread::JoinHandle};
+use std::{
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    thread::JoinHandle,
+};
 use thiserror::Error;
 
 pub struct DesktopApplication {
@@ -1930,6 +1934,10 @@ pub enum CommandError {
     RestoreNodeSynchronizing,
     #[error("restore destination already exists")]
     RestoreDestinationExists,
+    #[error("restore staging state is incompatible")]
+    RestoreStagingIncompatible,
+    #[error("wallet name is invalid")]
+    InvalidWalletName,
     #[error("wallet synchronization is paused")]
     SynchronizationPaused,
     #[error("wallet cursor initialization failed")]
@@ -1997,7 +2005,26 @@ impl From<CommandError> for CommandErrorDto {
             CommandError::RestoreDestinationExists => Self {
                 code: "RESTORE_DESTINATION_EXISTS".into(),
                 category: "STORAGE".into(),
-                message: "Choose a new empty wallet folder for seed restore.".into(),
+                message: "A wallet with this name already exists. Choose another name or remove \
+                          the existing wallet folder."
+                    .into(),
+                retryable: false,
+            },
+            CommandError::RestoreStagingIncompatible => Self {
+                code: "RESTORE_STAGING_INCOMPATIBLE".into(),
+                category: "STORAGE".into(),
+                message: "An interrupted restore left staging data for this destination. Retry \
+                          with the same password used before, or remove the hidden restore \
+                          staging folder next to the destination."
+                    .into(),
+                retryable: false,
+            },
+            CommandError::InvalidWalletName => Self {
+                code: "WALLET_NAME_INVALID".into(),
+                category: "VALIDATION".into(),
+                message: "Use a simple wallet name without separators, special characters, or \
+                          reserved Windows names."
+                    .into(),
                 retryable: false,
             },
             CommandError::SynchronizationPaused => Self {
@@ -2116,6 +2143,72 @@ impl From<CoreError> for CommandError {
     }
 }
 
+/// Windows device names that can never be wallet names on any platform, so a
+/// managed wallet directory always round-trips across operating systems.
+const RESERVED_WALLET_NAMES: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Validate a user-facing wallet name for the managed wallets directory.
+///
+/// Fail closed: a name is a single path component with no traversal, no
+/// leading dot (hidden and restore-staging namespace), no trailing dot or
+/// space (silently stripped by Windows), no control or Windows-forbidden
+/// characters, and no reserved Windows device name as its stem.
+pub fn validate_wallet_name(name: &str) -> Result<(), CommandError> {
+    if name.is_empty()
+        || name.len() > 64
+        || name.starts_with('.')
+        || name.ends_with('.')
+        || name.starts_with(' ')
+        || name.ends_with(' ')
+    {
+        return Err(CommandError::InvalidWalletName);
+    }
+    if name.chars().any(|character| {
+        character.is_control()
+            || matches!(
+                character,
+                '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+            )
+    }) {
+        return Err(CommandError::InvalidWalletName);
+    }
+    let stem = name.split('.').next().unwrap_or_default();
+    if RESERVED_WALLET_NAMES
+        .iter()
+        .any(|reserved| stem.eq_ignore_ascii_case(reserved))
+    {
+        return Err(CommandError::InvalidWalletName);
+    }
+    Ok(())
+}
+
+/// Resolve a validated wallet name inside the managed wallets root.
+pub fn resolve_wallet_directory(wallets_root: &Path, name: &str) -> Result<PathBuf, CommandError> {
+    validate_wallet_name(name)?;
+    Ok(wallets_root.join(name))
+}
+
+/// List valid wallet names inside the managed wallets root, sorted.
+///
+/// A missing root simply yields no wallets; files, hidden restore-staging
+/// directories and foreign entries are never listed.
+pub fn list_wallet_names(wallets_root: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(wallets_root) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| validate_wallet_name(name).is_ok())
+        .collect();
+    names.sort();
+    names
+}
+
 fn command_error_from_restore(error: SeedRestoreError) -> CommandError {
     match error {
         SeedRestoreError::InvalidDestination => CommandError::RestoreDestinationExists,
@@ -2131,13 +2224,12 @@ fn command_error_from_restore(error: SeedRestoreError) -> CommandError {
             retryable: false,
         },
         SeedRestoreError::ChainIdentityMismatch => CommandError::IdentityMismatch,
-        SeedRestoreError::Storage | SeedRestoreError::IncompatibleCheckpoint => {
-            CommandError::Wallet {
-                code: "RESTORE_STORAGE_FAILED",
-                message: "The encrypted restore state could not be resumed safely.",
-                retryable: true,
-            }
-        }
+        SeedRestoreError::IncompatibleCheckpoint => CommandError::RestoreStagingIncompatible,
+        SeedRestoreError::Storage => CommandError::Wallet {
+            code: "RESTORE_STORAGE_FAILED",
+            message: "The encrypted restore state could not be resumed safely.",
+            retryable: true,
+        },
         SeedRestoreError::CanonicalScan => CommandError::Wallet {
             code: "RESTORE_CANONICAL_SCAN_FAILED",
             message: "The canonical chain scan failed. Check node synchronization and retry.",
@@ -2496,6 +2588,97 @@ mod tests {
     }
 
     #[test]
+    fn wallet_name_validation_fails_closed() {
+        for valid in [
+            "main",
+            "savings-2026",
+            "Leo_wallet",
+            "a",
+            "COM10",
+            "COM",
+            "LPT",
+            "LPT10",
+            "console",
+            "aux-backup",
+        ] {
+            assert!(
+                validate_wallet_name(valid).is_ok(),
+                "expected valid: {valid:?}"
+            );
+        }
+        let oversized = "x".repeat(65);
+        for invalid in [
+            "",
+            ".",
+            "..",
+            ".hidden",
+            ".main.seed-restore",
+            "a/b",
+            "a\\b",
+            "../up",
+            "..\\up",
+            "name.",
+            "name ",
+            " name",
+            "CON",
+            "con",
+            "Con.wallet",
+            "com7",
+            "LPT9",
+            "lpt1.old",
+            "nul",
+            "a:b",
+            "a*b",
+            "a?b",
+            "a|b",
+            "a<b",
+            "a>b",
+            "a\"b",
+            "tab\tname",
+            oversized.as_str(),
+        ] {
+            assert!(
+                matches!(
+                    validate_wallet_name(invalid),
+                    Err(CommandError::InvalidWalletName)
+                ),
+                "expected invalid: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wallet_directory_resolution_and_listing_use_validated_names() {
+        let root = tempfile::tempdir().unwrap();
+        let resolved = resolve_wallet_directory(root.path(), "primary").unwrap();
+        assert_eq!(resolved, root.path().join("primary"));
+        assert!(matches!(
+            resolve_wallet_directory(root.path(), "../escape"),
+            Err(CommandError::InvalidWalletName)
+        ));
+
+        std::fs::create_dir_all(root.path().join("beta")).unwrap();
+        std::fs::create_dir_all(root.path().join("alpha")).unwrap();
+        std::fs::create_dir_all(root.path().join(".alpha.seed-restore")).unwrap();
+        std::fs::write(root.path().join("stray-file"), b"x").unwrap();
+        assert_eq!(
+            list_wallet_names(root.path()),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+        assert!(list_wallet_names(&root.path().join("missing")).is_empty());
+    }
+
+    #[test]
+    fn incompatible_restore_staging_maps_to_guided_error() {
+        let staging: CommandErrorDto =
+            CommandError::from(CoreError::Restore(SeedRestoreError::IncompatibleCheckpoint)).into();
+        assert_eq!(staging.code, "RESTORE_STAGING_INCOMPATIBLE");
+        assert_eq!(staging.category, "STORAGE");
+        assert!(!staging.retryable);
+        assert!(staging.message.contains("same password"));
+    }
+
+    #[test]
     fn seed_restore_app_reports_destination_and_sync_errors_without_node_mislabeling() {
         let app = DesktopApplication::default();
         let parent = tempfile::tempdir().unwrap();
@@ -2516,6 +2699,8 @@ mod tests {
             CommandError::from(CoreError::Restore(SeedRestoreError::InvalidDestination)).into();
         assert_eq!(destination.code, "RESTORE_DESTINATION_EXISTS");
         assert_eq!(destination.category, "STORAGE");
+        assert!(destination.message.contains("already exists"));
+        assert!(destination.message.contains("another name"));
 
         let busy: CommandErrorDto =
             CommandError::from(CoreError::Restore(SeedRestoreError::CoreBusy)).into();

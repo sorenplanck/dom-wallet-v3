@@ -14,7 +14,7 @@ export const COMMANDS = Object.freeze([
   "native_bridge_status", "get_build_info", "update_status", "check_updates_now", "check_node_now",
   "application_status", "wallet_create_recoverable", "wallet_restore_from_mnemonic",
   "wallet_backup_export", "wallet_backup_import", "wallet_recovery_phrase_confirm",
-  "wallet_open", "wallet_unlock", "wallet_lock", "wallet_close", "wallet_summary",
+  "wallet_open", "wallet_open_named", "wallet_list", "wallet_unlock", "wallet_lock", "wallet_close", "wallet_summary",
   "account_list", "account_summary", "embedded_node_start", "embedded_node_stop", "embedded_node_status",
   "node_network_status", "node_peer_status", "wallet_sync_status", "wallet_sync_start",
   "wallet_sync_pause", "wallet_sync_resume", "wallet_sync_retry", "wallet_rescan",
@@ -101,7 +101,20 @@ document.querySelectorAll("[data-gate-panel]").forEach((button) => button.addEve
   const panel = button.dataset.gatePanel;
   document.querySelectorAll(".gate-panel").forEach((node) => { node.hidden = node.id !== panel; });
   if (panel === "restore-form") refreshOnboardingNode().catch((error) => show(redactedError(error), true));
+  if (panel === "open-form") refreshWalletList().catch((error) => show(redactedError(error), true));
 }));
+const refreshWalletList = async () => {
+  const names = await invoke("wallet_list");
+  const select = byId("open-wallet-select");
+  select.replaceChildren(...names.map((name) => {
+    const option = document.createElement("option");
+    option.value = name;
+    option.textContent = name;
+    return option;
+  }));
+  byId("open-wallet-empty").hidden = names.length > 0;
+  return names;
+};
 const enterApp = () => { byId("gate").classList.add("hidden"); byId("app").classList.remove("hidden"); selectScreen("dashboard"); };
 const enterGate = () => { byId("app").classList.add("hidden"); byId("gate").classList.remove("hidden"); clearSecretForms(); };
 
@@ -151,7 +164,7 @@ byId("recovery-abandon").addEventListener("click", () => { clearPhrase(); show("
 byId("create-form").addEventListener("submit", async (event) => {
   event.preventDefault(); const form = event.currentTarget; const data = new FormData(form);
   try {
-    const created = await run(() => invoke("wallet_create_recoverable", { path: data.get("path"), password: data.get("password") }));
+    const created = await run(() => invoke("wallet_create_recoverable", { name: data.get("name"), password: data.get("password") }));
     clearPasswords(form); beginPhrase(created.mnemonic); show("Write down and confirm the recovery phrase.");
   } catch (error) { clearPasswords(form); show(redactedError(error), true); }
 });
@@ -159,7 +172,7 @@ byId("restore-form").addEventListener("submit", async (event) => {
   event.preventDefault(); const form = event.currentTarget; const data = new FormData(form);
   try {
     show("Restore: initializing Mainnet node.");
-    const result = await run(() => invoke("wallet_restore_from_mnemonic", { path: data.get("path"), password: data.get("password"), mnemonic: data.get("mnemonic") }));
+    const result = await run(() => invoke("wallet_restore_from_mnemonic", { name: data.get("name"), password: data.get("password"), mnemonic: data.get("mnemonic") }));
     form.querySelector('textarea[name="mnemonic"]').value = ""; clearPasswords(form);
     show(`Restore completed: ${result.owned_outputs} owned outputs, ${result.balance.confirmed} confirmed noms.`);
   } catch (error) { form.querySelector('textarea[name="mnemonic"]').value = ""; clearPasswords(form); show(redactedError(error), true); }
@@ -170,6 +183,11 @@ byId("onboarding-node-retry").addEventListener("click", () => {
     .catch((error) => show(redactedError(error), true));
 });
 byId("open-form").addEventListener("submit", async (event) => {
+  event.preventDefault(); const form = event.currentTarget;
+  try { await run(() => invoke("wallet_open_named", { name: new FormData(form).get("name") })); show("Mainnet wallet opened in locked state."); }
+  catch (error) { show(redactedError(error), true); }
+});
+byId("locate-form").addEventListener("submit", async (event) => {
   event.preventDefault(); const form = event.currentTarget;
   try { await run(() => invoke("wallet_open", { path: new FormData(form).get("path") })); show("Mainnet wallet opened in locked state."); }
   catch (error) { show(redactedError(error), true); }
@@ -422,7 +440,7 @@ byId("backup-import-form").addEventListener("submit", async (event) => {
     await run(async () => {
       await invoke("wallet_close");
       await invoke("wallet_backup_import", {
-        destination: data.get("destination"),
+        name: data.get("name"),
         backupPath: data.get("backup_path"),
         backupPassword: data.get("backup_password"),
         password: data.get("password"),
