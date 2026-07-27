@@ -211,12 +211,12 @@ try {
   `);
   assert.deepEqual(panels, { create: true, restore: true, locate: true });
 
-  const walletPath = `${profile}/wallet`;
+  const walletName = "packaged-mainnet-wallet";
   const testPassword = "packaged-mainnet-test-only";
   await execute(`
     document.querySelector('[data-gate-panel="create-form"]').click();
     const form = document.getElementById("create-form");
-    form.querySelector('input[name="path"]').value = arguments[0];
+    form.querySelector('input[name="name"]').value = arguments[0];
     form.querySelector('input[name="password"]').value = arguments[1];
     form.requestSubmit();
     return new Promise((resolve, reject) => {
@@ -229,7 +229,7 @@ try {
       };
       poll();
     });
-  `, [walletPath, testPassword]);
+  `, [walletName, testPassword]);
 
   await execute(`
     const confirmed = document.getElementById("recovery-confirmed");
@@ -579,7 +579,7 @@ try {
     });
   `, [testPassword]);
   const backupPath = `${profile}/wallet-backup.dom`;
-  const restoredWalletPath = `${profile}/wallet-restored`;
+  const restoredWalletName = "packaged-restored-wallet";
   const backupPassword = "packaged-backup-password-only";
   const restoredPassword = "packaged-restored-password-only";
   const backupUi = await execute(`
@@ -604,7 +604,7 @@ try {
     window.confirm = () => true;
     const form = document.getElementById("backup-import-form");
     form.querySelector('input[name="backup_path"]').value = arguments[0];
-    form.querySelector('input[name="destination"]').value = arguments[1];
+    form.querySelector('input[name="name"]').value = arguments[1];
     form.querySelector('input[name="backup_password"]').value = arguments[2];
     form.querySelector('input[name="password"]').value = arguments[3];
     form.requestSubmit();
@@ -619,7 +619,7 @@ try {
       };
       poll();
     });
-  `, [backupPath, restoredWalletPath, backupPassword, restoredPassword]);
+  `, [backupPath, restoredWalletName, backupPassword, restoredPassword]);
   assert.match(restoreUi, /Encrypted backup imported in locked state/);
   await execute(`
     const form = document.getElementById("unlock-form");
