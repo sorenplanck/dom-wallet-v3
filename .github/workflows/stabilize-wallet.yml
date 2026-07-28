@@ -52,7 +52,7 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
-          test "$VERSION" = "0.2.6"
+          test "$VERSION" = "0.2.8"
           test "$VERSION" = "$(node -p 'require("./frontend/package.json").version')"
           test "$VERSION" = "$(node -p 'require("./src-tauri/tauri.conf.json").version')"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
@@ -137,7 +137,7 @@ jobs:
         uses: tauri-apps/tauri-action@fce9c6108b31ea247710505d3aaaa893ee6768d4
         with:
           projectPath: src-tauri
-          args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} -- --locked
+          args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --no-sign -- --locked
       - name: Verify required installer families
         shell: bash
         run: |
@@ -168,7 +168,7 @@ jobs:
       - name: Preserve validated installers
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: dom-wallet-v0.2.6-${{ matrix.target }}
+          name: dom-wallet-v0.2.8-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/bundle
           if-no-files-found: error
           retention-days: 7
