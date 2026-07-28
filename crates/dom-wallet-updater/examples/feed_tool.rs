@@ -142,7 +142,7 @@ fn draft(directory: &Path, version: &str, wallet_revision: &str) -> Result<(), S
         release_url: format!("{REPOSITORY}/releases/tag/{tag}")
             .parse()
             .expect("release URL parses"),
-        release_notes: format!("DOM Wallet V3 {version} experimental release."),
+        release_notes: format!("DOM Wallet V3 {version} stable release."),
         wallet_revision: wallet_revision.into(),
         embedded_node_version: EMBEDDED_NODE_VERSION.into(),
         embedded_node_revision: EMBEDDED_NODE_REVISION.into(),
