@@ -767,9 +767,17 @@ impl WalletService {
                 self.summary()
             }
             Err(error) => {
-                self.record_sync_failure(&error);
+                self.finish_sync_failure(&error);
                 Err(error.into())
             }
+        }
+    }
+
+    fn finish_sync_failure(&mut self, error: &ProductionBackendError) {
+        if error.is_transient_sync_unavailability() {
+            self.state = ApplicationState::Unlocked;
+        } else {
+            self.record_sync_failure(error);
         }
     }
 
@@ -823,7 +831,7 @@ impl WalletService {
                 self.summary()
             }
             Err(error) => {
-                self.record_sync_failure(&error);
+                self.finish_sync_failure(&error);
                 Err(error.into())
             }
         }
@@ -2625,6 +2633,26 @@ mod tests {
             diagnostics.last_error.as_deref(),
             Some("CURSOR_SYNCHRONIZATION_FAILED:Core scan contract failed (CORE_INTERNAL_FAILURE)")
         );
+        assert!(service.summary().is_ok());
+    }
+
+    #[test]
+    fn transient_core_not_ready_is_not_recorded_as_a_cursor_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut service = test_service();
+        service
+            .create_recoverable(temp.path().join("wallet"), "password-1", backup_identity())
+            .unwrap();
+        service.unlock("password-1").unwrap();
+        service.state = ApplicationState::Synchronizing;
+
+        service.finish_sync_failure(&ProductionBackendError::Scan(
+            dom_wallet_core_sync::CoreScanError::CoreNotReady,
+        ));
+
+        let diagnostics = service.diagnostics();
+        assert_eq!(diagnostics.application_state, "READY");
+        assert!(diagnostics.last_error.is_none());
         assert!(service.summary().is_ok());
     }
 

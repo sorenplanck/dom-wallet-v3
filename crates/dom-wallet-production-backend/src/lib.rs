@@ -44,6 +44,14 @@ pub enum ProductionBackendError {
     Restore(#[from] SeedRestoreError),
 }
 
+impl ProductionBackendError {
+    /// Whether a live Wallet scan was rejected only because Core is
+    /// temporarily unable to serve a canonical view.
+    pub fn is_transient_sync_unavailability(&self) -> bool {
+        matches!(self, Self::Scan(CoreScanError::CoreNotReady))
+    }
+}
+
 /// Explicit owner of the embedded node and every Wallet-facing frozen adapter.
 pub struct ProductionWalletBackend {
     lifecycle: EmbeddedCoreLifecycle,

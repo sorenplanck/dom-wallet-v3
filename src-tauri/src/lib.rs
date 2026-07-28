@@ -638,6 +638,60 @@ const SYNC_IDLE: u64 = 0;
 const SYNC_RUNNING: u64 = 1;
 const SYNC_STOPPING: u64 = 2;
 const SYNC_ERROR: u64 = 3;
+const SYNC_CATCH_UP_RETRY_MILLIS: u64 = 10;
+const SYNC_FOLLOW_POLL_MILLIS: u64 = 1_000;
+const SYNC_NOT_READY_INITIAL_BACKOFF_MILLIS: u64 = 100;
+const SYNC_NOT_READY_MAX_BACKOFF_MILLIS: u64 = 2_000;
+
+fn transient_synchronization_error(error: &CommandError) -> bool {
+    matches!(
+        error,
+        CommandError::NodeNotReady | CommandError::ActivityBusy
+    )
+}
+
+fn synchronization_retry_backoff(consecutive_failures: u32) -> std::time::Duration {
+    let shift = consecutive_failures.min(4);
+    std::time::Duration::from_millis(
+        SYNC_NOT_READY_INITIAL_BACKOFF_MILLIS
+            .saturating_mul(1_u64 << shift)
+            .min(SYNC_NOT_READY_MAX_BACKOFF_MILLIS),
+    )
+}
+
+fn run_synchronization_follow_loop<Synchronize, Wait>(
+    stop: &AtomicBool,
+    mut synchronize_once: Synchronize,
+    mut wait: Wait,
+) -> Result<(), CommandError>
+where
+    Synchronize: FnMut() -> Result<bool, CommandError>,
+    Wait: FnMut(std::time::Duration),
+{
+    let mut consecutive_transient_failures = 0_u32;
+    while !stop.load(Ordering::Acquire) {
+        let delay = match synchronize_once() {
+            Ok(synchronized) => {
+                consecutive_transient_failures = 0;
+                std::time::Duration::from_millis(if synchronized {
+                    SYNC_FOLLOW_POLL_MILLIS
+                } else {
+                    SYNC_CATCH_UP_RETRY_MILLIS
+                })
+            }
+            Err(error) if transient_synchronization_error(&error) => {
+                let delay = synchronization_retry_backoff(consecutive_transient_failures);
+                consecutive_transient_failures = consecutive_transient_failures.saturating_add(1);
+                delay
+            }
+            Err(error) => return Err(error),
+        };
+        if !stop.load(Ordering::Acquire) {
+            wait(delay);
+        }
+    }
+    Ok(())
+}
 
 struct SynchronizationRuntime {
     state: Arc<AtomicU64>,
@@ -1904,52 +1958,53 @@ impl DesktopApplication {
         let state = Arc::clone(&runtime.state);
         let error_code = Arc::clone(&runtime.error_code);
         let cached = Arc::clone(&runtime.cached_status);
+        let activities = Arc::clone(&self.activities);
         let worker = std::thread::Builder::new()
             .name("dom-wallet-sync".into())
             .spawn(move || {
-                let _activity = activity;
+                let mut initial_activity = Some(activity);
                 let worker_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    if stop.load(Ordering::Acquire) {
-                        return;
-                    }
-                    while !stop.load(Ordering::Acquire) {
-                        let result = service
-                            .lock()
-                            .map_err(|_| CommandError::RecoveryRequired)
-                            .and_then(|mut wallet| {
-                                wallet.synchronize_live().map_err(CommandError::from)?;
-                                let snapshot = sync_status_from_service(&wallet, false);
-                                let complete = snapshot.synchronized;
-                                if let Ok(mut cached) = cached.lock() {
-                                    *cached = Some(snapshot);
-                                }
-                                Ok(complete)
-                            });
-                        match result {
-                            Ok(true) => break,
-                            Ok(false) => std::thread::yield_now(),
-                            Err(error) => {
-                                state.store(SYNC_ERROR, Ordering::Release);
-                                if let Ok(mut slot) = error_code.lock() {
-                                    *slot = Some(match error {
-                                        CommandError::RecoveryRequired => {
-                                            "SYNC_RECOVERY_REQUIRED".into()
-                                        }
-                                        _ => "SYNC_WORK_FAILED".into(),
-                                    });
-                                }
-                                break;
+                    run_synchronization_follow_loop(
+                        &stop,
+                        || {
+                            let _activity = match initial_activity.take() {
+                                Some(activity) => activity,
+                                None => activities.try_begin(ActivityKind::Synchronization)?,
+                            };
+                            let mut wallet =
+                                service.lock().map_err(|_| CommandError::RecoveryRequired)?;
+                            let result = wallet.synchronize_live().map_err(CommandError::from);
+                            let snapshot = sync_status_from_service(&wallet, false);
+                            let synchronized = snapshot.synchronized;
+                            if let Ok(mut cached) = cached.lock() {
+                                *cached = Some(snapshot);
                             }
+                            result.map(|_| synchronized)
+                        },
+                        std::thread::park_timeout,
+                    )
+                }));
+                match worker_result {
+                    Ok(Ok(())) => {
+                        if state.load(Ordering::Acquire) != SYNC_ERROR {
+                            state.store(SYNC_IDLE, Ordering::Release);
                         }
                     }
-                }));
-                if worker_result.is_err() {
-                    state.store(SYNC_ERROR, Ordering::Release);
-                    if let Ok(mut slot) = error_code.lock() {
-                        *slot = Some("SYNC_WORKER_PANIC".into());
+                    Ok(Err(error)) => {
+                        state.store(SYNC_ERROR, Ordering::Release);
+                        if let Ok(mut slot) = error_code.lock() {
+                            *slot = Some(match error {
+                                CommandError::RecoveryRequired => "SYNC_RECOVERY_REQUIRED".into(),
+                                _ => "SYNC_WORK_FAILED".into(),
+                            });
+                        }
                     }
-                } else if state.load(Ordering::Acquire) != SYNC_ERROR {
-                    state.store(SYNC_IDLE, Ordering::Release);
+                    Err(_) => {
+                        state.store(SYNC_ERROR, Ordering::Release);
+                        if let Ok(mut slot) = error_code.lock() {
+                            *slot = Some("SYNC_WORKER_PANIC".into());
+                        }
+                    }
                 }
             });
         match worker {
@@ -1975,7 +2030,11 @@ impl DesktopApplication {
             if runtime.worker.is_some() {
                 runtime.state.store(SYNC_STOPPING, Ordering::Release);
             }
-            runtime.worker.take()
+            let worker = runtime.worker.take();
+            if let Some(worker) = worker.as_ref() {
+                worker.thread().unpark();
+            }
+            worker
         };
         if worker.is_some_and(|worker| worker.join().is_err()) {
             if let Ok(runtime) = self.synchronization.lock() {
@@ -3088,6 +3147,9 @@ impl From<CoreError> for CommandError {
                 message: "The fee is below the embedded node policy minimum.",
                 retryable: false,
             },
+            CoreError::Backend(error) if error.is_transient_sync_unavailability() => {
+                Self::NodeNotReady
+            }
             CoreError::Backend(_) => Self::Wallet {
                 code: "EMBEDDED_NODE_OPERATION_FAILED",
                 message: "The embedded Mainnet node could not complete the requested operation.",
@@ -3859,6 +3921,67 @@ mod tests {
             app.mining.lock().unwrap().state.load(Ordering::Acquire),
             MINING_READY
         );
+    }
+
+    #[test]
+    fn regression_cursor_follow_survives_tip_matches_and_transient_core_not_ready() {
+        let stop = AtomicBool::new(false);
+        let canonical_height = std::cell::Cell::new(10_007_u64);
+        let cursor_height = std::cell::Cell::new(10_006_u64);
+        let calls = std::cell::Cell::new(0_u64);
+        let observed_not_ready = std::cell::Cell::new(false);
+        let waits = std::cell::RefCell::new(Vec::new());
+
+        let result = run_synchronization_follow_loop(
+            &stop,
+            || {
+                let call = calls.get() + 1;
+                calls.set(call);
+                if call == 3 {
+                    observed_not_ready.set(true);
+                    return Err(CommandError::NodeNotReady);
+                }
+                if cursor_height.get() < canonical_height.get() {
+                    cursor_height.set(cursor_height.get() + 1);
+                }
+                Ok(cursor_height.get() == canonical_height.get())
+            },
+            |delay| {
+                let mut waits = waits.borrow_mut();
+                waits.push(delay);
+                if waits.len() <= 3 {
+                    canonical_height.set(canonical_height.get() + 1);
+                }
+                if canonical_height.get() == 10_010 && cursor_height.get() == canonical_height.get()
+                {
+                    stop.store(true, Ordering::Release);
+                }
+            },
+        );
+
+        assert!(result.is_ok());
+        assert!(observed_not_ready.get());
+        assert_eq!(cursor_height.get(), canonical_height.get());
+        assert_eq!(cursor_height.get(), 10_010);
+        assert_eq!(calls.get(), 5);
+        assert_eq!(
+            waits.borrow()[2],
+            std::time::Duration::from_millis(SYNC_NOT_READY_INITIAL_BACKOFF_MILLIS)
+        );
+    }
+
+    #[test]
+    fn cursor_follow_still_stops_on_non_transient_failures() {
+        let stop = AtomicBool::new(false);
+        let waits = std::cell::Cell::new(0_u64);
+        let result = run_synchronization_follow_loop(
+            &stop,
+            || Err(CommandError::IdentityMismatch),
+            |_| waits.set(waits.get() + 1),
+        );
+
+        assert!(matches!(result, Err(CommandError::IdentityMismatch)));
+        assert_eq!(waits.get(), 0);
     }
 
     #[test]
