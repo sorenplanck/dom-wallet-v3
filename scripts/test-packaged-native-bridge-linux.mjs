@@ -286,6 +286,16 @@ try {
     settingsMainnet: true,
   });
 
+  let peerStatus;
+  for (let attempt = 0; attempt < synchronizationAttemptLimit; attempt += 1) {
+    const result = await nativeResult("node_peer_status", {});
+    if (!result.ok) throw new Error("packaged peer diagnostics failed");
+    peerStatus = result.value;
+    if (peerStatus.total_connected_peers > 0) break;
+    await new Promise((done) => setTimeout(done, 500));
+  }
+  assert.ok(peerStatus.total_connected_peers > 0, "packaged node did not register a Mainnet peer");
+
   let genesisSyncStatus;
   for (let attempt = 0; attempt < synchronizationAttemptLimit; attempt += 1) {
     const syncStart = await nativeResult("wallet_sync_start", {});
@@ -310,15 +320,6 @@ try {
   assert.equal(genesisSyncStatus.value.cursor_height, 0);
   assert.equal(genesisSyncStatus.value.cursor_hash, genesisSyncStatus.value.canonical_hash);
 
-  let peerStatus;
-  for (let attempt = 0; attempt < synchronizationAttemptLimit; attempt += 1) {
-    const result = await nativeResult("node_peer_status", {});
-    if (!result.ok) throw new Error("packaged peer diagnostics failed");
-    peerStatus = result.value;
-    if (peerStatus.total_connected_peers > 0) break;
-    await new Promise((done) => setTimeout(done, 500));
-  }
-  assert.ok(peerStatus.total_connected_peers > 0, "packaged node did not register a Mainnet peer");
   const liveDashboard = await execute(`
     document.querySelector('[data-screen="dashboard"]').click();
     return new Promise((resolve, reject) => {
