@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 pub const MODEL_VERSION: u16 = 1;
 pub const SECRET_PROFILE_VERSION: u16 = 1;
+pub const TRANSACTION_EXPOSURE_VERSION: u16 = 1;
 pub const MAX_ACCOUNTS: usize = 64;
 pub const MAX_OUTPUTS: usize = 100_000;
 
@@ -163,7 +164,7 @@ pub enum OutputOwnership {
     NotOwnedOrUnprovable,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TransactionLifecycle {
     Draft,
@@ -184,6 +185,101 @@ pub enum TransactionLifecycle {
     Cancelled,
     Failed,
     ReconciliationRequired,
+}
+
+/// Authoritative durable evidence of how far a transaction may have reached.
+///
+/// This is deliberately monotonic. A lifecycle can move to a reconciliation
+/// state after a reorg or an ambiguous response, but evidence that bytes may
+/// have reached the network can never be forgotten.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BroadcastExposure {
+    #[default]
+    NeverBroadcast,
+    SubmissionStarted,
+    PossiblyRelayed,
+    ObservedInMempool,
+    Confirmed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CancellationDecision {
+    ReleaseNeverBroadcastReservations,
+    DenyPossiblyBroadcast,
+    RequireReconciliation,
+}
+
+pub fn cancellation_decision(exposure: BroadcastExposure) -> CancellationDecision {
+    match exposure {
+        BroadcastExposure::NeverBroadcast => {
+            CancellationDecision::ReleaseNeverBroadcastReservations
+        }
+        BroadcastExposure::SubmissionStarted
+        | BroadcastExposure::PossiblyRelayed
+        | BroadcastExposure::ObservedInMempool
+        | BroadcastExposure::Confirmed => CancellationDecision::RequireReconciliation,
+    }
+}
+
+pub fn infer_legacy_exposure(
+    lifecycle: &TransactionLifecycle,
+    submitted: bool,
+) -> BroadcastExposure {
+    if submitted
+        || matches!(
+            lifecycle,
+            TransactionLifecycle::Submitting
+                | TransactionLifecycle::Submitted
+                | TransactionLifecycle::AcceptedNotRelayed
+                | TransactionLifecycle::InMempool
+                | TransactionLifecycle::RetransmitRequired
+                | TransactionLifecycle::ReconciliationRequired
+                | TransactionLifecycle::Reorged
+                | TransactionLifecycle::Failed
+                | TransactionLifecycle::Confirmed { .. }
+        )
+    {
+        BroadcastExposure::PossiblyRelayed
+    } else {
+        BroadcastExposure::NeverBroadcast
+    }
+}
+
+fn minimum_current_exposure(
+    lifecycle: &TransactionLifecycle,
+    submitted: bool,
+) -> BroadcastExposure {
+    if submitted {
+        return BroadcastExposure::PossiblyRelayed;
+    }
+    match lifecycle {
+        TransactionLifecycle::Submitting => BroadcastExposure::SubmissionStarted,
+        TransactionLifecycle::Submitted
+        | TransactionLifecycle::AcceptedNotRelayed
+        | TransactionLifecycle::InMempool
+        | TransactionLifecycle::Confirmed { .. }
+        | TransactionLifecycle::Reorged
+        | TransactionLifecycle::RetransmitRequired
+        | TransactionLifecycle::Failed
+        | TransactionLifecycle::ReconciliationRequired => BroadcastExposure::PossiblyRelayed,
+        _ => BroadcastExposure::NeverBroadcast,
+    }
+}
+
+/// Evidence required for every persisted lifecycle transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransactionTransitionEvidence {
+    LocalConstruction,
+    RecipientResponse,
+    Finalization,
+    SubmissionStarted,
+    SubmissionOutcome,
+    MempoolObservation,
+    ConfirmationEvidence,
+    ReorgEvidence,
+    ReconciliationEvidence,
+    Cancellation,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -236,6 +332,8 @@ pub struct LocalTransactionIntent {
     pub kernel_excess: Vec<u8>,
     pub lifecycle: TransactionLifecycle,
     pub submitted: bool,
+    #[serde(default)]
+    pub exposure: BroadcastExposure,
     /// A protocol-independent identifier carried by the manual transport
     /// envelope. It is not a replacement for the DOM canonical slate bytes.
     #[serde(default)]
@@ -264,6 +362,124 @@ pub struct LocalTransactionIntent {
     pub recipient_output_id: Option<Uuid>,
     #[serde(default)]
     pub change_output_id: Option<Uuid>,
+    /// Cached expiry used for fail-closed checks after restart. Legacy
+    /// transactions retain zero here and are validated from canonical slate
+    /// bytes before any operation that can expose or submit them.
+    #[serde(default)]
+    pub expires_at_height: u64,
+}
+
+impl LocalTransactionIntent {
+    pub fn transition(
+        &mut self,
+        next: TransactionLifecycle,
+        evidence: TransactionTransitionEvidence,
+    ) -> Result<(), DomainError> {
+        use TransactionLifecycle as L;
+        use TransactionTransitionEvidence as E;
+
+        let allowed = if self.lifecycle == next {
+            true
+        } else {
+            matches!(
+                (self.lifecycle, next, evidence),
+                (L::Draft, L::InputsReserved, E::LocalConstruction)
+                    | (
+                        L::RequestImported,
+                        L::ResponsePrepared,
+                        E::RecipientResponse
+                    )
+                    | (
+                        L::InputsReserved | L::RequestExported,
+                        L::ResponseImported,
+                        E::RecipientResponse
+                    )
+                    | (L::ResponseImported, L::Finalized, E::Finalization)
+                    | (
+                        L::Finalized | L::RetransmitRequired,
+                        L::Submitting,
+                        E::SubmissionStarted
+                    )
+                    | (
+                        L::Submitting,
+                        L::Submitted
+                            | L::AcceptedNotRelayed
+                            | L::InMempool
+                            | L::RetransmitRequired
+                            | L::Failed
+                            | L::ReconciliationRequired,
+                        E::SubmissionOutcome
+                    )
+                    | (
+                        L::Submitting
+                            | L::Submitted
+                            | L::AcceptedNotRelayed
+                            | L::RetransmitRequired
+                            | L::ReconciliationRequired
+                            | L::Reorged,
+                        L::InMempool,
+                        E::MempoolObservation
+                    )
+                    | (
+                        L::ResponsePrepared
+                            | L::ResponseExported
+                            | L::Submitting
+                            | L::Submitted
+                            | L::AcceptedNotRelayed
+                            | L::InMempool
+                            | L::RetransmitRequired
+                            | L::ReconciliationRequired
+                            | L::Reorged,
+                        L::Confirmed { .. },
+                        E::ConfirmationEvidence
+                    )
+                    | (L::Confirmed { .. }, L::Reorged, E::ReorgEvidence)
+                    | (
+                        L::Submitting
+                            | L::Submitted
+                            | L::AcceptedNotRelayed
+                            | L::InMempool
+                            | L::Confirmed { .. }
+                            | L::Reorged
+                            | L::RetransmitRequired
+                            | L::Failed,
+                        L::ReconciliationRequired,
+                        E::ReconciliationEvidence
+                    )
+                    | (
+                        L::Draft
+                            | L::InputsReserved
+                            | L::RequestExported
+                            | L::RequestImported
+                            | L::ResponsePrepared
+                            | L::ResponseExported
+                            | L::ResponseImported
+                            | L::Finalized
+                            | L::Failed,
+                        L::Cancelled,
+                        E::Cancellation
+                    )
+            )
+        };
+        if !allowed || matches!(self.lifecycle, L::Cancelled) && next != L::Cancelled {
+            return Err(DomainError::InvalidTransactionTransition);
+        }
+
+        let observed = match evidence {
+            E::SubmissionStarted => BroadcastExposure::SubmissionStarted,
+            E::SubmissionOutcome | E::ReconciliationEvidence | E::ReorgEvidence => {
+                BroadcastExposure::PossiblyRelayed
+            }
+            E::MempoolObservation => BroadcastExposure::ObservedInMempool,
+            E::ConfirmationEvidence => BroadcastExposure::Confirmed,
+            E::LocalConstruction | E::RecipientResponse | E::Finalization | E::Cancellation => {
+                BroadcastExposure::NeverBroadcast
+            }
+        };
+        self.exposure = self.exposure.max(observed);
+        self.lifecycle = next;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -535,6 +751,10 @@ pub struct WalletState {
     pub private_output_blindings: Vec<PrivateOutputBlinding>,
     #[serde(default)]
     pub transactions: Vec<LocalTransactionIntent>,
+    /// Version of the transaction exposure migration applied to this state.
+    /// Missing legacy values deserialize as zero and are upgraded before use.
+    #[serde(default)]
+    pub transaction_exposure_version: u16,
     pub sync_status: SyncStatus,
     pub provisional_target: Option<ScanTarget>,
     #[serde(default)]
@@ -601,6 +821,7 @@ impl WalletState {
             outputs: Vec::new(),
             private_output_blindings: Vec::new(),
             transactions: Vec::new(),
+            transaction_exposure_version: TRANSACTION_EXPOSURE_VERSION,
             sync_status: SyncStatus::Idle,
             provisional_target: None,
             rescan_plan: None,
@@ -628,6 +849,7 @@ impl WalletState {
             || self.default_account.label.is_empty()
             || self.default_account.label.len() > 128
             || self.mining_preferences.cpu_threads > 4_096
+            || self.transaction_exposure_version != TRANSACTION_EXPOSURE_VERSION
         {
             return Err(DomainError::InvalidState);
         }
@@ -654,6 +876,8 @@ impl WalletState {
         for transaction in &self.transactions {
             if (!transaction.kernel_excess.is_empty() && transaction.kernel_excess.len() != 33)
                 || (transaction.submitted && transaction.kernel_excess.len() != 33)
+                || transaction.exposure
+                    < minimum_current_exposure(&transaction.lifecycle, transaction.submitted)
             {
                 return Err(DomainError::InvalidTransactionIntent);
             }
@@ -724,6 +948,31 @@ impl WalletState {
             return Err(DomainError::InvalidState);
         }
         Ok(())
+    }
+
+    /// Upgrade pre-exposure wallet generations conservatively. This is
+    /// idempotent and never lowers exposure already persisted by a newer
+    /// writer.
+    pub fn migrate_transaction_exposure(&mut self) -> Result<bool, DomainError> {
+        match self.transaction_exposure_version {
+            0 | TRANSACTION_EXPOSURE_VERSION => {
+                let mut changed = self.transaction_exposure_version == 0;
+                for transaction in &mut self.transactions {
+                    let inferred = if self.transaction_exposure_version == 0 {
+                        infer_legacy_exposure(&transaction.lifecycle, transaction.submitted)
+                    } else {
+                        minimum_current_exposure(&transaction.lifecycle, transaction.submitted)
+                    };
+                    if transaction.exposure < inferred {
+                        transaction.exposure = inferred;
+                        changed = true;
+                    }
+                }
+                self.transaction_exposure_version = TRANSACTION_EXPOSURE_VERSION;
+                Ok(changed)
+            }
+            _ => Err(DomainError::UnsupportedVersion),
+        }
     }
 
     pub fn allocate(&mut self) -> Result<u64, DomainError> {
@@ -869,7 +1118,10 @@ impl WalletState {
                             | TransactionLifecycle::ResponseExported
                     )
                 {
-                    transaction.lifecycle = TransactionLifecycle::Confirmed { height, block_hash };
+                    transaction.transition(
+                        TransactionLifecycle::Confirmed { height, block_hash },
+                        TransactionTransitionEvidence::ConfirmationEvidence,
+                    )?;
                 }
             }
         }
@@ -930,15 +1182,20 @@ impl WalletState {
                     | TransactionLifecycle::RetransmitRequired
                     | TransactionLifecycle::Submitting
                     | TransactionLifecycle::Reorged => {
-                        transaction.lifecycle =
-                            TransactionLifecycle::Confirmed { height, block_hash }
+                        transaction.transition(
+                            TransactionLifecycle::Confirmed { height, block_hash },
+                            TransactionTransitionEvidence::ConfirmationEvidence,
+                        )?;
                     }
                     TransactionLifecycle::Confirmed {
                         height: known_height,
                         block_hash: known_hash,
                     } if known_height == height && known_hash == block_hash => {}
                     TransactionLifecycle::Confirmed { .. } => {
-                        transaction.lifecycle = TransactionLifecycle::ReconciliationRequired
+                        transaction.transition(
+                            TransactionLifecycle::ReconciliationRequired,
+                            TransactionTransitionEvidence::ReconciliationEvidence,
+                        )?;
                     }
                     TransactionLifecycle::ReconciliationRequired
                     | TransactionLifecycle::Draft
@@ -957,19 +1214,19 @@ impl WalletState {
         Ok(())
     }
 
-    pub fn rollback_confirmations_for_rescan(&mut self) {
+    pub fn rollback_confirmations_for_rescan(&mut self) -> Result<(), DomainError> {
         for transaction in &mut self.transactions {
             if matches!(
                 transaction.lifecycle,
                 TransactionLifecycle::Confirmed { .. }
             ) {
-                transaction.lifecycle = if transaction.submitted {
-                    TransactionLifecycle::Submitted
-                } else {
-                    TransactionLifecycle::Finalized
-                };
+                transaction.transition(
+                    TransactionLifecycle::Reorged,
+                    TransactionTransitionEvidence::ReorgEvidence,
+                )?;
             }
         }
+        Ok(())
     }
 
     pub fn prepare_rescan(&mut self, target: ScanTarget) -> Result<(), DomainError> {
@@ -983,7 +1240,10 @@ impl WalletState {
                 transaction.lifecycle,
                 TransactionLifecycle::Confirmed { .. }
             ) {
-                transaction.lifecycle = TransactionLifecycle::Submitted;
+                transaction.transition(
+                    TransactionLifecycle::Reorged,
+                    TransactionTransitionEvidence::ReorgEvidence,
+                )?;
             }
         }
         self.rescan_plan = Some(RescanPlan {
@@ -1187,6 +1447,8 @@ pub enum DomainError {
     NonReuseFloorRegression,
     #[error("invalid local transaction intent")]
     InvalidTransactionIntent,
+    #[error("invalid transaction lifecycle transition")]
+    InvalidTransactionTransition,
     #[error("duplicate kernel evidence")]
     DuplicateKernelEvidence,
     #[error("kernel evidence maps to multiple local transactions")]
@@ -1204,6 +1466,186 @@ pub enum DomainError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn all_lifecycles() -> Vec<TransactionLifecycle> {
+        vec![
+            TransactionLifecycle::Draft,
+            TransactionLifecycle::InputsReserved,
+            TransactionLifecycle::RequestExported,
+            TransactionLifecycle::RequestImported,
+            TransactionLifecycle::ResponsePrepared,
+            TransactionLifecycle::ResponseExported,
+            TransactionLifecycle::ResponseImported,
+            TransactionLifecycle::Finalized,
+            TransactionLifecycle::Submitting,
+            TransactionLifecycle::Submitted,
+            TransactionLifecycle::AcceptedNotRelayed,
+            TransactionLifecycle::InMempool,
+            TransactionLifecycle::Confirmed {
+                height: 7,
+                block_hash: [7; 32],
+            },
+            TransactionLifecycle::Reorged,
+            TransactionLifecycle::RetransmitRequired,
+            TransactionLifecycle::Cancelled,
+            TransactionLifecycle::Failed,
+            TransactionLifecycle::ReconciliationRequired,
+        ]
+    }
+
+    fn transaction_in(lifecycle: TransactionLifecycle) -> LocalTransactionIntent {
+        LocalTransactionIntent {
+            id: Uuid::nil(),
+            kernel_excess: Vec::new(),
+            lifecycle,
+            submitted: false,
+            exposure: BroadcastExposure::NeverBroadcast,
+            slate_id: None,
+            role: None,
+            amount: 0,
+            fee: 0,
+            reserved_output_ids: Vec::new(),
+            request_bytes: Vec::new(),
+            response_bytes: Vec::new(),
+            finalized_transaction_bytes: Vec::new(),
+            transaction_hash: None,
+            attempt_count: 0,
+            private_context: None,
+            recipient_output_id: None,
+            change_output_id: None,
+            expires_at_height: 0,
+        }
+    }
+
+    #[test]
+    fn regression_c2_exhaustive_lifecycle_exposure_cancellation_invariant() {
+        let exposures = [
+            BroadcastExposure::NeverBroadcast,
+            BroadcastExposure::SubmissionStarted,
+            BroadcastExposure::PossiblyRelayed,
+            BroadcastExposure::ObservedInMempool,
+            BroadcastExposure::Confirmed,
+        ];
+        for lifecycle in all_lifecycles() {
+            for exposure in exposures {
+                let decision = cancellation_decision(exposure);
+                assert_eq!(
+                    decision == CancellationDecision::ReleaseNeverBroadcastReservations,
+                    exposure == BroadcastExposure::NeverBroadcast,
+                    "{lifecycle:?} with {exposure:?}"
+                );
+            }
+            let inferred = infer_legacy_exposure(&lifecycle, false);
+            let expected_exposed = matches!(
+                lifecycle,
+                TransactionLifecycle::Submitting
+                    | TransactionLifecycle::Submitted
+                    | TransactionLifecycle::AcceptedNotRelayed
+                    | TransactionLifecycle::InMempool
+                    | TransactionLifecycle::RetransmitRequired
+                    | TransactionLifecycle::ReconciliationRequired
+                    | TransactionLifecycle::Reorged
+                    | TransactionLifecycle::Failed
+                    | TransactionLifecycle::Confirmed { .. }
+            );
+            assert_eq!(
+                inferred != BroadcastExposure::NeverBroadcast,
+                expected_exposed
+            );
+            assert_ne!(
+                infer_legacy_exposure(&lifecycle, true),
+                BroadcastExposure::NeverBroadcast
+            );
+        }
+    }
+
+    #[test]
+    fn regression_c4_transition_table_is_exhaustive_and_cancelled_is_terminal() {
+        let evidence = [
+            TransactionTransitionEvidence::LocalConstruction,
+            TransactionTransitionEvidence::RecipientResponse,
+            TransactionTransitionEvidence::Finalization,
+            TransactionTransitionEvidence::SubmissionStarted,
+            TransactionTransitionEvidence::SubmissionOutcome,
+            TransactionTransitionEvidence::MempoolObservation,
+            TransactionTransitionEvidence::ConfirmationEvidence,
+            TransactionTransitionEvidence::ReorgEvidence,
+            TransactionTransitionEvidence::ReconciliationEvidence,
+            TransactionTransitionEvidence::Cancellation,
+        ];
+        for current in all_lifecycles() {
+            for next in all_lifecycles() {
+                for reason in evidence {
+                    let mut transaction = transaction_in(current);
+                    let result = transaction.transition(next, reason);
+                    if current == TransactionLifecycle::Cancelled
+                        && next != TransactionLifecycle::Cancelled
+                    {
+                        assert!(result.is_err());
+                    }
+                    if matches!(current, TransactionLifecycle::Confirmed { .. })
+                        && next == TransactionLifecycle::Reorged
+                    {
+                        assert_eq!(
+                            result.is_ok(),
+                            reason == TransactionTransitionEvidence::ReorgEvidence
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn regression_c2_legacy_exposure_migration_is_conservative_and_idempotent() {
+        let mut state = WalletState::new(identity(), [7; 32], configuration());
+        state.transaction_exposure_version = 0;
+        state
+            .transactions
+            .push(transaction_in(TransactionLifecycle::RetransmitRequired));
+        assert!(state.migrate_transaction_exposure().unwrap());
+        assert_eq!(
+            state.transactions[0].exposure,
+            BroadcastExposure::PossiblyRelayed
+        );
+        assert!(!state.migrate_transaction_exposure().unwrap());
+
+        let mut legacy = WalletState::new(identity(), [7; 32], configuration());
+        legacy.transaction_exposure_version = 0;
+        legacy
+            .transactions
+            .push(transaction_in(TransactionLifecycle::RetransmitRequired));
+        let mut legacy_json = serde_json::to_value(legacy).unwrap();
+        let object = legacy_json.as_object_mut().unwrap();
+        object.remove("transaction_exposure_version");
+        object["transactions"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("exposure");
+        let mut deserialized: WalletState = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(deserialized.transaction_exposure_version, 0);
+        assert_eq!(
+            deserialized.transactions[0].exposure,
+            BroadcastExposure::NeverBroadcast
+        );
+        assert!(deserialized.migrate_transaction_exposure().unwrap());
+        assert_eq!(
+            deserialized.transactions[0].exposure,
+            BroadcastExposure::PossiblyRelayed
+        );
+
+        let mut current_version = WalletState::new(identity(), [7; 32], configuration());
+        current_version
+            .transactions
+            .push(transaction_in(TransactionLifecycle::Submitting));
+        assert!(current_version.validate().is_err());
+        assert!(current_version.migrate_transaction_exposure().unwrap());
+        assert_eq!(
+            current_version.transactions[0].exposure,
+            BroadcastExposure::SubmissionStarted
+        );
+        current_version.validate().unwrap();
+    }
 
     fn identity() -> NetworkIdentity {
         NetworkIdentity {
@@ -1303,6 +1745,7 @@ mod tests {
             kernel_excess: vec![3; 33],
             lifecycle: TransactionLifecycle::Submitted,
             submitted: true,
+            exposure: BroadcastExposure::PossiblyRelayed,
             slate_id: None,
             role: None,
             amount: 0,
@@ -1316,6 +1759,7 @@ mod tests {
             private_context: None,
             recipient_output_id: None,
             change_output_id: None,
+            expires_at_height: 0,
         });
         state
             .apply_kernel_evidence(8, [8; 32], &[[3; 33], [4; 33]])
@@ -1353,6 +1797,7 @@ mod tests {
             kernel_excess: Vec::new(),
             lifecycle: TransactionLifecycle::ResponseExported,
             submitted: false,
+            exposure: BroadcastExposure::NeverBroadcast,
             slate_id: Some(Uuid::new_v4()),
             role: Some(TransactionRole::Recipient),
             amount: 600_000,
@@ -1366,6 +1811,7 @@ mod tests {
             private_context: None,
             recipient_output_id: Some(output_id),
             change_output_id: None,
+            expires_at_height: 0,
         });
         state
             .mark_known_outputs_confirmed(&[[5; 33], [6; 33]], 12, [7; 32])

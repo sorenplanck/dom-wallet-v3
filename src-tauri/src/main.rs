@@ -4,19 +4,24 @@
 use dom_wallet_node_manager::ManagedNodeConfig;
 use dom_wallet_tauri_shell::{DesktopApplication, UpdateControl};
 use dom_wallet_updater::{
-    validate_download, validate_wallet_manifest, verify_wallet_manifest_signature,
-    MinisignVerifier, UpdateError, WalletDecision, WalletManifest, WalletPolicy,
-    WalletUpdaterState, MAX_INITIAL_JITTER_SECONDS, UPDATE_INTERVAL_SECONDS,
+    download_verified_artifact_async, validate_artifact_staging_destination,
+    validate_wallet_manifest, verify_staged_artifact, verify_wallet_manifest_signature,
+    ArtifactDownloadTimeouts, MinisignVerifier, UpdateError, WalletDecision, WalletManifest,
+    WalletPolicy, WalletUpdaterState, MAX_INITIAL_JITTER_SECONDS, UPDATE_INTERVAL_SECONDS,
     WALLET_UPDATE_ENDPOINT,
 };
+use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, OpenOptions},
-    net::TcpListener,
+    io::Write,
+    net::{TcpListener, ToSocketAddrs},
+    path::{Path, PathBuf},
     sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::Manager;
 use tauri_plugin_updater::UpdaterExt;
+use zeroize::Zeroizing;
 
 /// Pinned primary DOM release signing key (Minisign key ID 74197A95CA309CF0).
 /// The backup key 1BD5CDF20DACC151 stays offline until an explicit rotation
@@ -40,6 +45,66 @@ fn unix_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AutomaticUpdatePreference {
+    schema_version: u32,
+    enabled: bool,
+}
+
+fn load_automatic_update_preference(path: &Path) -> bool {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<AutomaticUpdatePreference>(&bytes).ok())
+        .filter(|preference| preference.schema_version == 1)
+        .map(|preference| preference.enabled)
+        .unwrap_or(true)
+}
+
+fn persist_automatic_update_preference(path: &Path, enabled: bool) -> Result<(), UpdateError> {
+    let parent = path.parent().ok_or(UpdateError::StateIo)?;
+    fs::create_dir_all(parent).map_err(|_| UpdateError::StateIo)?;
+    let temporary = parent.join(format!(
+        ".automatic-update-preference-{}.tmp",
+        uuid::Uuid::new_v4()
+    ));
+    let bytes = serde_json::to_vec(&AutomaticUpdatePreference {
+        schema_version: 1,
+        enabled,
+    })
+    .map_err(|_| UpdateError::StateIo)?;
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut output = options.open(&temporary).map_err(|_| UpdateError::StateIo)?;
+    let result = (|| {
+        output.write_all(&bytes).map_err(|_| UpdateError::StateIo)?;
+        output.sync_all().map_err(|_| UpdateError::StateIo)?;
+        fs::rename(&temporary, path).map_err(|_| UpdateError::StateIo)?;
+        #[cfg(unix)]
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| UpdateError::StateIo)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn automatic_update_preference_path(handle: &tauri::AppHandle) -> Result<PathBuf, UpdateError> {
+    handle
+        .path()
+        .app_config_dir()
+        .map(|directory| directory.join("automatic-update-preference.json"))
+        .map_err(|_| UpdateError::StateIo)
 }
 
 fn initialize_file_logging(app: &tauri::App) {
@@ -125,18 +190,75 @@ fn update_status(
 }
 
 #[tauri::command]
-async fn check_updates_now(handle: tauri::AppHandle) -> dom_wallet_tauri_shell::UpdateStatusDto {
-    perform_update_cycle(handle, true).await
+fn automatic_updates_set(
+    handle: tauri::AppHandle,
+    updater: tauri::State<'_, UpdateControl>,
+    enabled: bool,
+) -> Result<dom_wallet_tauri_shell::UpdateStatusDto, dom_wallet_tauri_shell::CommandErrorDto> {
+    let path = automatic_update_preference_path(&handle).map_err(|_| {
+        dom_wallet_tauri_shell::CommandErrorDto {
+            code: "UPDATE_PREFERENCE_IO".into(),
+            category: "UPDATER".into(),
+            message: "The automatic update preference could not be persisted.".into(),
+            retryable: true,
+        }
+    })?;
+    persist_automatic_update_preference(&path, enabled).map_err(|_| {
+        dom_wallet_tauri_shell::CommandErrorDto {
+            code: "UPDATE_PREFERENCE_IO".into(),
+            category: "UPDATER".into(),
+            message: "The automatic update preference could not be persisted.".into(),
+            retryable: true,
+        }
+    })?;
+    updater.set_automatic_updates(enabled);
+    Ok(updater.snapshot())
 }
 
 #[tauri::command]
-async fn check_node_now(handle: tauri::AppHandle) -> dom_wallet_tauri_shell::UpdateStatusDto {
-    perform_update_cycle(handle, false).await
+async fn check_updates_now(handle: tauri::AppHandle) -> dom_wallet_tauri_shell::UpdateStatusDto {
+    perform_update_cycle(handle, UpdateAction::Check).await
+}
+
+#[tauri::command]
+async fn download_update_now(handle: tauri::AppHandle) -> dom_wallet_tauri_shell::UpdateStatusDto {
+    perform_update_cycle(handle, UpdateAction::DownloadAndVerify).await
+}
+
+#[tauri::command]
+async fn apply_update_now(
+    handle: tauri::AppHandle,
+    confirmed: bool,
+) -> dom_wallet_tauri_shell::UpdateStatusDto {
+    if !confirmed {
+        handle
+            .state::<UpdateControl>()
+            .fail_wallet_check("UPDATE_APPLY_CONFIRMATION_REQUIRED");
+        return handle.state::<UpdateControl>().snapshot();
+    }
+    perform_update_cycle(handle, UpdateAction::Apply).await
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UpdateAction {
+    Check,
+    DownloadAndVerify,
+    Apply,
+}
+
+impl UpdateAction {
+    fn downloads(self) -> bool {
+        matches!(self, Self::DownloadAndVerify)
+    }
+
+    fn installs_or_restarts(self) -> bool {
+        matches!(self, Self::Apply)
+    }
 }
 
 async fn perform_update_cycle(
     handle: tauri::AppHandle,
-    allow_wallet_install: bool,
+    action: UpdateAction,
 ) -> dom_wallet_tauri_shell::UpdateStatusDto {
     let updater_state = handle.state::<UpdateControl>();
     if !updater_state.begin_check(unix_seconds()) {
@@ -146,7 +268,7 @@ async fn perform_update_cycle(
         updater_state.finish_check_without_key();
         return updater_state.snapshot();
     };
-    let result = check_wallet_update(&handle, public_key, allow_wallet_install).await;
+    let result = check_wallet_update(&handle, public_key, action).await;
     if let Err(error) = result {
         tracing::warn!(code = %error, "signed update check failed");
         updater_state.fail_wallet_check(error_code(error));
@@ -157,7 +279,7 @@ async fn perform_update_cycle(
 async fn check_wallet_update(
     handle: &tauri::AppHandle,
     public_key: &str,
-    allow_install: bool,
+    action: UpdateAction,
 ) -> Result<(), UpdateError> {
     let endpoint = WALLET_UPDATE_ENDPOINT
         .parse()
@@ -225,35 +347,54 @@ async fn check_wallet_update(
             .finish_network_check(None, None);
         return Ok(());
     };
-    if !allow_install {
+    if !action.downloads() && !action.installs_or_restarts() {
         handle
             .state::<UpdateControl>()
             .finish_network_check(Some(version.to_string()), None);
         return Ok(());
     }
     let state = handle.state::<UpdateControl>();
-    state.set_wallet_download_state(WalletUpdaterState::Downloading, Some(0));
-    let bytes = update
-        .download(
-            |_chunk, _total| {},
-            || tracing::info!("signed Wallet update download completed"),
+    let cache_root = handle
+        .path()
+        .app_cache_dir()
+        .map_err(|_| UpdateError::StateIo)?;
+    fs::create_dir_all(&cache_root).map_err(|_| UpdateError::StateIo)?;
+    let staging_directory = cache_root.join("verified-updates");
+    if !staging_directory.exists() {
+        fs::create_dir(&staging_directory).map_err(|_| UpdateError::StateIo)?;
+    }
+    let staging_path = staging_directory.join("wallet-update.stage");
+    validate_artifact_staging_destination(&staging_directory, &staging_path)?;
+    if action.downloads() {
+        state.set_wallet_download_state(WalletUpdaterState::Downloading, Some(0));
+        if staging_path.exists() {
+            fs::remove_file(&staging_path).map_err(|_| UpdateError::StateIo)?;
+        }
+        let verifier = MinisignVerifier::from_base64(public_key)?;
+        download_verified_artifact_async(
+            artifact,
+            &verifier,
+            &staging_directory,
+            &staging_path,
+            ArtifactDownloadTimeouts::default(),
         )
-        .await
-        .map_err(|_| UpdateError::SignatureInvalid)?;
-    state.set_wallet_download_state(WalletUpdaterState::Verifying, Some(100));
-    validate_download(&bytes, artifact)?;
-    let application = handle.state::<DesktopApplication>();
-    if !application
-        .update_safe_point_available()
-        .map_err(|_| UpdateError::BusyCriticalOperation)?
-    {
-        state.defer_wallet_install(version.to_string());
+        .await?;
+        state.finish_verified_download(version.to_string());
         return Ok(());
     }
+
+    state.set_wallet_download_state(WalletUpdaterState::Verifying, Some(100));
+    let verifier = MinisignVerifier::from_base64(public_key)?;
+    let bytes = verify_staged_artifact(&staging_directory, &staging_path, artifact, &verifier)?;
+    let application = handle.state::<DesktopApplication>();
+    let lease = application
+        .acquire_update_apply_lease()
+        .map_err(|_| UpdateError::BusyCriticalOperation)?;
     state.set_wallet_download_state(WalletUpdaterState::Installing, Some(100));
     application
-        .application_shutdown()
+        .prepare_for_update(&lease)
         .map_err(|_| UpdateError::WalletPersistFailed)?;
+    let _ = fs::remove_file(&staging_path);
     if update.install(bytes).is_err() {
         tracing::error!("Wallet installer failed; restarting the current signed version");
         handle.restart();
@@ -275,6 +416,14 @@ fn error_code(error: UpdateError) -> &'static str {
         UpdateError::Expired => "UPDATE_MANIFEST_EXPIRED",
         UpdateError::OriginRejected => "UPDATE_ORIGIN_REJECTED",
         UpdateError::BusyCriticalOperation => "UPDATE_BUSY_CRITICAL_OPERATION",
+        UpdateError::ConnectTimeout => "UPDATE_CONNECT_TIMEOUT",
+        UpdateError::HeaderTimeout => "UPDATE_HEADER_TIMEOUT",
+        UpdateError::InactivityTimeout => "UPDATE_INACTIVITY_TIMEOUT",
+        UpdateError::TotalTimeout => "UPDATE_TOTAL_TIMEOUT",
+        UpdateError::ArtifactTooLarge => "UPDATE_ARTIFACT_TOO_LARGE",
+        UpdateError::ArtifactSizeMismatch => "UPDATE_ARTIFACT_SIZE_MISMATCH",
+        UpdateError::UnsafePath => "UPDATE_STAGING_PATH_UNSAFE",
+        UpdateError::StateIo => "UPDATE_STAGING_IO_FAILED",
         _ => "UPDATE_INSTALL_FAILED",
     }
 }
@@ -309,14 +458,13 @@ fn managed_wallet_path(
     name: &str,
 ) -> Result<std::path::PathBuf, dom_wallet_tauri_shell::CommandErrorDto> {
     let root = managed_wallets_root(handle)?;
-    let path = dom_wallet_tauri_shell::resolve_wallet_directory(&root, name)?;
     fs::create_dir_all(&root).map_err(|_| dom_wallet_tauri_shell::CommandErrorDto {
         code: "APP_DATA_DIRECTORY_UNAVAILABLE".into(),
         category: "PLATFORM".into(),
         message: "The managed wallets directory could not be prepared.".into(),
         retryable: true,
     })?;
-    Ok(path)
+    dom_wallet_tauri_shell::resolve_wallet_directory(&root, name).map_err(Into::into)
 }
 
 #[tauri::command]
@@ -331,6 +479,31 @@ fn wallet_create_recoverable(
     app.wallet_create_recoverable(path, &password)
         .map_err(Into::into)
 }
+
+#[tauri::command]
+fn wallet_create_resume(
+    handle: tauri::AppHandle,
+    app: tauri::State<'_, DesktopApplication>,
+    name: String,
+    password: String,
+) -> Result<dom_wallet_tauri_shell::RecoveryCreateDto, dom_wallet_tauri_shell::CommandErrorDto> {
+    let path = managed_wallet_path(&handle, &name)?;
+    ensure_mainnet_node(&handle, &app)?;
+    app.wallet_create_resume(path, &password)
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+fn wallet_create_abort(
+    handle: tauri::AppHandle,
+    app: tauri::State<'_, DesktopApplication>,
+    name: String,
+    password: String,
+) -> Result<(), dom_wallet_tauri_shell::CommandErrorDto> {
+    let path = managed_wallet_path(&handle, &name)?;
+    app.wallet_create_abort(path, &password).map_err(Into::into)
+}
+
 #[tauri::command]
 fn wallet_restore_from_mnemonic(
     handle: tauri::AppHandle,
@@ -339,9 +512,30 @@ fn wallet_restore_from_mnemonic(
     password: String,
     mnemonic: String,
 ) -> Result<dom_wallet_tauri_shell::RecoveryResultDto, dom_wallet_tauri_shell::CommandErrorDto> {
+    let password = Zeroizing::new(password);
+    let mnemonic = Zeroizing::new(mnemonic);
     let path = managed_wallet_path(&handle, &name)?;
     ensure_mainnet_node(&handle, &app)?;
-    app.wallet_restore_from_mnemonic(path, &password, &mnemonic)
+    app.wallet_restore_from_mnemonic(path, password.as_str(), mnemonic.as_str())
+        .map_err(Into::into)
+}
+#[tauri::command]
+fn wallet_restore_staging_list(
+    handle: tauri::AppHandle,
+) -> Result<Vec<String>, dom_wallet_tauri_shell::CommandErrorDto> {
+    Ok(dom_wallet_core_restore::discover_restore_stages(
+        &managed_wallets_root(&handle)?,
+    ))
+}
+#[tauri::command]
+fn wallet_restore_abort(
+    handle: tauri::AppHandle,
+    name: String,
+    password: String,
+) -> Result<(), dom_wallet_tauri_shell::CommandErrorDto> {
+    let destination = managed_wallet_path(&handle, &name)?;
+    dom_wallet_core_restore::abort_restore_stage(&destination, &password)
+        .map_err(dom_wallet_tauri_shell::CommandError::from)
         .map_err(Into::into)
 }
 #[tauri::command]
@@ -375,14 +569,15 @@ fn wallet_recovery_phrase_confirm(
     app.wallet_recovery_phrase_confirm(&password)
         .map_err(Into::into)
 }
+
 #[tauri::command]
-fn wallet_open(
-    handle: tauri::AppHandle,
+fn wallet_recovery_phrase_resume(
     app: tauri::State<'_, DesktopApplication>,
-    path: String,
-) -> Result<dom_wallet_core::WalletSummary, dom_wallet_tauri_shell::CommandErrorDto> {
-    ensure_mainnet_node(&handle, &app)?;
-    app.wallet_open(path).map_err(Into::into)
+    password: String,
+) -> Result<dom_wallet_tauri_shell::RecoveryCreateDto, dom_wallet_tauri_shell::CommandErrorDto> {
+    let password = Zeroizing::new(password);
+    app.wallet_recovery_phrase_resume(password.as_str())
+        .map_err(Into::into)
 }
 #[tauri::command]
 fn wallet_open_named(
@@ -390,9 +585,18 @@ fn wallet_open_named(
     app: tauri::State<'_, DesktopApplication>,
     name: String,
 ) -> Result<dom_wallet_core::WalletSummary, dom_wallet_tauri_shell::CommandErrorDto> {
-    let path = managed_wallet_path(&handle, &name)?;
+    let root = managed_wallets_root(&handle)?;
     ensure_mainnet_node(&handle, &app)?;
-    app.wallet_open(path).map_err(Into::into)
+    app.wallet_open_managed(&root, &name).map_err(Into::into)
+}
+#[tauri::command]
+fn wallet_recover_from_disk(
+    handle: tauri::AppHandle,
+    app: tauri::State<'_, DesktopApplication>,
+    name: String,
+) -> Result<dom_wallet_core::WalletSummary, dom_wallet_tauri_shell::CommandErrorDto> {
+    app.recover_managed_wallet_from_disk(&managed_wallets_root(&handle)?, &name)
+        .map_err(Into::into)
 }
 #[tauri::command]
 fn wallet_list(
@@ -499,15 +703,20 @@ fn experimental_sidecar_start(
         .join("sidecar-node");
     let rpc_address = reserve_loopback_address()?;
     let p2p_address = reserve_loopback_address()?;
+    let seed_peers = dom_wallet_embedded_core::MAINNET_DNS_SEEDS
+        .iter()
+        .flat_map(|seed| {
+            ((*seed, dom_wallet_embedded_core::MAINNET_P2P_PORT).to_socket_addrs())
+                .into_iter()
+                .flatten()
+        })
+        .collect();
     app.experimental_sidecar_start(ManagedNodeConfig {
         network: "mainnet".into(),
         data_directory,
         rpc_address,
         p2p_address,
-        seed_peers: dom_wallet_embedded_core::MAINNET_BOOTSTRAP_PEERS
-            .iter()
-            .filter_map(|peer| peer.parse().ok())
-            .collect(),
+        seed_peers,
     })
     .map_err(Into::into)
 }
@@ -573,7 +782,7 @@ fn wallet_sync_status(
 #[tauri::command]
 fn wallet_sync_start(
     app: tauri::State<'_, DesktopApplication>,
-) -> Result<dom_wallet_core::WalletSummary, dom_wallet_tauri_shell::CommandErrorDto> {
+) -> Result<dom_wallet_tauri_shell::WalletSyncStatusDto, dom_wallet_tauri_shell::CommandErrorDto> {
     app.synchronization_start_live().map_err(Into::into)
 }
 #[tauri::command]
@@ -585,13 +794,13 @@ fn wallet_sync_pause(
 #[tauri::command]
 fn wallet_sync_resume(
     app: tauri::State<'_, DesktopApplication>,
-) -> Result<dom_wallet_core::WalletSummary, dom_wallet_tauri_shell::CommandErrorDto> {
+) -> Result<dom_wallet_tauri_shell::WalletSyncStatusDto, dom_wallet_tauri_shell::CommandErrorDto> {
     app.synchronization_resume_live().map_err(Into::into)
 }
 #[tauri::command]
 fn wallet_sync_retry(
     app: tauri::State<'_, DesktopApplication>,
-) -> Result<dom_wallet_core::WalletSummary, dom_wallet_tauri_shell::CommandErrorDto> {
+) -> Result<dom_wallet_tauri_shell::WalletSyncStatusDto, dom_wallet_tauri_shell::CommandErrorDto> {
     app.synchronization_resume_live().map_err(Into::into)
 }
 #[tauri::command]
@@ -649,19 +858,19 @@ fn synchronization_pause(
 #[tauri::command]
 fn synchronization_start(
     app: tauri::State<'_, DesktopApplication>,
-) -> Result<dom_wallet_core::WalletSummary, dom_wallet_tauri_shell::CommandErrorDto> {
+) -> Result<dom_wallet_tauri_shell::WalletSyncStatusDto, dom_wallet_tauri_shell::CommandErrorDto> {
     app.synchronization_start_live().map_err(Into::into)
 }
 #[tauri::command]
 fn synchronization_resume(
     app: tauri::State<'_, DesktopApplication>,
-) -> Result<dom_wallet_core::WalletSummary, dom_wallet_tauri_shell::CommandErrorDto> {
+) -> Result<dom_wallet_tauri_shell::WalletSyncStatusDto, dom_wallet_tauri_shell::CommandErrorDto> {
     app.synchronization_resume_live().map_err(Into::into)
 }
 #[tauri::command]
 fn synchronization_retry(
     app: tauri::State<'_, DesktopApplication>,
-) -> Result<dom_wallet_core::WalletSummary, dom_wallet_tauri_shell::CommandErrorDto> {
+) -> Result<dom_wallet_tauri_shell::WalletSyncStatusDto, dom_wallet_tauri_shell::CommandErrorDto> {
     app.synchronization_start_live().map_err(Into::into)
 }
 #[tauri::command]
@@ -830,6 +1039,12 @@ fn slate_qr_reassembly_clear(
     app.slate_qr_reassembly_clear().map_err(Into::into)
 }
 
+macro_rules! tauri_command_handler {
+    ($($command:ident),+ $(,)?) => {
+        tauri::generate_handler![$($command),+]
+    };
+}
+
 fn application_builder() -> tauri::Builder<tauri::Wry> {
     tauri::Builder::default()
         .plugin(
@@ -843,6 +1058,10 @@ fn application_builder() -> tauri::Builder<tauri::Wry> {
         .manage(DesktopApplication::default())
         .setup(|app| {
             initialize_file_logging(app);
+            if let Ok(path) = automatic_update_preference_path(app.handle()) {
+                app.state::<UpdateControl>()
+                    .set_automatic_updates(load_automatic_update_preference(&path));
+            }
             let runtime_root = app
                 .path()
                 .app_local_data_dir()?
@@ -856,83 +1075,17 @@ fn application_builder() -> tauri::Builder<tauri::Wry> {
                 let jitter = unix_seconds() % (MAX_INITIAL_JITTER_SECONDS + 1);
                 tokio::time::sleep(Duration::from_secs(jitter)).await;
                 loop {
-                    let _ = perform_update_cycle(handle.clone(), true).await;
+                    if handle.state::<UpdateControl>().snapshot().automatic_updates {
+                        let _ = perform_update_cycle(handle.clone(), UpdateAction::Check).await;
+                    }
                     tokio::time::sleep(Duration::from_secs(UPDATE_INTERVAL_SECONDS)).await;
                 }
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
-            native_bridge_status,
-            get_build_info,
-            update_status,
-            check_updates_now,
-            check_node_now,
-            application_status,
-            wallet_create_recoverable,
-            wallet_restore_from_mnemonic,
-            wallet_backup_export,
-            wallet_backup_import,
-            wallet_recovery_phrase_confirm,
-            wallet_open,
-            wallet_open_named,
-            wallet_list,
-            wallet_unlock,
-            wallet_lock,
-            wallet_close,
-            wallet_summary,
-            account_list,
-            account_summary,
-            embedded_node_start,
-            embedded_node_stop,
-            embedded_node_status,
-            experimental_sidecar_status,
-            experimental_sidecar_enable,
-            experimental_sidecar_disable,
-            experimental_sidecar_start,
-            experimental_sidecar_stop,
-            experimental_sidecar_evaluate_release,
-            node_network_status,
-            node_peer_status,
-            wallet_sync_status,
-            wallet_sync_start,
-            wallet_sync_pause,
-            wallet_sync_resume,
-            wallet_sync_retry,
-            wallet_rescan,
-            mining_status,
-            mining_config_get,
-            mining_config_set,
-            mining_start,
-            mining_stop,
-            synchronization_start,
-            synchronization_pause,
-            synchronization_resume,
-            synchronization_retry,
-            synchronization_rescan,
-            diagnostics_redacted,
-            application_shutdown,
-            transaction_fee_estimate,
-            wallet_address_validate,
-            transaction_send_create,
-            slate_request_export,
-            slate_request_import,
-            slate_response_create,
-            slate_response_export,
-            slate_response_import,
-            slate_summary_redacted,
-            transaction_finalize,
-            transaction_submit,
-            transaction_retry_submission,
-            transaction_reconcile_submission,
-            transaction_cancel,
-            transaction_list,
-            transaction_detail_redacted,
-            slate_qr_encode,
-            slate_qr_decode_frame,
-            slate_qr_reassembly_status,
-            slate_qr_reassembly_clear,
-        ])
+        .invoke_handler(dom_wallet_tauri_shell::wallet_command_registry!(
+            tauri_command_handler
+        ))
 }
 
 fn main() {
@@ -943,7 +1096,9 @@ fn main() {
         tauri::RunEvent::Resumed => {
             let handle = handle.clone();
             tauri::async_runtime::spawn(async move {
-                let _ = perform_update_cycle(handle, true).await;
+                if handle.state::<UpdateControl>().snapshot().automatic_updates {
+                    let _ = perform_update_cycle(handle, UpdateAction::Check).await;
+                }
             });
         }
         tauri::RunEvent::Exit | tauri::RunEvent::ExitRequested { .. } => {
@@ -960,9 +1115,30 @@ mod tests {
     #[test]
     fn packaged_entrypoint_constructs_the_registered_builder() {
         let _builder = application_builder();
-        assert_eq!(dom_wallet_tauri_shell::COMMAND_NAMES.len(), 67);
+        assert!(!dom_wallet_tauri_shell::COMMAND_NAMES.is_empty());
         assert!(dom_wallet_tauri_shell::COMMAND_NAMES.contains(&"native_bridge_status"));
         assert!(dom_wallet_tauri_shell::COMMAND_NAMES.contains(&"check_updates_now"));
         assert!(dom_wallet_tauri_shell::COMMAND_NAMES.contains(&"embedded_node_stop"));
+    }
+
+    #[test]
+    fn regression_m5_check_download_apply_and_preference_are_distinct() {
+        assert_ne!(UpdateAction::Check, UpdateAction::DownloadAndVerify);
+        assert_ne!(UpdateAction::DownloadAndVerify, UpdateAction::Apply);
+        assert!(!UpdateAction::Check.downloads());
+        assert!(!UpdateAction::Check.installs_or_restarts());
+        assert!(UpdateAction::DownloadAndVerify.downloads());
+        assert!(!UpdateAction::DownloadAndVerify.installs_or_restarts());
+        assert!(!UpdateAction::Apply.downloads());
+        assert!(UpdateAction::Apply.installs_or_restarts());
+        let directory = tempfile::tempdir().expect("preference directory");
+        let path = directory.path().join("preference.json");
+        persist_automatic_update_preference(&path, false).expect("persist preference");
+        assert!(!load_automatic_update_preference(&path));
+        persist_automatic_update_preference(&path, true).expect("replace preference");
+        assert!(load_automatic_update_preference(&path));
+        assert!(dom_wallet_tauri_shell::COMMAND_NAMES.contains(&"check_updates_now"));
+        assert!(dom_wallet_tauri_shell::COMMAND_NAMES.contains(&"download_update_now"));
+        assert!(dom_wallet_tauri_shell::COMMAND_NAMES.contains(&"apply_update_now"));
     }
 }

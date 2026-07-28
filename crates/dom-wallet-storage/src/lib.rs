@@ -5,7 +5,7 @@
 use dom_wallet_crypto::{decode, encode, open, seal, CryptoError, KdfParameters};
 use dom_wallet_domain::{
     NetworkIdentity, NodeConfiguration, RescanPlan, WalletState, MODEL_VERSION,
-    SECRET_PROFILE_VERSION,
+    RECOVERY_SCHEME_BIP39_256_V1, SECRET_PROFILE_VERSION,
 };
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,8 @@ const METADATA_FILE: &str = "metadata.json";
 const ACTIVE_FILE: &str = "active-generation";
 const GENERATIONS_DIR: &str = "generations";
 const STATE_FILE: &str = "state.envelope";
+const AUTHENTICATION_FILE: &str = "authentication.envelope";
+const AUTHENTICATION_PLAINTEXT: &[u8] = b"DOM-WALLET-V3-PASSWORD-CHECK-V1";
 const RESCAN_PLAN_FILE: &str = "rescan-plan.envelope";
 const WRITER_LOCK_FILE: &str = ".wallet.lock";
 const MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
@@ -81,6 +83,12 @@ pub struct WalletDirectory {
 }
 
 impl WalletDirectory {
+    fn create_staging_path(root: &Path) -> Result<PathBuf, StorageError> {
+        let parent = root.parent().ok_or(StorageError::UnsafePath)?;
+        let name = root.file_name().ok_or(StorageError::UnsafePath)?;
+        Ok(parent.join(format!(".{}.create-staging", name.to_string_lossy())))
+    }
+
     pub fn create(
         root: impl AsRef<Path>,
         state: &WalletState,
@@ -91,21 +99,91 @@ impl WalletDirectory {
         if root.exists() {
             return Err(StorageError::AlreadyExists);
         }
+        let parent = root.parent().ok_or(StorageError::UnsafePath)?.to_path_buf();
+        if !parent.is_dir() {
+            return Err(StorageError::NotFound);
+        }
+        let staging = Self::create_staging_path(&root)?;
+        if staging.exists() {
+            return Err(StorageError::IncompleteGeneration);
+        }
         state.validate().map_err(StorageError::Domain)?;
-        fs::create_dir_all(root.join(GENERATIONS_DIR)).map_err(StorageError::Io)?;
-        let wallet = Self {
-            _writer_lock: acquire_writer_lock(&root)?,
-            root,
-        };
-        wallet.publish_initial(state, password, kdf)?;
-        Ok(wallet)
+        fs::create_dir(&staging).map_err(StorageError::Io)?;
+        restrict_private_directory(&staging)?;
+        let result = (|| {
+            fs::create_dir(staging.join(GENERATIONS_DIR)).map_err(StorageError::Io)?;
+            let wallet = Self {
+                _writer_lock: acquire_writer_lock(&staging)?,
+                root: staging.clone(),
+            };
+            wallet.publish_initial(state, password, kdf)?;
+            sync_directory(&staging)?;
+            drop(wallet);
+            fs::rename(&staging, &root).map_err(StorageError::Io)?;
+            sync_directory(&parent)?;
+            Self::open(&root)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&staging);
+        }
+        result
+    }
+
+    /// Authenticated crash recovery for a fully committed create stage.
+    pub fn resume_create(
+        root: impl AsRef<Path>,
+        password: &str,
+    ) -> Result<(Self, WalletState), StorageError> {
+        let root = root.as_ref().to_path_buf();
+        if root.exists() {
+            return Err(StorageError::AlreadyExists);
+        }
+        let parent = root.parent().ok_or(StorageError::UnsafePath)?;
+        let staging = Self::create_staging_path(&root)?;
+        Self::inspect_structure(&staging)?;
+        let wallet = Self::open(&staging)?;
+        let state = wallet.load(password)?;
+        if !state.recovery.as_ref().is_some_and(|recovery| {
+            recovery.scheme == RECOVERY_SCHEME_BIP39_256_V1 && !recovery.phrase_confirmed
+        }) {
+            return Err(StorageError::IncompleteGeneration);
+        }
+        drop(wallet);
+        sync_directory(&staging)?;
+        fs::rename(&staging, &root).map_err(StorageError::Io)?;
+        sync_directory(parent)?;
+        Ok((Self::open(&root)?, state))
+    }
+
+    /// Remove only an authenticated, structurally valid interrupted create.
+    pub fn abort_create(root: impl AsRef<Path>, password: &str) -> Result<(), StorageError> {
+        let root = root.as_ref();
+        if root.exists() {
+            return Err(StorageError::AlreadyExists);
+        }
+        let parent = root.parent().ok_or(StorageError::UnsafePath)?;
+        let staging = Self::create_staging_path(root)?;
+        Self::inspect_structure(&staging)?;
+        let wallet = Self::open(&staging)?;
+        wallet.load(password)?;
+        drop(wallet);
+        fs::remove_dir_all(&staging).map_err(StorageError::Io)?;
+        sync_directory(parent)
     }
 
     pub fn open(root: impl AsRef<Path>) -> Result<Self, StorageError> {
         let root = root.as_ref().to_path_buf();
-        if !root.is_dir() {
+        let metadata = root.symlink_metadata().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                StorageError::NotFound
+            } else {
+                StorageError::Io(error)
+            }
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(StorageError::NotFound);
         }
+        Self::inspect_structure(&root)?;
         Ok(Self {
             _writer_lock: acquire_writer_lock(&root)?,
             root,
@@ -125,8 +203,64 @@ impl WalletDirectory {
         Ok(metadata)
     }
 
+    /// Perform a lock-free structural catalog check. This never decrypts state
+    /// and never mutates a wallet.
+    pub fn inspect_structure(root: impl AsRef<Path>) -> Result<WalletMetadata, StorageError> {
+        let root = root.as_ref();
+        let root_metadata = fs::symlink_metadata(root).map_err(StorageError::Io)?;
+        if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+            return Err(StorageError::UnsafePath);
+        }
+        let metadata_path = root.join(METADATA_FILE);
+        require_regular_file(&metadata_path)?;
+        let metadata_bytes = read_bounded(&metadata_path)?;
+        let metadata: WalletMetadata =
+            serde_json::from_slice(&metadata_bytes).map_err(|_| StorageError::InvalidMetadata)?;
+        if metadata.metadata_version != 1
+            || metadata.schema_version != MODEL_VERSION
+            || metadata.secret_profile_version != SECRET_PROFILE_VERSION
+        {
+            return Err(StorageError::UnsupportedVersion);
+        }
+        let active_path = root.join(ACTIVE_FILE);
+        require_regular_file(&active_path)?;
+        let active_bytes = read_bounded(&active_path)?;
+        let active_text = std::str::from_utf8(&active_bytes)
+            .map_err(|_| StorageError::InvalidActiveGeneration)?;
+        let active = parse_generation(active_text)?;
+        let interrupted_publication = metadata
+            .active_generation
+            .checked_add(1)
+            .is_some_and(|next| next == active);
+        if active != metadata.active_generation && !interrupted_publication {
+            return Err(StorageError::GenerationConflict);
+        }
+        let generations = root.join(GENERATIONS_DIR);
+        let generations_metadata = fs::symlink_metadata(&generations).map_err(StorageError::Io)?;
+        if generations_metadata.file_type().is_symlink() || !generations_metadata.is_dir() {
+            return Err(StorageError::UnsafePath);
+        }
+        let generation = generations.join(generation_name(active));
+        let generation_metadata = fs::symlink_metadata(&generation).map_err(StorageError::Io)?;
+        if generation_metadata.file_type().is_symlink() || !generation_metadata.is_dir() {
+            return Err(StorageError::UnsafePath);
+        }
+        let state_path = generation.join(STATE_FILE);
+        require_regular_file(&state_path)?;
+        let state_encoded = read_bounded(&state_path)?;
+        decode(&state_encoded).map_err(|_| StorageError::AuthenticatedPayloadCorrupt)?;
+        let authentication = root.join(AUTHENTICATION_FILE);
+        if authentication.exists() {
+            require_regular_file(&authentication)?;
+            let authentication_encoded = read_bounded(&authentication)?;
+            decode(&authentication_encoded).map_err(|_| StorageError::AuthenticationDataCorrupt)?;
+        }
+        Ok(metadata)
+    }
+
     pub fn load(&self, password: &str) -> Result<WalletState, StorageError> {
         let metadata = self.metadata()?;
+        let password_authenticated = self.authenticate_password(password, &metadata)?;
         let active = self.active_generation()?;
         let interrupted_publication = metadata
             .active_generation
@@ -135,7 +269,7 @@ impl WalletDirectory {
         if active != metadata.active_generation && !interrupted_publication {
             return Err(StorageError::GenerationConflict);
         }
-        let state = self.load_generation(active, password, &metadata)?;
+        let state = self.load_generation(active, password, &metadata, password_authenticated)?;
         if state.generation != active
             || state.wallet_id != metadata.wallet_id
             || state.identity != metadata.identity
@@ -148,6 +282,9 @@ impl WalletDirectory {
                 .map_err(|_| StorageError::CanonicalEncoding)?;
             atomic_write(&self.root.join(METADATA_FILE), &repaired)?;
             sync_directory(&self.root)?;
+        }
+        if !password_authenticated {
+            self.write_authenticator(password, &metadata, KdfParameters::DOM_CONTINUITY)?;
         }
         Ok(state)
     }
@@ -189,6 +326,7 @@ impl WalletDirectory {
             .checked_add(1)
             .ok_or(StorageError::GenerationOverflow)?;
         state.validate().map_err(StorageError::Domain)?;
+        self.remove_unpublished_generation(state.generation)?;
         self.write_generation(&state, password, kdf)?;
         Ok(state)
     }
@@ -221,7 +359,9 @@ impl WalletDirectory {
         password: &str,
     ) -> Result<WalletState, StorageError> {
         let metadata = self.metadata()?;
-        let state = self.load_generation(generation, password, &metadata)?;
+        let password_authenticated = self.authenticate_password(password, &metadata)?;
+        let state =
+            self.load_generation(generation, password, &metadata, password_authenticated)?;
         if state.generation != generation
             || state.wallet_id != metadata.wallet_id
             || state.identity != metadata.identity
@@ -353,7 +493,7 @@ impl WalletDirectory {
         );
         let plaintext =
             open(&container.envelope, backup_password, &context).map_err(StorageError::Crypto)?;
-        let payload: BackupPayload =
+        let mut payload: BackupPayload =
             serde_json::from_slice(&plaintext).map_err(|_| StorageError::InvalidBackup)?;
         if payload.payload_version != BACKUP_FORMAT_VERSION
             || payload.state.wallet_id != container.wallet_id
@@ -362,6 +502,10 @@ impl WalletDirectory {
         {
             return Err(StorageError::IdentityMismatch);
         }
+        payload
+            .state
+            .migrate_transaction_exposure()
+            .map_err(StorageError::Domain)?;
         payload.state.validate().map_err(StorageError::Domain)?;
         if let Some(plan) = &payload.rescan_plan {
             if plan.wallet_id != payload.state.wallet_id || plan.identity != payload.state.identity
@@ -386,6 +530,7 @@ impl WalletDirectory {
             if let Some(plan) = &payload.rescan_plan {
                 staged.save_rescan_plan(&payload.state, plan, wallet_password, kdf)?;
             }
+            drop(staged);
             fs::rename(&staging, destination).map_err(StorageError::Io)?;
             sync_directory(parent)
         })();
@@ -393,7 +538,6 @@ impl WalletDirectory {
             let _ = fs::remove_dir_all(&staging);
         }
         result?;
-        drop(staged);
         WalletDirectory::open(destination)
     }
 
@@ -448,7 +592,55 @@ impl WalletDirectory {
         kdf: KdfParameters,
     ) -> Result<(), StorageError> {
         self.write_generation(state, password, kdf)?;
+        self.write_authenticator(password, &WalletMetadata::from_state(state), kdf)?;
         self.publish_pointer_and_metadata(state)
+    }
+
+    fn authenticate_password(
+        &self,
+        password: &str,
+        metadata: &WalletMetadata,
+    ) -> Result<bool, StorageError> {
+        let path = self.root.join(AUTHENTICATION_FILE);
+        if !path.exists() {
+            return Ok(false);
+        }
+        let encoded = read_bounded(&path).map_err(|_| StorageError::AuthenticationDataCorrupt)?;
+        let envelope = decode(&encoded).map_err(|_| StorageError::AuthenticationDataCorrupt)?;
+        let plaintext = match open(
+            &envelope,
+            password,
+            &authentication_context(metadata.wallet_id, &metadata.identity),
+        ) {
+            Ok(plaintext) => plaintext,
+            Err(CryptoError::AuthenticationFailed) => return Err(StorageError::InvalidPassword),
+            Err(_) => return Err(StorageError::AuthenticationDataCorrupt),
+        };
+        if plaintext.as_slice() != AUTHENTICATION_PLAINTEXT {
+            return Err(StorageError::AuthenticationDataCorrupt);
+        }
+        Ok(true)
+    }
+
+    fn write_authenticator(
+        &self,
+        password: &str,
+        metadata: &WalletMetadata,
+        kdf: KdfParameters,
+    ) -> Result<(), StorageError> {
+        let path = self.root.join(AUTHENTICATION_FILE);
+        if path.exists() {
+            return Ok(());
+        }
+        let envelope = seal(
+            AUTHENTICATION_PLAINTEXT,
+            password,
+            &authentication_context(metadata.wallet_id, &metadata.identity),
+            kdf,
+        )
+        .map_err(StorageError::Crypto)?;
+        let encoded = encode(&envelope).map_err(StorageError::Crypto)?;
+        atomic_write_private(&path, &encoded, MAX_STATE_BYTES)
     }
 
     fn write_generation(
@@ -465,10 +657,7 @@ impl WalletDirectory {
         let temporary_dir = self
             .root
             .join(GENERATIONS_DIR)
-            .join(format!(".{generation}.staging"));
-        if temporary_dir.exists() {
-            return Err(StorageError::IncompleteGeneration);
-        }
+            .join(format!(".{generation}.{}.staging", Uuid::new_v4()));
         fs::create_dir(&temporary_dir).map_err(StorageError::Io)?;
         let result = (|| {
             let plaintext =
@@ -487,6 +676,26 @@ impl WalletDirectory {
             let _ = fs::remove_dir_all(&temporary_dir);
         }
         result
+    }
+
+    /// Remove only the exact adjacent generation left complete but
+    /// unpublished by a crash before the active pointer changed.
+    fn remove_unpublished_generation(&self, generation: u64) -> Result<(), StorageError> {
+        let generations = self.root.join(GENERATIONS_DIR);
+        let path = generations.join(generation_name(generation));
+        if !path.exists() {
+            return Ok(());
+        }
+        let metadata = fs::symlink_metadata(&path).map_err(StorageError::Io)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(StorageError::UnsafePath);
+        }
+        let state_path = path.join(STATE_FILE);
+        require_regular_file(&state_path)?;
+        let encoded = read_bounded(&state_path)?;
+        decode(&encoded).map_err(|_| StorageError::AuthenticatedPayloadCorrupt)?;
+        fs::remove_dir_all(&path).map_err(StorageError::Io)?;
+        sync_directory(&generations)
     }
 
     fn publish_pointer_and_metadata(&self, state: &WalletState) -> Result<(), StorageError> {
@@ -510,6 +719,7 @@ impl WalletDirectory {
         generation: u64,
         password: &str,
         metadata: &WalletMetadata,
+        password_authenticated: bool,
     ) -> Result<WalletState, StorageError> {
         let encoded = read_bounded(
             &self
@@ -518,10 +728,23 @@ impl WalletDirectory {
                 .join(generation_name(generation))
                 .join(STATE_FILE),
         )?;
-        let envelope = decode(&encoded).map_err(StorageError::Crypto)?;
+        let envelope = decode(&encoded).map_err(|_| StorageError::AuthenticatedPayloadCorrupt)?;
         let context = state_context(metadata.wallet_id, &metadata.identity, generation);
-        let plaintext = open(&envelope, password, &context).map_err(StorageError::Crypto)?;
-        serde_json::from_slice(&plaintext).map_err(|_| StorageError::CanonicalEncoding)
+        let plaintext = open(&envelope, password, &context).map_err(|error| {
+            if password_authenticated {
+                StorageError::AuthenticatedPayloadCorrupt
+            } else if matches!(error, CryptoError::AuthenticationFailed) {
+                StorageError::InvalidPassword
+            } else {
+                StorageError::AuthenticatedPayloadCorrupt
+            }
+        })?;
+        let mut state: WalletState = serde_json::from_slice(&plaintext)
+            .map_err(|_| StorageError::AuthenticatedPayloadCorrupt)?;
+        state
+            .migrate_transaction_exposure()
+            .map_err(StorageError::Domain)?;
+        Ok(state)
     }
 }
 
@@ -564,6 +787,15 @@ fn state_context(wallet_id: Uuid, identity: &NetworkIdentity, generation: u64) -
     context
 }
 
+fn authentication_context(wallet_id: Uuid, identity: &NetworkIdentity) -> Vec<u8> {
+    let mut context = Vec::with_capacity(16 + 32 + 32 + 32);
+    context.extend_from_slice(b"DOM-WALLET-V3-AUTH-V1");
+    context.extend_from_slice(wallet_id.as_bytes());
+    context.extend_from_slice(&identity.chain_id);
+    context.extend_from_slice(&identity.genesis_id);
+    context
+}
+
 fn rescan_context(wallet_id: Uuid, identity: &NetworkIdentity) -> Vec<u8> {
     let mut context = Vec::with_capacity(16 + 32 + 32 + 24);
     context.extend_from_slice(b"DOM-WALLET-V3-RESCAN-V1");
@@ -593,6 +825,14 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>, StorageError> {
 }
 
 fn acquire_writer_lock(root: &Path) -> Result<Arc<File>, StorageError> {
+    let lock_path = root.join(WRITER_LOCK_FILE);
+    if lock_path
+        .symlink_metadata()
+        .map(|metadata| metadata.file_type().is_symlink() || !metadata.is_file())
+        .unwrap_or(false)
+    {
+        return Err(StorageError::UnsafePath);
+    }
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true);
     #[cfg(unix)]
@@ -600,9 +840,7 @@ fn acquire_writer_lock(root: &Path) -> Result<Arc<File>, StorageError> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let lock = options
-        .open(root.join(WRITER_LOCK_FILE))
-        .map_err(StorageError::Io)?;
+    let lock = options.open(lock_path).map_err(StorageError::Io)?;
     match FileExt::try_lock_exclusive(&lock) {
         Ok(()) => Ok(Arc::new(lock)),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -610,6 +848,14 @@ fn acquire_writer_lock(root: &Path) -> Result<Arc<File>, StorageError> {
         }
         Err(error) => Err(StorageError::Io(error)),
     }
+}
+
+fn require_regular_file(path: &Path) -> Result<(), StorageError> {
+    let metadata = fs::symlink_metadata(path).map_err(StorageError::Io)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(StorageError::UnsafePath);
+    }
+    Ok(())
 }
 
 fn read_bounded_with_limit(path: &Path, max_bytes: usize) -> Result<Vec<u8>, StorageError> {
@@ -624,7 +870,7 @@ fn atomic_write_private(path: &Path, bytes: &[u8], max_bytes: usize) -> Result<(
     if bytes.is_empty() || bytes.len() > max_bytes {
         return Err(StorageError::FileSizeOutOfBounds);
     }
-    let temporary = path.with_extension("tmp");
+    let temporary = unique_temporary_sibling(path)?;
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -653,7 +899,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
     if bytes.is_empty() || bytes.len() > MAX_STATE_BYTES {
         return Err(StorageError::FileSizeOutOfBounds);
     }
-    let temporary = path.with_extension("tmp");
+    let temporary = unique_temporary_sibling(path)?;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -669,6 +915,15 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
     Ok(())
 }
 
+fn unique_temporary_sibling(path: &Path) -> Result<PathBuf, StorageError> {
+    let mut name = path
+        .file_name()
+        .ok_or(StorageError::UnsafePath)?
+        .to_os_string();
+    name.push(format!(".{}.tmp", Uuid::new_v4()));
+    Ok(path.with_file_name(name))
+}
+
 fn sync_directory(path: &Path) -> Result<(), StorageError> {
     #[cfg(unix)]
     {
@@ -680,14 +935,31 @@ fn sync_directory(path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 
+fn restrict_private_directory(path: &Path) -> Result<(), StorageError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(StorageError::Io)?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("wallet directory already exists")]
     AlreadyExists,
     #[error("wallet directory was not found")]
     NotFound,
+    #[error("wallet path is unsafe")]
+    UnsafePath,
     #[error("wallet is already open by another writer")]
     WriterActive,
+    #[error("wallet password is invalid")]
+    InvalidPassword,
+    #[error("wallet authentication data is corrupt")]
+    AuthenticationDataCorrupt,
+    #[error("authenticated wallet payload is corrupt")]
+    AuthenticatedPayloadCorrupt,
     #[error("invalid wallet metadata")]
     InvalidMetadata,
     #[error("unsupported wallet version")]
@@ -729,7 +1001,12 @@ pub enum StorageError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dom_wallet_domain::{Network, NetworkIdentity, WalletState};
+    use dom_wallet_domain::{
+        cancellation_decision, BroadcastExposure, CancellationDecision, LocalTransactionIntent,
+        Network, NetworkIdentity, OutputRecord, OutputState, TransactionLifecycle, TransactionRole,
+        WalletState,
+    };
+    use uuid::Uuid;
 
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -765,7 +1042,280 @@ mod tests {
         assert_eq!(reopened.wallet_id, state.wallet_id);
         assert!(matches!(
             wallet.load("wrong"),
-            Err(StorageError::Crypto(CryptoError::AuthenticationFailed))
+            Err(StorageError::InvalidPassword)
+        ));
+    }
+
+    #[test]
+    fn regression_a1_real_encrypted_fixtures_separate_auth_storage_and_corruption_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let create = |name: &str| {
+            let state =
+                WalletState::new(identity(), [6; 32], default_node_configuration(identity()));
+            let root = temp.path().join(name);
+            let wallet =
+                WalletDirectory::create(&root, &state, "correct", KdfParameters::TEST).unwrap();
+            (root, wallet)
+        };
+
+        let (_wrong_root, wrong) = create("wrong");
+        assert!(matches!(
+            wrong.load("incorrect"),
+            Err(StorageError::InvalidPassword)
+        ));
+
+        let (auth_root, auth_corrupt) = create("auth-corrupt");
+        fs::write(auth_root.join(AUTHENTICATION_FILE), b"not-an-envelope").unwrap();
+        assert!(matches!(
+            auth_corrupt.load("correct"),
+            Err(StorageError::AuthenticationDataCorrupt)
+        ));
+
+        let (payload_root, payload_corrupt) = create("payload-corrupt");
+        fs::write(
+            payload_root
+                .join(GENERATIONS_DIR)
+                .join(generation_name(0))
+                .join(STATE_FILE),
+            b"not-an-envelope",
+        )
+        .unwrap();
+        assert!(matches!(
+            payload_corrupt.load("correct"),
+            Err(StorageError::AuthenticatedPayloadCorrupt)
+        ));
+
+        let (metadata_root, metadata_corrupt) = create("metadata-corrupt");
+        fs::write(metadata_root.join(METADATA_FILE), b"not-json").unwrap();
+        assert!(matches!(
+            metadata_corrupt.load("correct"),
+            Err(StorageError::InvalidMetadata)
+        ));
+
+        assert!(matches!(
+            WalletDirectory::open(temp.path().join("missing")),
+            Err(StorageError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn regression_m9_interrupted_creation_can_resume_or_authenticated_abort_without_consuming_name()
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let staged_state = || {
+            let mut state =
+                WalletState::new(identity(), [9; 32], default_node_configuration(identity()));
+            state.recovery = Some(dom_wallet_domain::RecoveryMetadata {
+                scheme: RECOVERY_SCHEME_BIP39_256_V1.into(),
+                phrase_confirmed: false,
+            });
+            state
+        };
+
+        let source = temp.path().join("source");
+        let wallet =
+            WalletDirectory::create(&source, &staged_state(), "correct", KdfParameters::TEST)
+                .unwrap();
+        drop(wallet);
+        let destination = temp.path().join("wallet");
+        fs::rename(&source, temp.path().join(".wallet.create-staging")).unwrap();
+        assert!(!destination.exists());
+        let (resumed, state) = WalletDirectory::resume_create(&destination, "correct").unwrap();
+        assert!(!state.recovery.unwrap().phrase_confirmed);
+        assert_eq!(resumed.root(), destination);
+        drop(resumed);
+
+        let source = temp.path().join("abort-source");
+        let wallet =
+            WalletDirectory::create(&source, &staged_state(), "correct", KdfParameters::TEST)
+                .unwrap();
+        drop(wallet);
+        let aborted_destination = temp.path().join("aborted");
+        let stage = temp.path().join(".aborted.create-staging");
+        fs::rename(&source, &stage).unwrap();
+        assert!(matches!(
+            WalletDirectory::abort_create(&aborted_destination, "wrong"),
+            Err(StorageError::InvalidPassword)
+        ));
+        assert!(stage.exists());
+        WalletDirectory::abort_create(&aborted_destination, "correct").unwrap();
+        assert!(!stage.exists());
+        assert!(!aborted_destination.exists());
+    }
+
+    #[test]
+    fn regression_c2_submitting_restart_and_post_acceptance_crash_retain_reservations() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("wallet");
+        let mut state =
+            WalletState::new(identity(), [6; 32], default_node_configuration(identity()));
+        let transaction_id = Uuid::new_v4();
+        let output_id = Uuid::new_v4();
+        state.outputs.push(OutputRecord {
+            id: output_id,
+            account_id: state.default_account.id,
+            commitment: Some([3; 33]),
+            value: 10,
+            state: OutputState::PendingOutgoing,
+            discovered_height: 1,
+            reserved_by: Some(transaction_id),
+        });
+        state.transactions.push(LocalTransactionIntent {
+            id: transaction_id,
+            kernel_excess: vec![4; 33],
+            lifecycle: TransactionLifecycle::Submitting,
+            submitted: false,
+            exposure: BroadcastExposure::SubmissionStarted,
+            slate_id: Some(Uuid::new_v4()),
+            role: Some(TransactionRole::Sender),
+            amount: 8,
+            fee: 2,
+            reserved_output_ids: vec![output_id],
+            request_bytes: Vec::new(),
+            response_bytes: Vec::new(),
+            finalized_transaction_bytes: Vec::new(),
+            transaction_hash: Some([5; 32]),
+            attempt_count: 1,
+            private_context: None,
+            recipient_output_id: None,
+            change_output_id: None,
+            expires_at_height: 100,
+        });
+        let wallet =
+            WalletDirectory::create(&root, &state, "correct-password", KdfParameters::TEST)
+                .unwrap();
+        drop(wallet);
+
+        let restarted = WalletDirectory::open(&root)
+            .unwrap()
+            .load("correct-password")
+            .unwrap();
+        let transaction = &restarted.transactions[0];
+        assert_eq!(transaction.lifecycle, TransactionLifecycle::Submitting);
+        assert_eq!(transaction.exposure, BroadcastExposure::SubmissionStarted);
+        assert_eq!(
+            cancellation_decision(transaction.exposure),
+            CancellationDecision::RequireReconciliation
+        );
+        assert_eq!(restarted.outputs[0].reserved_by, Some(transaction_id));
+
+        let mut accepted_but_not_committed = transaction.clone();
+        accepted_but_not_committed.submitted = true;
+        accepted_but_not_committed.lifecycle = TransactionLifecycle::Submitted;
+        assert_eq!(
+            restarted.transactions[0].lifecycle,
+            TransactionLifecycle::Submitting,
+            "a crash immediately after node acceptance reloads the durable pre-I/O state"
+        );
+        assert_eq!(
+            cancellation_decision(restarted.transactions[0].exposure),
+            CancellationDecision::RequireReconciliation
+        );
+    }
+
+    #[test]
+    fn regression_m9_generation_crash_between_write_and_activation_recovers_atomically() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("wallet");
+        let state = WalletState::new(identity(), [6; 32], default_node_configuration(identity()));
+        let wallet =
+            WalletDirectory::create(&root, &state, "correct-password", KdfParameters::TEST)
+                .unwrap();
+        let mut next = wallet.load("correct-password").unwrap();
+        next.allocation_floor = 7;
+        next.non_reuse_floor = 7;
+        let staged = wallet
+            .stage_generation(0, next, "correct-password", KdfParameters::TEST)
+            .unwrap();
+        drop(wallet);
+
+        let before_activation = WalletDirectory::open(&root)
+            .unwrap()
+            .load("correct-password")
+            .unwrap();
+        assert_eq!(before_activation.generation, 0);
+        assert_eq!(before_activation.allocation_floor, 0);
+        drop(before_activation);
+
+        atomic_write(&root.join(ACTIVE_FILE), generation_name(1).as_bytes()).unwrap();
+        let after_pointer_crash = WalletDirectory::open(&root)
+            .unwrap()
+            .load("correct-password")
+            .unwrap();
+        assert_eq!(after_pointer_crash, staged);
+        let repaired: WalletMetadata =
+            serde_json::from_slice(&fs::read(root.join(METADATA_FILE)).unwrap()).unwrap();
+        assert_eq!(repaired.active_generation, 1);
+    }
+
+    #[test]
+    fn unpublished_generation_and_stale_temporary_files_are_restart_safe() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("wallet");
+        let state = WalletState::new(identity(), [6; 32], default_node_configuration(identity()));
+        let wallet =
+            WalletDirectory::create(&root, &state, "correct-password", KdfParameters::TEST)
+                .unwrap();
+
+        let mut abandoned = wallet.load("correct-password").unwrap();
+        abandoned.allocation_floor = 7;
+        abandoned.non_reuse_floor = 7;
+        wallet
+            .stage_generation(0, abandoned, "correct-password", KdfParameters::TEST)
+            .unwrap();
+        drop(wallet);
+
+        let wallet = WalletDirectory::open(&root).unwrap();
+        let mut replacement = wallet.load("correct-password").unwrap();
+        replacement.allocation_floor = 8;
+        replacement.non_reuse_floor = 8;
+        let committed = wallet
+            .commit(0, replacement, "correct-password", KdfParameters::TEST)
+            .unwrap();
+        assert_eq!(committed.allocation_floor, 8);
+        assert_eq!(wallet.load("correct-password").unwrap(), committed);
+
+        fs::remove_file(root.join(AUTHENTICATION_FILE)).unwrap();
+        fs::write(root.join("authentication.tmp"), b"crash residue").unwrap();
+        drop(wallet);
+        let reopened = WalletDirectory::open(&root).unwrap();
+        assert_eq!(
+            reopened.load("correct-password").unwrap().allocation_floor,
+            8
+        );
+        assert!(root.join(AUTHENTICATION_FILE).is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn regression_a7_internal_wallet_symlinks_never_escape_the_managed_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = temp.path().join("wallet");
+        let state = WalletState::new(identity(), [6; 32], default_node_configuration(identity()));
+        let wallet =
+            WalletDirectory::create(&root, &state, "correct-password", KdfParameters::TEST)
+                .unwrap();
+        drop(wallet);
+
+        let metadata = root.join(METADATA_FILE);
+        let outside_metadata = outside.path().join("metadata.json");
+        fs::rename(&metadata, &outside_metadata).unwrap();
+        std::os::unix::fs::symlink(&outside_metadata, &metadata).unwrap();
+        assert!(matches!(
+            WalletDirectory::inspect_structure(&root),
+            Err(StorageError::UnsafePath)
+        ));
+        fs::remove_file(&metadata).unwrap();
+        fs::rename(&outside_metadata, &metadata).unwrap();
+
+        let generations = root.join(GENERATIONS_DIR);
+        let outside_generations = outside.path().join("generations");
+        fs::rename(&generations, &outside_generations).unwrap();
+        std::os::unix::fs::symlink(&outside_generations, &generations).unwrap();
+        assert!(matches!(
+            WalletDirectory::open(&root),
+            Err(StorageError::UnsafePath)
         ));
     }
 
@@ -876,16 +1426,10 @@ mod tests {
         let generation_before = fs::read(&generation_path).unwrap();
         drop(wallet);
 
-        let reopened = WalletDirectory::open(&root).unwrap();
         assert!(matches!(
-            reopened.metadata(),
+            WalletDirectory::open(&root),
             Err(StorageError::UnsupportedVersion)
         ));
-        assert!(matches!(
-            reopened.load("correct"),
-            Err(StorageError::UnsupportedVersion)
-        ));
-        drop(reopened);
         assert_eq!(fs::read(root.join(METADATA_FILE)).unwrap(), unsupported);
         assert_eq!(fs::read(generation_path).unwrap(), generation_before);
     }
@@ -932,7 +1476,7 @@ mod tests {
 
         assert!(matches!(
             wallet.load("wrong"),
-            Err(StorageError::Crypto(CryptoError::AuthenticationFailed))
+            Err(StorageError::InvalidPassword)
         ));
         assert_eq!(wallet.metadata().unwrap().active_generation, 0);
 

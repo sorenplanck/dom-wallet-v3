@@ -24,10 +24,11 @@ use dom_wallet_core_sync::{
 };
 use dom_wallet_crypto::{KdfParameters, SecretBytes};
 use dom_wallet_domain::{
-    BalanceProjection, LocalTransactionIntent, MiningPreferences, Network, NetworkIdentity,
-    NodeConfiguration, OutputRecord, OutputState, PrivateTransactionContext, RecoveryMetadata,
-    RecoveryOutputClass, RedactedNodeConfiguration, TransactionLifecycle, TransactionRole,
-    WalletState, RECOVERY_SCHEME_BIP39_256_V1,
+    cancellation_decision, BalanceProjection, BroadcastExposure, CancellationDecision,
+    LocalTransactionIntent, MiningPreferences, Network, NetworkIdentity, NodeConfiguration,
+    OutputRecord, OutputState, PrivateTransactionContext, RecoveryMetadata, RecoveryOutputClass,
+    RedactedNodeConfiguration, TransactionLifecycle, TransactionRole,
+    TransactionTransitionEvidence, WalletState, RECOVERY_SCHEME_BIP39_256_V1,
 };
 use dom_wallet_embedded_core::{EmbeddedCoreConfiguration, EmbeddedPeerStatus};
 use dom_wallet_production_backend::{
@@ -42,6 +43,10 @@ use std::{fmt, path::Path};
 use thiserror::Error;
 use uuid::Uuid;
 use zeroize::Zeroizing;
+
+/// Explicit maximum lifetime for an interactive transaction, measured from
+/// the authoritative canonical tip observed at each operation boundary.
+pub const MAX_TRANSACTION_LIFETIME_BLOCKS: u64 = 1_440;
 
 pub const MAINNET_CHAIN_ID_HEX: &str =
     "f9831fadabc8a4234beab35fbb6327e84581645f33e9f75ed2ea78e8bcf1165b";
@@ -144,6 +149,20 @@ pub struct RecoveryRestoreResult {
     pub recovery: SeedRestoreResult,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ErrorDomainSnapshot {
+    pub authentication: Option<String>,
+    pub storage: Option<String>,
+    pub lifecycle: Option<String>,
+    pub node: Option<String>,
+    pub peer_bootstrap: Option<String>,
+    pub synchronization: Option<String>,
+    pub mining: Option<String>,
+    pub submission: Option<String>,
+    pub updater: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackupStatus {
@@ -160,7 +179,7 @@ pub struct WalletService {
     kdf: KdfParameters,
     backend: Option<ProductionWalletBackend>,
     sender_secrets: Option<(Uuid, RecoverableSenderParts)>,
-    last_error: Option<String>,
+    errors: ErrorDomainSnapshot,
 }
 
 impl fmt::Debug for WalletService {
@@ -188,7 +207,7 @@ impl Default for WalletService {
             kdf: KdfParameters::DOM_CONTINUITY,
             backend: None,
             sender_secrets: None,
-            last_error: None,
+            errors: ErrorDomainSnapshot::default(),
         }
     }
 }
@@ -232,6 +251,40 @@ impl WalletService {
             wallet: self.summary_locked()?,
             mnemonic: seed.mnemonic_text(),
         })
+    }
+
+    pub fn resume_recoverable_creation(
+        &mut self,
+        path: impl AsRef<Path>,
+        password: &str,
+    ) -> Result<RecoveryCreateResult, CoreError> {
+        self.ensure_closed()?;
+        validate_password(password)?;
+        let (directory, state) = WalletDirectory::resume_create(path, password)?;
+        if !state.recovery.as_ref().is_some_and(|recovery| {
+            recovery.scheme == RECOVERY_SCHEME_BIP39_256_V1 && !recovery.phrase_confirmed
+        }) {
+            return Err(CoreError::RecoveryPhraseAlreadyConfirmed);
+        }
+        let seed = CanonicalWalletSeed::from_entropy(&state.root_material)
+            .map_err(|_| CoreError::RecoveryPhraseInvalid)?;
+        self.metadata = Some(directory.metadata()?);
+        self.location = Some(directory);
+        self.state = ApplicationState::Locked;
+        Ok(RecoveryCreateResult {
+            wallet: self.summary_locked()?,
+            mnemonic: seed.mnemonic_text(),
+        })
+    }
+
+    pub fn abort_recoverable_creation(
+        &mut self,
+        path: impl AsRef<Path>,
+        password: &str,
+    ) -> Result<(), CoreError> {
+        self.ensure_closed()?;
+        validate_password(password)?;
+        WalletDirectory::abort_create(path, password).map_err(CoreError::from)
     }
 
     pub fn create_recoverable_for_embedded(
@@ -294,7 +347,9 @@ impl WalletService {
         })();
         if let Err(error) = &result {
             self.state = ApplicationState::Locked;
-            self.last_error = Some(error.redacted_message());
+            self.errors.authentication = Some(error.redacted_code().into());
+        } else {
+            self.errors.authentication = None;
         }
         result
     }
@@ -329,6 +384,20 @@ impl WalletService {
             .ok_or(CoreError::EmbeddedCoreRequired)?
             .current_identity()
             .map_err(CoreError::from)
+    }
+
+    pub fn embedded_core_cached_identity(&self) -> Result<CoreChainIdentity, CoreError> {
+        self.backend
+            .as_ref()
+            .map(|backend| backend.identity().clone())
+            .ok_or(CoreError::EmbeddedCoreRequired)
+    }
+
+    pub fn embedded_core_running(&self) -> Result<bool, CoreError> {
+        self.backend
+            .as_ref()
+            .map(ProductionWalletBackend::is_running)
+            .ok_or(CoreError::EmbeddedCoreRequired)
     }
 
     pub fn embedded_core_ready(&self) -> Result<bool, CoreError> {
@@ -371,6 +440,7 @@ impl WalletService {
         &mut self,
         height: u64,
     ) -> Result<dom_consensus::CoinbaseTransaction, CoreError> {
+        self.ensure_phrase_confirmed()?;
         self.backend
             .as_ref()
             .ok_or(CoreError::EmbeddedCoreRequired)?;
@@ -484,12 +554,55 @@ impl WalletService {
         Ok(())
     }
 
+    /// Re-display an unfinished creation ceremony only after authenticating the
+    /// currently open wallet. This is the restart/dismissal recovery path; a
+    /// confirmed phrase is never exposed again.
+    pub fn recovery_phrase_resume(
+        &self,
+        password: &str,
+    ) -> Result<RecoveryCreateResult, CoreError> {
+        if !matches!(
+            self.state,
+            ApplicationState::Locked | ApplicationState::Unlocked
+        ) {
+            return Err(CoreError::InvalidLifecycleState);
+        }
+        validate_password(password)?;
+        let state = self
+            .location
+            .as_ref()
+            .ok_or(CoreError::WalletNotOpen)?
+            .load(password)?;
+        let recovery = state
+            .recovery
+            .as_ref()
+            .ok_or(CoreError::RecoveryUnavailable)?;
+        if recovery.scheme != RECOVERY_SCHEME_BIP39_256_V1 {
+            return Err(CoreError::RecoveryPhraseInvalid);
+        }
+        if recovery.phrase_confirmed {
+            return Err(CoreError::RecoveryPhraseAlreadyConfirmed);
+        }
+        let seed = CanonicalWalletSeed::from_entropy(&state.root_material)
+            .map_err(|_| CoreError::RecoveryPhraseInvalid)?;
+        let wallet = if self.state == ApplicationState::Unlocked {
+            self.summary()?
+        } else {
+            self.summary_locked()?
+        };
+        Ok(RecoveryCreateResult {
+            wallet,
+            mnemonic: seed.mnemonic_text(),
+        })
+    }
+
     pub fn backup_export(
         &self,
         destination: impl AsRef<Path>,
         backup_password: &str,
     ) -> Result<BackupStatus, CoreError> {
         validate_password(backup_password)?;
+        self.ensure_phrase_confirmed()?;
         let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
         let password = self.password.as_ref().ok_or(CoreError::Locked)?;
         let wallet_password = std::str::from_utf8(password.expose_for_crypto())
@@ -643,7 +756,7 @@ impl WalletService {
         self.unlocked = Some(sink.state);
         match result {
             Ok(_) => {
-                self.last_error = None;
+                self.errors.synchronization = None;
                 self.metadata = Some(
                     self.location
                         .as_ref()
@@ -661,7 +774,7 @@ impl WalletService {
     }
 
     fn record_sync_failure(&mut self, error: &ProductionBackendError) {
-        self.last_error = Some(match error {
+        self.errors.synchronization = Some(match error {
             ProductionBackendError::Scan(scan) => {
                 format!("CURSOR_SYNCHRONIZATION_FAILED:{scan}")
             }
@@ -671,7 +784,49 @@ impl WalletService {
     }
 
     pub fn synchronize_live(&mut self) -> Result<WalletSummary, CoreError> {
-        self.synchronize()
+        let backend = self
+            .backend
+            .as_ref()
+            .ok_or(CoreError::EmbeddedCoreRequired)?;
+        if !backend.is_ready()? {
+            return Err(CoreError::NodeNotReady);
+        }
+        let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
+        let seed = CanonicalWalletSeed::from_entropy(&state.root_material)
+            .map_err(|_| CoreError::RecoveryPhraseInvalid)?;
+        let identity = backend.identity().clone();
+        require_domain_identity(&state.identity, &identity)?;
+        let location = self
+            .location
+            .as_ref()
+            .ok_or(CoreError::WalletNotOpen)?
+            .clone();
+        let password = self.password_text()?.to_owned();
+
+        let backend = self.backend.take().ok_or(CoreError::EmbeddedCoreRequired)?;
+        let state = self.unlocked.take().ok_or(CoreError::Locked)?;
+        let mut sink = WalletRecoverySink::new(location, state, password, self.kdf, seed, identity);
+        self.state = ApplicationState::Synchronizing;
+        let result = backend.reconcile_page(&mut sink);
+        self.backend = Some(backend);
+        self.unlocked = Some(sink.state);
+        match result {
+            Ok(_) => {
+                self.errors.synchronization = None;
+                self.metadata = Some(
+                    self.location
+                        .as_ref()
+                        .ok_or(CoreError::WalletNotOpen)?
+                        .metadata()?,
+                );
+                self.state = ApplicationState::Unlocked;
+                self.summary()
+            }
+            Err(error) => {
+                self.record_sync_failure(&error);
+                Err(error.into())
+            }
+        }
     }
 
     pub fn rescan_from_genesis(&mut self) -> Result<WalletSummary, CoreError> {
@@ -802,12 +957,14 @@ impl WalletService {
         if amount == 0 {
             return Err(CoreError::InvalidTransactionInput);
         }
+        self.ensure_phrase_confirmed()?;
         let identity = self
             .backend
             .as_ref()
             .ok_or(CoreError::EmbeddedCoreRequired)?
             .identity()
             .clone();
+        validate_transaction_expiry(expires_at_height, identity.current_tip.height)?;
         let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
         let mut selected = Vec::new();
         let mut total = 0u64;
@@ -872,6 +1029,7 @@ impl WalletService {
             kernel_excess: Vec::new(),
             lifecycle: TransactionLifecycle::InputsReserved,
             submitted: false,
+            exposure: BroadcastExposure::NeverBroadcast,
             slate_id: Some(public_slate_id),
             role: Some(TransactionRole::Sender),
             amount,
@@ -885,6 +1043,7 @@ impl WalletService {
             private_context: None,
             recipient_output_id: None,
             change_output_id: None,
+            expires_at_height,
         });
         self.commit(state)?; // Coordinate and reservations are durable before construction.
 
@@ -1007,27 +1166,31 @@ impl WalletService {
         )
     }
 
-    pub fn slate_request_export(&mut self, slate_id: Uuid) -> Result<SlateExport, CoreError> {
+    pub fn slate_request_export(&self, slate_id: Uuid) -> Result<SlateExport, CoreError> {
+        self.ensure_phrase_confirmed()?;
         let identity = self
             .backend
             .as_ref()
             .ok_or(CoreError::EmbeddedCoreRequired)?
             .identity()
             .clone();
-        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
-        let transaction = find_transaction_mut(&mut state, slate_id, TransactionRole::Sender)?;
+        let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
+        let index = find_transaction_index(state, slate_id, TransactionRole::Sender)?;
+        let transaction = state
+            .transactions
+            .get(index)
+            .ok_or(CoreError::TransactionNotFound)?;
         let slate = CanonicalSlate::from_recovery_bytes(
             &transaction.request_bytes,
             &identity,
             identity.current_tip.height,
         )?;
-        transaction.lifecycle = TransactionLifecycle::RequestExported;
+        validate_transaction_expiry(slate.expires_at_height(), identity.current_tip.height)?;
         let export = SlateExport {
             transaction_id: transaction.id,
             slate_id,
             text: slate.to_text(),
         };
-        self.commit(state)?;
         Ok(export)
     }
 
@@ -1039,6 +1202,7 @@ impl WalletService {
             .identity()
             .clone();
         let slate = CanonicalSlate::from_text(text, &identity, identity.current_tip.height)?;
+        validate_transaction_expiry(slate.expires_at_height(), identity.current_tip.height)?;
         if slate.phase()? != SlatePhase::SenderOffer {
             return Err(CoreError::InvalidSlateTransport);
         }
@@ -1058,6 +1222,7 @@ impl WalletService {
             kernel_excess: Vec::new(),
             lifecycle: TransactionLifecycle::RequestImported,
             submitted: false,
+            exposure: BroadcastExposure::NeverBroadcast,
             slate_id: Some(slate_id),
             role: Some(TransactionRole::Recipient),
             amount: slate.recovery_body()?.amount_noms(),
@@ -1071,6 +1236,7 @@ impl WalletService {
             private_context: None,
             recipient_output_id: None,
             change_output_id: None,
+            expires_at_height: slate.expires_at_height(),
         });
         self.commit(state)?;
         self.transaction_summary(id)
@@ -1096,6 +1262,7 @@ impl WalletService {
             &identity,
             identity.current_tip.height,
         )?;
+        validate_transaction_expiry(request.expires_at_height(), identity.current_tip.height)?;
         let seed = CanonicalWalletSeed::from_entropy(&state.root_material)
             .map_err(|_| CoreError::RecoveryPhraseInvalid)?;
         let builder = RecoverableOutputBuilder::new(&seed, &identity)?;
@@ -1129,33 +1296,40 @@ impl WalletService {
             recipient_output_blinding: Some(*blinding),
         });
         state.transactions[index].response_bytes = response.canonical_bytes().to_vec();
-        state.transactions[index].lifecycle = TransactionLifecycle::ResponsePrepared;
+        state.transactions[index].transition(
+            TransactionLifecycle::ResponsePrepared,
+            TransactionTransitionEvidence::RecipientResponse,
+        )?;
         let id = state.transactions[index].id;
         self.commit(state)?;
         self.transaction_summary(id)
     }
 
-    pub fn slate_response_export(&mut self, slate_id: Uuid) -> Result<SlateExport, CoreError> {
+    pub fn slate_response_export(&self, slate_id: Uuid) -> Result<SlateExport, CoreError> {
+        self.ensure_phrase_confirmed()?;
         let identity = self
             .backend
             .as_ref()
             .ok_or(CoreError::EmbeddedCoreRequired)?
             .identity()
             .clone();
-        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
-        let transaction = find_transaction_mut(&mut state, slate_id, TransactionRole::Recipient)?;
+        let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
+        let index = find_transaction_index(state, slate_id, TransactionRole::Recipient)?;
+        let transaction = state
+            .transactions
+            .get(index)
+            .ok_or(CoreError::TransactionNotFound)?;
         let slate = CanonicalSlate::from_recovery_bytes(
             &transaction.response_bytes,
             &identity,
             identity.current_tip.height,
         )?;
-        transaction.lifecycle = TransactionLifecycle::ResponseExported;
+        validate_transaction_expiry(slate.expires_at_height(), identity.current_tip.height)?;
         let export = SlateExport {
             transaction_id: transaction.id,
             slate_id,
             text: slate.to_text(),
         };
-        self.commit(state)?;
         Ok(export)
     }
 
@@ -1167,6 +1341,7 @@ impl WalletService {
             .identity()
             .clone();
         let response = CanonicalSlate::from_text(text, &identity, identity.current_tip.height)?;
+        validate_transaction_expiry(response.expires_at_height(), identity.current_tip.height)?;
         if response.phase()? != SlatePhase::ReceiverResponse {
             return Err(CoreError::InvalidSlateTransport);
         }
@@ -1178,11 +1353,15 @@ impl WalletService {
             &identity,
             identity.current_tip.height,
         )?;
+        validate_transaction_expiry(request.expires_at_height(), identity.current_tip.height)?;
         if request.replay_key() != response.replay_key() {
             return Err(CoreError::SlateReplayConflict);
         }
         transaction.response_bytes = response.canonical_bytes().to_vec();
-        transaction.lifecycle = TransactionLifecycle::ResponseImported;
+        transaction.transition(
+            TransactionLifecycle::ResponseImported,
+            TransactionTransitionEvidence::RecipientResponse,
+        )?;
         let id = transaction.id;
         self.commit(state)?;
         self.transaction_summary(id)
@@ -1192,6 +1371,7 @@ impl WalletService {
         &mut self,
         slate_id: Uuid,
     ) -> Result<TransactionSummary, CoreError> {
+        self.ensure_phrase_confirmed()?;
         let identity = self
             .backend
             .as_ref()
@@ -1208,11 +1388,13 @@ impl WalletService {
             &identity,
             identity.current_tip.height,
         )?;
+        validate_transaction_expiry(request.expires_at_height(), identity.current_tip.height)?;
         let response = CanonicalSlate::from_recovery_bytes(
             &state.transactions[index].response_bytes,
             &identity,
             identity.current_tip.height,
         )?;
+        validate_transaction_expiry(response.expires_at_height(), identity.current_tip.height)?;
         let persisted_sender;
         let sender = if let Some((_, sender)) = self
             .sender_secrets
@@ -1255,7 +1437,10 @@ impl WalletService {
         state.transactions[index].finalized_transaction_bytes = finalized.canonical_bytes;
         state.transactions[index].transaction_hash = Some(finalized.transaction_hash);
         state.transactions[index].kernel_excess = finalized.kernel_excess.to_vec();
-        state.transactions[index].lifecycle = TransactionLifecycle::Finalized;
+        state.transactions[index].transition(
+            TransactionLifecycle::Finalized,
+            TransactionTransitionEvidence::Finalization,
+        )?;
         self.commit(state)?;
         self.transaction_summary(state_transaction_id(self.unlocked.as_ref(), index)?)
     }
@@ -1294,7 +1479,7 @@ impl WalletService {
 
         let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
         let index = find_transaction_index(&state, slate_id, TransactionRole::Sender)?;
-        apply_submission_query(&mut state.transactions[index], query, status);
+        apply_submission_query(&mut state.transactions[index], query, status)?;
         let id = state.transactions[index].id;
         self.commit(state)?;
         self.transaction_summary(id)
@@ -1305,9 +1490,13 @@ impl WalletService {
         slate_id: Uuid,
         retry: bool,
     ) -> Result<TransactionSummary, CoreError> {
-        self.backend
+        self.ensure_phrase_confirmed()?;
+        let identity = self
+            .backend
             .as_ref()
-            .ok_or(CoreError::EmbeddedCoreRequired)?;
+            .ok_or(CoreError::EmbeddedCoreRequired)?
+            .identity()
+            .clone();
         let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
         let index = find_transaction_index(&state, slate_id, TransactionRole::Sender)?;
         let tx = &state.transactions[index];
@@ -1320,6 +1509,17 @@ impl WalletService {
         {
             return Err(CoreError::InvalidTransactionTransition);
         }
+        let expiry = if tx.expires_at_height == 0 {
+            CanonicalSlate::from_recovery_bytes(
+                &tx.request_bytes,
+                &identity,
+                identity.current_tip.height,
+            )?
+            .expires_at_height()
+        } else {
+            tx.expires_at_height
+        };
+        validate_transaction_expiry(expiry, identity.current_tip.height)?;
         let transaction = Transaction::from_bytes(&tx.finalized_transaction_bytes)
             .map_err(|_| CoreError::ProtocolRejected)?;
         let hash = tx.transaction_hash.ok_or(CoreError::ProtocolRejected)?;
@@ -1327,7 +1527,10 @@ impl WalletService {
             .then(|| tx.kernel_excess.clone().try_into().ok())
             .flatten();
         let submission = CanonicalTransactionSubmission::new(transaction, hash, kernel)?;
-        state.transactions[index].lifecycle = TransactionLifecycle::Submitting;
+        state.transactions[index].transition(
+            TransactionLifecycle::Submitting,
+            TransactionTransitionEvidence::SubmissionStarted,
+        )?;
         state.transactions[index].attempt_count = state.transactions[index]
             .attempt_count
             .checked_add(1)
@@ -1346,7 +1549,7 @@ impl WalletService {
         };
         let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
         let index = find_transaction_index(&state, slate_id, TransactionRole::Sender)?;
-        apply_submission_outcome(&mut state.transactions[index], outcome);
+        apply_submission_outcome(&mut state.transactions[index], outcome)?;
         let id = state.transactions[index].id;
         self.commit(state)?;
         self.transaction_summary(id)
@@ -1363,15 +1566,23 @@ impl WalletService {
             .iter()
             .position(|transaction| transaction.slate_id == Some(slate_id))
             .ok_or(CoreError::TransactionNotFound)?;
-        if matches!(
-            state.transactions[index].lifecycle,
-            TransactionLifecycle::Submitting
-                | TransactionLifecycle::Submitted
-                | TransactionLifecycle::AcceptedNotRelayed
-                | TransactionLifecycle::InMempool
-                | TransactionLifecycle::Confirmed { .. }
-        ) {
-            return Err(CoreError::CannotCancelTransaction);
+        match cancellation_decision(state.transactions[index].exposure) {
+            CancellationDecision::ReleaseNeverBroadcastReservations => {}
+            CancellationDecision::DenyPossiblyBroadcast => {
+                return Err(CoreError::CannotCancelTransaction);
+            }
+            CancellationDecision::RequireReconciliation => {
+                if state.transactions[index].lifecycle
+                    != TransactionLifecycle::ReconciliationRequired
+                {
+                    state.transactions[index].transition(
+                        TransactionLifecycle::ReconciliationRequired,
+                        TransactionTransitionEvidence::ReconciliationEvidence,
+                    )?;
+                    self.commit(state)?;
+                }
+                return Err(CoreError::CannotCancelTransaction);
+            }
         }
         if matches!(
             state.transactions[index].lifecycle,
@@ -1389,7 +1600,10 @@ impl WalletService {
                 }
             }
         }
-        state.transactions[index].lifecycle = TransactionLifecycle::Cancelled;
+        state.transactions[index].transition(
+            TransactionLifecycle::Cancelled,
+            TransactionTransitionEvidence::Cancellation,
+        )?;
         let id = state.transactions[index].id;
         self.commit(state)?;
         self.transaction_summary(id)
@@ -1435,8 +1649,12 @@ impl WalletService {
             generation: self.unlocked.as_ref().map(|state| state.generation),
             cursor_height: cursor.as_ref().map(|cursor| cursor.anchor_height),
             cursor_hash: cursor.map(|cursor| hex::encode(cursor.anchor_hash)),
-            last_error: self.last_error.clone(),
+            last_error: self.errors.synchronization.clone(),
         }
+    }
+
+    pub fn error_domains(&self) -> ErrorDomainSnapshot {
+        self.errors.clone()
     }
 
     fn transaction_summary(&self, id: Uuid) -> Result<TransactionSummary, CoreError> {
@@ -1458,6 +1676,19 @@ impl WalletService {
                 .expose_for_crypto(),
         )
         .map_err(|_| CoreError::InvalidPassword)
+    }
+
+    fn ensure_phrase_confirmed(&self) -> Result<(), CoreError> {
+        let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
+        if state
+            .recovery
+            .as_ref()
+            .is_some_and(|recovery| recovery.phrase_confirmed)
+        {
+            Ok(())
+        } else {
+            Err(CoreError::RecoveryCeremonyRequired)
+        }
     }
 
     fn commit(&mut self, state: WalletState) -> Result<(), CoreError> {
@@ -1600,6 +1831,22 @@ fn validate_password(password: &str) -> Result<(), CoreError> {
     }
 }
 
+pub fn validate_transaction_expiry(
+    expires_at_height: u64,
+    canonical_tip_height: u64,
+) -> Result<(), CoreError> {
+    if expires_at_height <= canonical_tip_height {
+        return Err(CoreError::TransactionExpired);
+    }
+    let maximum = canonical_tip_height
+        .checked_add(MAX_TRANSACTION_LIFETIME_BLOCKS)
+        .ok_or(CoreError::ArithmeticOverflow)?;
+    if expires_at_height > maximum {
+        return Err(CoreError::TransactionLifetimeExceeded);
+    }
+    Ok(())
+}
+
 fn require_domain_identity(
     expected: &NetworkIdentity,
     core: &CoreChainIdentity,
@@ -1695,61 +1942,90 @@ fn state_transaction_id(state: Option<&WalletState>, index: usize) -> Result<Uui
 fn apply_submission_outcome(
     transaction: &mut LocalTransactionIntent,
     outcome: WalletSubmissionOutcome,
-) {
-    transaction.lifecycle = match outcome {
+) -> Result<(), CoreError> {
+    let (lifecycle, evidence) = match outcome {
         WalletSubmissionOutcome::Accepted(evidence) if evidence.relayed => {
             transaction.submitted = true;
-            TransactionLifecycle::Submitted
+            (
+                TransactionLifecycle::Submitted,
+                TransactionTransitionEvidence::SubmissionOutcome,
+            )
         }
         WalletSubmissionOutcome::Accepted(_) => {
             transaction.submitted = true;
-            TransactionLifecycle::AcceptedNotRelayed
+            (
+                TransactionLifecycle::AcceptedNotRelayed,
+                TransactionTransitionEvidence::SubmissionOutcome,
+            )
         }
         WalletSubmissionOutcome::AlreadyKnown(_) => {
             transaction.submitted = true;
-            TransactionLifecycle::InMempool
+            (
+                TransactionLifecycle::InMempool,
+                TransactionTransitionEvidence::MempoolObservation,
+            )
         }
         WalletSubmissionOutcome::NodeNotReady(_)
         | WalletSubmissionOutcome::TemporaryFailure(_)
-        | WalletSubmissionOutcome::InternalFailure(_) => TransactionLifecycle::RetransmitRequired,
+        | WalletSubmissionOutcome::InternalFailure(_) => (
+            TransactionLifecycle::RetransmitRequired,
+            TransactionTransitionEvidence::SubmissionOutcome,
+        ),
         WalletSubmissionOutcome::RejectedInvalid(_)
         | WalletSubmissionOutcome::RejectedFee(_)
         | WalletSubmissionOutcome::RejectedDoubleSpend(_)
         | WalletSubmissionOutcome::RejectedImmatureCoinbase(_)
         | WalletSubmissionOutcome::RejectedExpired(_)
-        | WalletSubmissionOutcome::RejectedPolicy(_) => TransactionLifecycle::Failed,
+        | WalletSubmissionOutcome::RejectedPolicy(_) => (
+            TransactionLifecycle::Failed,
+            TransactionTransitionEvidence::SubmissionOutcome,
+        ),
     };
+    transaction.transition(lifecycle, evidence)?;
+    Ok(())
 }
 
 fn apply_submission_query(
     transaction: &mut LocalTransactionIntent,
     query: WalletSubmissionQuery,
     status: Option<WalletTransactionStatus>,
-) {
+) -> Result<(), CoreError> {
     match query {
         WalletSubmissionQuery::InMempool(outcome) => {
-            apply_submission_outcome(transaction, outcome);
+            apply_submission_outcome(transaction, outcome)?;
             transaction.submitted = true;
-            transaction.lifecycle = TransactionLifecycle::InMempool;
+            transaction.transition(
+                TransactionLifecycle::InMempool,
+                TransactionTransitionEvidence::MempoolObservation,
+            )?;
         }
         WalletSubmissionQuery::Confirmed {
             height, block_hash, ..
         } => {
             transaction.submitted = true;
-            transaction.lifecycle = TransactionLifecycle::Confirmed { height, block_hash };
+            transaction.transition(
+                TransactionLifecycle::Confirmed { height, block_hash },
+                TransactionTransitionEvidence::ConfirmationEvidence,
+            )?;
         }
         WalletSubmissionQuery::Rejected(outcome)
         | WalletSubmissionQuery::TemporarilyUnavailable(outcome) => {
-            apply_submission_outcome(transaction, outcome);
+            apply_submission_outcome(transaction, outcome)?;
         }
         WalletSubmissionQuery::Unknown => match status {
             Some(WalletTransactionStatus::Confirmed { height, block_hash }) => {
                 transaction.submitted = true;
-                transaction.lifecycle = TransactionLifecycle::Confirmed { height, block_hash };
+                transaction.transition(
+                    TransactionLifecycle::Confirmed { height, block_hash },
+                    TransactionTransitionEvidence::ConfirmationEvidence,
+                )?;
             }
             Some(WalletTransactionStatus::InMempool) => {
                 transaction.submitted = true;
-                transaction.lifecycle = TransactionLifecycle::InMempool;
+                transaction.transition(
+                    TransactionLifecycle::InMempool,
+                    TransactionTransitionEvidence::MempoolObservation,
+                )?;
             }
             Some(WalletTransactionStatus::Unknown)
                 if matches!(
@@ -1757,13 +2033,20 @@ fn apply_submission_query(
                     TransactionLifecycle::Confirmed { .. }
                 ) =>
             {
-                transaction.lifecycle = TransactionLifecycle::Reorged;
+                transaction.transition(
+                    TransactionLifecycle::Reorged,
+                    TransactionTransitionEvidence::ReorgEvidence,
+                )?;
             }
             Some(WalletTransactionStatus::Unknown) | None => {
-                transaction.lifecycle = TransactionLifecycle::ReconciliationRequired;
+                transaction.transition(
+                    TransactionLifecycle::ReconciliationRequired,
+                    TransactionTransitionEvidence::ReconciliationEvidence,
+                )?;
             }
         },
     }
+    Ok(())
 }
 
 fn summary_from_state(state: &WalletState, application_state: &str) -> WalletSummary {
@@ -1850,6 +2133,8 @@ pub enum CoreError {
     RandomnessUnavailable,
     #[error("BIP-39 recovery ceremony is required")]
     RecoveryCeremonyRequired,
+    #[error("BIP-39 recovery phrase was already confirmed")]
+    RecoveryPhraseAlreadyConfirmed,
     #[error("recovery phrase is invalid")]
     RecoveryPhraseInvalid,
     #[error("wallet is not eligible for mnemonic recovery")]
@@ -1866,6 +2151,10 @@ pub enum CoreError {
     AddressIdentityRequired,
     #[error("transaction input is invalid")]
     InvalidTransactionInput,
+    #[error("transaction expiry is not above the canonical tip")]
+    TransactionExpired,
+    #[error("transaction lifetime exceeds the local maximum")]
+    TransactionLifetimeExceeded,
     #[error("insufficient spendable funds")]
     InsufficientFunds,
     #[error("selected outputs have no encrypted spending evidence")]
@@ -1921,6 +2210,7 @@ impl CoreError {
             Self::InvalidPassword => "INVALID_PASSWORD",
             Self::RandomnessUnavailable => "RANDOMNESS_UNAVAILABLE",
             Self::RecoveryCeremonyRequired => "RECOVERY_CONFIRMATION_REQUIRED",
+            Self::RecoveryPhraseAlreadyConfirmed => "RECOVERY_PHRASE_ALREADY_CONFIRMED",
             Self::RecoveryPhraseInvalid => "RECOVERY_PHRASE_INVALID",
             Self::RecoveryUnavailable => "RECOVERY_UNAVAILABLE",
             Self::InvalidBackupDestination => "BACKUP_DESTINATION_INVALID",
@@ -1929,6 +2219,8 @@ impl CoreError {
             Self::IdentityMismatch => "CHAIN_IDENTITY_MISMATCH",
             Self::AddressIdentityRequired => "ADDRESS_IDENTITY_REQUIRED",
             Self::InvalidTransactionInput => "TRANSACTION_INPUT_INVALID",
+            Self::TransactionExpired => "TRANSACTION_EXPIRED",
+            Self::TransactionLifetimeExceeded => "TRANSACTION_LIFETIME_EXCEEDED",
             Self::InsufficientFunds => "INSUFFICIENT_FUNDS",
             Self::UnsupportedSpendingEvidence => "SPENDING_EVIDENCE_UNSUPPORTED",
             Self::FeeTooLow => "FEE_TOO_LOW",
@@ -1945,6 +2237,11 @@ impl CoreError {
             Self::TransactionNotFound => "TRANSACTION_NOT_FOUND",
             Self::InvalidCoreCursor => "CURSOR_INVALID",
             Self::Storage(StorageError::WriterActive) => "WALLET_WRITER_ACTIVE",
+            Self::Storage(StorageError::InvalidPassword) => "INVALID_PASSWORD",
+            Self::Storage(StorageError::AuthenticationDataCorrupt) => "WALLET_AUTH_DATA_CORRUPT",
+            Self::Storage(StorageError::AuthenticatedPayloadCorrupt) => "WALLET_PAYLOAD_CORRUPT",
+            Self::Storage(StorageError::InvalidMetadata) => "WALLET_METADATA_CORRUPT",
+            Self::Storage(StorageError::NotFound) => "WALLET_NOT_FOUND",
             Self::Storage(_) => "WALLET_STORAGE_FAILED",
             Self::Domain(_) => "WALLET_STATE_VALIDATION_FAILED",
             Self::Backend(_) => "EMBEDDED_NODE_OPERATION_FAILED",
@@ -1961,11 +2258,22 @@ impl CoreError {
             Self::IdentityMismatch => "embedded Core identity does not match wallet",
             Self::InsufficientFunds => "insufficient spendable funds",
             Self::FeeTooLow => "transaction fee is below the required Core policy floor",
+            Self::TransactionExpired => "transaction expiry is not above the canonical tip",
+            Self::TransactionLifetimeExceeded => "transaction lifetime exceeds the local maximum",
             Self::NodeNotReady => "embedded Core is not ready",
             Self::InvalidCoreCursor => "wallet cursor is invalid",
             Self::InvalidSlateTransport => "Slate v4 transport is invalid",
             Self::MissingPrivateContext => "private Slate context is unavailable",
             Self::Storage(StorageError::WriterActive) => "wallet is already open by another writer",
+            Self::Storage(StorageError::InvalidPassword) => "wallet password is invalid",
+            Self::Storage(StorageError::AuthenticationDataCorrupt) => {
+                "wallet authentication data is corrupt"
+            }
+            Self::Storage(StorageError::AuthenticatedPayloadCorrupt) => {
+                "authenticated wallet payload is corrupt"
+            }
+            Self::Storage(StorageError::InvalidMetadata) => "wallet metadata is corrupt",
+            Self::Storage(StorageError::NotFound) => "wallet was not found",
             _ => "the requested wallet operation was rejected",
         };
         format!("{}:{description}", self.redacted_code())
@@ -2016,6 +2324,119 @@ mod tests {
     }
 
     #[test]
+    fn regression_c3_expiry_boundaries_overflow_and_restart_round_trip() {
+        let tip = 10_000;
+        assert!(matches!(
+            validate_transaction_expiry(tip, tip),
+            Err(CoreError::TransactionExpired)
+        ));
+        assert!(matches!(
+            validate_transaction_expiry(tip - 1, tip),
+            Err(CoreError::TransactionExpired)
+        ));
+        assert!(validate_transaction_expiry(tip + 1, tip).is_ok());
+        assert!(validate_transaction_expiry(tip + MAX_TRANSACTION_LIFETIME_BLOCKS, tip).is_ok());
+        assert!(matches!(
+            validate_transaction_expiry(tip + MAX_TRANSACTION_LIFETIME_BLOCKS + 1, tip),
+            Err(CoreError::TransactionLifetimeExceeded)
+        ));
+        assert!(matches!(
+            validate_transaction_expiry(u64::MAX, u64::MAX - 1),
+            Err(CoreError::ArithmeticOverflow)
+        ));
+
+        let mut state = WalletState::new(
+            backup_identity(),
+            [7; 32],
+            default_node_configuration(backup_identity()),
+        );
+        state.transactions.push(LocalTransactionIntent {
+            id: Uuid::nil(),
+            kernel_excess: Vec::new(),
+            lifecycle: TransactionLifecycle::InputsReserved,
+            submitted: false,
+            exposure: BroadcastExposure::NeverBroadcast,
+            slate_id: Some(Uuid::nil()),
+            role: Some(TransactionRole::Sender),
+            amount: 1,
+            fee: 1,
+            reserved_output_ids: Vec::new(),
+            request_bytes: Vec::new(),
+            response_bytes: Vec::new(),
+            finalized_transaction_bytes: Vec::new(),
+            transaction_hash: None,
+            attempt_count: 0,
+            private_context: None,
+            recipient_output_id: None,
+            change_output_id: None,
+            expires_at_height: tip + 1,
+        });
+        let encoded = serde_json::to_vec(&state).unwrap();
+        let restarted: WalletState = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(restarted.transactions[0].expires_at_height, tip + 1);
+        assert!(
+            validate_transaction_expiry(restarted.transactions[0].expires_at_height, tip).is_ok()
+        );
+    }
+
+    #[test]
+    fn regression_c4_export_is_read_only_after_submitted_mempool_and_confirmed() {
+        let _: fn(&WalletService, Uuid) -> Result<SlateExport, CoreError> =
+            WalletService::slate_request_export;
+        let _: fn(&WalletService, Uuid) -> Result<SlateExport, CoreError> =
+            WalletService::slate_response_export;
+
+        for lifecycle in [
+            TransactionLifecycle::Submitted,
+            TransactionLifecycle::InMempool,
+            TransactionLifecycle::Confirmed {
+                height: 42,
+                block_hash: [8; 32],
+            },
+        ] {
+            let mut state = WalletState::new(
+                backup_identity(),
+                [7; 32],
+                default_node_configuration(backup_identity()),
+            );
+            state.recovery = Some(RecoveryMetadata {
+                scheme: RECOVERY_SCHEME_BIP39_256_V1.into(),
+                phrase_confirmed: true,
+            });
+            state.transactions.push(LocalTransactionIntent {
+                id: Uuid::new_v4(),
+                kernel_excess: vec![2; 33],
+                lifecycle,
+                submitted: true,
+                exposure: BroadcastExposure::PossiblyRelayed,
+                slate_id: Some(Uuid::new_v4()),
+                role: Some(TransactionRole::Sender),
+                amount: 1,
+                fee: 1,
+                reserved_output_ids: Vec::new(),
+                request_bytes: b"durable canonical bytes".to_vec(),
+                response_bytes: Vec::new(),
+                finalized_transaction_bytes: Vec::new(),
+                transaction_hash: Some([3; 32]),
+                attempt_count: 1,
+                private_context: None,
+                recipient_output_id: None,
+                change_output_id: None,
+                expires_at_height: 100,
+            });
+            let before = state.transactions[0].clone();
+            let mut service = test_service();
+            service.state = ApplicationState::Unlocked;
+            service.unlocked = Some(state);
+            assert!(matches!(
+                service.slate_request_export(before.slate_id.unwrap()),
+                Err(CoreError::EmbeddedCoreRequired)
+            ));
+            assert_eq!(service.unlocked.as_ref().unwrap().transactions[0], before);
+        }
+    }
+
+    #[test]
     fn backup_round_trip_preserves_existing_state_and_rejects_wrong_identity() {
         let temp = tempfile::tempdir().unwrap();
         let wallet_path = temp.path().join("wallet");
@@ -2024,6 +2445,7 @@ mod tests {
         let created = service
             .create_recoverable(&wallet_path, "password-1", backup_identity())
             .unwrap();
+        service.recovery_phrase_confirmed("password-1").unwrap();
         service.unlock("password-1").unwrap();
         service
             .backup_export(&backup_path, "backup-password")
@@ -2056,6 +2478,97 @@ mod tests {
             ),
             Err(CoreError::Storage(StorageError::IdentityMismatch))
         ));
+    }
+
+    #[test]
+    fn regression_a2_lock_close_and_switch_wallets_without_process_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let wallet_a = temp.path().join("a");
+        let wallet_b = temp.path().join("b");
+        let mut service = test_service();
+        service
+            .create_recoverable(&wallet_a, "password-a", backup_identity())
+            .unwrap();
+        service.close().unwrap();
+        service
+            .create_recoverable(&wallet_b, "password-b", backup_identity())
+            .unwrap();
+        service.close().unwrap();
+
+        service.open(&wallet_a).unwrap();
+        service.unlock("password-a").unwrap();
+        service.lock().unwrap();
+        service.close().unwrap();
+        service.open(&wallet_b).unwrap();
+        service.unlock("password-b").unwrap();
+        assert_eq!(service.diagnostics().application_state, "READY");
+    }
+
+    #[test]
+    fn regression_m7_phrase_confirmation_is_a_durable_policy_gate() {
+        let temp = tempfile::tempdir().unwrap();
+        let wallet_path = temp.path().join("wallet");
+        let mut service = test_service();
+        let created = service
+            .create_recoverable(&wallet_path, "password-1", backup_identity())
+            .unwrap();
+        service.unlock("password-1").unwrap();
+        let resumed = service.recovery_phrase_resume("password-1").unwrap();
+        assert_eq!(resumed.mnemonic.as_str(), created.mnemonic.as_str());
+        assert!(matches!(
+            service.recovery_phrase_resume("wrong-password"),
+            Err(CoreError::Storage(StorageError::InvalidPassword))
+        ));
+        assert!(matches!(
+            service.transaction_send_create(1, None, 10),
+            Err(CoreError::RecoveryCeremonyRequired)
+        ));
+        assert!(matches!(
+            service.mining_coinbase_candidate(1),
+            Err(CoreError::RecoveryCeremonyRequired)
+        ));
+        assert!(matches!(
+            service.backup_export(temp.path().join("blocked.dombackup"), "backup-pass"),
+            Err(CoreError::RecoveryCeremonyRequired)
+        ));
+        assert!(matches!(
+            service.slate_request_export(Uuid::nil()),
+            Err(CoreError::RecoveryCeremonyRequired)
+        ));
+        assert!(matches!(
+            service.transaction_submit(Uuid::nil()),
+            Err(CoreError::RecoveryCeremonyRequired)
+        ));
+
+        service.lock().unwrap();
+        service.close().unwrap();
+        service.open(&wallet_path).unwrap();
+        assert_eq!(
+            service
+                .recovery_phrase_resume("password-1")
+                .unwrap()
+                .mnemonic
+                .as_str(),
+            created.mnemonic.as_str(),
+            "dismissal and process reconstruction must not strand the ceremony"
+        );
+        service.recovery_phrase_confirmed("password-1").unwrap();
+        service.unlock("password-1").unwrap();
+        assert!(matches!(
+            service.recovery_phrase_resume("password-1"),
+            Err(CoreError::RecoveryPhraseAlreadyConfirmed)
+        ));
+        assert!(matches!(
+            service.transaction_send_create(1, None, 10),
+            Err(CoreError::EmbeddedCoreRequired)
+        ));
+        service.lock().unwrap();
+        service.unlock("password-1").unwrap();
+        assert!(service
+            .unlocked
+            .as_ref()
+            .and_then(|state| state.recovery.as_ref())
+            .is_some_and(|recovery| recovery.phrase_confirmed));
     }
 
     #[test]
@@ -2116,6 +2629,33 @@ mod tests {
     }
 
     #[test]
+    fn regression_a5_error_domains_do_not_contaminate_or_cross_clear() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut service = test_service();
+        service
+            .create_recoverable(temp.path().join("wallet"), "password-1", backup_identity())
+            .unwrap();
+        assert!(matches!(
+            service.unlock("password-2"),
+            Err(CoreError::Storage(StorageError::InvalidPassword))
+        ));
+        assert_eq!(
+            service.error_domains().authentication.as_deref(),
+            Some("INVALID_PASSWORD")
+        );
+        assert!(service.error_domains().synchronization.is_none());
+        assert!(service.diagnostics().last_error.is_none());
+
+        service.errors.synchronization = Some("CURSOR_SYNCHRONIZATION_FAILED".into());
+        service.unlock("password-1").unwrap();
+        let domains = service.error_domains();
+        assert!(domains.authentication.is_none());
+        assert!(domains.synchronization.is_some());
+        assert!(domains.node.is_none());
+        assert!(domains.mining.is_none());
+    }
+
+    #[test]
     fn active_writer_has_a_distinct_redacted_error_code() {
         let error = CoreError::Storage(StorageError::WriterActive);
         assert_eq!(error.redacted_code(), "WALLET_WRITER_ACTIVE");
@@ -2147,19 +2687,17 @@ mod tests {
     #[test]
     fn embedded_core_can_stop_and_restart_without_closing_the_service() {
         let directory = tempfile::tempdir().unwrap();
-        let first_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let first_address = first_listener.local_addr().unwrap();
-        drop(first_listener);
-        let second_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let second_address = second_listener.local_addr().unwrap();
-        drop(second_listener);
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral embedded-core listener");
+        let address = listener.local_addr().unwrap();
+        drop(listener);
         let mut service = test_service();
 
         service
             .start_embedded_core(EmbeddedCoreConfiguration::new(
                 dom_wallet_embedded_core::EmbeddedCoreNetwork::Regtest,
                 directory.path(),
-                first_address,
+                address,
             ))
             .unwrap();
         assert!(service.embedded_core_identity().is_ok());
@@ -2172,7 +2710,7 @@ mod tests {
             .start_embedded_core(EmbeddedCoreConfiguration::new(
                 dom_wallet_embedded_core::EmbeddedCoreNetwork::Regtest,
                 directory.path(),
-                second_address,
+                address,
             ))
             .unwrap();
         assert!(service.embedded_core_identity().is_ok());

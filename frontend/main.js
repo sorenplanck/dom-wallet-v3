@@ -10,28 +10,11 @@ import {
   synchronizationPresentation,
 } from "./status.js";
 
-export const COMMANDS = Object.freeze([
-  "native_bridge_status", "get_build_info", "update_status", "check_updates_now", "check_node_now",
-  "application_status", "wallet_create_recoverable", "wallet_restore_from_mnemonic",
-  "wallet_backup_export", "wallet_backup_import", "wallet_recovery_phrase_confirm",
-  "wallet_open", "wallet_open_named", "wallet_list", "wallet_unlock", "wallet_lock", "wallet_close", "wallet_summary",
-  "account_list", "account_summary", "embedded_node_start", "embedded_node_stop", "embedded_node_status",
-  "node_network_status", "node_peer_status", "wallet_sync_status", "wallet_sync_start",
-  "wallet_sync_pause", "wallet_sync_resume", "wallet_sync_retry", "wallet_rescan",
-  "mining_status", "mining_config_get", "mining_config_set", "mining_start", "mining_stop",
-  "wallet_address_validate", "synchronization_start", "synchronization_pause",
-  "synchronization_resume", "synchronization_retry", "synchronization_rescan",
-  "diagnostics_redacted", "application_shutdown", "transaction_fee_estimate",
-  "transaction_send_create", "slate_request_export", "slate_request_import",
-  "slate_response_create", "slate_response_export", "slate_response_import",
-  "slate_summary_redacted", "transaction_finalize", "transaction_submit",
-  "transaction_retry_submission", "transaction_reconcile_submission", "transaction_cancel",
-  "transaction_list", "transaction_detail_redacted", "slate_qr_encode",
-  "slate_qr_decode_frame", "slate_qr_reassembly_status", "slate_qr_reassembly_clear"
-]);
-
-const invoke = (command, args = {}) => {
-  if (!COMMANDS.includes(command)) return Promise.reject(new Error("Unsupported desktop command."));
+const invoke = async (command, args = {}) => {
+  const bridge = await nativeBridge.initialize();
+  if (!Array.isArray(bridge.command_names) || !bridge.command_names.includes(command)) {
+    throw new Error("Unsupported desktop command.");
+  }
   return nativeBridge.invoke(command, args);
 };
 const byId = (id) => document.getElementById(id);
@@ -43,6 +26,7 @@ let refreshTimer;
 let scanner;
 let qrFrames = [];
 let qrIndex = 0;
+let qrAnimationTimer;
 let phrasePending = false;
 let latestSynchronizationPresentation;
 let latestEmbeddedNodeStatus;
@@ -81,6 +65,9 @@ const integerNoms = (value, optional = false) => {
 const clearSecretForms = () => {
   document.querySelectorAll('textarea[name="mnemonic"], #transaction-text, #receive-transaction-text').forEach((node) => { node.value = ""; });
   document.querySelectorAll("form").forEach(clearPasswords);
+  byId("recovery-phrase").textContent = "";
+  byId("recovery-confirmed").checked = false;
+  phrasePending = false;
 };
 
 export function selectScreen(name) {
@@ -100,7 +87,14 @@ document.querySelectorAll("[data-gate-panel]").forEach((button) => button.addEve
   clearSecretForms();
   const panel = button.dataset.gatePanel;
   document.querySelectorAll(".gate-panel").forEach((node) => { node.hidden = node.id !== panel; });
-  if (panel === "restore-form") refreshOnboardingNode().catch((error) => show(redactedError(error), true));
+  if (panel === "restore-form") {
+    refreshOnboardingNode().catch((error) => show(redactedError(error), true));
+    invoke("wallet_restore_staging_list").then((names) => {
+      byId("restore-staging-note").textContent = names.length
+        ? `Interrupted restores available: ${names.join(", ")}. Submit matching details to resume, or authenticate and abort.`
+        : "No interrupted restore staging was discovered.";
+    }).catch((error) => show(redactedError(error), true));
+  }
   if (panel === "open-form") refreshWalletList().catch((error) => show(redactedError(error), true));
 }));
 const refreshWalletList = async () => {
@@ -165,7 +159,7 @@ byId("create-form").addEventListener("submit", async (event) => {
   event.preventDefault(); const form = event.currentTarget; const data = new FormData(form);
   try {
     const created = await run(() => invoke("wallet_create_recoverable", { name: data.get("name"), password: data.get("password") }));
-    clearPasswords(form); beginPhrase(created.mnemonic); show("Write down and confirm the recovery phrase.");
+    clearPasswords(form); beginPhrase(created.mnemonic); created.mnemonic = ""; show("Write down and confirm the recovery phrase.");
   } catch (error) { clearPasswords(form); show(redactedError(error), true); }
 });
 byId("restore-form").addEventListener("submit", async (event) => {
@@ -177,6 +171,24 @@ byId("restore-form").addEventListener("submit", async (event) => {
     show(`Restore completed: ${result.owned_outputs} owned outputs, ${result.balance.confirmed} confirmed noms.`);
   } catch (error) { form.querySelector('textarea[name="mnemonic"]').value = ""; clearPasswords(form); show(redactedError(error), true); }
 });
+byId("restore-abort").addEventListener("click", async () => {
+  const form = byId("restore-form");
+  const data = new FormData(form);
+  if (!window.confirm("Authenticate and remove this interrupted restore stage?")) return;
+  try {
+    await run(() => invoke("wallet_restore_abort", {
+      name: data.get("name"),
+      password: data.get("password"),
+    }));
+    form.querySelector('textarea[name="mnemonic"]').value = "";
+    clearPasswords(form);
+    byId("restore-staging-note").textContent = "Interrupted restore staging removed.";
+    show("Interrupted restore aborted.");
+  } catch (error) {
+    clearPasswords(form);
+    show(redactedError(error), true);
+  }
+});
 byId("onboarding-node-retry").addEventListener("click", () => {
   run(() => invoke("embedded_node_start"))
     .then(() => refreshOnboardingNode())
@@ -187,15 +199,46 @@ byId("open-form").addEventListener("submit", async (event) => {
   try { await run(() => invoke("wallet_open_named", { name: new FormData(form).get("name") })); show("Mainnet wallet opened in locked state."); }
   catch (error) { show(redactedError(error), true); }
 });
-byId("locate-form").addEventListener("submit", async (event) => {
-  event.preventDefault(); const form = event.currentTarget;
-  try { await run(() => invoke("wallet_open", { path: new FormData(form).get("path") })); show("Mainnet wallet opened in locked state."); }
-  catch (error) { show(redactedError(error), true); }
+byId("wallet-recover-from-disk").addEventListener("click", async () => {
+  const name = byId("open-wallet-select").value;
+  try {
+    await run(() => invoke("wallet_recover_from_disk", { name }));
+    show("Wallet service reconstructed from the managed on-disk wallet.");
+  } catch (error) {
+    show(redactedError(error), true);
+  }
 });
+byId("gate-close-wallet").addEventListener("click", () => run(async () => {
+  clearPhrase();
+  await invoke("wallet_close");
+  await refreshWalletList();
+  show("Wallet closed. Choose another managed wallet.");
+}).catch((error) => show(redactedError(error), true)));
 byId("unlock-form").addEventListener("submit", async (event) => {
   event.preventDefault(); const form = event.currentTarget;
-  try { await run(() => invoke("wallet_unlock", { password: new FormData(form).get("password") })); clearPasswords(form); enterApp(); await refreshSummary(); show("Wallet unlocked."); }
-  catch (error) { clearPasswords(form); show(redactedError(error), true); }
+  const password = new FormData(form).get("password");
+  try {
+    await run(() => invoke("wallet_unlock", { password }));
+    try {
+      const ceremony = await invoke("wallet_recovery_phrase_resume", { password });
+      await invoke("wallet_lock");
+      clearPasswords(form);
+      enterGate();
+      beginPhrase(ceremony.mnemonic);
+      ceremony.mnemonic = "";
+      show("Recovery phrase confirmation is still required.");
+      return;
+    } catch (error) {
+      if (error?.code !== "RECOVERY_PHRASE_ALREADY_CONFIRMED") {
+        await invoke("wallet_lock").catch(() => {});
+        throw error;
+      }
+    }
+    clearPasswords(form);
+    enterApp();
+    await refreshSummary();
+    show("Wallet unlocked.");
+  } catch (error) { clearPasswords(form); show(redactedError(error), true); }
 });
 
 const refreshSummary = async () => {
@@ -208,7 +251,15 @@ const refreshSummary = async () => {
   if (nodeResult.status === "fulfilled") latestEmbeddedNodeStatus = nodeResult.value;
   const node = nodeResult.status === "fulfilled"
     ? nodeResult.value
-    : latestEmbeddedNodeStatus;
+    : latestEmbeddedNodeStatus
+      ? {
+          ...latestEmbeddedNodeStatus,
+          lifecycle: "STALE",
+          ready: false,
+          status_message: "Node status is stale; retry the embedded node.",
+          error_code: "NODE_STATUS_STALE",
+        }
+      : undefined;
   const network = networkResult.status === "fulfilled" ? networkResult.value : undefined;
   const peers = peersResult.status === "fulfilled" ? peersResult.value : undefined;
   const synchronization = synchronizationResult.status === "fulfilled"
@@ -269,20 +320,15 @@ const refreshUpdates = async () => {
   byId("update-wallet-last-check").textContent = updates.wallet.last_check_unix_seconds
     ? new Date(updates.wallet.last_check_unix_seconds * 1000).toLocaleString()
     : "Never";
-  byId("update-node-version").textContent = updates.node.active_version;
-  byId("update-node-revision").textContent = updates.node.active_revision;
-  byId("update-node-previous").textContent = updates.node.previous_revision ?? "None";
-  byId("update-node-state").textContent = updates.node.state;
-  byId("update-node-compatibility").textContent = updates.node.compatibility;
-  byId("update-peer-state").textContent = updates.peers.state;
   byId("update-channel").textContent = updates.channel;
+  byId("automatic-updates").checked = updates.automatic_updates;
   byId("update-mode").textContent = updates.automatic_updates && updates.signature_key_configured
     ? "Enabled · Stable"
     : updates.automatic_updates
       ? "Scheduled · signing unavailable"
       : "Unavailable · fail closed";
   byId("update-signing-state").textContent = updates.signature_key_configured ? "Configured" : "Unavailable — updates fail closed";
-  const error = updates.wallet.sanitized_error ?? updates.node.sanitized_error ?? updates.peers.sanitized_error;
+  const error = updates.wallet.sanitized_error;
   byId("update-error").textContent = error ?? "No updater error.";
 };
 const renderMining = (value, node) => {
@@ -413,14 +459,23 @@ byId("diagnostics-refresh").addEventListener("click", () => run(async () => { aw
 byId("updates-check").addEventListener("click", () => run(async () => {
   const updates = await invoke("check_updates_now");
   await refreshUpdates();
-  const error = updates.wallet.sanitized_error ?? updates.node.sanitized_error ?? updates.peers.sanitized_error;
-  show(error ? `Update check failed closed (${error}).` : "Signed Wallet, node and peer update check completed.", Boolean(error));
+  const error = updates.wallet.sanitized_error;
+  show(error ? `Update check failed closed (${error}).` : "Signed Wallet update check completed. Nothing was downloaded or installed.", Boolean(error));
 }).catch((error) => show(redactedError(error), true)));
-byId("node-updates-check").addEventListener("click", () => run(async () => {
-  const updates = await invoke("check_node_now");
+byId("updates-download").addEventListener("click", () => run(async () => {
+  const updates = await invoke("download_update_now");
   await refreshUpdates();
-  const error = updates.node.sanitized_error;
-  show(error ? `Node update check failed closed (${error}).` : "Signed node update check completed.", Boolean(error));
+  const error = updates.wallet.sanitized_error;
+  show(error ? `Update download failed closed (${error}).` : "Signed Wallet update downloaded and verified. Apply remains explicit.", Boolean(error));
+}).catch((error) => show(redactedError(error), true)));
+byId("updates-apply").addEventListener("click", () => {
+  if (!window.confirm("Apply the already downloaded and verified Wallet update, close the wallet, and restart now?")) return;
+  run(() => invoke("apply_update_now", { confirmed: true }))
+    .catch((error) => show(redactedError(error), true));
+});
+byId("automatic-updates").addEventListener("change", (event) => run(async () => {
+  await invoke("automatic_updates_set", { enabled: event.target.checked });
+  await refreshUpdates();
 }).catch((error) => show(redactedError(error), true)));
 byId("lock").addEventListener("click", () => run(async () => { await stopScanner(); await invoke("wallet_lock"); enterGate(); }).catch((error) => show(redactedError(error), true)));
 byId("close").addEventListener("click", () => run(async () => { await stopScanner(); await invoke("wallet_close"); enterGate(); }).catch((error) => show(redactedError(error), true)));
@@ -532,21 +587,55 @@ const canvas = byId("slate-qr-canvas");
 const qrMeta = byId("slate-qr-meta");
 const video = byId("slate-qr-video");
 const drawQr = async () => { if (!qrFrames.length) return; await QRCode.toCanvas(canvas, qrFrames[qrIndex], { errorCorrectionLevel: "M", margin: 2, width: 360 }); qrMeta.textContent = `Frame ${qrIndex + 1} of ${qrFrames.length}`; };
-const exportQr = async (response) => { const result = await run(() => invoke("slate_qr_encode", { slateId: requiredId(), response })); qrFrames = result.frames; qrIndex = 0; await drawQr(); };
+const stopQrAnimation = () => {
+  clearInterval(qrAnimationTimer);
+  qrAnimationTimer = undefined;
+};
+const exportQr = async (slateId, response) => { const result = await run(() => invoke("slate_qr_encode", { slateId, response })); qrFrames = result.frames; qrIndex = 0; await drawQr(); };
 const stopScanner = async () => { if (scanner) { scanner.stop(); scanner.destroy(); scanner = undefined; } video.srcObject = null; try { await invoke("slate_qr_reassembly_clear"); } catch { /* lifecycle may already be closed */ } };
-byId("request-qr").addEventListener("click", () => exportQr(false).catch((error) => show(redactedError(error), true)));
-byId("response-qr").addEventListener("click", () => exportQr(true).catch((error) => show(redactedError(error), true)));
+byId("request-qr").addEventListener("click", () => exportQr(requiredId(), false).catch((error) => show(redactedError(error), true)));
+byId("receive-response-qr").addEventListener("click", async () => {
+  try {
+    const result = await run(() => invoke("slate_qr_encode", {
+      slateId: requiredReceiveId(),
+      response: true,
+    }));
+    qrFrames = result.frames;
+    qrIndex = 0;
+    await QRCode.toCanvas(byId("receive-qr-canvas"), qrFrames[0], { errorCorrectionLevel: "M", margin: 2, width: 360 });
+    byId("receive-qr-meta").textContent = `Receiver response frame 1 of ${qrFrames.length}`;
+  } catch (error) {
+    show(redactedError(error), true);
+  }
+});
+byId("receive-qr-next").addEventListener("click", async () => {
+  if (!qrFrames.length) return;
+  qrIndex = (qrIndex + 1) % qrFrames.length;
+  await QRCode.toCanvas(byId("receive-qr-canvas"), qrFrames[qrIndex], { errorCorrectionLevel: "M", margin: 2, width: 360 });
+  byId("receive-qr-meta").textContent = `Receiver response frame ${qrIndex + 1} of ${qrFrames.length}`;
+});
 byId("qr-next").addEventListener("click", () => { if (qrFrames.length) { qrIndex = (qrIndex + 1) % qrFrames.length; drawQr(); } });
 byId("qr-previous").addEventListener("click", () => { if (qrFrames.length) { qrIndex = (qrIndex + qrFrames.length - 1) % qrFrames.length; drawQr(); } });
-byId("qr-clear").addEventListener("click", () => { qrFrames = []; canvas.getContext("2d").clearRect(0, 0, canvas.width, canvas.height); qrMeta.textContent = "No QR export shown."; });
+byId("qr-clear").addEventListener("click", () => { stopQrAnimation(); qrFrames = []; canvas.getContext("2d").clearRect(0, 0, canvas.width, canvas.height); qrMeta.textContent = "No QR export shown."; });
 byId("qr-cancel").addEventListener("click", () => stopScanner());
 byId("qr-scan").addEventListener("click", async () => {
   await stopScanner();
   scanner = new QrScanner(video, async (scan) => { const decoded = await invoke("slate_qr_decode_frame", { frame: scan.data }); if (decoded.complete_text) { slateText.value = decoded.complete_text; await stopScanner(); } }, { preferredCamera: "environment", returnDetailedScanResult: true });
   try { await scanner.start(); } catch (error) { await stopScanner(); show(redactedError(error), true); }
 });
-byId("qr-animate").addEventListener("click", () => show("Single canonical QR frame requires no animation."));
-byId("qr-pause").addEventListener("click", () => show("QR presentation paused."));
+byId("qr-animate").addEventListener("click", () => {
+  stopQrAnimation();
+  if (qrFrames.length <= 1) {
+    show("This QR export contains one frame.");
+    return;
+  }
+  qrAnimationTimer = setInterval(() => {
+    qrIndex = (qrIndex + 1) % qrFrames.length;
+    drawQr().catch((error) => { stopQrAnimation(); show(redactedError(error), true); });
+  }, 800);
+  show(`Animating ${qrFrames.length} authenticated QR frames.`);
+});
+byId("qr-pause").addEventListener("click", () => { stopQrAnimation(); show("QR presentation paused."); });
 
 document.documentElement.dataset.nativeBridge = nativeBridge.state;
 nativeBridge.initialize()
@@ -569,4 +658,4 @@ const refresh = async () => {
   refreshTimer = setTimeout(refresh, gateVisible ? 5000 : 15000);
 };
 refreshTimer = setTimeout(refresh, 15000);
-window.addEventListener("beforeunload", () => { clearTimeout(refreshTimer); clearPhrase(); clearSecretForms(); stopScanner(); }, { once: true });
+window.addEventListener("beforeunload", () => { clearTimeout(refreshTimer); stopQrAnimation(); clearPhrase(); clearSecretForms(); stopScanner(); }, { once: true });

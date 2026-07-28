@@ -21,17 +21,19 @@ test("dashboard refreshes live IBD progress every fifteen seconds", async () => 
   assert.equal(source.includes('invoke("embedded_node_status")'), true);
   assert.equal(source.includes("liveStatusProjection(summary, node, network, peers, synchronization)"), true);
   assert.equal(source.includes("let latestEmbeddedNodeStatus;"), true);
-  assert.equal(source.includes(": latestEmbeddedNodeStatus;"), true);
+  assert.equal(source.includes('lifecycle: "STALE"'), true);
   assert.equal(source.includes(": [refreshSummary(), refreshNode(), refreshMining()]"), true);
   assert.equal(source.includes("? [refreshOnboardingNode()]"), true);
   assert.equal(source.includes("await Promise.allSettled(tasks)"), true);
   assert.equal(source.includes("setTimeout(refresh, gateVisible ? 5000 : 15000)"), true);
+  assert.equal(source.includes('lifecycle: "STALE"'), true);
+  assert.equal(source.includes('ready: false'), true);
 });
 
 test("dashboard badge cannot report READY while a peer is ahead", () => {
   const result = synchronizationPresentation(
     { canonical_height: 1_008 },
-    { highest_known_peer_height: 6_684 },
+    { highest_known_peer_height: 6_684, total_connected_peers: 1 },
     { synchronized: false, cursor_height: 1_008, last_error: null },
   );
   assert.deepEqual(result, {
@@ -46,7 +48,7 @@ test("dashboard badge cannot report READY while a peer is ahead", () => {
 test("dashboard reports READY only when canonical height and cursor are synchronized", () => {
   const result = synchronizationPresentation(
     { canonical_height: 6_684 },
-    { highest_known_peer_height: 6_684 },
+    { highest_known_peer_height: 6_684, total_connected_peers: 1 },
     { synchronized: true, cursor_height: 6_684, last_error: null },
   );
   assert.equal(result.badgeState, "READY");
@@ -56,11 +58,32 @@ test("dashboard reports READY only when canonical height and cursor are synchron
 test("dashboard exposes a synchronization error instead of READY", () => {
   const result = synchronizationPresentation(
     { canonical_height: 20 },
-    { highest_known_peer_height: 20 },
+    { highest_known_peer_height: 20, total_connected_peers: 1 },
     { synchronized: false, cursor_height: 19, last_error: "CURSOR_HASH_MISMATCH" },
   );
   assert.equal(result.badgeState, "ATTENTION");
   assert.equal(result.message, "CURSOR_HASH_MISMATCH");
+});
+
+test("regression_c5_frontend_renders_every_authoritative_state_without_local_height_fallback", () => {
+  const render = (lifecycle, local, peer, connected, synchronized = false) =>
+    synchronizationPresentation(
+      { canonical_height: local, lifecycle, status_message: `state:${lifecycle}` },
+      { highest_known_peer_height: peer, total_connected_peers: connected },
+      { synchronized, cursor_height: local, last_error: null },
+    );
+
+  assert.equal(render("STOPPED", 0, undefined, 0).badgeState, "STOPPED");
+  assert.equal(render("STARTING", 0, undefined, 0).badgeState, "STARTING");
+  assert.equal(render("WAITING_FOR_PEERS", 9, undefined, 0).badgeState, "WAITING_FOR_PEERS");
+  const unknown = render("UNKNOWN_PEER_HEIGHT", 9, undefined, 1);
+  assert.equal(unknown.badgeState, "UNKNOWN_PEER_HEIGHT");
+  assert.equal(unknown.peerHeight, null);
+  assert.equal(render("CONNECTED_AT_GENESIS", 0, 0, 1).badgeState, "CONNECTED_AT_GENESIS");
+  assert.equal(render("SYNCHRONIZING", 9, 10, 1).badgeState, "SYNCHRONIZING");
+  assert.equal(render("READY", 10, 10, 1, true).badgeState, "READY");
+  assert.equal(render("STALE", 10, 10, 1).badgeState, "STALE");
+  assert.equal(render("FAILED", 10, 10, 1).badgeState, "FAILED");
 });
 
 test("dashboard preserves live node identity when peer or wallet status is transiently unavailable", () => {
@@ -172,24 +195,24 @@ test("DOM balances use the canonical 100,000,000 noms denomination", () => {
 
 test("settings expose separate fail-closed Wallet and node update states", async () => {
   const { readFile } = await import("node:fs/promises");
-  const [html, js] = await Promise.all([
+  const [html, js, rust] = await Promise.all([
     readFile(new URL("../index.html", import.meta.url), "utf8"),
     readFile(new URL("../main.js", import.meta.url), "utf8"),
+    readFile(new URL("../../src-tauri/src/lib.rs", import.meta.url), "utf8"),
   ]);
-  for (const marker of [
-    "update-wallet-state",
-    "update-node-state",
-    "update-peer-state",
-    "update-signing-state",
-    "Check node now",
-  ]) assert.equal(html.includes(marker), true);
+  for (const marker of ["update-wallet-state", "update-signing-state", "updates-check", "updates-download", "updates-apply", "automatic-updates"]) {
+    assert.equal(html.includes(marker), true);
+  }
+  for (const removed of ["update-node-state", "update-peer-state", "Check node now"]) {
+    assert.equal(html.includes(removed), false);
+  }
   assert.equal(js.includes('"Scheduled · signing unavailable"'), true);
-  for (const command of [
-    '"get_build_info"',
-    '"update_status"',
-    '"check_updates_now"',
-    '"check_node_now"',
-  ]) assert.equal(js.includes(command), true);
+  for (const command of ["get_build_info", "update_status", "check_updates_now", "download_update_now", "apply_update_now", "automatic_updates_set"]) {
+    assert.equal(rust.includes(command), true);
+  }
+  const registry = rust.slice(rust.indexOf("macro_rules! wallet_command_registry"), rust.indexOf("macro_rules! define_command_names"));
+  assert.equal(registry.includes("check_node_now"), false);
+  assert.equal(js.includes("bridge.command_names.includes(command)"), true);
   assert.equal(js.includes("localStorage"), false);
   assert.equal(js.includes("sessionStorage"), false);
 });
@@ -212,6 +235,18 @@ test("production adapter maps each recovery and backup command without a mock", 
   ]) assert.equal(source.includes(`"${command}"`), true);
 });
 
+test("regression_a2_gate_exposes_close_switch_and_no_raw_path_open", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const [html, source] = await Promise.all([
+    readFile(new URL("../index.html", import.meta.url), "utf8"),
+    readFile(new URL("../main.js", import.meta.url), "utf8"),
+  ]);
+  assert.equal(html.includes('id="gate-close-wallet"'), true);
+  assert.equal(source.includes('invoke("wallet_close")'), true);
+  assert.equal(source.includes('invoke("wallet_open",'), false);
+  assert.equal(source.includes('"wallet_open"'), false);
+});
+
 test("recovery and backup inputs are transient and use no browser persistence", async () => {
   const { readFile } = await import("node:fs/promises");
   const [html, js] = await Promise.all([
@@ -230,24 +265,49 @@ test("recovery and backup inputs are transient and use no browser persistence", 
   assert.equal(js.includes("localStorage"), false);
 });
 
+test("regression_m7_frontend_clears_phrase_and_exposes_no_persistent_secret_state", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const source = await readFile(new URL("../main.js", import.meta.url), "utf8");
+  assert.equal(source.includes('byId("recovery-phrase").textContent = "";'), true);
+  assert.equal(source.includes("phrasePending = false;"), true);
+  assert.equal(source.includes('invoke("wallet_recovery_phrase_resume"'), true);
+  assert.equal(source.includes('await invoke("wallet_lock")'), true);
+  assert.equal(source.includes('created.mnemonic = "";'), true);
+  assert.equal(source.includes('ceremony.mnemonic = "";'), true);
+  assert.equal(source.includes("localStorage"), false);
+  assert.equal(source.includes("sessionStorage"), false);
+});
+
 test("manual slate controls use only the production invoke adapter and clear pasted text", async () => {
-  const source = await (await import("node:fs/promises")).readFile(new URL("../main.js", import.meta.url), "utf8");
+  const { readFile } = await import("node:fs/promises");
+  const [source, registry] = await Promise.all([
+    readFile(new URL("../main.js", import.meta.url), "utf8"),
+    readFile(new URL("../../src-tauri/src/lib.rs", import.meta.url), "utf8"),
+  ]);
   for (const command of [
     "transaction_fee_estimate", "transaction_send_create", "slate_request_export",
     "slate_request_import", "slate_response_create", "slate_response_export",
     "slate_response_import", "slate_summary_redacted", "transaction_finalize",
     "transaction_submit", "transaction_retry_submission", "transaction_reconcile_submission", "transaction_cancel",
     "transaction_list", "transaction_detail_redacted"
-  ]) assert.equal(source.includes(`"${command}"`), true);
+  ]) assert.equal(source.includes(`"${command}"`) || registry.includes(command), true);
   assert.equal(source.includes("clearSecretForms"), true);
   assert.equal(source.includes("/wallet/spend"), false);
 });
 
 test("QR exchange stays local, uses canonical native frames, and releases camera state", async () => {
-  const source = await (await import("node:fs/promises")).readFile(new URL("../main.js", import.meta.url), "utf8");
+  const { readFile } = await import("node:fs/promises");
+  const [source, registry] = await Promise.all([
+    readFile(new URL("../main.js", import.meta.url), "utf8"),
+    readFile(new URL("../../src-tauri/src/lib.rs", import.meta.url), "utf8"),
+  ]);
   for (const command of ["slate_qr_encode", "slate_qr_decode_frame", "slate_qr_reassembly_status", "slate_qr_reassembly_clear"]) {
-    assert.equal(source.includes(`"${command}"`), true);
+    assert.equal(source.includes(`"${command}"`) || registry.includes(command), true);
   }
+  assert.equal(source.includes("slateId: requiredReceiveId()"), true);
+  assert.equal(source.includes("Receiver response frame"), true);
+  assert.equal(source.includes("setInterval(() =>"), true);
+  assert.equal(source.includes("Single canonical QR frame requires no animation"), false);
   assert.equal(source.includes("QrScanner"), true);
   assert.equal(source.includes("stopScanner"), true);
   assert.equal(source.includes("fetch("), false);

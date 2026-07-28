@@ -464,6 +464,10 @@ impl CanonicalSlate {
         self.inner.body.fee
     }
 
+    pub fn expires_at_height(&self) -> u64 {
+        self.inner.expires_at_height
+    }
+
     /// Return a canonical recovery body for the frozen recoverable builder.
     pub fn recovery_body(&self) -> Result<RecoverySlateBody, ProtocolAdapterError> {
         RecoverySlateBody::from_canonical_bytes(

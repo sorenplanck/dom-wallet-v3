@@ -2,15 +2,46 @@ export function synchronizationPresentation(network, peers, synchronization) {
   const localHeight = Number.isSafeInteger(network?.canonical_height)
     ? network.canonical_height
     : 0;
-  const reportedPeerHeight = Number.isSafeInteger(peers?.highest_known_peer_height)
+  const peerHeight = Number.isSafeInteger(peers?.highest_known_peer_height)
     ? peers.highest_known_peer_height
-    : localHeight;
-  const peerHeight = Math.max(localHeight, reportedPeerHeight);
-  const progress = peerHeight > 0
+    : null;
+  const connectedPeers = Number.isSafeInteger(peers?.total_connected_peers)
+    ? peers.total_connected_peers
+    : 0;
+  const lifecycle = network?.lifecycle;
+  const progress = peerHeight != null && peerHeight > 0
     ? Math.min(100, Math.floor((localHeight * 100) / peerHeight))
     : 0;
 
-  if (peerHeight > localHeight) {
+  if (lifecycle === "FAILED" || lifecycle === "STALE" || lifecycle === "STOPPED"
+    || lifecycle === "STARTING") {
+    return {
+      badgeState: lifecycle,
+      message: network?.status_message ?? `Node state: ${lifecycle}`,
+      localHeight,
+      peerHeight,
+      progress,
+    };
+  }
+  if (connectedPeers === 0 || lifecycle === "WAITING_FOR_PEERS") {
+    return {
+      badgeState: "WAITING_FOR_PEERS",
+      message: `Waiting for peers at local height ${localHeight}`,
+      localHeight,
+      peerHeight: null,
+      progress: 0,
+    };
+  }
+  if (peerHeight == null || lifecycle === "UNKNOWN_PEER_HEIGHT") {
+    return {
+      badgeState: "UNKNOWN_PEER_HEIGHT",
+      message: `Connected; waiting for authoritative peer height at ${localHeight}`,
+      localHeight,
+      peerHeight: null,
+      progress: 0,
+    };
+  }
+  if (peerHeight > localHeight || lifecycle === "SYNCHRONIZING") {
     return {
       badgeState: "SYNCHRONIZING",
       message: `Synchronizing ${localHeight} / ${peerHeight} (${progress}%)`,
@@ -19,7 +50,16 @@ export function synchronizationPresentation(network, peers, synchronization) {
       progress,
     };
   }
-  if (synchronization?.synchronized) {
+  if (localHeight === 0 && peerHeight === 0) {
+    return {
+      badgeState: "CONNECTED_AT_GENESIS",
+      message: "Connected to canonical peers at genesis",
+      localHeight,
+      peerHeight,
+      progress: 100,
+    };
+  }
+  if (peerHeight === localHeight && synchronization?.synchronized) {
     return {
       badgeState: "READY",
       message: `Wallet synchronized at height ${synchronization.cursor_height}`,
@@ -127,12 +167,16 @@ export function liveStatusProjection(summary, node, network, peers, synchronizat
     ? node.highest_known_peer_height
     : Number.isSafeInteger(peers?.highest_known_peer_height)
       ? peers.highest_known_peer_height
-      : canonicalHeight;
+      : undefined;
   const cursorHeight = synchronization?.cursor_height ?? summary?.cursor_height ?? null;
 
   const effectiveNetwork = canonicalHeight == null
     ? undefined
-    : { canonical_height: canonicalHeight };
+    : {
+        canonical_height: canonicalHeight,
+        lifecycle: node?.lifecycle,
+        status_message: node?.status_message,
+      };
   const effectivePeers = canonicalHeight == null
     ? undefined
     : {
@@ -175,7 +219,8 @@ export function liveStatusProjection(summary, node, network, peers, synchronizat
 
 export function miningPresentation(mining, node) {
   const lifecycle = node?.lifecycle ?? "NOT_READY";
-  const nodeReady = lifecycle === "READY" && node?.ready === true;
+  const nodeReady = (lifecycle === "READY" || lifecycle === "CONNECTED_AT_GENESIS")
+    && node?.ready === true;
   if (!nodeReady) {
     return {
       status: lifecycle === "SYNCHRONIZING" ? "SYNCHRONIZING" : "NODE NOT READY",

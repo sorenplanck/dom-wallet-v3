@@ -49,8 +49,14 @@ test("manual payment UI exposes Slate v4 exchange without address-only transfer"
 });
 
 test("production protocol and secret boundaries are explicit", async () => {
-  const [html, js] = await Promise.all([source("index.html"), source("main.js")]);
-  for (const command of ["embedded_node_start", "embedded_node_stop", "wallet_address_validate", "transaction_reconcile_submission"]) assert.equal(js.includes(`"${command}"`), true);
+  const [html, js, registry] = await Promise.all([
+    source("index.html"),
+    source("main.js"),
+    readFile(new URL("../../src-tauri/src/lib.rs", import.meta.url), "utf8"),
+  ]);
+  for (const command of ["embedded_node_start", "embedded_node_stop", "wallet_address_validate", "transaction_reconcile_submission"]) {
+    assert.equal(js.includes(`"${command}"`) || registry.includes(command), true);
+  }
   assert.equal(js.includes("DOMSLATE4."), true);
   assert.equal(js.includes("integerNoms"), true);
   assert.equal(html.includes("recovery-confirm-password"), true);

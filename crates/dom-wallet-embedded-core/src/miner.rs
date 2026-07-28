@@ -143,7 +143,7 @@ pub async fn mine_wallet_block(
                             worker_node.metrics.peer_count.load(Ordering::Acquire),
                             worker_node
                                 .metrics
-                                .ibd_progress_percent
+                                .best_known_peer_height
                                 .load(Ordering::Acquire),
                             require_network_ready,
                             template_started.elapsed(),
@@ -200,8 +200,11 @@ pub async fn mine_wallet_block(
         return if stop_requested.load(Ordering::Acquire) {
             Ok(WalletMiningOutcome::Stopped)
         } else if require_network_ready
-            && (node.metrics.peer_count.load(Ordering::Acquire) == 0
-                || node.metrics.ibd_progress_percent.load(Ordering::Acquire) < 100)
+            && !authoritative_network_ready(
+                node.metrics.chain_height.load(Ordering::Acquire),
+                node.metrics.peer_count.load(Ordering::Acquire),
+                node.metrics.best_known_peer_height.load(Ordering::Acquire),
+            )
         {
             Err(WalletMiningError::Preparation("NODE_NOT_SYNCHRONIZED"))
         } else if node.metrics.chain_height.load(Ordering::Acquire) != tip_height.0 {
@@ -246,13 +249,22 @@ fn template_is_current(
     tip_height: u64,
     current_height: u64,
     peer_count: u64,
-    ibd_progress_percent: u64,
+    highest_known_peer_height: u64,
     require_network_ready: bool,
     elapsed: Duration,
 ) -> bool {
     tip_height == current_height
         && elapsed < TEMPLATE_REFRESH_INTERVAL
-        && (!require_network_ready || (peer_count > 0 && ibd_progress_percent >= 100))
+        && (!require_network_ready
+            || authoritative_network_ready(current_height, peer_count, highest_known_peer_height))
+}
+
+fn authoritative_network_ready(
+    current_height: u64,
+    peer_count: u64,
+    highest_known_peer_height: u64,
+) -> bool {
+    peer_count > 0 && highest_known_peer_height == current_height
 }
 
 fn now_seconds() -> u64 {
@@ -272,21 +284,30 @@ mod tests {
             7,
             7,
             1,
-            100,
+            7,
             true,
             Duration::from_secs(29)
         ));
-        assert!(!template_is_current(7, 8, 1, 100, true, Duration::ZERO));
-        assert!(!template_is_current(7, 7, 0, 100, true, Duration::ZERO));
-        assert!(!template_is_current(7, 7, 1, 99, true, Duration::ZERO));
+        assert!(!template_is_current(7, 8, 1, 8, true, Duration::ZERO));
+        assert!(!template_is_current(7, 7, 0, 7, true, Duration::ZERO));
+        assert!(!template_is_current(7, 7, 1, 8, true, Duration::ZERO));
         assert!(!template_is_current(
             7,
             7,
             1,
-            100,
+            7,
             true,
             TEMPLATE_REFRESH_INTERVAL
         ));
         assert!(template_is_current(7, 7, 0, 0, false, Duration::ZERO));
+    }
+
+    #[test]
+    fn regression_c1_miner_uses_authoritative_peer_height_without_ibd_metric() {
+        assert!(authoritative_network_ready(0, 1, 0));
+        assert!(authoritative_network_ready(9, 1, 9));
+        assert!(!authoritative_network_ready(0, 0, 0));
+        assert!(!authoritative_network_ready(9, 1, 10));
+        assert!(!authoritative_network_ready(9, 1, 0));
     }
 }

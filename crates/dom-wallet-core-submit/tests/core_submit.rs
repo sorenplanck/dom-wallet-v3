@@ -666,7 +666,7 @@ fn api_unavailable_before_embedded_startup() {
     let lifecycle = EmbeddedCoreLifecycle::new(EmbeddedCoreConfiguration::new(
         EmbeddedCoreNetwork::Regtest,
         directory.path(),
-        unused_loopback_address(),
+        "127.0.0.1:1".parse().unwrap(),
     ));
     assert!(lifecycle.wallet_api().is_err());
 }

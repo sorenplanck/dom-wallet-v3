@@ -219,20 +219,25 @@ impl SeedRestoreService {
             chain_id: self.expected_identity.chain_id,
         };
         let password = Zeroizing::new(password.to_owned());
-        let (directory, state) = if staging.exists() {
+        let (directory, state, ready_to_publish) = if staging.exists() {
             let directory =
                 WalletDirectory::open(&staging).map_err(|_| SeedRestoreError::Storage)?;
-            let state = directory
-                .load(password.as_str())
-                .map_err(|_| SeedRestoreError::IncompatibleCheckpoint)?;
+            let state = directory.load(password.as_str()).map_err(|error| {
+                if matches!(error, StorageError::InvalidPassword) {
+                    SeedRestoreError::InvalidPassword
+                } else {
+                    SeedRestoreError::IncompatibleCheckpoint
+                }
+            })?;
             validate_checkpoint(&state, &seed, &self.expected_identity)?;
-            (directory, state)
+            let ready_to_publish = state.seed_restore_status == Some(SeedRestoreStatus::Complete);
+            (directory, state, ready_to_publish)
         } else {
             let state = initial_restore_state(&seed, &self.expected_identity)?;
             let directory = WalletDirectory::create(&staging, &state, password.as_str(), self.kdf)
                 .map_err(|_| SeedRestoreError::Storage)?;
             restrict_directory(&staging)?;
-            (directory, state)
+            (directory, state, false)
         };
         Ok(SeedRestoreSession {
             adapter,
@@ -245,7 +250,7 @@ impl SeedRestoreService {
             kdf: self.kdf,
             destination,
             staging,
-            ready_to_publish: false,
+            ready_to_publish,
         })
     }
 
@@ -280,6 +285,60 @@ impl SeedRestoreService {
             }
         }
     }
+}
+
+/// Discover structurally valid, resumable restore stages at startup without
+/// decrypting them or exposing their paths.
+pub fn discover_restore_stages(parent: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    let mut names = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let destination = name
+                .strip_prefix('.')?
+                .strip_suffix(".seed-restore")?
+                .to_owned();
+            let file_type = entry.file_type().ok()?;
+            if file_type.is_symlink()
+                || !file_type.is_dir()
+                || WalletDirectory::inspect_structure(entry.path()).is_err()
+            {
+                return None;
+            }
+            Some(destination)
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+/// Authenticate and remove one abandoned in-progress restore stage.
+pub fn abort_restore_stage(destination: &Path, password: &str) -> Result<(), SeedRestoreError> {
+    validate_password(password)?;
+    if destination.exists() {
+        return Err(SeedRestoreError::InvalidDestination);
+    }
+    let staging = staging_path(destination)?;
+    let directory = WalletDirectory::open(&staging).map_err(|_| SeedRestoreError::Storage)?;
+    let state = directory.load(password).map_err(|error| {
+        if matches!(error, StorageError::InvalidPassword) {
+            SeedRestoreError::InvalidPassword
+        } else {
+            SeedRestoreError::IncompatibleCheckpoint
+        }
+    })?;
+    if !matches!(
+        state.seed_restore_status,
+        Some(SeedRestoreStatus::InProgress | SeedRestoreStatus::Complete)
+    ) {
+        return Err(SeedRestoreError::IncompatibleCheckpoint);
+    }
+    drop(directory);
+    fs::remove_dir_all(&staging).map_err(|_| SeedRestoreError::Storage)?;
+    sync_parent(destination)
 }
 
 /// Resumable encrypted restore session. Debug output contains no paths or secrets.
@@ -356,17 +415,21 @@ impl SeedRestoreSession {
         if state.core_scan_cursor.is_none() {
             return Err(SeedRestoreError::Incomplete);
         }
-        state.seed_restore_status = Some(SeedRestoreStatus::Complete);
-        state.sync_status = SyncStatus::Synced;
-        let expected_generation = state.generation;
-        let state = self
-            .directory
-            .commit(expected_generation, state, self.password.as_str(), self.kdf)
-            .map_err(|_| SeedRestoreError::Storage)?;
+        let state = if state.seed_restore_status == Some(SeedRestoreStatus::Complete) {
+            state
+        } else {
+            state.seed_restore_status = Some(SeedRestoreStatus::Complete);
+            state.sync_status = SyncStatus::Synced;
+            let expected_generation = state.generation;
+            self.directory
+                .commit(expected_generation, state, self.password.as_str(), self.kdf)
+                .map_err(|_| SeedRestoreError::Storage)?
+        };
         let result = result_from_state(&state, &self.identity)?;
         if self.destination.exists() {
             return Err(SeedRestoreError::InvalidDestination);
         }
+        drop(self.directory);
         fs::rename(&self.staging, &self.destination).map_err(|_| SeedRestoreError::Storage)?;
         sync_parent(&self.destination)?;
         Ok(result)
@@ -844,7 +907,12 @@ fn validate_checkpoint(
     seed.copy_entropy_to(&mut entropy);
     if state.root_material != *entropy
         || state.identity != domain_identity(identity)
-        || state.seed_restore_status != Some(SeedRestoreStatus::InProgress)
+        || !matches!(
+            state.seed_restore_status,
+            Some(SeedRestoreStatus::InProgress | SeedRestoreStatus::Complete)
+        )
+        || (state.seed_restore_status == Some(SeedRestoreStatus::Complete)
+            && (state.core_scan_cursor.is_none() || state.sync_status != SyncStatus::Synced))
         || state
             .recovery
             .as_ref()

@@ -14,8 +14,8 @@ use dom_wallet_core_api::{
 };
 use dom_wallet_core_recovery::{CanonicalWalletSeed, RecoverableOutputBuilder};
 use dom_wallet_core_restore::{
-    RestoredSpendSource, SeedRestoreCompletion, SeedRestoreError, SeedRestoreProgress,
-    SeedRestoreService, SeedRestoreWarning,
+    abort_restore_stage, discover_restore_stages, RestoredSpendSource, SeedRestoreCompletion,
+    SeedRestoreError, SeedRestoreProgress, SeedRestoreService, SeedRestoreWarning,
 };
 use dom_wallet_core_sync::{CoreBlockReference, CoreChainIdentity};
 use dom_wallet_crypto::KdfParameters;
@@ -761,6 +761,75 @@ fn interrupted_restore_resumes_exact_cursor_without_false_completion() {
         service.restore(&fixture.phrase, &password, &destination),
         Err(SeedRestoreError::InvalidDestination)
     ));
+}
+
+#[test]
+fn regression_a8_abandoned_restore_is_private_discoverable_resumable_and_authenticated_abortable() {
+    let fixture = fixture();
+    let fake = FakeCore::new(fixture.blocks.clone(), fixture.identity.clone());
+    let temp = TempDir::new().unwrap();
+    let destination = temp.path().join("crash-restart");
+    let password = password();
+    let service = service(&fake, &fixture.identity);
+    let mut interrupted = service
+        .begin(&fixture.phrase, &password, &destination)
+        .unwrap();
+    interrupted.advance_once().unwrap();
+    drop(interrupted);
+
+    let staging = temp.path().join(".crash-restart.seed-restore");
+    assert!(staging.is_dir());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&staging).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+    assert_eq!(discover_restore_stages(temp.path()), vec!["crash-restart"]);
+    assert!(matches!(
+        abort_restore_stage(&destination, "wrong-password"),
+        Err(SeedRestoreError::InvalidPassword)
+    ));
+    assert!(staging.exists());
+
+    let resumed = service
+        .begin(&fixture.phrase, &password, &destination)
+        .unwrap();
+    drop(resumed);
+    abort_restore_stage(&destination, &password).unwrap();
+    assert!(!staging.exists());
+    assert!(discover_restore_stages(temp.path()).is_empty());
+    assert!(!destination.exists());
+
+    let completed_destination = temp.path().join("completed-before-rename");
+    let mut completed = service
+        .begin(&fixture.phrase, &password, &completed_destination)
+        .unwrap();
+    loop {
+        if completed.advance_once().unwrap() == SeedRestoreProgress::ReadyToPublish {
+            break;
+        }
+    }
+    drop(completed);
+    let completed_staging = temp.path().join(".completed-before-rename.seed-restore");
+    let directory = WalletDirectory::open(&completed_staging).unwrap();
+    let mut state = directory.load(&password).unwrap();
+    let expected_generation = state.generation;
+    state.seed_restore_status = Some(SeedRestoreStatus::Complete);
+    state.sync_status = dom_wallet_domain::SyncStatus::Synced;
+    directory
+        .commit(expected_generation, state, &password, KdfParameters::TEST)
+        .unwrap();
+    drop(directory);
+
+    let published = service
+        .restore(&fixture.phrase, &password, &completed_destination)
+        .unwrap();
+    assert_eq!(published.owned_outputs, 5);
+    assert!(completed_destination.is_dir());
+    assert!(!completed_staging.exists());
 }
 
 #[test]

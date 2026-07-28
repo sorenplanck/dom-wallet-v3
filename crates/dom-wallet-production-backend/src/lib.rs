@@ -96,6 +96,10 @@ impl ProductionWalletBackend {
         &self.identity
     }
 
+    pub fn is_running(&self) -> bool {
+        self.lifecycle.state() == dom_wallet_embedded_core::EmbeddedCoreLifecycleState::Running
+    }
+
     /// Refresh the canonical tip while requiring every immutable chain identity
     /// field to remain equal to the identity validated at startup.
     pub fn current_identity(&self) -> Result<CoreChainIdentity, ProductionBackendError> {
@@ -119,6 +123,18 @@ impl ProductionWalletBackend {
         sink: &mut S,
     ) -> Result<CoreReconcileResult, ProductionBackendError> {
         Ok(self.chain.reconcile_to_tip(sink)?)
+    }
+
+    /// Reconcile at most one bounded canonical page.
+    ///
+    /// Desktop background synchronization uses this boundary so pause,
+    /// shutdown, status, and mining-stop requests are never held behind an
+    /// unbounded scan-to-tip loop.
+    pub fn reconcile_page<S: CoreScanTransactionSink>(
+        &self,
+        sink: &mut S,
+    ) -> Result<CoreReconcileResult, ProductionBackendError> {
+        Ok(self.chain.reconcile_wallet_once(sink)?)
     }
 
     pub fn minimum_fee(
@@ -200,12 +216,18 @@ mod tests {
     use dom_wallet_embedded_core::{EmbeddedCoreConfiguration, EmbeddedCoreNetwork};
     use std::net::TcpListener;
 
+    fn unused_loopback_address() -> std::net::SocketAddr {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("ephemeral production-backend listener");
+        let address = listener.local_addr().expect("loopback address");
+        drop(listener);
+        address
+    }
+
     #[test]
     fn production_core_backend_cutover_e2e() {
         let directory = tempfile::tempdir().expect("temporary node directory");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral loopback port");
-        let address = listener.local_addr().expect("loopback address");
-        drop(listener);
+        let address = unused_loopback_address();
         let configuration =
             EmbeddedCoreConfiguration::new(EmbeddedCoreNetwork::Regtest, directory.path(), address)
                 .with_maximum_inbound_peers(2);
@@ -224,9 +246,7 @@ mod tests {
     fn seed_restore_round_trip_uses_the_real_embedded_core() {
         let node_directory = tempfile::tempdir().expect("temporary node directory");
         let wallet_parent = tempfile::tempdir().expect("temporary wallet parent");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral loopback port");
-        let address = listener.local_addr().expect("loopback address");
-        drop(listener);
+        let address = unused_loopback_address();
         let configuration = EmbeddedCoreConfiguration::new(
             EmbeddedCoreNetwork::Regtest,
             node_directory.path(),

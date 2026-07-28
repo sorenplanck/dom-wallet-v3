@@ -49,18 +49,6 @@ pub const MAINNET_DNS_SEEDS: [&str; 3] = [
 ];
 /// Canonical Mainnet P2P port.
 pub const MAINNET_P2P_PORT: u16 = 33_369;
-/// Alternate direct P2P bootstrap endpoint for networks blocking the canonical port.
-pub const MAINNET_BOOTSTRAP_ALTERNATE: &str = "168.100.9.70:8443";
-/// Canonical direct P2P bootstrap fallback. This is never used as a Wallet backend.
-pub const MAINNET_BOOTSTRAP_FALLBACK: &str = "168.100.9.70:33369";
-/// Independent Mainnet emergency relay.
-pub const MAINNET_BOOTSTRAP_SECONDARY: &str = "168.100.8.144:33369";
-/// Ordered Mainnet direct bootstrap endpoints. The alternate endpoint is tried first.
-pub const MAINNET_BOOTSTRAP_PEERS: [&str; 3] = [
-    MAINNET_BOOTSTRAP_ALTERNATE,
-    MAINNET_BOOTSTRAP_FALLBACK,
-    MAINNET_BOOTSTRAP_SECONDARY,
-];
 
 /// Network selected for the embedded node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,15 +105,6 @@ impl EmbeddedCoreConfiguration {
             p2p_listen_address,
         )
         .with_maximum_inbound_peers(1)
-        .with_seed_peers(
-            MAINNET_BOOTSTRAP_PEERS
-                .iter()
-                .map(|peer| {
-                    peer.parse()
-                        .expect("hard-coded Mainnet bootstrap peer must be a SocketAddr")
-                })
-                .collect(),
-        )
     }
 
     /// Set the maximum inbound peer count.
@@ -997,7 +976,7 @@ mod tests {
         EmbeddedCoreConfiguration::new(
             EmbeddedCoreNetwork::Regtest,
             directory,
-            unused_loopback_address(),
+            "127.0.0.1:34341".parse().expect("static test address"),
         )
         .with_maximum_inbound_peers(2)
     }
@@ -1005,7 +984,7 @@ mod tests {
     #[test]
     fn mainnet_wallet_configuration_is_fixed_private_and_non_mining() {
         let directory = TempDir::new().expect("temporary directory");
-        let address = unused_loopback_address();
+        let address = "127.0.0.1:34341".parse().expect("static test address");
         let configuration = EmbeddedCoreConfiguration::mainnet(directory.path(), address);
         configuration
             .validate()
@@ -1017,14 +996,17 @@ mod tests {
         assert_eq!(node.max_inbound, 1);
         assert!(node.disable_dns_seeds);
         assert!(node.dns_seeds.is_empty());
+        assert!(configuration.seed_peers.is_empty());
+        assert!(node.seed_peers.is_empty());
         assert_eq!(
-            configuration.seed_peers,
-            MAINNET_BOOTSTRAP_PEERS
-                .iter()
-                .map(|peer| peer.parse().expect("bootstrap address"))
-                .collect::<Vec<SocketAddr>>()
+            MAINNET_DNS_SEEDS,
+            [
+                "seed1.dom-protocol.org",
+                "seed2.dom-protocol.org",
+                "seed3.dom-protocol.org",
+            ]
         );
-        assert_eq!(node.seed_peers, vec![MAINNET_BOOTSTRAP_ALTERNATE]);
+        assert_eq!(MAINNET_P2P_PORT, 33_369);
         assert!(!node.mine);
         assert!(node.wallet_path.is_none());
         assert!(node.wallet_password.is_none());
@@ -1039,7 +1021,7 @@ mod tests {
             "0.0.0.0:33369".parse().expect("address"),
         );
         assert!(public.validate().is_err());
-        let address = unused_loopback_address();
+        let address = "127.0.0.1:34341".parse().expect("static test address");
         let self_peer = EmbeddedCoreConfiguration::mainnet(directory.path(), address)
             .with_seed_peers(vec![address]);
         assert!(self_peer.validate().is_err());
@@ -1074,9 +1056,11 @@ mod tests {
         let directory = TempDir::new().expect("temporary directory");
         for value in rejected {
             let seed = value.parse().expect("test socket address");
-            let configuration =
-                EmbeddedCoreConfiguration::mainnet(directory.path(), unused_loopback_address())
-                    .with_seed_peers(vec![seed]);
+            let configuration = EmbeddedCoreConfiguration::mainnet(
+                directory.path(),
+                "127.0.0.1:34341".parse().expect("static test address"),
+            )
+            .with_seed_peers(vec![seed]);
             assert!(
                 configuration.validate().is_err(),
                 "accepted non-routable seed {value}"
@@ -1108,57 +1092,29 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_accepts_alternate_and_canonical_relay_ports() {
-        let alternate: SocketAddr = MAINNET_BOOTSTRAP_ALTERNATE
-            .parse()
-            .expect("alternate Mainnet bootstrap address");
-        let canonical: SocketAddr = MAINNET_BOOTSTRAP_FALLBACK
-            .parse()
-            .expect("canonical Mainnet bootstrap address");
-        assert_eq!(alternate.ip(), canonical.ip());
-        assert_eq!(alternate.port(), 8_443);
-        assert_eq!(canonical.port(), MAINNET_P2P_PORT);
-        assert!(is_public_routable_peer(alternate));
-        assert!(is_public_routable_peer(canonical));
-    }
-
-    #[test]
     fn bootstrap_failure_advances_to_the_next_untried_endpoint() {
-        let canonical: SocketAddr = MAINNET_BOOTSTRAP_FALLBACK
-            .parse()
-            .expect("canonical Mainnet bootstrap address");
-        let alternate: SocketAddr = MAINNET_BOOTSTRAP_ALTERNATE
-            .parse()
-            .expect("alternate Mainnet bootstrap address");
-        let mut bootstrap = BootstrapFallbackSequence::new(vec![canonical, alternate]);
+        let first: SocketAddr = "8.8.8.8:33369".parse().expect("first test peer");
+        let second: SocketAddr = "1.1.1.1:33369".parse().expect("second test peer");
+        let mut bootstrap = BootstrapFallbackSequence::new(vec![first, second]);
 
-        assert_eq!(bootstrap.active(), Some(canonical));
+        assert_eq!(bootstrap.active(), Some(first));
         assert!(bootstrap.has_untried_endpoint());
-        assert_eq!(bootstrap.observe_failure(canonical, 1), Some(alternate));
-        assert_eq!(bootstrap.active(), Some(alternate));
+        assert_eq!(bootstrap.observe_failure(first, 1), Some(second));
+        assert_eq!(bootstrap.active(), Some(second));
     }
 
     #[test]
     fn bootstrap_endpoints_are_deduplicated_by_socket_address() {
-        let alternate: SocketAddr = MAINNET_BOOTSTRAP_ALTERNATE
-            .parse()
-            .expect("alternate Mainnet bootstrap address");
-        let canonical: SocketAddr = MAINNET_BOOTSTRAP_FALLBACK
-            .parse()
-            .expect("canonical Mainnet bootstrap address");
-        let bootstrap =
-            BootstrapFallbackSequence::new(vec![alternate, alternate, canonical, canonical]);
+        let first: SocketAddr = "8.8.8.8:33369".parse().expect("first test peer");
+        let second: SocketAddr = "1.1.1.1:33369".parse().expect("second test peer");
+        let bootstrap = BootstrapFallbackSequence::new(vec![first, first, second, second]);
 
-        assert_eq!(bootstrap.endpoints, vec![alternate, canonical]);
+        assert_eq!(bootstrap.endpoints, vec![first, second]);
     }
 
     #[test]
-    fn any_connected_bootstrap_endpoint_reports_connected() {
-        for endpoint in MAINNET_BOOTSTRAP_PEERS {
-            let connected: SocketAddr = endpoint.parse().expect("Mainnet bootstrap address");
-            assert!(is_public_routable_peer(connected));
-            assert_eq!(bootstrap_phase(1), "CONNECTED");
-        }
+    fn connected_peer_reports_connected_bootstrap_phase() {
+        assert_eq!(bootstrap_phase(1), "CONNECTED");
         assert_eq!(bootstrap_phase(0), "DISCOVERING_PEERS");
     }
 

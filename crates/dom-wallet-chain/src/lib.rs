@@ -697,32 +697,10 @@ impl DomHttpChainSource {
         if !(200..300).contains(&status) {
             return Err(ChainError::HttpStatus(status));
         }
-        let bytes = Self::decode_response::<serde_json::Value>(response)?;
-        let found = bytes
-            .get("found")
-            .and_then(serde_json::Value::as_bool)
-            .ok_or(ChainError::MalformedResponse)?;
-        if !found {
-            let missing: TxMissingDto =
-                serde_json::from_value(bytes).map_err(|_| ChainError::MalformedResponse)?;
-            if missing.found {
-                return Err(ChainError::MalformedResponse);
-            }
-            return Ok(TransactionLookup {
-                transaction_hash,
-                in_mempool: false,
-            });
-        }
-        let found: TxFoundDto =
-            serde_json::from_value(bytes).map_err(|_| ChainError::MalformedResponse)?;
-        if !found.found || decode_hash(&found.tx_hash)? != transaction_hash {
-            return Err(ChainError::MalformedResponse);
-        }
-        let _ = (found.fee, found.fee_rate, found.weight);
-        Ok(TransactionLookup {
+        decode_transaction_lookup(
+            Self::decode_response::<serde_json::Value>(response)?,
             transaction_hash,
-            in_mempool: true,
-        })
+        )
     }
 
     fn block(&self, id: &str) -> Result<BlockDto, ChainError> {
@@ -863,6 +841,38 @@ impl DomHttpChainSource {
             status,
         })
     }
+}
+
+fn decode_transaction_lookup(
+    value: serde_json::Value,
+    transaction_hash: [u8; 32],
+) -> Result<TransactionLookup, ChainError> {
+    let is_found = value
+        .get("found")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or(ChainError::MalformedResponse)?;
+    if !is_found {
+        let missing: TxMissingDto =
+            serde_json::from_value(value).map_err(|_| ChainError::MalformedResponse)?;
+        if missing.found {
+            return Err(ChainError::MalformedResponse);
+        }
+        return Ok(TransactionLookup {
+            transaction_hash,
+            in_mempool: false,
+        });
+    }
+    let found: TxFoundDto =
+        serde_json::from_value(value).map_err(|_| ChainError::MalformedResponse)?;
+    let found_hash = decode_hash(&found.tx_hash).map_err(|_| ChainError::MalformedResponse)?;
+    if !found.found || found_hash != transaction_hash {
+        return Err(ChainError::MalformedResponse);
+    }
+    let _ = (found.fee, found.fee_rate, found.weight);
+    Ok(TransactionLookup {
+        transaction_hash,
+        in_mempool: true,
+    })
 }
 
 impl ChainSource for DomHttpChainSource {
@@ -1063,9 +1073,6 @@ pub enum ChainError {
 mod tests {
     use super::*;
     use dom_wallet_domain::Network;
-    use std::io::Write as _;
-    use std::net::TcpListener;
-    use std::thread;
 
     fn identity() -> NetworkIdentity {
         NetworkIdentity {
@@ -1089,69 +1096,56 @@ mod tests {
         .1
     }
 
-    fn one_response_server(status: &str, body: String) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let status = status.to_owned();
-        thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0u8; 4096];
-            let _ = stream.read(&mut request).unwrap();
-            let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream.write_all(response.as_bytes()).unwrap();
-        });
-        format!("http://{address}")
-    }
-
     #[test]
     fn transaction_lookup_decodes_only_exact_wallet_safe_dtos() {
         let hash = [0xabu8; 32];
-        let found_url = one_response_server(
-            "200 OK",
-            format!(
-                r#"{{"found":true,"tx_hash":"{}","fee":7,"fee_rate":1,"weight":3}}"#,
-                hex::encode(hash)
-            ),
-        );
-        let source = DomHttpChainSource::new(
-            &found_url,
-            identity(),
-            "fixture".into(),
-            1,
-            1_000,
-            1_000,
-            None,
-        )
+        let found = serde_json::from_str(&format!(
+            r#"{{"found":true,"tx_hash":"{}","fee":7,"fee_rate":1,"weight":3}}"#,
+            hex::encode(hash)
+        ))
         .unwrap();
         assert_eq!(
-            source.lookup_transaction(hash).unwrap(),
+            decode_transaction_lookup(found, hash).unwrap(),
             TransactionLookup {
                 transaction_hash: hash,
                 in_mempool: true,
             }
         );
 
-        let missing_url = one_response_server("200 OK", r#"{"found":false}"#.into());
-        let source = DomHttpChainSource::new(
-            &missing_url,
-            identity(),
-            "fixture".into(),
-            1,
-            1_000,
-            1_000,
-            None,
-        )
-        .unwrap();
         assert_eq!(
-            source.lookup_transaction(hash).unwrap(),
+            decode_transaction_lookup(serde_json::json!({"found": false}), hash).unwrap(),
             TransactionLookup {
                 transaction_hash: hash,
                 in_mempool: false,
             }
         );
+        assert!(matches!(
+            decode_transaction_lookup(
+                serde_json::json!({
+                    "found": true,
+                    "tx_hash": hex::encode(hash),
+                    "fee": 7,
+                    "fee_rate": 1,
+                    "weight": 3,
+                    "private": "must be rejected"
+                }),
+                hash
+            ),
+            Err(ChainError::MalformedResponse)
+        ));
+        assert!(matches!(
+            decode_transaction_lookup(
+                serde_json::json!({
+                    "found": true,
+                    "tx_hash": "00".repeat(32),
+                    "fee": 7,
+                    "fee_rate": 1,
+                    "weight": 3
+                }),
+                hash
+            ),
+            Err(ChainError::MalformedResponse)
+        ));
     }
 
     #[test]

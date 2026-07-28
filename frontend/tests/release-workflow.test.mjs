@@ -16,6 +16,7 @@ test("release workflow provides pinned experimental dry-run packaging", async ()
     "Test native bridge in packaged Linux application", "webkit2gtk-driver", "xvfb-run -a",
     "scripts/test-packaged-native-bridge-linux.mjs", "tauri-driver --version 2.0.6",
     "TAURI_VERSION", "test \"$VERSION\" = \"$TAURI_VERSION\"",
+    "\"createUpdaterArtifacts\":true", "--no-sign",
   ]) assert.equal(workflow.includes(required), true, `missing ${required}`);
 
   const actionRefs = [...workflow.matchAll(/uses:\s+[^@\s]+@([^\s]+)/g)].map((match) => match[1]);
@@ -76,7 +77,7 @@ test("Tauri resolves the frontend build from both supported CLI contexts", async
     "pinned updater key must decode to the canonical Minisign public key file",
   );
   assert.equal(config.plugins.updater.endpoints.every((endpoint) => endpoint.startsWith("https://")), true);
-  assert.equal(config.bundle.createUpdaterArtifacts, false);
+  assert.equal(config.bundle.createUpdaterArtifacts, true);
   const ico = await readFile(new URL("../../src-tauri/icons/icon.ico", import.meta.url));
   assert.deepEqual([...ico.subarray(0, 4)], [0, 0, 1, 0]);
 });

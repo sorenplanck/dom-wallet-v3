@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+use futures_util::StreamExt;
 use minisign_verify::{PublicKey, Signature};
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
@@ -9,10 +10,11 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
     fs::{self, OpenOptions},
-    io::Write,
+    io::{self, Read, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -32,11 +34,13 @@ pub const NODE_UPDATE_ENDPOINT: &str =
 pub const PEER_UPDATE_ENDPOINT: &str =
     "https://github.com/sorenplanck/dom-wallet-v3/releases/latest/download/mainnet-peers.json";
 /// Pinned DOM Protocol revision compiled into this Wallet.
-pub const EMBEDDED_NODE_REVISION: &str = "28ba3cefc9fbc913f126336482662528c68a7d8c";
+pub const EMBEDDED_NODE_REVISION: &str = "b5a86a2049986f90558cae12a859759ed0db5c36";
 /// First immutable DOM Protocol revision with authenticated build-info and shutdown.
 pub const MANAGED_NODE_CONTROL_REVISION: &str = "28ba3cefc9fbc913f126336482662528c68a7d8c";
 /// Stable update channel.
 pub const UPDATE_CHANNEL: &str = "stable";
+/// Hard ceiling independent of signed manifest metadata.
+pub const MAX_UPDATE_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 
 const ALLOWED_DOWNLOAD_HOSTS: [&str; 4] = [
     "github.com",
@@ -97,6 +101,18 @@ pub enum UpdateError {
     StateIo,
     #[error("UPDATE_UNSAFE_PATH")]
     UnsafePath,
+    #[error("UPDATE_CONNECT_TIMEOUT")]
+    ConnectTimeout,
+    #[error("UPDATE_HEADER_TIMEOUT")]
+    HeaderTimeout,
+    #[error("UPDATE_INACTIVITY_TIMEOUT")]
+    InactivityTimeout,
+    #[error("UPDATE_TOTAL_TIMEOUT")]
+    TotalTimeout,
+    #[error("UPDATE_ARTIFACT_TOO_LARGE")]
+    ArtifactTooLarge,
+    #[error("UPDATE_ARTIFACT_SIZE_MISMATCH")]
+    ArtifactSizeMismatch,
 }
 
 /// Signed artifact metadata for one platform.
@@ -457,7 +473,7 @@ pub struct SignedPeerManifest {
 }
 
 /// Minimal signature abstraction for deterministic tests.
-pub trait SignatureVerifier {
+pub trait SignatureVerifier: Send + Sync {
     fn verify(&self, payload: &[u8], signature: &str) -> bool;
 }
 
@@ -533,7 +549,7 @@ pub fn validate_peer_manifest(
     if peers.is_empty() {
         return Err(UpdateError::PeerManifestInvalid);
     }
-    Ok(prioritize_mainnet_relay(peers))
+    Ok(peers)
 }
 
 pub fn persist_peer_manifest_cache(
@@ -588,17 +604,6 @@ pub fn load_valid_peer_manifest_cache(
         now,
     )?;
     Ok((manifest.payload.sequence, peers))
-}
-
-fn prioritize_mainnet_relay(mut peers: Vec<SocketAddr>) -> Vec<SocketAddr> {
-    const PRIORITY: [&str; 2] = ["168.100.9.70:8443", "168.100.9.70:33369"];
-    peers.sort_by_key(|peer| {
-        PRIORITY
-            .iter()
-            .position(|priority| peer.to_string() == *priority)
-            .unwrap_or(PRIORITY.len())
-    });
-    peers
 }
 
 fn validate_schema_channel_time(
@@ -677,6 +682,301 @@ pub fn validate_download(bytes: &[u8], artifact: &ArtifactDescriptor) -> Result<
     Ok(())
 }
 
+/// Independent deadlines enforced by the production HTTP client and stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArtifactDownloadTimeouts {
+    pub connect: Duration,
+    pub headers: Duration,
+    pub inactivity: Duration,
+    pub total: Duration,
+}
+
+impl Default for ArtifactDownloadTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(10),
+            headers: Duration::from_secs(15),
+            inactivity: Duration::from_secs(20),
+            total: Duration::from_secs(15 * 60),
+        }
+    }
+}
+
+/// Stream a signed artifact into a newly-created private file, enforcing the
+/// signed length and an independent hard ceiling before it can be activated.
+///
+/// The returned bytes are bounded by [`MAX_UPDATE_ARTIFACT_BYTES`] and are
+/// provided only after the file is durable and size, hash, and signature all
+/// verify. Callers must use a same-filesystem staging destination.
+pub fn stream_and_verify_artifact<R: Read>(
+    mut input: R,
+    content_length: Option<u64>,
+    artifact: &ArtifactDescriptor,
+    verifier: &dyn SignatureVerifier,
+    staging_root: &Path,
+    destination: &Path,
+    total_timeout: Duration,
+) -> Result<Vec<u8>, UpdateError> {
+    if artifact.size == 0 || artifact.size > MAX_UPDATE_ARTIFACT_BYTES {
+        return Err(UpdateError::ArtifactTooLarge);
+    }
+    if let Some(length) = content_length {
+        if length > artifact.size || length > MAX_UPDATE_ARTIFACT_BYTES {
+            return Err(UpdateError::ArtifactTooLarge);
+        }
+        if length != artifact.size {
+            return Err(UpdateError::ArtifactSizeMismatch);
+        }
+    }
+
+    validate_artifact_staging_destination(staging_root, destination)?;
+    let parent = destination.parent().ok_or(UpdateError::UnsafePath)?;
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut output = options
+        .open(destination)
+        .map_err(|_| UpdateError::StateIo)?;
+    let started = Instant::now();
+    let mut downloaded = 0_u64;
+    let mut hasher = Sha256::new();
+    let mut verified_bytes = Vec::new();
+    let mut chunk = [0_u8; 64 * 1024];
+    let result = (|| {
+        loop {
+            if started.elapsed() > total_timeout {
+                return Err(UpdateError::TotalTimeout);
+            }
+            let count = match input.read(&mut chunk) {
+                Ok(count) => count,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    return Err(UpdateError::InactivityTimeout);
+                }
+                Err(_) => return Err(UpdateError::InactivityTimeout),
+            };
+            if count == 0 {
+                break;
+            }
+            downloaded = downloaded
+                .checked_add(count as u64)
+                .ok_or(UpdateError::ArtifactTooLarge)?;
+            if downloaded > artifact.size || downloaded > MAX_UPDATE_ARTIFACT_BYTES {
+                return Err(UpdateError::ArtifactTooLarge);
+            }
+            hasher.update(&chunk[..count]);
+            output
+                .write_all(&chunk[..count])
+                .map_err(|_| UpdateError::StateIo)?;
+            verified_bytes.extend_from_slice(&chunk[..count]);
+        }
+        if downloaded != artifact.size {
+            return Err(UpdateError::ArtifactSizeMismatch);
+        }
+        let digest = format!("{:x}", hasher.finalize());
+        if !digest.eq_ignore_ascii_case(&artifact.sha256) {
+            return Err(UpdateError::HashMismatch);
+        }
+        if !verifier.verify(&verified_bytes, &artifact.signature) {
+            return Err(UpdateError::SignatureInvalid);
+        }
+        output.sync_all().map_err(|_| UpdateError::StateIo)?;
+        sync_directory(parent)?;
+        Ok(verified_bytes)
+    })();
+    if result.is_err() {
+        drop(output);
+        let _ = fs::remove_file(destination);
+    }
+    result
+}
+
+/// Download through the approved-host policy with separate connection,
+/// response-header, inactivity, and whole-transfer deadlines.
+pub fn download_verified_artifact(
+    artifact: &ArtifactDescriptor,
+    verifier: &dyn SignatureVerifier,
+    staging_root: &Path,
+    destination: &Path,
+    timeouts: ArtifactDownloadTimeouts,
+) -> Result<Vec<u8>, UpdateError> {
+    validate_release_url(&artifact.url)?;
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(timeouts.connect)
+        .timeout(timeouts.inactivity)
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 || validate_release_url(attempt.url()).is_err() {
+                attempt.stop()
+            } else {
+                attempt.follow()
+            }
+        }))
+        .build()
+        .map_err(|_| UpdateError::CheckFailed)?;
+    let started = Instant::now();
+    let response = client.get(artifact.url.clone()).send().map_err(|error| {
+        if error.is_timeout() && error.is_connect() {
+            UpdateError::ConnectTimeout
+        } else if error.is_timeout() {
+            UpdateError::HeaderTimeout
+        } else {
+            UpdateError::CheckFailed
+        }
+    })?;
+    if started.elapsed() > timeouts.headers {
+        return Err(UpdateError::HeaderTimeout);
+    }
+    if !response.status().is_success() {
+        return Err(UpdateError::CheckFailed);
+    }
+    validate_release_url(response.url())?;
+    let remaining = timeouts
+        .total
+        .checked_sub(started.elapsed())
+        .ok_or(UpdateError::TotalTimeout)?;
+    let content_length = response.content_length();
+    stream_and_verify_artifact(
+        response,
+        content_length,
+        artifact,
+        verifier,
+        staging_root,
+        destination,
+        remaining,
+    )
+}
+
+/// Async production downloader with independent per-phase deadlines.
+pub async fn download_verified_artifact_async(
+    artifact: &ArtifactDescriptor,
+    verifier: &dyn SignatureVerifier,
+    staging_root: &Path,
+    destination: &Path,
+    timeouts: ArtifactDownloadTimeouts,
+) -> Result<Vec<u8>, UpdateError> {
+    validate_release_url(&artifact.url)?;
+    if artifact.size == 0 || artifact.size > MAX_UPDATE_ARTIFACT_BYTES {
+        return Err(UpdateError::ArtifactTooLarge);
+    }
+    let client = reqwest::Client::builder()
+        .connect_timeout(timeouts.connect)
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 || validate_release_url(attempt.url()).is_err() {
+                attempt.stop()
+            } else {
+                attempt.follow()
+            }
+        }))
+        .build()
+        .map_err(|_| UpdateError::CheckFailed)?;
+    let started = Instant::now();
+    let response = tokio::time::timeout(timeouts.headers, client.get(artifact.url.clone()).send())
+        .await
+        .map_err(|_| UpdateError::HeaderTimeout)?
+        .map_err(|error| {
+            if error.is_timeout() && error.is_connect() {
+                UpdateError::ConnectTimeout
+            } else if error.is_timeout() {
+                UpdateError::HeaderTimeout
+            } else {
+                UpdateError::CheckFailed
+            }
+        })?;
+    if !response.status().is_success() {
+        return Err(UpdateError::CheckFailed);
+    }
+    validate_release_url(response.url())?;
+    if let Some(length) = response.content_length() {
+        if length > artifact.size || length > MAX_UPDATE_ARTIFACT_BYTES {
+            return Err(UpdateError::ArtifactTooLarge);
+        }
+        if length != artifact.size {
+            return Err(UpdateError::ArtifactSizeMismatch);
+        }
+    }
+
+    validate_artifact_staging_destination(staging_root, destination)?;
+    let parent = destination.parent().ok_or(UpdateError::UnsafePath)?;
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut output = options
+        .open(destination)
+        .map_err(|_| UpdateError::StateIo)?;
+    let mut downloaded = 0_u64;
+    let mut hasher = Sha256::new();
+    let mut verified_bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    let result = async {
+        loop {
+            let remaining = timeouts
+                .total
+                .checked_sub(started.elapsed())
+                .ok_or(UpdateError::TotalTimeout)?;
+            let deadline = remaining.min(timeouts.inactivity);
+            let chunk = tokio::time::timeout(deadline, stream.next())
+                .await
+                .map_err(|_| {
+                    if started.elapsed() >= timeouts.total {
+                        UpdateError::TotalTimeout
+                    } else {
+                        UpdateError::InactivityTimeout
+                    }
+                })?;
+            let Some(chunk) = chunk else {
+                break;
+            };
+            let chunk = chunk.map_err(|error| {
+                if error.is_timeout() {
+                    UpdateError::InactivityTimeout
+                } else {
+                    UpdateError::CheckFailed
+                }
+            })?;
+            downloaded = downloaded
+                .checked_add(chunk.len() as u64)
+                .ok_or(UpdateError::ArtifactTooLarge)?;
+            if downloaded > artifact.size || downloaded > MAX_UPDATE_ARTIFACT_BYTES {
+                return Err(UpdateError::ArtifactTooLarge);
+            }
+            hasher.update(&chunk);
+            output.write_all(&chunk).map_err(|_| UpdateError::StateIo)?;
+            verified_bytes.extend_from_slice(&chunk);
+        }
+        if downloaded != artifact.size {
+            return Err(UpdateError::ArtifactSizeMismatch);
+        }
+        let digest = format!("{:x}", hasher.finalize());
+        if !digest.eq_ignore_ascii_case(&artifact.sha256) {
+            return Err(UpdateError::HashMismatch);
+        }
+        if !verifier.verify(&verified_bytes, &artifact.signature) {
+            return Err(UpdateError::SignatureInvalid);
+        }
+        output.sync_all().map_err(|_| UpdateError::StateIo)?;
+        sync_directory(parent)?;
+        Ok(verified_bytes)
+    }
+    .await;
+    if result.is_err() {
+        drop(output);
+        let _ = fs::remove_file(destination);
+    }
+    result
+}
+
 /// Persisted non-secret updater metadata.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -707,10 +1007,95 @@ pub enum WalletUpdaterState {
     WalletUpdateAvailable,
     Downloading,
     Verifying,
+    ReadyToApply,
     WaitingForSafePoint,
     Installing,
     Restarting,
     Failed,
+}
+
+/// Revalidate a durable staged file immediately before installer activation.
+pub fn verify_staged_artifact(
+    staging_root: &Path,
+    path: &Path,
+    artifact: &ArtifactDescriptor,
+    verifier: &dyn SignatureVerifier,
+) -> Result<Vec<u8>, UpdateError> {
+    validate_artifact_staging_destination(staging_root, path)?;
+    let metadata = fs::symlink_metadata(path).map_err(|_| UpdateError::StateIo)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(UpdateError::UnsafePath);
+    }
+    if metadata.len() > MAX_UPDATE_ARTIFACT_BYTES || metadata.len() > artifact.size {
+        return Err(UpdateError::ArtifactTooLarge);
+    }
+    if metadata.len() != artifact.size {
+        return Err(UpdateError::ArtifactSizeMismatch);
+    }
+    let bytes = fs::read(path).map_err(|_| UpdateError::StateIo)?;
+    validate_download(&bytes, artifact)?;
+    if !verifier.verify(&bytes, &artifact.signature) {
+        return Err(UpdateError::SignatureInvalid);
+    }
+    Ok(bytes)
+}
+
+/// Require an existing regular staging directory and a destination wholly
+/// contained beneath it. Every existing path component is checked without
+/// following a symlink before a download and again before activation.
+pub fn validate_artifact_staging_destination(
+    staging_root: &Path,
+    destination: &Path,
+) -> Result<(), UpdateError> {
+    let root_metadata = fs::symlink_metadata(staging_root).map_err(|_| UpdateError::UnsafePath)?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(UpdateError::UnsafePath);
+    }
+    let relative = destination
+        .strip_prefix(staging_root)
+        .map_err(|_| UpdateError::UnsafePath)?;
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(UpdateError::UnsafePath);
+    }
+    let canonical_root = staging_root
+        .canonicalize()
+        .map_err(|_| UpdateError::UnsafePath)?;
+    let parent = destination.parent().ok_or(UpdateError::UnsafePath)?;
+    let parent_metadata = fs::symlink_metadata(parent).map_err(|_| UpdateError::UnsafePath)?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        return Err(UpdateError::UnsafePath);
+    }
+    let canonical_parent = parent.canonicalize().map_err(|_| UpdateError::UnsafePath)?;
+    if !canonical_parent.starts_with(&canonical_root) {
+        return Err(UpdateError::UnsafePath);
+    }
+    let mut current = staging_root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(UpdateError::UnsafePath);
+        };
+        current.push(component);
+        if current == destination {
+            break;
+        }
+        let metadata = fs::symlink_metadata(&current).map_err(|_| UpdateError::UnsafePath)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(UpdateError::UnsafePath);
+        }
+    }
+    if destination
+        .symlink_metadata()
+        .map(|metadata| metadata.file_type().is_symlink() || !metadata.is_file())
+        .unwrap_or(false)
+    {
+        return Err(UpdateError::UnsafePath);
+    }
+    Ok(())
 }
 
 /// Independent node updater lifecycle.
@@ -1144,6 +1529,12 @@ fn is_public_ipv6(ip: Ipv6Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+    #[cfg(unix)]
+    use std::io::{BufRead, BufReader};
+    #[cfg(unix)]
+    use std::os::unix::net::UnixStream;
+    use std::{sync::mpsc, thread};
     use tempfile::TempDir;
 
     const NOW: &str = "2026-07-23T12:00:00Z";
@@ -1165,6 +1556,285 @@ mod tests {
             sha256: format!("{:x}", Sha256::digest(bytes)),
             size: bytes.len() as u64,
             signature: "trusted-test-signature".into(),
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct ExactArtifactVerifier;
+
+    impl SignatureVerifier for ExactArtifactVerifier {
+        fn verify(&self, payload: &[u8], signature: &str) -> bool {
+            payload == b"signed update" && signature == "trusted-test-signature"
+        }
+    }
+
+    fn local_http_body(
+        body: Vec<u8>,
+        declared_length: u64,
+    ) -> (Box<dyn Read>, Option<thread::JoinHandle<()>>) {
+        #[cfg(not(unix))]
+        {
+            return (Box::new(Cursor::new(body)), None);
+        }
+        #[cfg(unix)]
+        let (mut client, mut server_stream) = UnixStream::pair().expect("local HTTP stream");
+        #[cfg(unix)]
+        let fallback_body = body.clone();
+        #[cfg(unix)]
+        let server = thread::spawn(move || {
+            let mut request = [0_u8; 256];
+            let _ = server_stream.read(&mut request);
+            let _ = write!(
+                server_stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {declared_length}\r\nConnection: close\r\n\r\n"
+            );
+            let _ = server_stream.write_all(&body);
+        });
+        #[cfg(unix)]
+        if client
+            .write_all(b"GET /artifact HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .is_err()
+        {
+            drop(client);
+            server.join().expect("restricted local HTTP server");
+            return (Box::new(Cursor::new(fallback_body)), None);
+        }
+        #[cfg(unix)]
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("HTTP status");
+        assert!(line.starts_with("HTTP/1.1 200"));
+        loop {
+            line.clear();
+            reader.read_line(&mut line).expect("HTTP header");
+            if line == "\r\n" {
+                break;
+            }
+        }
+        (Box::new(reader), Some(server))
+    }
+
+    fn stalled_local_http_body(
+        declared_length: u64,
+    ) -> (
+        Box<dyn Read>,
+        mpsc::Sender<()>,
+        Option<thread::JoinHandle<()>>,
+    ) {
+        let (release_sender, release_receiver) = mpsc::channel();
+        #[cfg(not(unix))]
+        {
+            drop(release_receiver);
+            return (Box::new(InactivityReader), release_sender, None);
+        }
+        #[cfg(unix)]
+        let (mut client, mut server_stream) = UnixStream::pair().expect("local slow HTTP stream");
+        #[cfg(unix)]
+        let server = thread::spawn(move || {
+            let mut request = [0_u8; 256];
+            let _ = server_stream.read(&mut request);
+            let _ = write!(
+                server_stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {declared_length}\r\nConnection: close\r\n\r\n"
+            );
+            let _ = server_stream.flush();
+            let _ = release_receiver.recv();
+        });
+        #[cfg(unix)]
+        if client
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .is_err()
+        {
+            drop(client);
+            return (Box::new(InactivityReader), release_sender, Some(server));
+        }
+        #[cfg(unix)]
+        if client
+            .write_all(b"GET /artifact HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .is_err()
+        {
+            drop(client);
+            return (Box::new(InactivityReader), release_sender, Some(server));
+        }
+        #[cfg(unix)]
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("slow HTTP status");
+        loop {
+            line.clear();
+            reader.read_line(&mut line).expect("slow HTTP header");
+            if line == "\r\n" {
+                break;
+            }
+        }
+        (Box::new(reader), release_sender, Some(server))
+    }
+
+    struct InactivityReader;
+
+    impl Read for InactivityReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "controlled inactivity",
+            ))
+        }
+    }
+
+    #[test]
+    fn regression_m6_streaming_enforces_size_hash_signature_and_distinct_timeouts() {
+        let directory = TempDir::new().expect("temporary updater directory");
+        let valid = artifact();
+        let valid_path = directory.path().join("valid.stage");
+        let (valid_http, valid_server) = local_http_body(b"signed update".to_vec(), valid.size);
+        let bytes = stream_and_verify_artifact(
+            valid_http,
+            Some(valid.size),
+            &valid,
+            &ExactArtifactVerifier,
+            directory.path(),
+            &valid_path,
+            Duration::from_secs(1),
+        )
+        .expect("valid signed fixture");
+        if let Some(server) = valid_server {
+            server.join().expect("valid local HTTP server");
+        }
+        assert_eq!(bytes, b"signed update");
+        assert_eq!(fs::read(&valid_path).expect("durable artifact"), bytes);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&valid_path)
+                    .expect("artifact metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
+        let cases: Vec<(Vec<u8>, ArtifactDescriptor, UpdateError)> = vec![
+            (
+                b"truncated".to_vec(),
+                valid.clone(),
+                UpdateError::ArtifactSizeMismatch,
+            ),
+            (
+                b"signed update extra".to_vec(),
+                valid.clone(),
+                UpdateError::ArtifactTooLarge,
+            ),
+            (
+                b"signed update".to_vec(),
+                ArtifactDescriptor {
+                    sha256: "00".repeat(32),
+                    ..valid.clone()
+                },
+                UpdateError::HashMismatch,
+            ),
+            (
+                b"signed update".to_vec(),
+                ArtifactDescriptor {
+                    signature: "wrong-signature".into(),
+                    ..valid.clone()
+                },
+                UpdateError::SignatureInvalid,
+            ),
+        ];
+        for (index, (input, descriptor, expected)) in cases.into_iter().enumerate() {
+            let path = directory.path().join(format!("rejected-{index}.stage"));
+            let (http, server) = local_http_body(input, descriptor.size);
+            assert_eq!(
+                stream_and_verify_artifact(
+                    http,
+                    Some(descriptor.size),
+                    &descriptor,
+                    &ExactArtifactVerifier,
+                    directory.path(),
+                    &path,
+                    Duration::from_secs(1),
+                ),
+                Err(expected)
+            );
+            if let Some(server) = server {
+                server.join().expect("rejected local HTTP server");
+            }
+            assert!(!path.exists());
+        }
+
+        let inactive_path = directory.path().join("inactive.stage");
+        let (inactive_http, release, server) = stalled_local_http_body(valid.size);
+        assert_eq!(
+            stream_and_verify_artifact(
+                inactive_http,
+                Some(valid.size),
+                &valid,
+                &ExactArtifactVerifier,
+                directory.path(),
+                &inactive_path,
+                Duration::from_secs(1),
+            ),
+            Err(UpdateError::InactivityTimeout)
+        );
+        release.send(()).expect("release local slow HTTP server");
+        if let Some(server) = server {
+            server.join().expect("local slow HTTP server");
+        }
+        assert!(!inactive_path.exists());
+        assert_ne!(UpdateError::ConnectTimeout, UpdateError::HeaderTimeout);
+        assert_ne!(UpdateError::HeaderTimeout, UpdateError::InactivityTimeout);
+        assert_ne!(UpdateError::InactivityTimeout, UpdateError::TotalTimeout);
+    }
+
+    #[test]
+    fn regression_m6_staging_rejects_symlink_traversal_and_outside_root_paths() {
+        let directory = TempDir::new().expect("temporary updater directory");
+        let root = directory.path().join("verified-updates");
+        let outside = directory.path().join("outside");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        assert_eq!(
+            validate_artifact_staging_destination(&root, &outside.join("artifact.stage")),
+            Err(UpdateError::UnsafePath)
+        );
+        assert_eq!(
+            validate_artifact_staging_destination(
+                &root,
+                &root.join("..").join("outside").join("artifact.stage")
+            ),
+            Err(UpdateError::UnsafePath)
+        );
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, root.join("redirect")).unwrap();
+            assert_eq!(
+                validate_artifact_staging_destination(
+                    &root,
+                    &root.join("redirect").join("artifact.stage")
+                ),
+                Err(UpdateError::UnsafePath)
+            );
+
+            let target = outside.join("target");
+            fs::write(&target, b"do not overwrite").unwrap();
+            std::os::unix::fs::symlink(&target, root.join("artifact.stage")).unwrap();
+            assert_eq!(
+                validate_artifact_staging_destination(&root, &root.join("artifact.stage")),
+                Err(UpdateError::UnsafePath)
+            );
+
+            let root_link = directory.path().join("verified-updates-link");
+            std::os::unix::fs::symlink(&root, &root_link).unwrap();
+            assert_eq!(
+                validate_artifact_staging_destination(
+                    &root_link,
+                    &root_link.join("artifact.stage")
+                ),
+                Err(UpdateError::UnsafePath)
+            );
         }
     }
 
@@ -1477,10 +2147,9 @@ mod tests {
                 expires_at: "2026-08-23T12:00:00Z".into(),
                 sequence: 2,
                 peers: vec![
-                    "168.100.9.70:33369".into(),
-                    "168.100.9.70:8443".into(),
-                    "168.100.9.70:8443".into(),
-                    "168.100.8.144:33369".into(),
+                    "8.8.8.8:33369".into(),
+                    "1.1.1.1:33369".into(),
+                    "1.1.1.1:33369".into(),
                 ],
             },
             signature: "valid".into(),
@@ -1495,9 +2164,8 @@ mod tests {
         assert_eq!(
             result,
             vec![
-                "168.100.9.70:8443".parse().expect("address"),
-                "168.100.9.70:33369".parse().expect("address"),
-                "168.100.8.144:33369".parse().expect("address"),
+                "8.8.8.8:33369".parse().expect("address"),
+                "1.1.1.1:33369".parse().expect("address"),
             ]
         );
     }
@@ -1528,7 +2196,7 @@ mod tests {
             Err(UpdateError::PeerManifestExpired)
         );
         manifest = peers();
-        manifest.payload.peers = vec!["127.0.0.1:8443".into(), "10.0.0.1:33369".into()];
+        manifest.payload.peers = vec!["127.0.0.1:33369".into(), "10.0.0.1:33369".into()];
         assert_eq!(
             validate_peer_manifest(&manifest, &AcceptSignature, "chain", "genesis", 1, now()),
             Err(UpdateError::PeerManifestInvalid)
@@ -1547,7 +2215,7 @@ mod tests {
         assert_eq!(sequence, 2);
         assert_eq!(
             loaded.first().map(ToString::to_string).as_deref(),
-            Some("168.100.9.70:8443")
+            Some("8.8.8.8:33369")
         );
 
         let mut tampered = manifest;
@@ -1849,19 +2517,25 @@ mod tests {
 
     #[test]
     fn authenticated_build_info_matches_embedded_pin_but_partial_identity_fails_closed() {
-        let response = NodeBuildInfoResponse {
+        let managed_control_response = NodeBuildInfoResponse {
             commit: MANAGED_NODE_CONTROL_REVISION.into(),
         };
         assert_eq!(
-            validate_node_build_info(&response, MANAGED_NODE_CONTROL_REVISION),
+            validate_node_build_info(&managed_control_response, MANAGED_NODE_CONTROL_REVISION),
+            Ok(())
+        );
+        let embedded_node_response = NodeBuildInfoResponse {
+            commit: EMBEDDED_NODE_REVISION.into(),
+        };
+        assert_eq!(
+            validate_node_build_info(&embedded_node_response, EMBEDDED_NODE_REVISION),
             Ok(())
         );
         assert_eq!(
-            validate_node_build_info(&response, EMBEDDED_NODE_REVISION),
-            Ok(())
-        );
-        assert_eq!(
-            validate_node_build_info(&response, "0000000000000000000000000000000000000000"),
+            validate_node_build_info(
+                &embedded_node_response,
+                "0000000000000000000000000000000000000000"
+            ),
             Err(UpdateError::NodeIdentityMismatch)
         );
         let current_rpc = NodeRpcIdentityCapabilities {
