@@ -154,7 +154,7 @@ jobs:
           DOM_WALLET_REVISION: ${{ github.sha }}
         with:
           projectPath: src-tauri
-          args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --config '{"bundle":{"createUpdaterArtifacts":false}}' -- --locked
+          args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --config '{"bundle":{"createUpdaterArtifacts":true}}' --no-sign -- --locked
       - name: Test native bridge in packaged Linux application
         if: runner.os == 'Linux'
         shell: bash
