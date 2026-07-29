@@ -13,7 +13,9 @@ use dom_wallet_core_recovery::{
     finalize_recoverable_transaction, CanonicalWalletSeed, RecoverableOutputBuilder,
     RecoverableSenderParts, WalletSlateInput, CANONICAL_TRANSACTION_OUTPUT_SIZE,
 };
-use dom_wallet_core_restore::{apply_recovery_batch, rewind_recovery_state, SeedRestoreResult};
+use dom_wallet_core_restore::{
+    apply_recovery_batch, offline_restore_state, rewind_recovery_state, SeedRestoreResult,
+};
 use dom_wallet_core_submit::{
     CanonicalTransactionSubmission, WalletSubmissionOutcome, WalletSubmissionQuery,
     WalletTransactionIdentifier, WalletTransactionStatus,
@@ -27,8 +29,8 @@ use dom_wallet_domain::{
     cancellation_decision, BalanceProjection, BroadcastExposure, CancellationDecision,
     LocalTransactionIntent, MiningPreferences, Network, NetworkIdentity, NodeConfiguration,
     OutputRecord, OutputState, PrivateTransactionContext, RecoveryMetadata, RecoveryOutputClass,
-    RedactedNodeConfiguration, TransactionLifecycle, TransactionRole,
-    TransactionTransitionEvidence, WalletState, RECOVERY_SCHEME_BIP39_256_V1,
+    RedactedNodeConfiguration, SeedRestoreStatus, SyncStatus, TransactionLifecycle,
+    TransactionRole, TransactionTransitionEvidence, WalletState, RECOVERY_SCHEME_BIP39_256_V1,
 };
 use dom_wallet_embedded_core::{EmbeddedCoreConfiguration, EmbeddedPeerStatus};
 use dom_wallet_production_backend::{
@@ -71,6 +73,15 @@ pub struct WalletSummary {
     pub network: Network,
     pub generation: u64,
     pub cursor_height: Option<u64>,
+    /// Canonical tip height observed by the last committed scan batch or, when
+    /// no batch has committed yet, by the embedded Core identity.
+    #[serde(default)]
+    pub tip_height: Option<u64>,
+    /// Redacted seed-restore progress: `in_progress` while the canonical
+    /// recovery scan is still catching up, `complete` afterwards.
+    #[serde(default)]
+    pub seed_restore_status: Option<String>,
+    /// Partial balances are exposed while synchronizing; they grow per batch.
     pub balance: BalanceProjection,
     pub state: String,
     pub experimental: bool,
@@ -180,6 +191,8 @@ pub struct WalletService {
     backend: Option<ProductionWalletBackend>,
     sender_secrets: Option<(Uuid, RecoverableSenderParts)>,
     errors: ErrorDomainSnapshot,
+    /// Last canonical tip height observed from a committed batch or Core identity.
+    observed_tip_height: Option<u64>,
 }
 
 impl fmt::Debug for WalletService {
@@ -208,6 +221,7 @@ impl Default for WalletService {
             backend: None,
             sender_secrets: None,
             errors: ErrorDomainSnapshot::default(),
+            observed_tip_height: None,
         }
     }
 }
@@ -375,6 +389,7 @@ impl WalletService {
             connected: true,
         };
         self.backend = Some(backend);
+        self.observed_tip_height = Some(identity.current_tip.height);
         Ok(result)
     }
 
@@ -506,6 +521,55 @@ impl WalletService {
         )
         .map(|value| value.encode())
         .map_err(CoreError::from)
+    }
+
+    /// Immediate offline restore: parse the mnemonic and create the encrypted
+    /// wallet directly at `path` with the canonical Mainnet identity, without
+    /// requiring any backend or node. The wallet is left `Locked` and ready to
+    /// unlock; `seed_restore_status` stays `in_progress` and the canonical
+    /// recovery scan runs later on the normal synchronization path, which
+    /// applies recovery per page and commits cursor plus state atomically.
+    pub fn restore_from_mnemonic_offline(
+        &mut self,
+        path: impl AsRef<Path>,
+        password: &str,
+        phrase: &str,
+    ) -> Result<WalletSummary, CoreError> {
+        self.restore_from_mnemonic_offline_with_identity(
+            path,
+            password,
+            phrase,
+            mainnet_network_identity()?,
+        )
+    }
+
+    /// Offline restore bound to an explicit network identity. Production uses
+    /// the Mainnet wrapper; non-Mainnet identities exist for embedded regtest
+    /// and test harnesses. When a backend is already running its identity must
+    /// match the requested one.
+    pub fn restore_from_mnemonic_offline_with_identity(
+        &mut self,
+        path: impl AsRef<Path>,
+        password: &str,
+        phrase: &str,
+        identity: NetworkIdentity,
+    ) -> Result<WalletSummary, CoreError> {
+        self.ensure_closed()?;
+        validate_password(password)?;
+        if let Some(backend) = &self.backend {
+            require_domain_identity(&identity, backend.identity())?;
+        }
+        let seed =
+            CanonicalWalletSeed::parse(phrase).map_err(|_| CoreError::RecoveryPhraseInvalid)?;
+        let state = offline_restore_state(&seed, identity);
+        let directory = WalletDirectory::create(path, &state, password, self.kdf)?;
+        self.metadata = Some(directory.metadata()?);
+        self.location = Some(directory);
+        self.state = ApplicationState::Locked;
+        let mut summary = self.summary_locked()?;
+        summary.seed_restore_status =
+            Some(seed_restore_status_name(SeedRestoreStatus::InProgress).into());
+        Ok(summary)
     }
 
     pub fn restore_from_mnemonic(
@@ -679,6 +743,7 @@ impl WalletService {
         Ok(summary_from_state(
             state,
             application_state_name(&self.state),
+            self.observed_tip_height,
         ))
     }
 
@@ -689,6 +754,8 @@ impl WalletService {
             network: metadata.identity.network,
             generation: metadata.active_generation,
             cursor_height: None,
+            tip_height: self.observed_tip_height,
+            seed_restore_status: None,
             balance: BalanceProjection::default(),
             state: application_state_name(&self.state).into(),
             experimental: true,
@@ -753,6 +820,10 @@ impl WalletService {
         self.state = ApplicationState::Synchronizing;
         let result = backend.reconcile_once(&mut sink);
         self.backend = Some(backend);
+        self.observed_tip_height = sink
+            .observed_tip_height
+            .or(self.observed_tip_height)
+            .or(Some(sink.identity.current_tip.height));
         self.unlocked = Some(sink.state);
         match result {
             Ok(_) => {
@@ -817,6 +888,10 @@ impl WalletService {
         self.state = ApplicationState::Synchronizing;
         let result = backend.reconcile_page(&mut sink);
         self.backend = Some(backend);
+        self.observed_tip_height = sink
+            .observed_tip_height
+            .or(self.observed_tip_height)
+            .or(Some(sink.identity.current_tip.height));
         self.unlocked = Some(sink.state);
         match result {
             Ok(_) => {
@@ -849,6 +924,12 @@ impl WalletService {
         rewind_recovery_state(&mut state, 0, tip);
         state.core_scan_cursor = None;
         state.recovery_canonical_blocks.clear();
+        // A genesis rescan restarts the whole-history totals. This also clears
+        // any residue that pre-window states accumulated for pruned heights,
+        // keeping the durable counters coherent with the emptied window.
+        state.recovery_scanned_blocks = 0;
+        state.recovery_scanned_outputs = 0;
+        state.legacy_proof_only_outputs = 0;
         self.commit(state)?;
         self.synchronize()
     }
@@ -1740,6 +1821,7 @@ struct WalletRecoverySink {
     kdf: KdfParameters,
     seed: CanonicalWalletSeed,
     identity: CoreChainIdentity,
+    observed_tip_height: Option<u64>,
 }
 
 impl WalletRecoverySink {
@@ -1758,6 +1840,7 @@ impl WalletRecoverySink {
             kdf,
             seed,
             identity,
+            observed_tip_height: None,
         }
     }
 
@@ -1782,12 +1865,25 @@ impl WalletRecoverySink {
             batch,
         )?;
         next.core_scan_cursor = Some(cursor.as_bytes().to_vec());
+        // An offline-restored wallet completes its seed restore the moment the
+        // committed cursor anchor catches up with the observed canonical tip.
+        if next.seed_restore_status == Some(SeedRestoreStatus::InProgress) {
+            let anchor_height = cursor
+                .decode()
+                .map_err(|_| CoreError::InvalidCoreCursor)?
+                .anchor_height;
+            if anchor_height >= batch.observed_tip.height {
+                next.seed_restore_status = Some(SeedRestoreStatus::Complete);
+                next.sync_status = SyncStatus::Synced;
+            }
+        }
         self.state = self.directory.commit(
             self.state.generation,
             next,
             self.password.as_str(),
             self.kdf,
         )?;
+        self.observed_tip_height = Some(batch.observed_tip.height);
         Ok(())
     }
 }
@@ -1866,6 +1962,28 @@ fn require_domain_identity(
         Err(CoreError::IdentityMismatch)
     } else {
         Ok(())
+    }
+}
+
+/// Canonical Mainnet identity assembled from the frozen desktop constants.
+pub fn mainnet_network_identity() -> Result<NetworkIdentity, CoreError> {
+    let mut chain_id = [0u8; 32];
+    let mut genesis_id = [0u8; 32];
+    hex::decode_to_slice(MAINNET_CHAIN_ID_HEX, &mut chain_id)
+        .map_err(|_| CoreError::IdentityMismatch)?;
+    hex::decode_to_slice(MAINNET_GENESIS_HASH_HEX, &mut genesis_id)
+        .map_err(|_| CoreError::IdentityMismatch)?;
+    Ok(NetworkIdentity {
+        network: Network::Mainnet,
+        chain_id,
+        genesis_id,
+    })
+}
+
+fn seed_restore_status_name(status: SeedRestoreStatus) -> &'static str {
+    match status {
+        SeedRestoreStatus::InProgress => "in_progress",
+        SeedRestoreStatus::Complete => "complete",
     }
 }
 
@@ -2057,7 +2175,11 @@ fn apply_submission_query(
     Ok(())
 }
 
-fn summary_from_state(state: &WalletState, application_state: &str) -> WalletSummary {
+fn summary_from_state(
+    state: &WalletState,
+    application_state: &str,
+    observed_tip_height: Option<u64>,
+) -> WalletSummary {
     WalletSummary {
         wallet_id: state.wallet_id,
         network: state.identity.network,
@@ -2067,6 +2189,10 @@ fn summary_from_state(state: &WalletState, application_state: &str) -> WalletSum
             .as_deref()
             .and_then(|bytes| WalletScanCursor::from_bytes(bytes).ok())
             .map(|cursor| cursor.anchor_height),
+        tip_height: observed_tip_height,
+        seed_restore_status: state
+            .seed_restore_status
+            .map(|status| seed_restore_status_name(status).into()),
         balance: state.balance(),
         state: application_state.into(),
         experimental: true,
@@ -2710,6 +2836,178 @@ mod tests {
         assert!(dom_wallet_core_recovery::PRODUCTION_OUTPUT_PATHS
             .iter()
             .all(|path| path.recovery_required));
+    }
+
+    #[test]
+    fn regression_offline_restore_creates_locked_wallet_without_backend() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("offline");
+        let mut service = test_service();
+        let phrase = CanonicalWalletSeed::from_entropy(&[0x11; 32])
+            .unwrap()
+            .mnemonic_text();
+
+        let summary = service
+            .restore_from_mnemonic_offline_with_identity(
+                &path,
+                "password-1",
+                phrase.as_str(),
+                backup_identity(),
+            )
+            .unwrap();
+        assert_eq!(summary.state, "LOCKED");
+        assert_eq!(summary.seed_restore_status.as_deref(), Some("in_progress"));
+        assert!(summary.cursor_height.is_none());
+        assert!(summary.tip_height.is_none());
+        assert_eq!(summary.balance, BalanceProjection::default());
+
+        let unlocked = service.unlock("password-1").unwrap();
+        assert_eq!(unlocked.state, "READY");
+        assert_eq!(unlocked.seed_restore_status.as_deref(), Some("in_progress"));
+        assert!(unlocked.cursor_height.is_none());
+        let state = service.unlocked.as_ref().unwrap();
+        assert_eq!(state.sync_status, SyncStatus::Synchronizing);
+        assert!(state.core_scan_cursor.is_none());
+        assert!(state
+            .recovery
+            .as_ref()
+            .is_some_and(|recovery| recovery.phrase_confirmed));
+        assert!(matches!(
+            service.recovery_phrase_resume("password-1"),
+            Err(CoreError::RecoveryPhraseAlreadyConfirmed)
+        ));
+        // Scanning is deferred and gated only on the embedded Core being
+        // available, never on restore staging or IBD completion.
+        assert!(matches!(
+            service.synchronize(),
+            Err(CoreError::EmbeddedCoreRequired)
+        ));
+
+        // The wallet survives a full close/open/unlock round-trip.
+        service.close().unwrap();
+        service.open(&path).unwrap();
+        service.unlock("password-1").unwrap();
+        assert_eq!(
+            service.summary().unwrap().seed_restore_status.as_deref(),
+            Some("in_progress")
+        );
+
+        // Restoring onto an existing destination fails closed.
+        let mut second = test_service();
+        assert!(second
+            .restore_from_mnemonic_offline_with_identity(
+                &path,
+                "password-1",
+                phrase.as_str(),
+                backup_identity(),
+            )
+            .is_err());
+        // Invalid phrases never create a directory.
+        let mut invalid = test_service();
+        assert!(matches!(
+            invalid.restore_from_mnemonic_offline_with_identity(
+                temp.path().join("invalid"),
+                "password-1",
+                "not a valid canonical mnemonic",
+                backup_identity(),
+            ),
+            Err(CoreError::RecoveryPhraseInvalid)
+        ));
+        assert!(!temp.path().join("invalid").exists());
+    }
+
+    #[test]
+    fn offline_restore_mainnet_wrapper_binds_the_canonical_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("mainnet-offline");
+        let mut service = test_service();
+        let phrase = CanonicalWalletSeed::from_entropy(&[0x12; 32])
+            .unwrap()
+            .mnemonic_text();
+        let summary = service
+            .restore_from_mnemonic_offline(&path, "password-1", phrase.as_str())
+            .unwrap();
+        assert_eq!(summary.network, Network::Mainnet);
+        service.unlock("password-1").unwrap();
+        let state = service.unlocked.as_ref().unwrap();
+        require_mainnet_identity(&state.identity).unwrap();
+    }
+
+    #[test]
+    fn regression_offline_restore_then_embedded_sync_completes_restore() {
+        use std::time::{Duration, Instant};
+
+        let node_directory = tempfile::tempdir().unwrap();
+        let wallet_directory = tempfile::tempdir().unwrap();
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral embedded-core listener");
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let mut service = test_service();
+        let phrase = CanonicalWalletSeed::from_entropy(&[0x13; 32])
+            .unwrap()
+            .mnemonic_text();
+
+        // Capture the embedded Regtest identity, then restore fully offline.
+        service
+            .start_embedded_core(EmbeddedCoreConfiguration::new(
+                dom_wallet_embedded_core::EmbeddedCoreNetwork::Regtest,
+                node_directory.path(),
+                address,
+            ))
+            .unwrap();
+        let core_identity = service.embedded_core_cached_identity().unwrap();
+        let identity = NetworkIdentity {
+            network: map_network(core_identity.network),
+            chain_id: core_identity.chain_id,
+            genesis_id: core_identity.genesis_hash,
+        };
+        service.stop_embedded_core().unwrap();
+
+        let path = wallet_directory.path().join("wallet");
+        let restored = service
+            .restore_from_mnemonic_offline_with_identity(
+                &path,
+                "password-1",
+                phrase.as_str(),
+                identity,
+            )
+            .unwrap();
+        assert_eq!(restored.seed_restore_status.as_deref(), Some("in_progress"));
+        service.unlock("password-1").unwrap();
+
+        // The later synchronization pass performs the canonical recovery scan
+        // and completes the restore once the cursor reaches the observed tip.
+        service
+            .start_embedded_core(EmbeddedCoreConfiguration::new(
+                dom_wallet_embedded_core::EmbeddedCoreNetwork::Regtest,
+                node_directory.path(),
+                address,
+            ))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let synced = loop {
+            match service.synchronize() {
+                Ok(summary) => break summary,
+                Err(CoreError::NodeNotReady) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(CoreError::Backend(error))
+                    if error.is_transient_sync_unavailability() && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(error) => panic!("synchronization failed: {error:?}"),
+            }
+        };
+        assert_eq!(synced.seed_restore_status.as_deref(), Some("complete"));
+        assert_eq!(synced.cursor_height, Some(0));
+        assert_eq!(synced.tip_height, Some(0));
+        assert!(synced.balance.total == 0);
+        let state = service.unlocked.as_ref().unwrap();
+        assert_eq!(state.sync_status, SyncStatus::Synced);
+        assert_eq!(state.seed_restore_status, Some(SeedRestoreStatus::Complete));
+        service.close().unwrap();
     }
 
     #[test]

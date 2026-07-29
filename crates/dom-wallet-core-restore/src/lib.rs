@@ -37,6 +37,20 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 pub const DEFAULT_RESTORE_BATCH_BLOCKS: u64 = 256;
 /// Default bounded canonical reorganization search.
 pub const DEFAULT_RESTORE_REORG_DEPTH: u64 = 1_024;
+/// Rolling window of canonical block anchors retained for reorg detection.
+///
+/// `recovery_canonical_blocks` is pruned to the most recent
+/// `RECOVERY_CANONICAL_WINDOW_BLOCKS` scanned heights so encrypted state stays
+/// bounded on long chains (the full list previously grew without limit toward
+/// the 16 MiB storage ceiling). The window must be at least as deep as every
+/// configured reorg search bound — `DEFAULT_RESTORE_REORG_DEPTH` here and the
+/// production backend reorg depth, both 1_024 — because `find_safe_anchor`
+/// walks at most `reorg_depth` heights below the invalidated cursor anchor and
+/// every one of those heights must still have a committed local hash.
+/// Whole-history totals (scanned blocks/outputs and legacy proof-only counts)
+/// are kept in durable counters that survive pruning.
+pub const RECOVERY_CANONICAL_WINDOW_BLOCKS: u64 = 2_048;
+const _: () = assert!(RECOVERY_CANONICAL_WINDOW_BLOCKS >= DEFAULT_RESTORE_REORG_DEPTH);
 /// Maximum transient Core lock collisions retried for one restore page.
 pub const DEFAULT_RESTORE_BUSY_RETRY_ATTEMPTS: u32 = 12;
 /// Initial bounded delay after a transient Core lock collision.
@@ -563,9 +577,10 @@ pub fn apply_recovery_batch(
         )?;
     }
 
+    migrate_durable_scan_counters(state)?;
     let mut page_inputs = BTreeSet::new();
     for block in &batch.blocks {
-        let legacy_count = block
+        let legacy_count: u32 = block
             .outputs
             .iter()
             .filter(|output| output.recovery_version == 0 && output.recovery_capsule.is_empty())
@@ -581,19 +596,32 @@ pub fn apply_recovery_batch(
                 return Err(SeedRestoreError::ConflictingOutput);
             }
         } else {
+            let output_count: u32 = block
+                .outputs
+                .len()
+                .try_into()
+                .map_err(|_| SeedRestoreError::MalformedRecovery)?;
             state
                 .recovery_canonical_blocks
                 .push(RecoveryCanonicalBlock {
                     height: block.height,
                     block_hash: block.block_hash,
                     previous_block_hash: block.previous_block_hash,
-                    output_count: block
-                        .outputs
-                        .len()
-                        .try_into()
-                        .map_err(|_| SeedRestoreError::MalformedRecovery)?,
+                    output_count,
                     legacy_proof_only_outputs: legacy_count,
                 });
+            state.recovery_scanned_blocks = state
+                .recovery_scanned_blocks
+                .checked_add(1)
+                .ok_or(SeedRestoreError::CoordinateOverflow)?;
+            state.recovery_scanned_outputs = state
+                .recovery_scanned_outputs
+                .checked_add(u64::from(output_count))
+                .ok_or(SeedRestoreError::CoordinateOverflow)?;
+            state.legacy_proof_only_outputs = state
+                .legacy_proof_only_outputs
+                .checked_add(u64::from(legacy_count))
+                .ok_or(SeedRestoreError::CoordinateOverflow)?;
         }
         for input in &block.inputs {
             if !page_inputs.insert(input.spent_commitment) {
@@ -621,14 +649,48 @@ pub fn apply_recovery_batch(
     state
         .recovery_canonical_blocks
         .sort_by_key(|block| block.height);
-    state.legacy_proof_only_outputs = state
-        .recovery_canonical_blocks
-        .iter()
-        .map(|block| u64::from(block.legacy_proof_only_outputs))
-        .try_fold(0u64, u64::checked_add)
-        .ok_or(SeedRestoreError::CoordinateOverflow)?;
+    prune_recovery_canonical_window(state);
     refresh_maturity(state, batch.observed_tip.height, identity.coinbase_maturity)?;
     Ok(())
+}
+
+/// Migrate a pre-window state that still carries its complete canonical block
+/// list: seed the durable scan counters from the full list once, before new
+/// blocks are appended and the list is pruned to the rolling window. Legacy
+/// states already persist `legacy_proof_only_outputs` as the whole-history sum,
+/// so that counter is carried forward unchanged.
+fn migrate_durable_scan_counters(state: &mut WalletState) -> Result<(), SeedRestoreError> {
+    if state.recovery_scanned_blocks != 0 || state.recovery_canonical_blocks.is_empty() {
+        return Ok(());
+    }
+    state.recovery_scanned_blocks = state.recovery_canonical_blocks.len() as u64;
+    state.recovery_scanned_outputs = state
+        .recovery_canonical_blocks
+        .iter()
+        .map(|block| u64::from(block.output_count))
+        .try_fold(0u64, u64::checked_add)
+        .ok_or(SeedRestoreError::CoordinateOverflow)?;
+    Ok(())
+}
+
+/// Prune canonical block anchors below the rolling reorg window. Durable scan
+/// counters and `legacy_proof_only_outputs` retain the whole-history totals.
+pub fn prune_recovery_canonical_window(state: &mut WalletState) {
+    let Some(last) = state.recovery_canonical_blocks.last() else {
+        return;
+    };
+    let minimum = last
+        .height
+        .saturating_sub(RECOVERY_CANONICAL_WINDOW_BLOCKS.saturating_sub(1));
+    if state
+        .recovery_canonical_blocks
+        .first()
+        .is_some_and(|first| first.height < minimum)
+    {
+        state
+            .recovery_canonical_blocks
+            .retain(|block| block.height >= minimum);
+    }
 }
 
 fn merge_restored_output(
@@ -752,6 +814,11 @@ fn refresh_maturity(
 }
 
 /// Rewind canonical recovery evidence while preserving allocation non-reuse floors.
+///
+/// Rewound blocks are always inside the retained rolling window because every
+/// reorg search bound is at most `RECOVERY_CANONICAL_WINDOW_BLOCKS`, so the
+/// durable scan counters can be decremented exactly; the replacement batch
+/// re-increments them when the reorganized heights are scanned again.
 pub fn rewind_recovery_state(state: &mut WalletState, safe_height: u64, tip_height: u64) {
     let removed_ids = state
         .outputs
@@ -768,6 +835,25 @@ pub fn rewind_recovery_state(state: &mut WalletState, safe_height: u64, tip_heig
     state
         .recovered_output_metadata
         .retain(|metadata| !removed_ids.contains(&metadata.output_id));
+    let mut rewound_blocks = 0u64;
+    let mut rewound_outputs = 0u64;
+    let mut rewound_legacy = 0u64;
+    for block in state
+        .recovery_canonical_blocks
+        .iter()
+        .filter(|block| block.height > safe_height)
+    {
+        rewound_blocks = rewound_blocks.saturating_add(1);
+        rewound_outputs = rewound_outputs.saturating_add(u64::from(block.output_count));
+        rewound_legacy = rewound_legacy.saturating_add(u64::from(block.legacy_proof_only_outputs));
+    }
+    state.recovery_scanned_blocks = state.recovery_scanned_blocks.saturating_sub(rewound_blocks);
+    state.recovery_scanned_outputs = state
+        .recovery_scanned_outputs
+        .saturating_sub(rewound_outputs);
+    state.legacy_proof_only_outputs = state
+        .legacy_proof_only_outputs
+        .saturating_sub(rewound_legacy);
     state
         .recovery_canonical_blocks
         .retain(|block| block.height <= safe_height);
@@ -881,13 +967,21 @@ fn initial_restore_state(
     seed: &CanonicalWalletSeed,
     identity: &CoreChainIdentity,
 ) -> Result<WalletState, SeedRestoreError> {
-    let domain_identity = domain_identity(identity);
+    Ok(offline_restore_state(seed, domain_identity(identity)))
+}
+
+/// Build the initial encrypted state for an immediate offline mnemonic
+/// restore: recovery-eligible, restore marked in progress, synchronization
+/// pending, and no Core cursor. The canonical recovery scan happens later on
+/// the normal synchronization path, which applies recovery per page and
+/// commits the cursor and the state in one atomic generation.
+pub fn offline_restore_state(seed: &CanonicalWalletSeed, identity: NetworkIdentity) -> WalletState {
     let mut entropy = Zeroizing::new([0u8; 32]);
     seed.copy_entropy_to(&mut entropy);
     let mut state = WalletState::new(
-        domain_identity.clone(),
+        identity.clone(),
         *entropy,
-        default_node_configuration(domain_identity),
+        default_node_configuration(identity),
     );
     state.recovery = Some(RecoveryMetadata {
         scheme: RECOVERY_SCHEME_BIP39_256_V1.into(),
@@ -895,7 +989,26 @@ fn initial_restore_state(
     });
     state.seed_restore_status = Some(SeedRestoreStatus::InProgress);
     state.sync_status = SyncStatus::Synchronizing;
-    Ok(state)
+    state
+}
+
+/// Whole-history scan totals: durable counters when present, otherwise the
+/// complete pre-window canonical block list.
+fn durable_scan_totals(state: &WalletState) -> Result<(u64, u64), SeedRestoreError> {
+    if state.recovery_scanned_blocks != 0 {
+        return Ok((
+            state.recovery_scanned_blocks,
+            state.recovery_scanned_outputs,
+        ));
+    }
+    let outputs = state
+        .recovery_canonical_blocks
+        .iter()
+        .try_fold(0u64, |total, block| {
+            total.checked_add(u64::from(block.output_count))
+        })
+        .ok_or(SeedRestoreError::CoordinateOverflow)?;
+    Ok((state.recovery_canonical_blocks.len() as u64, outputs))
 }
 
 fn validate_checkpoint(
@@ -981,13 +1094,7 @@ fn result_from_state(
         .iter()
         .filter(|metadata| metadata.is_coinbase)
         .count() as u64;
-    let scanned_outputs = state
-        .recovery_canonical_blocks
-        .iter()
-        .try_fold(0u64, |total, block| {
-            total.checked_add(u64::from(block.output_count))
-        })
-        .ok_or(SeedRestoreError::CoordinateOverflow)?;
+    let (scanned_blocks, scanned_outputs) = durable_scan_totals(state)?;
     let mut warnings = vec![SeedRestoreWarning::OffChainMetadataNotRecoverableWithSeed];
     if state.legacy_proof_only_outputs != 0 {
         warnings.push(SeedRestoreWarning::LegacyBackupRequired);
@@ -1000,7 +1107,7 @@ fn result_from_state(
         },
         network: identity.network,
         chain_id: identity.chain_id,
-        scanned_blocks: state.recovery_canonical_blocks.len() as u64,
+        scanned_blocks,
         scanned_outputs,
         owned_outputs: state.outputs.len() as u64,
         spent_outputs,

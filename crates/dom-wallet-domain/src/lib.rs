@@ -781,6 +781,16 @@ pub struct WalletState {
     /// Count of canonical proof-only outputs observed during recovery.
     #[serde(default)]
     pub legacy_proof_only_outputs: u64,
+    /// Durable count of canonical blocks scanned by recovery. Unlike
+    /// `recovery_canonical_blocks`, which is pruned to a rolling reorg window,
+    /// this counter covers the whole scanned history. Zero means the state
+    /// predates the counter and still carries the complete block list.
+    #[serde(default)]
+    pub recovery_scanned_blocks: u64,
+    /// Durable count of canonical outputs observed by recovery, maintained
+    /// alongside `recovery_scanned_blocks` across window pruning.
+    #[serde(default)]
+    pub recovery_scanned_outputs: u64,
     pub node_configuration: NodeConfiguration,
     /// Non-secret local CPU mining preferences. Runtime mining state is never persisted.
     #[serde(default)]
@@ -833,6 +843,8 @@ impl WalletState {
             recovered_output_metadata: Vec::new(),
             seed_restore_status: None,
             legacy_proof_only_outputs: 0,
+            recovery_scanned_blocks: 0,
+            recovery_scanned_outputs: 0,
             node_configuration,
             mining_preferences: MiningPreferences::default(),
             root_material,
@@ -916,6 +928,11 @@ impl WalletState {
                 blocks[1].height != blocks[0].height.saturating_add(1)
                     || blocks[1].previous_block_hash != blocks[0].block_hash
             })
+            // A nonzero durable counter must cover at least the retained
+            // rolling window. Zero marks a pre-counter state whose complete
+            // block list migrates on the next recovery batch.
+            || (self.recovery_scanned_blocks != 0
+                && self.recovery_scanned_blocks < self.recovery_canonical_blocks.len() as u64)
         {
             return Err(DomainError::InvalidState);
         }
@@ -1898,6 +1915,8 @@ mod tests {
             "recovered_output_metadata",
             "seed_restore_status",
             "legacy_proof_only_outputs",
+            "recovery_scanned_blocks",
+            "recovery_scanned_outputs",
         ] {
             object.remove(field);
         }
@@ -1908,6 +1927,8 @@ mod tests {
         assert!(decoded.recovered_output_metadata.is_empty());
         assert!(decoded.seed_restore_status.is_none());
         assert_eq!(decoded.legacy_proof_only_outputs, 0);
+        assert_eq!(decoded.recovery_scanned_blocks, 0);
+        assert_eq!(decoded.recovery_scanned_outputs, 0);
         decoded.validate().unwrap();
     }
 
