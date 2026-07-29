@@ -50,6 +50,47 @@ pub const MAINNET_DNS_SEEDS: [&str; 3] = [
 /// Canonical Mainnet P2P port.
 pub const MAINNET_P2P_PORT: u16 = 33_369;
 
+/// Outbound peers the embedded Mainnet node keeps connected.
+///
+/// This was 1, and a single peer is a single point of truth: the wallet
+/// bootstrapped against one seed that was ~4400 blocks behind the real tip and
+/// had no second opinion to notice, while losing that one peer stalled
+/// synchronization outright. Several peers make a stale or lying seed visible
+/// immediately and keep the wallet alive when one drops.
+///
+/// Upstream's own Mainnet default is 8, which is also the connector's
+/// `max_in_flight_attempts` ceiling — asking for more would be silently capped.
+pub const MAINNET_OUTBOUND_PEER_TARGET: usize = 8;
+
+/// Inbound slots on Mainnet. The wallet is a leaf client that dials out and
+/// never advertises itself, so this stays small; it does not limit the outbound
+/// connections that carry synchronization.
+pub const MAINNET_INBOUND_PEER_LIMIT: usize = 4;
+
+/// LMDB map-exhaustion sentinel emitted by the protocol store layer
+/// (`dom-store`). The embedded adapter surfaces this exact code so the
+/// desktop shell can restart the node with a doubled map size.
+pub const LMDB_MAP_FULL_ERROR_CODE: &str = "LMDB_MAP_FULL";
+
+/// Smallest LMDB map size the Wallet accepts (64 MiB); anything below this
+/// cannot even hold the genesis chain state plus store metadata.
+pub const MINIMUM_LMDB_MAP_SIZE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Platform-conscious default LMDB map size for the embedded node.
+///
+/// LMDB reserves the whole map eagerly in the on-disk file allocation on
+/// Windows (no sparse punch-through as on unix), so a 16 GiB default there
+/// immediately claims 16 GiB of disk. Windows therefore starts at 4 GiB and
+/// grows on demand when the shell observes [`LMDB_MAP_FULL_ERROR_CODE`];
+/// unix keeps the upstream 16 GiB default.
+pub fn default_lmdb_map_size() -> usize {
+    if cfg!(windows) {
+        4 * 1024 * 1024 * 1024
+    } else {
+        16 * 1024 * 1024 * 1024
+    }
+}
+
 /// Network selected for the embedded node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbeddedCoreNetwork {
@@ -79,6 +120,7 @@ pub struct EmbeddedCoreConfiguration {
     p2p_listen_address: SocketAddr,
     maximum_inbound_peers: usize,
     seed_peers: Vec<SocketAddr>,
+    lmdb_map_size: Option<usize>,
 }
 
 impl EmbeddedCoreConfiguration {
@@ -94,6 +136,7 @@ impl EmbeddedCoreConfiguration {
             p2p_listen_address,
             maximum_inbound_peers: 32,
             seed_peers: Vec::new(),
+            lmdb_map_size: None,
         }
     }
 
@@ -104,7 +147,7 @@ impl EmbeddedCoreConfiguration {
             data_directory,
             p2p_listen_address,
         )
-        .with_maximum_inbound_peers(1)
+        .with_maximum_inbound_peers(MAINNET_INBOUND_PEER_LIMIT)
     }
 
     /// Set the maximum inbound peer count.
@@ -117,6 +160,21 @@ impl EmbeddedCoreConfiguration {
     pub fn with_seed_peers(mut self, peers: Vec<SocketAddr>) -> Self {
         self.seed_peers = deduplicate_socket_addresses(peers);
         self
+    }
+
+    /// Override the LMDB map size used by `DomNode::init_with_map_size`.
+    ///
+    /// Without an override the platform-conscious [`default_lmdb_map_size`]
+    /// applies. The shell persists and doubles this value after observing
+    /// [`LMDB_MAP_FULL_ERROR_CODE`].
+    pub fn with_lmdb_map_size(mut self, map_size: usize) -> Self {
+        self.lmdb_map_size = Some(map_size);
+        self
+    }
+
+    /// Effective LMDB map size: the explicit override or the platform default.
+    pub fn lmdb_map_size(&self) -> usize {
+        self.lmdb_map_size.unwrap_or_else(default_lmdb_map_size)
     }
 
     fn validate(&self) -> Result<(), EmbeddedCoreAdapterError> {
@@ -138,6 +196,14 @@ impl EmbeddedCoreConfiguration {
         if self.seed_peers.iter().any(|peer| peer.port() == 0) {
             return Err(EmbeddedCoreAdapterError::InvalidConfiguration {
                 code: "ZERO_SEED_PORT",
+            });
+        }
+        if self
+            .lmdb_map_size
+            .is_some_and(|map_size| map_size < MINIMUM_LMDB_MAP_SIZE_BYTES)
+        {
+            return Err(EmbeddedCoreAdapterError::InvalidConfiguration {
+                code: "LMDB_MAP_SIZE_TOO_SMALL",
             });
         }
         if self.network == EmbeddedCoreNetwork::Mainnet
@@ -164,7 +230,11 @@ impl EmbeddedCoreConfiguration {
         config.data_dir = self.data_directory.to_string_lossy().into_owned();
         config.p2p_listen_addr = self.p2p_listen_address.to_string();
         config.max_inbound = self.maximum_inbound_peers;
-        config.min_outbound = usize::from(self.network == EmbeddedCoreNetwork::Mainnet);
+        config.min_outbound = if self.network == EmbeddedCoreNetwork::Mainnet {
+            MAINNET_OUTBOUND_PEER_TARGET
+        } else {
+            0
+        };
         // The Wallet owns DNS discovery so each seed has independent bounded
         // backoff. Core's resolver logs every failed seed on every connector
         // pass and is therefore deliberately disabled here.
@@ -390,10 +460,21 @@ impl EmbeddedCoreLifecycle {
         self.lifecycle.store(STATE_STARTING, Ordering::Release);
 
         let node = Arc::new(
-            DomNode::init(self.configuration.node_config()).map_err(|_| {
+            DomNode::init_with_map_size(
+                self.configuration.node_config(),
+                self.configuration.lmdb_map_size(),
+            )
+            .map_err(|error| {
                 self.lifecycle.store(STATE_FAILED, Ordering::Release);
                 EmbeddedCoreAdapterError::InitializationFailed {
-                    code: "DOM_NODE_INIT",
+                    // The store layer tags MDB_MAP_FULL with a stable sentinel;
+                    // surface it verbatim so the shell can double the map size
+                    // and retry. Every other cause stays a redacted init code.
+                    code: if format!("{error:?}").contains(LMDB_MAP_FULL_ERROR_CODE) {
+                        LMDB_MAP_FULL_ERROR_CODE
+                    } else {
+                        "DOM_NODE_INIT"
+                    },
                 }
             })?,
         );
@@ -972,13 +1053,19 @@ mod tests {
         address
     }
 
+    /// Configuration for the tests that start a REAL node.
+    ///
+    /// The listen port must be reserved per test: `cargo test` runs these in
+    /// parallel threads inside one process, and a hardcoded port made whichever
+    /// node lost the race die with a bare `DOM_NODE_RUN`, so the suite failed
+    /// on an arbitrary one of these tests while every one of them passed alone.
     fn regtest_configuration(directory: &Path) -> EmbeddedCoreConfiguration {
-        EmbeddedCoreConfiguration::new(
-            EmbeddedCoreNetwork::Regtest,
-            directory,
-            "127.0.0.1:34341".parse().expect("static test address"),
-        )
-        .with_maximum_inbound_peers(2)
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral test listener");
+        let address = listener.local_addr().expect("ephemeral local address");
+        drop(listener);
+        EmbeddedCoreConfiguration::new(EmbeddedCoreNetwork::Regtest, directory, address)
+            .with_maximum_inbound_peers(2)
     }
 
     #[test]
@@ -992,8 +1079,16 @@ mod tests {
         let node = configuration.node_config();
         assert_eq!(node.network, Network::Mainnet);
         assert_eq!(node.p2p_listen_addr, address.to_string());
-        assert_eq!(node.min_outbound, 1);
-        assert_eq!(node.max_inbound, 1);
+        // A single outbound peer is a single point of truth: the wallet used to
+        // bootstrap against one stale seed with no second opinion, and lost all
+        // synchronization when that peer dropped.
+        assert_eq!(node.min_outbound, MAINNET_OUTBOUND_PEER_TARGET);
+        assert!(
+            node.min_outbound >= 5,
+            "Mainnet must keep several outbound peers, got {}",
+            node.min_outbound
+        );
+        assert_eq!(node.max_inbound, MAINNET_INBOUND_PEER_LIMIT);
         assert!(node.disable_dns_seeds);
         assert!(node.dns_seeds.is_empty());
         assert!(configuration.seed_peers.is_empty());
@@ -1011,6 +1106,38 @@ mod tests {
         assert!(node.wallet_path.is_none());
         assert!(node.wallet_password.is_none());
         assert!(node.rpc_listen_addr.is_none());
+    }
+
+    #[test]
+    fn regression_lmdb_map_size_default_is_platform_conscious_and_overridable() {
+        let expected_default = if cfg!(windows) {
+            4 * 1024 * 1024 * 1024
+        } else {
+            16 * 1024 * 1024 * 1024
+        };
+        assert_eq!(default_lmdb_map_size(), expected_default);
+
+        let directory = TempDir::new().expect("temporary directory");
+        let address = "127.0.0.1:34341".parse().expect("static test address");
+        let configuration = EmbeddedCoreConfiguration::mainnet(directory.path(), address);
+        assert_eq!(configuration.lmdb_map_size(), expected_default);
+        configuration.validate().expect("default map size is valid");
+
+        let doubled = expected_default * 2;
+        let grown = EmbeddedCoreConfiguration::mainnet(directory.path(), address)
+            .with_lmdb_map_size(doubled);
+        assert_eq!(grown.lmdb_map_size(), doubled);
+        grown.validate().expect("doubled map size is valid");
+
+        let too_small = EmbeddedCoreConfiguration::mainnet(directory.path(), address)
+            .with_lmdb_map_size(MINIMUM_LMDB_MAP_SIZE_BYTES - 1);
+        assert!(matches!(
+            too_small.validate(),
+            Err(EmbeddedCoreAdapterError::InvalidConfiguration {
+                code: "LMDB_MAP_SIZE_TOO_SMALL",
+            })
+        ));
+        assert_eq!(LMDB_MAP_FULL_ERROR_CODE, "LMDB_MAP_FULL");
     }
 
     #[test]
