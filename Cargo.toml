@@ -19,7 +19,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.9"
+version = "0.3.0"
 edition = "2021"
 authors = ["Soren Planck <sorenplanck@tutamail.com>"]
 repository = "https://github.com/sorenplanck/dom-wallet-v3"
@@ -59,46 +59,20 @@ tauri-plugin-updater = "=2.10.1"
 # sole authority for slate construction, transaction serialization, proof and
 # signature validation.  These are deliberately revision pinned rather than
 # copied into this wallet workspace.
-dom-core = { git = "https://github.com/sorenplanck/dom-protocol", rev = "b5a86a2049986f90558cae12a859759ed0db5c36" }
-dom-crypto = { git = "https://github.com/sorenplanck/dom-protocol", rev = "b5a86a2049986f90558cae12a859759ed0db5c36" }
-dom-consensus = { git = "https://github.com/sorenplanck/dom-protocol", rev = "b5a86a2049986f90558cae12a859759ed0db5c36" }
-dom-serialization = { git = "https://github.com/sorenplanck/dom-protocol", rev = "b5a86a2049986f90558cae12a859759ed0db5c36" }
-dom-tx = { git = "https://github.com/sorenplanck/dom-protocol", rev = "b5a86a2049986f90558cae12a859759ed0db5c36" }
-dom-slate = { git = "https://github.com/sorenplanck/dom-protocol", rev = "b5a86a2049986f90558cae12a859759ed0db5c36" }
-dom-config = { git = "https://github.com/sorenplanck/dom-protocol", rev = "b5a86a2049986f90558cae12a859759ed0db5c36" }
-dom-chain = { git = "https://github.com/sorenplanck/dom-protocol", rev = "b5a86a2049986f90558cae12a859759ed0db5c36" }
-dom-node = { git = "https://github.com/sorenplanck/dom-protocol", rev = "b5a86a2049986f90558cae12a859759ed0db5c36" }
-dom-pow = { git = "https://github.com/sorenplanck/dom-protocol", rev = "b5a86a2049986f90558cae12a859759ed0db5c36" }
-dom-wallet-core-api = { git = "https://github.com/sorenplanck/dom-protocol", rev = "b5a86a2049986f90558cae12a859759ed0db5c36" }
-dom-wallet-recovery = { git = "https://github.com/sorenplanck/dom-protocol", rev = "b5a86a2049986f90558cae12a859759ed0db5c36" }
+dom-core = { git = "https://github.com/sorenplanck/dom-protocol", rev = "387b744474d2414f9d2d0e542bc654096ce2f8ed" }
+dom-crypto = { git = "https://github.com/sorenplanck/dom-protocol", rev = "387b744474d2414f9d2d0e542bc654096ce2f8ed" }
+dom-consensus = { git = "https://github.com/sorenplanck/dom-protocol", rev = "387b744474d2414f9d2d0e542bc654096ce2f8ed" }
+dom-serialization = { git = "https://github.com/sorenplanck/dom-protocol", rev = "387b744474d2414f9d2d0e542bc654096ce2f8ed" }
+dom-tx = { git = "https://github.com/sorenplanck/dom-protocol", rev = "387b744474d2414f9d2d0e542bc654096ce2f8ed" }
+dom-slate = { git = "https://github.com/sorenplanck/dom-protocol", rev = "387b744474d2414f9d2d0e542bc654096ce2f8ed" }
+dom-config = { git = "https://github.com/sorenplanck/dom-protocol", rev = "387b744474d2414f9d2d0e542bc654096ce2f8ed" }
+dom-chain = { git = "https://github.com/sorenplanck/dom-protocol", rev = "387b744474d2414f9d2d0e542bc654096ce2f8ed" }
+dom-node = { git = "https://github.com/sorenplanck/dom-protocol", rev = "387b744474d2414f9d2d0e542bc654096ce2f8ed" }
+dom-pow = { git = "https://github.com/sorenplanck/dom-protocol", rev = "387b744474d2414f9d2d0e542bc654096ce2f8ed" }
+dom-wallet-core-api = { git = "https://github.com/sorenplanck/dom-protocol", rev = "387b744474d2414f9d2d0e542bc654096ce2f8ed" }
+dom-wallet-recovery = { git = "https://github.com/sorenplanck/dom-protocol", rev = "387b744474d2414f9d2d0e542bc654096ce2f8ed" }
 
 # Sidecar release authentication and atomic pointer handling are deliberately
 # consumed from their reviewed protocol commit. This does not move the wallet's
-# consensus crates away from the independent immutable revision above.
+# consensus crates away from the immutable revision above.
 dom-sidecar = { git = "https://github.com/sorenplanck/dom-protocol", rev = "ab45a2944f22fe00f9b12984354f0d5d7cdd229a" }
-
-# TEMPORARY LOCAL PATCH — remote full-fidelity scan development.
-#
-# The Wallet V3 remote restore work consumes the new `/chain/scan/full`
-# endpoint that currently only exists on the local `feat/chain-scan-full`
-# worktree of dom-protocol (rev 5c28a1c, based on the pinned b5a86a2 above).
-# Until that branch is pushed upstream and the `rev =` pins are moved to the
-# published commit, local builds and tests resolve every wallet-consumed
-# dom-protocol crate from the worktree path below. `dom-sidecar` keeps its own
-# independent immutable pin and is deliberately NOT patched.
-#
-# Definitive repin: after the upstream push, delete this whole [patch] table
-# and bump the `rev =` pins in [workspace.dependencies] instead.
-[patch."https://github.com/sorenplanck/dom-protocol"]
-dom-core = { path = "/home/leonardov/dom-protocol-scanfull/crates/dom-core" }
-dom-crypto = { path = "/home/leonardov/dom-protocol-scanfull/crates/dom-crypto" }
-dom-consensus = { path = "/home/leonardov/dom-protocol-scanfull/crates/dom-consensus" }
-dom-serialization = { path = "/home/leonardov/dom-protocol-scanfull/crates/dom-serialization" }
-dom-tx = { path = "/home/leonardov/dom-protocol-scanfull/crates/dom-tx" }
-dom-slate = { path = "/home/leonardov/dom-protocol-scanfull/crates/dom-slate" }
-dom-config = { path = "/home/leonardov/dom-protocol-scanfull/crates/dom-config" }
-dom-chain = { path = "/home/leonardov/dom-protocol-scanfull/crates/dom-chain" }
-dom-node = { path = "/home/leonardov/dom-protocol-scanfull/crates/dom-node" }
-dom-pow = { path = "/home/leonardov/dom-protocol-scanfull/crates/dom-pow" }
-dom-wallet-core-api = { path = "/home/leonardov/dom-protocol-scanfull/crates/dom-wallet-core-api" }
-dom-wallet-recovery = { path = "/home/leonardov/dom-protocol-scanfull/crates/dom-wallet-recovery" }

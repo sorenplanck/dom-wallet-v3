@@ -8,9 +8,9 @@ No independent security audit is claimed.
 
 ## Release identity
 
-- Wallet version: `0.2.6`
-- Recommended tag: `wallet-v0.2.6`
-- DOM Core revision: `28ba3cefc9fbc913f126336482662528c68a7d8c`
+- Wallet version: `0.3.0`
+- Recommended tag: `wallet-v0.3.0`
+- DOM Core revision: `387b744474d2414f9d2d0e542bc654096ce2f8ed`
 - Final genesis revision: `6a8a6475b36ad68bb760d61cf323126d95cd7416`
 - Mainnet chain ID: `f9831fadabc8a4234beab35fbb6327e84581645f33e9f75ed2ea78e8bcf1165b`
 
@@ -26,8 +26,9 @@ may be published without a live updater feed, but `latest.json` must not be
 published until every referenced artifact and signature is present and
 verified.
 
-The updater consumes the regular bundles (`.AppImage`, NSIS `-setup.exe`,
-`.app.tar.gz`), so `createUpdaterArtifacts` stays `false` and CI never needs a
+The updater consumes the generated updater bundles (`.AppImage`, NSIS
+`-setup.exe`, `.app.tar.gz`). CI enables `createUpdaterArtifacts` while passing
+`--no-sign`, so it creates the unsigned archives without ever receiving a
 signing key. The offline feed flow, per release:
 
 1. `cargo run -p dom-wallet-updater --example feed_tool -- draft <artifacts-dir>
@@ -45,9 +46,11 @@ signing key. The offline feed flow, per release:
    `releases/latest/download/` only resolve when a non-prerelease release
    exists.
 
-Wallet V3 uses its embedded DOM Core through `WalletCoreApi`. It creates only
-Recovery Capsule v1 outputs, uses Address v1 and recovery Slate v4, and has no
-remote HTTP backend or proof-only production output path.
+Wallet V3 uses its embedded DOM Core through `WalletCoreApi` by default and can
+use the authenticated remote scan-only source for restore and synchronization.
+Transaction construction, submission and mining remain embedded-only. It
+creates only Recovery Capsule v1 outputs, uses Address v1 and recovery Slate
+v4, and has no proof-only production output path.
 
 Confirmed Recovery Capsule v1 funds are recoverable from the 24-word BIP-39
 phrase plus the canonical chain. Encrypted backup remains additional and
@@ -57,18 +60,18 @@ reservations, and preferences.
 ## Validation build
 
 Run the Actions workflow manually on the intended branch with
-`publish_release=false` and `validation_only=false`. This builds unsigned Linux,
+`validation_only=false` and `release_version=0.3.0`. This builds unsigned Linux,
 Windows, and macOS artifacts and uploads checksums without creating or moving a
 tag and without creating a GitHub Release.
 
 ## Later release authorization
 
 After all local and CI gates pass and explicit authorization is given, verify
-that the clean release commit reports version `0.2.6`, then run:
+that the clean release commit reports version `0.3.0`, then run:
 
 ```bash
-git tag -a wallet-v0.2.6 -m "DOM Wallet V3 0.2.6 experimental"
-git push origin wallet-v0.2.6
+git tag -a wallet-v0.3.0 -m "DOM Wallet V3 0.3.0 experimental"
+git push origin wallet-v0.3.0
 ```
 
 Do not run these commands as part of validation. The tag workflow verifies

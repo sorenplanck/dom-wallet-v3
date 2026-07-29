@@ -8,8 +8,8 @@ use dom_core::{BlockHeight, Hash256, Timestamp};
 use dom_node::node::DomNode;
 use dom_pow::{
     compute_expected_target, fast_pow_hash, hash_meets_target, pow_validation_mode_for_network,
-    randomx_pool, randomx_seed_height, target_to_compact,
-    target_to_difficulty_for_network_height, CompactTarget, PowValidationMode,
+    randomx_pool, randomx_seed_height, target_to_compact, target_to_difficulty_for_network_height,
+    CompactTarget, PowValidationMode,
 };
 use dom_serialization::{DomDeserialize, DomSerialize};
 use std::sync::{
@@ -369,8 +369,8 @@ mod tests {
                 &target,
             )
             .expect("wallet work");
-            let wallet_total = checked_accumulated_difficulty(tip_difficulty, wallet_work)
-                .expect("wallet total");
+            let wallet_total =
+                checked_accumulated_difficulty(tip_difficulty, wallet_work).expect("wallet total");
 
             // What `ChainState::validate` recomputes and demands.
             let expected_work = target_to_difficulty_for_network_height(

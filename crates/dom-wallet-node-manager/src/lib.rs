@@ -1822,7 +1822,7 @@ mod tests {
             rpc_protocol_version: 1,
             p2p_protocol_version: 1,
             storage_schema_version: 1,
-            compatible_wallet_versions: ">=0.2.0, <0.3.0".into(),
+            compatible_wallet_versions: format!("={}", env!("CARGO_PKG_VERSION")),
             requires_wallet_update: false,
             node_only_compatible: true,
             critical_update: false,

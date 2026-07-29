@@ -1060,8 +1060,7 @@ mod tests {
     /// node lost the race die with a bare `DOM_NODE_RUN`, so the suite failed
     /// on an arbitrary one of these tests while every one of them passed alone.
     fn regtest_configuration(directory: &Path) -> EmbeddedCoreConfiguration {
-        let listener =
-            std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral test listener");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral test listener");
         let address = listener.local_addr().expect("ephemeral local address");
         drop(listener);
         EmbeddedCoreConfiguration::new(EmbeddedCoreNetwork::Regtest, directory, address)

@@ -1,8 +1,9 @@
 # REMOTE SCAN V3 — Schema do endpoint `/chain/scan/full` e superfície de trait remota
 
 Data: 2026-07-28. Base: wallet V3 em `redesign/restore-remote-scan`; node upstream
-`dom-protocol` rev pinada `b5a86a2` (`feat/chain-scan-full`), checkout de referência
-`~/.cargo/git/checkouts/dom-protocol-2d332bfc8b024ad9/b5a86a2/`.
+`sorenplanck/dom-protocol` na revisão imutável
+`387b744474d2414f9d2d0e542bc654096ce2f8ed`
+(`feat/chain-scan-full`).
 
 Escopo: (1) inventário completo do trait `WalletCoreApi` com matriz de chamadores;
 (2) montagem node-side de `ScanBlock` que o endpoint novo deve reusar; (3) schema

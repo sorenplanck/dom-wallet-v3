@@ -1,9 +1,10 @@
 # REMOTE_SCAN_CONTRACT — contrato REAL do RPC do dom-node
 
-Fonte da verdade: worktree `/home/leonardov/dom-protocol-scanfull` (branch
-`feat/chain-scan-full`, rev pinada `b5a86a2`, a mesma do `Cargo.toml` do wallet).
-Todas as citações são `arquivo:linha` desse worktree, extraídas por leitura direta
-do código — nada foi assumido.
+Fonte da verdade: `sorenplanck/dom-protocol`, branch
+`feat/chain-scan-full`, revisão imutável
+`387b744474d2414f9d2d0e542bc654096ce2f8ed`, a mesma pinada pelo
+`Cargo.toml` da wallet. Todas as citações são `arquivo:linha` dessa revisão,
+extraídas por leitura direta do código — nada foi assumido.
 
 Crates relevantes:
 

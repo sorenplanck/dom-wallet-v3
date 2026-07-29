@@ -19,11 +19,11 @@ use dom_wallet_embedded_core::{
     default_lmdb_map_size, mine_wallet_block, EmbeddedCoreConfiguration, WalletMiningOutcome,
     LMDB_MAP_FULL_ERROR_CODE, MAINNET_DNS_SEEDS, MAINNET_P2P_PORT,
 };
-use dom_wallet_remote_source::RemoteNodeSource;
 use dom_wallet_node_manager::{
     ManagedNodeConfig, NodeManager, NodeReleaseMetadata, SidecarStatus,
     EXPERIMENTAL_ENABLE_CONFIRMATION,
 };
+use dom_wallet_remote_source::RemoteNodeSource;
 use dom_wallet_storage::WalletDirectory;
 use dom_wallet_updater::{
     WalletUpdaterState, EMBEDDED_NODE_REVISION, UPDATE_CHANNEL, UPDATE_INTERVAL_SECONDS,
@@ -858,7 +858,10 @@ impl std::fmt::Debug for ChainSourceState {
             .debug_struct("ChainSourceState")
             .field("kind", &self.kind)
             .field("base_url", &self.base_url)
-            .field("bearer_token", &self.bearer_token.as_ref().map(|_| "<redacted>"))
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_ref().map(|_| "<redacted>"),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -903,7 +906,11 @@ pub fn chain_source_transport_warning(base_url: &str) -> bool {
 fn atomic_write_private_json(path: &Path, bytes: &[u8]) -> Result<(), CommandError> {
     let parent = path.parent().ok_or(CommandError::Unavailable)?;
     std::fs::create_dir_all(parent).map_err(|_| CommandError::Unavailable)?;
-    let temporary = parent.join(format!(".{}.tmp-{}", CHAIN_SOURCE_FILE_NAME, Uuid::new_v4()));
+    let temporary = parent.join(format!(
+        ".{}.tmp-{}",
+        CHAIN_SOURCE_FILE_NAME,
+        Uuid::new_v4()
+    ));
     let mut options = std::fs::OpenOptions::new();
     options.create_new(true).write(true);
     #[cfg(unix)]
@@ -943,10 +950,9 @@ fn attach_remote_backend(
     let (base_url, bearer_token) = {
         let state = chain_source.lock().map_err(|_| CommandError::Unavailable)?;
         (
-            state
-                .base_url
-                .clone()
-                .ok_or(CommandError::InvalidInput("remote node URL is missing".into()))?,
+            state.base_url.clone().ok_or(CommandError::InvalidInput(
+                "remote node URL is missing".into(),
+            ))?,
             state.bearer_token.clone(),
         )
     };
@@ -1632,13 +1638,10 @@ impl DesktopApplication {
                             .filter(|_| state.base_url.as_deref() == Some(base_url.as_str())),
                     };
                     // Validate URL and token shape without any network I/O.
-                    RemoteNodeSource::new(
-                        &base_url,
-                        token.as_ref().map(|token| token.as_str()),
-                    )
-                    .map_err(|_| {
-                        CommandError::InvalidInput("remote node URL is invalid".into())
-                    })?;
+                    RemoteNodeSource::new(&base_url, token.as_ref().map(|token| token.as_str()))
+                        .map_err(|_| {
+                            CommandError::InvalidInput("remote node URL is invalid".into())
+                        })?;
                     (Some(base_url), token)
                 }
             };
@@ -1647,9 +1650,7 @@ impl DesktopApplication {
                     schema_version: CHAIN_SOURCE_SCHEMA_VERSION,
                     source: kind.name().into(),
                     base_url: next_base_url.clone(),
-                    bearer_token: next_token
-                        .as_ref()
-                        .map(|token| token.as_str().to_owned()),
+                    bearer_token: next_token.as_ref().map(|token| token.as_str().to_owned()),
                 })
                 .map_err(|_| CommandError::Unavailable)?;
                 atomic_write_private_json(&directory.join(CHAIN_SOURCE_FILE_NAME), &bytes)?;
@@ -1751,15 +1752,12 @@ impl DesktopApplication {
                             .with_lmdb_map_size(map_size);
                     match ProductionWalletBackend::start(configuration, None) {
                         Ok(backend) => {
-                            let attached = service
-                                .lock()
-                                .map_err(|_| ())
-                                .and_then(|mut wallet| {
-                                    if cancelled.load(Ordering::Acquire) {
-                                        return Err(());
-                                    }
-                                    wallet.attach_backend(backend).map(|_| ()).map_err(|_| ())
-                                });
+                            let attached = service.lock().map_err(|_| ()).and_then(|mut wallet| {
+                                if cancelled.load(Ordering::Acquire) {
+                                    return Err(());
+                                }
+                                wallet.attach_backend(backend).map(|_| ()).map_err(|_| ())
+                            });
                             match attached {
                                 Ok(()) => started_mirror.store(true, Ordering::Release),
                                 Err(()) => {
@@ -1782,9 +1780,7 @@ impl DesktopApplication {
                         {
                             // Grow-on-demand: double the LMDB map and persist
                             // the new size so the next boot starts there.
-                            map_size = map_size
-                                .saturating_mul(2)
-                                .min(MAX_LMDB_MAP_SIZE_BYTES);
+                            map_size = map_size.saturating_mul(2).min(MAX_LMDB_MAP_SIZE_BYTES);
                             persist_map_size(map_size_directory.as_deref(), map_size);
                             continue;
                         }
@@ -2379,10 +2375,8 @@ impl DesktopApplication {
                             // and keep the worker alive so mining resumes on its
                             // own once synchronization recovers.
                             Err(error) if error.is_transient() => {
-                                let delay =
-                                    synchronization_retry_backoff(consecutive_not_ready);
-                                consecutive_not_ready =
-                                    consecutive_not_ready.saturating_add(1);
+                                let delay = synchronization_retry_backoff(consecutive_not_ready);
+                                consecutive_not_ready = consecutive_not_ready.saturating_add(1);
                                 state.store(MINING_WAITING, Ordering::Release);
                                 set_mining_notice(&error_code, error.code());
                                 // A stale template must not be reused after the
@@ -2587,15 +2581,15 @@ impl DesktopApplication {
                             // Self-healing: (re)acquire the configured chain
                             // source before scanning; failures are retried by
                             // the follow loop, never treated as terminal.
-                            let result = ensure_scan_backend(&mut wallet, &chain_source)
-                                .and_then(|()| {
+                            let result =
+                                ensure_scan_backend(&mut wallet, &chain_source).and_then(|()| {
                                     wallet.synchronize_live().map_err(CommandError::from)
                                 });
                             let remote_source = {
                                 let state = chain_source.lock().ok();
-                                let remote = state.as_ref().and_then(|state| {
-                                    state.active_remote.as_ref().map(Arc::clone)
-                                });
+                                let remote = state
+                                    .as_ref()
+                                    .and_then(|state| state.active_remote.as_ref().map(Arc::clone));
                                 let kind = state
                                     .map(|state| state.effective_kind())
                                     .unwrap_or(ChainSourceKind::Embedded);
@@ -4315,7 +4309,7 @@ mod tests {
     fn native_bridge_probe_is_static_redacted_and_versioned() {
         let status = native_bridge_status();
         assert_eq!(status.bridge, "ready");
-        assert_eq!(status.app_version, "0.2.9");
+        assert_eq!(status.app_version, "0.3.0");
         fn assert_serializable<T: serde::Serialize>(_: &T) {}
         assert_serializable(&status);
     }
@@ -4323,7 +4317,7 @@ mod tests {
     #[test]
     fn build_and_update_status_are_separate_redacted_channels() {
         let build = get_build_info();
-        assert_eq!(build.wallet_version, "0.2.9");
+        assert_eq!(build.wallet_version, "0.3.0");
         assert_eq!(build.embedded_node_revision, EMBEDDED_NODE_REVISION);
         assert_eq!(build.update_channel, "stable");
 
@@ -4433,7 +4427,7 @@ mod tests {
             rpc_protocol_version: 1,
             p2p_protocol_version: 1,
             storage_schema_version: 1,
-            compatible_wallet_versions: ">=0.2.0, <0.3.0".into(),
+            compatible_wallet_versions: format!("={}", env!("CARGO_PKG_VERSION")),
             requires_wallet_update: false,
             node_only_compatible: true,
             critical_update: false,
@@ -4926,7 +4920,9 @@ mod tests {
             &CommandError::RestoreNodeSynchronizing
         ));
         // ...while a source that is not our chain must stop it immediately.
-        assert!(terminal_synchronization_error(&CommandError::IdentityMismatch));
+        assert!(terminal_synchronization_error(
+            &CommandError::IdentityMismatch
+        ));
     }
 
     #[test]
@@ -5328,7 +5324,9 @@ mod tests {
         let not_yet_created = parent.path().join("new-wallet");
         assert!(matches!(
             app.wallet_restore_from_mnemonic(&not_yet_created, "correct-horse", "test-only"),
-            Err(CommandError::RecoveryPhrase(PhraseProblem::WrongWordCount { got: 1 }))
+            Err(CommandError::RecoveryPhrase(
+                PhraseProblem::WrongWordCount { got: 1 }
+            ))
         ));
         assert!(!not_yet_created.exists());
 
@@ -5391,8 +5389,7 @@ mod tests {
         let later = synchronization_retry_backoff(10);
         assert!(first < later);
         assert!(
-            later.as_millis() as u64
-                <= SYNC_RETRY_MAX_BACKOFF_MILLIS + SYNC_RETRY_JITTER_MILLIS
+            later.as_millis() as u64 <= SYNC_RETRY_MAX_BACKOFF_MILLIS + SYNC_RETRY_JITTER_MILLIS
         );
 
         // A stop request is honored during the wait instead of sleeping it out.

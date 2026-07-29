@@ -79,7 +79,8 @@ fn main() {
     // Unlocking starts the self-healing background scan.
     app.wallet_open_managed(std::path::Path::new(&wallet_parent), "probe-restored")
         .expect("restored wallet opens");
-    app.wallet_unlock(password).expect("restored wallet unlocks");
+    app.wallet_unlock(password)
+        .expect("restored wallet unlocks");
 
     let scan_started = Instant::now();
     let deadline = scan_started + Duration::from_secs(60 * 60);
@@ -100,7 +101,9 @@ fn main() {
             sync.tip_height,
             sync.scan_progress_percent,
             sync.seed_restore_in_progress,
-            sync.partial_balance.as_ref().map(|balance| balance.spendable),
+            sync.partial_balance
+                .as_ref()
+                .map(|balance| balance.spendable),
             sync.last_error
         );
         if line != last_line {

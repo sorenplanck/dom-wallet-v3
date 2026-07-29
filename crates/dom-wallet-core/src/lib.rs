@@ -13,6 +13,7 @@ use dom_wallet_core_recovery::{
     finalize_recoverable_transaction, CanonicalWalletSeed, RecoverableOutputBuilder,
     RecoverableSenderParts, WalletSlateInput, CANONICAL_TRANSACTION_OUTPUT_SIZE,
 };
+pub use dom_wallet_core_recovery::{PhraseProblem, CANONICAL_PHRASE_WORDS};
 use dom_wallet_core_restore::{
     apply_recovery_batch, offline_restore_state, rewind_recovery_state, SeedRestoreResult,
 };
@@ -34,14 +35,13 @@ use dom_wallet_domain::{
 };
 use dom_wallet_embedded_core::{EmbeddedCoreConfiguration, EmbeddedPeerStatus};
 use dom_wallet_production_backend::{ProductionBackendError, PRODUCTION_BACKEND_KIND};
-pub use dom_wallet_core_recovery::{PhraseProblem, CANONICAL_PHRASE_WORDS};
 pub use dom_wallet_production_backend::{ProductionWalletBackend, REMOTE_BACKEND_KIND};
-use std::sync::Arc;
 use dom_wallet_storage::{
     default_node_configuration, StorageError, WalletDirectory, WalletMetadata,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::{fmt, path::Path};
 use thiserror::Error;
 use uuid::Uuid;

@@ -1890,7 +1890,7 @@ mod tests {
             rpc_protocol_version: 1,
             p2p_protocol_version: 1,
             storage_schema_version: 1,
-            compatible_wallet_versions: ">=0.2.0, <0.3.0".into(),
+            compatible_wallet_versions: format!("={}", env!("CARGO_PKG_VERSION")),
             requires_wallet_update: false,
             node_only_compatible: true,
             critical_update: false,
@@ -1901,7 +1901,7 @@ mod tests {
 
     fn compatibility() -> NodeCompatibility {
         NodeCompatibility {
-            wallet_version: "0.2.0".into(),
+            wallet_version: env!("CARGO_PKG_VERSION").into(),
             active_node_version: "0.1.0".into(),
             active_node_revision: "b".repeat(40),
             update_sequence: 1,

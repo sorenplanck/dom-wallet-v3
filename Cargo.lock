@@ -1086,6 +1086,7 @@ dependencies = [
 [[package]]
 name = "dom-chain"
 version = "0.1.2"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=387b744474d2414f9d2d0e542bc654096ce2f8ed#387b744474d2414f9d2d0e542bc654096ce2f8ed"
 dependencies = [
  "blake2",
  "dom-consensus",
@@ -1105,6 +1106,7 @@ dependencies = [
 [[package]]
 name = "dom-config"
 version = "0.1.2"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=387b744474d2414f9d2d0e542bc654096ce2f8ed#387b744474d2414f9d2d0e542bc654096ce2f8ed"
 dependencies = [
  "dom-core",
  "serde",
@@ -1115,6 +1117,7 @@ dependencies = [
 [[package]]
 name = "dom-consensus"
 version = "0.1.2"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=387b744474d2414f9d2d0e542bc654096ce2f8ed#387b744474d2414f9d2d0e542bc654096ce2f8ed"
 dependencies = [
  "dom-core",
  "dom-crypto",
@@ -1128,6 +1131,7 @@ dependencies = [
 [[package]]
 name = "dom-core"
 version = "0.1.2"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=387b744474d2414f9d2d0e542bc654096ce2f8ed#387b744474d2414f9d2d0e542bc654096ce2f8ed"
 dependencies = [
  "hex",
  "subtle",
@@ -1138,6 +1142,7 @@ dependencies = [
 [[package]]
 name = "dom-crypto"
 version = "0.1.2"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=387b744474d2414f9d2d0e542bc654096ce2f8ed#387b744474d2414f9d2d0e542bc654096ce2f8ed"
 dependencies = [
  "blake2",
  "chacha20poly1305",
@@ -1159,6 +1164,7 @@ dependencies = [
 [[package]]
 name = "dom-mempool"
 version = "0.1.2"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=387b744474d2414f9d2d0e542bc654096ce2f8ed#387b744474d2414f9d2d0e542bc654096ce2f8ed"
 dependencies = [
  "dom-consensus",
  "dom-core",
@@ -1173,6 +1179,7 @@ dependencies = [
 [[package]]
 name = "dom-node"
 version = "0.1.2"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=387b744474d2414f9d2d0e542bc654096ce2f8ed#387b744474d2414f9d2d0e542bc654096ce2f8ed"
 dependencies = [
  "anyhow",
  "dom-chain",
@@ -1206,6 +1213,7 @@ dependencies = [
 [[package]]
 name = "dom-pmmr"
 version = "0.1.2"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=387b744474d2414f9d2d0e542bc654096ce2f8ed#387b744474d2414f9d2d0e542bc654096ce2f8ed"
 dependencies = [
  "dom-core",
  "dom-crypto",
@@ -1215,6 +1223,7 @@ dependencies = [
 [[package]]
 name = "dom-pow"
 version = "0.1.2"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=387b744474d2414f9d2d0e542bc654096ce2f8ed#387b744474d2414f9d2d0e542bc654096ce2f8ed"
 dependencies = [
  "blake2",
  "dom-core",
@@ -1228,6 +1237,7 @@ dependencies = [
 [[package]]
 name = "dom-rpc"
 version = "0.1.2"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=387b744474d2414f9d2d0e542bc654096ce2f8ed#387b744474d2414f9d2d0e542bc654096ce2f8ed"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1254,6 +1264,7 @@ dependencies = [
 [[package]]
 name = "dom-serialization"
 version = "0.1.2"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=387b744474d2414f9d2d0e542bc654096ce2f8ed#387b744474d2414f9d2d0e542bc654096ce2f8ed"
 dependencies = [
  "dom-core",
  "thiserror 1.0.69",
@@ -1275,6 +1286,7 @@ dependencies = [
 [[package]]
 name = "dom-slate"
 version = "0.1.2"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=387b744474d2414f9d2d0e542bc654096ce2f8ed#387b744474d2414f9d2d0e542bc654096ce2f8ed"
 dependencies = [
  "dom-consensus",
  "dom-core",
@@ -1289,6 +1301,7 @@ dependencies = [
 [[package]]
 name = "dom-store"
 version = "0.1.2"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=387b744474d2414f9d2d0e542bc654096ce2f8ed#387b744474d2414f9d2d0e542bc654096ce2f8ed"
 dependencies = [
  "blake2",
  "dom-consensus",
@@ -1304,6 +1317,7 @@ dependencies = [
 [[package]]
 name = "dom-tx"
 version = "0.1.2"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=387b744474d2414f9d2d0e542bc654096ce2f8ed#387b744474d2414f9d2d0e542bc654096ce2f8ed"
 dependencies = [
  "dom-consensus",
  "dom-core",
@@ -1315,6 +1329,7 @@ dependencies = [
 [[package]]
 name = "dom-wallet"
 version = "0.1.2"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=387b744474d2414f9d2d0e542bc654096ce2f8ed#387b744474d2414f9d2d0e542bc654096ce2f8ed"
 dependencies = [
  "argon2",
  "bip39",
@@ -1346,7 +1361,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-chain"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "dom-wallet-domain",
  "hex",
@@ -1359,7 +1374,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-core"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "dom-consensus",
  "dom-core",
@@ -1373,7 +1388,7 @@ dependencies = [
  "dom-wallet-core-restore",
  "dom-wallet-core-submit",
  "dom-wallet-core-sync",
- "dom-wallet-crypto 0.2.9",
+ "dom-wallet-crypto 0.3.0",
  "dom-wallet-domain",
  "dom-wallet-embedded-core",
  "dom-wallet-production-backend",
@@ -1393,6 +1408,7 @@ dependencies = [
 [[package]]
 name = "dom-wallet-core-api"
 version = "0.1.2"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=387b744474d2414f9d2d0e542bc654096ce2f8ed#387b744474d2414f9d2d0e542bc654096ce2f8ed"
 dependencies = [
  "dom-consensus",
  "dom-core",
@@ -1402,7 +1418,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-core-protocol"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "dom-consensus",
@@ -1419,7 +1435,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-core-recovery"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "bip39",
  "dom-consensus",
@@ -1445,7 +1461,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-core-restore"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "dom-consensus",
  "dom-core",
@@ -1454,7 +1470,7 @@ dependencies = [
  "dom-wallet-core-api",
  "dom-wallet-core-recovery",
  "dom-wallet-core-sync",
- "dom-wallet-crypto 0.2.9",
+ "dom-wallet-crypto 0.3.0",
  "dom-wallet-domain",
  "dom-wallet-recovery",
  "dom-wallet-storage",
@@ -1466,7 +1482,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-core-submit"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "dom-consensus",
  "dom-core",
@@ -1480,7 +1496,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-core-sync"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "dom-consensus",
  "dom-core",
@@ -1494,6 +1510,7 @@ dependencies = [
 [[package]]
 name = "dom-wallet-crypto"
 version = "0.1.2"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=387b744474d2414f9d2d0e542bc654096ce2f8ed#387b744474d2414f9d2d0e542bc654096ce2f8ed"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -1508,7 +1525,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-crypto"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -1523,7 +1540,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-domain"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1533,7 +1550,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-embedded-core"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "dom-chain",
  "dom-config",
@@ -1552,6 +1569,7 @@ dependencies = [
 [[package]]
 name = "dom-wallet-keys"
 version = "0.1.2"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=387b744474d2414f9d2d0e542bc654096ce2f8ed#387b744474d2414f9d2d0e542bc654096ce2f8ed"
 dependencies = [
  "bip39",
  "hmac",
@@ -1564,7 +1582,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-node-manager"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "dom-sidecar",
  "dom-wallet-updater",
@@ -1582,7 +1600,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-production-backend"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "dom-node",
  "dom-wallet-core-api",
@@ -1591,7 +1609,7 @@ dependencies = [
  "dom-wallet-core-restore",
  "dom-wallet-core-submit",
  "dom-wallet-core-sync",
- "dom-wallet-crypto 0.2.9",
+ "dom-wallet-crypto 0.3.0",
  "dom-wallet-embedded-core",
  "dom-wallet-storage",
  "tempfile",
@@ -1600,7 +1618,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-protocol"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "dom-consensus",
@@ -1617,6 +1635,7 @@ dependencies = [
 [[package]]
 name = "dom-wallet-recovery"
 version = "0.1.2"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=387b744474d2414f9d2d0e542bc654096ce2f8ed#387b744474d2414f9d2d0e542bc654096ce2f8ed"
 dependencies = [
  "dom-core",
  "dom-crypto",
@@ -1627,7 +1646,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-remote-source"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "dom-consensus",
@@ -1642,9 +1661,9 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-storage"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
- "dom-wallet-crypto 0.2.9",
+ "dom-wallet-crypto 0.3.0",
  "dom-wallet-domain",
  "fs2",
  "serde",
@@ -1656,14 +1675,14 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-tauri-shell"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "dom-wallet-core",
  "dom-wallet-core-api",
  "dom-wallet-core-restore",
  "dom-wallet-core-sync",
- "dom-wallet-crypto 0.2.9",
+ "dom-wallet-crypto 0.3.0",
  "dom-wallet-domain",
  "dom-wallet-embedded-core",
  "dom-wallet-node-manager",
@@ -1691,7 +1710,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-updater"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "futures-util",
@@ -1711,6 +1730,7 @@ dependencies = [
 [[package]]
 name = "dom-wire"
 version = "0.1.2"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=387b744474d2414f9d2d0e542bc654096ce2f8ed#387b744474d2414f9d2d0e542bc654096ce2f8ed"
 dependencies = [
  "blake2",
  "dom-config",
