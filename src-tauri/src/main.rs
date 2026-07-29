@@ -511,11 +511,21 @@ fn wallet_restore_from_mnemonic(
     name: String,
     password: String,
     mnemonic: String,
-) -> Result<dom_wallet_tauri_shell::RecoveryResultDto, dom_wallet_tauri_shell::CommandErrorDto> {
+) -> Result<dom_wallet_tauri_shell::RestoreStartedDto, dom_wallet_tauri_shell::CommandErrorDto> {
     let password = Zeroizing::new(password);
     let mnemonic = Zeroizing::new(mnemonic);
     let path = managed_wallet_path(&handle, &name)?;
-    ensure_mainnet_node(&handle, &app)?;
+    // Restore is derivation-only and must NEVER be gated on a chain source
+    // (see the regression guard on `wallet_restore_from_mnemonic`). When the
+    // embedded node is the selected source it is merely nudged awake — the
+    // start is asynchronous and its failure can never fail the restore.
+    if app
+        .chain_source_get()
+        .map(|source| source.source == "EMBEDDED")
+        .unwrap_or(true)
+    {
+        let _ = ensure_mainnet_node(&handle, &app);
+    }
     app.wallet_restore_from_mnemonic(path, password.as_str(), mnemonic.as_str())
         .map_err(Into::into)
 }
@@ -772,6 +782,27 @@ fn node_peer_status(
     app: tauri::State<'_, DesktopApplication>,
 ) -> Result<dom_wallet_tauri_shell::NodePeerStatusDto, dom_wallet_tauri_shell::CommandErrorDto> {
     app.node_peer_status().map_err(Into::into)
+}
+#[tauri::command]
+fn chain_source_get(
+    app: tauri::State<'_, DesktopApplication>,
+) -> Result<dom_wallet_tauri_shell::ChainSourceStatusDto, dom_wallet_tauri_shell::CommandErrorDto> {
+    app.chain_source_get().map_err(Into::into)
+}
+#[tauri::command]
+fn chain_source_set(
+    app: tauri::State<'_, DesktopApplication>,
+    source: String,
+    base_url: Option<String>,
+    bearer_token: Option<String>,
+) -> Result<dom_wallet_tauri_shell::ChainSourceStatusDto, dom_wallet_tauri_shell::CommandErrorDto> {
+    let bearer_token = bearer_token.map(Zeroizing::new);
+    app.chain_source_set(
+        source.as_str(),
+        base_url.as_deref(),
+        bearer_token.as_ref().map(|token| token.as_str()),
+    )
+    .map_err(Into::into)
 }
 #[tauri::command]
 fn wallet_sync_status(
@@ -1061,6 +1092,17 @@ fn application_builder() -> tauri::Builder<tauri::Wry> {
             if let Ok(path) = automatic_update_preference_path(app.handle()) {
                 app.state::<UpdateControl>()
                     .set_automatic_updates(load_automatic_update_preference(&path));
+            }
+            // Bind the persistent app-config directory before anything can read
+            // the chain source, so a saved REMOTE selection (and the embedded
+            // node map size) survives the restart instead of silently
+            // reverting to the embedded default.
+            if let Ok(config_directory) = app.path().app_config_dir() {
+                if fs::create_dir_all(&config_directory).is_ok() {
+                    let _ = app
+                        .state::<DesktopApplication>()
+                        .configure_app_config_storage(config_directory);
+                }
             }
             let runtime_root = app
                 .path()

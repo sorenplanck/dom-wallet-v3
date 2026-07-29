@@ -8,17 +8,18 @@
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use dom_wallet_core::{
-    BackupStatus, CoreError, DiagnosticSnapshot, FeeEstimate, RecoveryCreateResult,
-    RecoveryRestoreResult, SlateExport, TransactionSummary, WalletService, WalletSummary,
-    MAINNET_CHAIN_ID_HEX, MAINNET_GENESIS_HASH_HEX,
+    BackupStatus, CoreError, DiagnosticSnapshot, FeeEstimate, PhraseProblem,
+    ProductionWalletBackend, RecoveryCreateResult, SlateExport, TransactionSummary, WalletService,
+    WalletSummary, CANONICAL_PHRASE_WORDS, MAINNET_CHAIN_ID_HEX, MAINNET_GENESIS_HASH_HEX,
 };
-use dom_wallet_core_api::CoreNetwork;
+use dom_wallet_core_api::{CoreNetwork, WalletCoreApi};
 use dom_wallet_core_restore::SeedRestoreError;
 use dom_wallet_domain::{BalanceProjection, Network, NetworkIdentity};
 use dom_wallet_embedded_core::{
-    mine_wallet_block, EmbeddedCoreConfiguration, WalletMiningOutcome, MAINNET_DNS_SEEDS,
-    MAINNET_P2P_PORT,
+    default_lmdb_map_size, mine_wallet_block, EmbeddedCoreConfiguration, WalletMiningOutcome,
+    LMDB_MAP_FULL_ERROR_CODE, MAINNET_DNS_SEEDS, MAINNET_P2P_PORT,
 };
+use dom_wallet_remote_source::RemoteNodeSource;
 use dom_wallet_node_manager::{
     ManagedNodeConfig, NodeManager, NodeReleaseMetadata, SidecarStatus,
     EXPERIMENTAL_ENABLE_CONFIRMATION,
@@ -46,7 +47,11 @@ use zeroize::Zeroizing;
 pub struct DesktopApplication {
     service: Arc<Mutex<WalletService>>,
     qr_reassembler: Mutex<SlateQrReassembler>,
-    node_started: AtomicBool,
+    node_started: Arc<AtomicBool>,
+    node_start: Mutex<NodeStartRuntime>,
+    node_starting: Arc<AtomicBool>,
+    node_start_cancelled: Arc<AtomicBool>,
+    node_start_error: Arc<Mutex<Option<&'static str>>>,
     last_successful_node_status_at: AtomicU64,
     last_peer_connected_unix_seconds: AtomicU64,
     synchronization_paused: AtomicBool,
@@ -55,6 +60,9 @@ pub struct DesktopApplication {
     sidecar: Mutex<NodeManager>,
     shutdown: AtomicBool,
     recovery_required: AtomicBool,
+    chain_source: Arc<Mutex<ChainSourceState>>,
+    remote_tip_alert: Arc<AtomicBool>,
+    seed_restore_started: Arc<AtomicBool>,
     activities: Arc<ActivityCoordinator>,
 }
 
@@ -156,6 +164,8 @@ macro_rules! wallet_command_registry {
             experimental_sidecar_evaluate_release,
             node_network_status,
             node_peer_status,
+            chain_source_get,
+            chain_source_set,
             wallet_sync_status,
             wallet_sync_start,
             wallet_sync_pause,
@@ -220,7 +230,12 @@ pub fn get_build_info() -> BuildInfoDto {
     BuildInfoDto {
         wallet_version: env!("CARGO_PKG_VERSION"),
         wallet_revision: option_env!("DOM_WALLET_REVISION").unwrap_or("UNAVAILABLE"),
-        embedded_node_version: option_env!("DOM_NODE_VERSION").unwrap_or("0.1.0"),
+        // Set by build.rs from the workspace lockfile. The previous `"0.1.0"`
+        // fallback was a literal that never changed with the compiled node, so
+        // it reported "up to date" regardless of what was built. When the
+        // version cannot be derived we say so, exactly like wallet_revision —
+        // the authoritative identity is embedded_node_revision below.
+        embedded_node_version: option_env!("DOM_NODE_VERSION").unwrap_or("UNAVAILABLE"),
         embedded_node_revision: EMBEDDED_NODE_REVISION,
         update_channel: UPDATE_CHANNEL,
     }
@@ -403,7 +418,11 @@ impl Default for DesktopApplication {
         Self {
             service: Arc::new(Mutex::new(WalletService::default())),
             qr_reassembler: Mutex::new(SlateQrReassembler::default()),
-            node_started: AtomicBool::new(false),
+            node_started: Arc::new(AtomicBool::new(false)),
+            node_start: Mutex::new(NodeStartRuntime::default()),
+            node_starting: Arc::new(AtomicBool::new(false)),
+            node_start_cancelled: Arc::new(AtomicBool::new(false)),
+            node_start_error: Arc::new(Mutex::new(None)),
             last_successful_node_status_at: AtomicU64::new(0),
             last_peer_connected_unix_seconds: AtomicU64::new(0),
             synchronization_paused: AtomicBool::new(false),
@@ -412,6 +431,9 @@ impl Default for DesktopApplication {
             sidecar: Mutex::new(NodeManager::default()),
             shutdown: AtomicBool::new(false),
             recovery_required: AtomicBool::new(false),
+            chain_source: Arc::new(Mutex::new(ChainSourceState::default())),
+            remote_tip_alert: Arc::new(AtomicBool::new(false)),
+            seed_restore_started: Arc::new(AtomicBool::new(false)),
             activities: Arc::new(ActivityCoordinator::default()),
         }
     }
@@ -576,6 +598,16 @@ pub struct WalletSyncStatusDto {
     pub cursor_hash: Option<String>,
     pub canonical_height: Option<u64>,
     pub canonical_hash: Option<String>,
+    /// Best known canonical tip height of the active chain source.
+    pub tip_height: Option<u64>,
+    /// Whole-percent scan progress (`cursor / tip`), when both are known.
+    pub scan_progress_percent: Option<u64>,
+    /// Whether a seed restore background scan is still catching up.
+    pub seed_restore_in_progress: bool,
+    /// Balance projection observed so far; partial while a restore scan runs.
+    pub partial_balance: Option<BalanceProjection>,
+    /// Latched alert: the remote node reported a regressing canonical tip.
+    pub remote_tip_alert: bool,
     pub synchronized: bool,
     pub paused: bool,
     pub last_result: String,
@@ -588,6 +620,10 @@ const MINING_STARTING: u64 = 2;
 const MINING_RUNNING: u64 = 3;
 const MINING_STOPPING: u64 = 4;
 const MINING_ERROR: u64 = 5;
+/// Mining is alive but idle, waiting for the node to finish catching up. This
+/// is deliberately NOT `MINING_ERROR`: the worker is still running and resumes
+/// by itself, so the UI must not present it as a failure the user has to fix.
+const MINING_WAITING: u64 = 6;
 
 struct MiningRuntime {
     state: Arc<AtomicU64>,
@@ -640,23 +676,68 @@ const SYNC_STOPPING: u64 = 2;
 const SYNC_ERROR: u64 = 3;
 const SYNC_CATCH_UP_RETRY_MILLIS: u64 = 10;
 const SYNC_FOLLOW_POLL_MILLIS: u64 = 1_000;
-const SYNC_NOT_READY_INITIAL_BACKOFF_MILLIS: u64 = 100;
-const SYNC_NOT_READY_MAX_BACKOFF_MILLIS: u64 = 2_000;
+/// First retry delay after a failed scan attempt (any retriable class).
+const SYNC_RETRY_INITIAL_BACKOFF_MILLIS: u64 = 250;
+/// Retry backoff ceiling: the worker never sleeps longer than this, so a
+/// recovered source is picked up within seconds.
+const SYNC_RETRY_MAX_BACKOFF_MILLIS: u64 = 5_000;
+/// Uniform jitter bound added to every retry delay so parallel wallets do not
+/// synchronize their retries against one busy Core or remote node.
+const SYNC_RETRY_JITTER_MILLIS: u64 = 250;
 
-fn transient_synchronization_error(error: &CommandError) -> bool {
-    matches!(
-        error,
-        CommandError::NodeNotReady | CommandError::ActivityBusy
-    )
+/// Whether a scan-layer failure ends the self-healing worker.
+///
+/// Terminal means "no amount of retrying can repair this": a poisoned service,
+/// a chain source that is not our chain, a rejected destination. Everything a
+/// retry could fix — busy Core, missing backend, unreachable remote node, no
+/// peers, activity contention — is transient and MUST keep the loop alive with
+/// bounded backoff. Treating a busy Core as terminal is exactly the frozen
+/// cursor regression, so `NodeNotReady` and `RestoreNodeSynchronizing` (the
+/// `SeedRestoreError::CoreBusy` mapping) are deliberately retriable here.
+///
+/// The split is the same one the frontend consumes through
+/// [`CommandErrorDto::retryable`]; the match is exhaustive on purpose so a new
+/// variant cannot be added without deciding its class, and
+/// `regression_terminal_sync_errors_agree_with_the_retryable_contract` proves
+/// the two never drift apart.
+fn terminal_synchronization_error(error: &CommandError) -> bool {
+    match error {
+        // Not our chain, or a state no retry can undo.
+        CommandError::IdentityMismatch
+        | CommandError::RecoveryRequired
+        | CommandError::RecoveryPhrase(_)
+        | CommandError::InvalidInput(_)
+        | CommandError::RestoreDestinationExists
+        | CommandError::RestoreStagingIncompatible
+        | CommandError::InvalidWalletName
+        | CommandError::ManagedWalletRejected
+        | CommandError::MiningRunning
+        | CommandError::MiningDisabled
+        | CommandError::MiningConfirmationRequired => true,
+        // Transient: the source is absent, busy, or catching up.
+        CommandError::Unavailable
+        | CommandError::NodeNotReady
+        | CommandError::RestoreNodeSynchronizing
+        | CommandError::SynchronizationPaused
+        | CommandError::CursorInitializationFailed
+        | CommandError::NoPeers
+        | CommandError::WorkerPanicked
+        | CommandError::ActivityBusy => false,
+        // Typed wallet errors carry their own decision.
+        CommandError::Wallet { retryable, .. } => !retryable,
+    }
 }
 
 fn synchronization_retry_backoff(consecutive_failures: u32) -> std::time::Duration {
-    let shift = consecutive_failures.min(4);
-    std::time::Duration::from_millis(
-        SYNC_NOT_READY_INITIAL_BACKOFF_MILLIS
-            .saturating_mul(1_u64 << shift)
-            .min(SYNC_NOT_READY_MAX_BACKOFF_MILLIS),
-    )
+    let shift = consecutive_failures.min(5);
+    let base = SYNC_RETRY_INITIAL_BACKOFF_MILLIS
+        .saturating_mul(1_u64 << shift)
+        .min(SYNC_RETRY_MAX_BACKOFF_MILLIS);
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|now| now.subsec_nanos() as u64 % SYNC_RETRY_JITTER_MILLIS)
+        .unwrap_or(0);
+    std::time::Duration::from_millis(base.saturating_add(jitter))
 }
 
 fn run_synchronization_follow_loop<Synchronize, Wait>(
@@ -668,23 +749,23 @@ where
     Synchronize: FnMut() -> Result<bool, CommandError>,
     Wait: FnMut(std::time::Duration),
 {
-    let mut consecutive_transient_failures = 0_u32;
+    let mut consecutive_failures = 0_u32;
     while !stop.load(Ordering::Acquire) {
         let delay = match synchronize_once() {
             Ok(synchronized) => {
-                consecutive_transient_failures = 0;
+                consecutive_failures = 0;
                 std::time::Duration::from_millis(if synchronized {
                     SYNC_FOLLOW_POLL_MILLIS
                 } else {
                     SYNC_CATCH_UP_RETRY_MILLIS
                 })
             }
-            Err(error) if transient_synchronization_error(&error) => {
-                let delay = synchronization_retry_backoff(consecutive_transient_failures);
-                consecutive_transient_failures = consecutive_transient_failures.saturating_add(1);
+            Err(error) if terminal_synchronization_error(&error) => return Err(error),
+            Err(_) => {
+                let delay = synchronization_retry_backoff(consecutive_failures);
+                consecutive_failures = consecutive_failures.saturating_add(1);
                 delay
             }
-            Err(error) => return Err(error),
         };
         if !stop.load(Ordering::Acquire) {
             wait(delay);
@@ -710,6 +791,195 @@ impl Default for SynchronizationRuntime {
             cached_status: Arc::new(Mutex::new(None)),
             worker: None,
         }
+    }
+}
+
+/// Background owner of the slow embedded-node construction (NTP probe,
+/// `ChainState::open`), kept off every command thread so the UI never blocks.
+#[derive(Default)]
+struct NodeStartRuntime {
+    worker: Option<JoinHandle<()>>,
+}
+
+/// Chain source selected by the user: the embedded validating node (default)
+/// or a remote DOM node consumed through `/chain/scan/full`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChainSourceKind {
+    Embedded,
+    Remote,
+}
+
+impl ChainSourceKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Embedded => "EMBEDDED",
+            Self::Remote => "REMOTE",
+        }
+    }
+}
+
+/// Persisted chain-source schema (`chain-source.json` in the app config dir).
+/// The bearer token is stored here and NEVER serialized into any status DTO.
+#[derive(Deserialize, Serialize)]
+struct PersistedChainSource {
+    schema_version: u32,
+    source: String,
+    base_url: Option<String>,
+    bearer_token: Option<String>,
+}
+
+const CHAIN_SOURCE_SCHEMA_VERSION: u32 = 1;
+const CHAIN_SOURCE_FILE_NAME: &str = "chain-source.json";
+const NODE_MAP_SIZE_FILE_NAME: &str = "embedded-node-map-size.json";
+/// Hard ceiling for automatic LMDB map growth (64 GiB).
+const MAX_LMDB_MAP_SIZE_BYTES: usize = 64 * 1024 * 1024 * 1024;
+
+#[derive(Deserialize, Serialize)]
+struct PersistedNodeMapSize {
+    schema_version: u32,
+    map_size_bytes: u64,
+}
+
+/// In-memory chain-source state. The bearer token lives in `Zeroizing` memory
+/// and is redacted from `Debug`; `active_remote` keeps the live remote handle
+/// so tip-regression alerts can be surfaced.
+#[derive(Default)]
+struct ChainSourceState {
+    kind: Option<ChainSourceKind>,
+    base_url: Option<String>,
+    bearer_token: Option<Zeroizing<String>>,
+    storage_directory: Option<PathBuf>,
+    active_remote: Option<Arc<RemoteNodeSource>>,
+}
+
+impl std::fmt::Debug for ChainSourceState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ChainSourceState")
+            .field("kind", &self.kind)
+            .field("base_url", &self.base_url)
+            .field("bearer_token", &self.bearer_token.as_ref().map(|_| "<redacted>"))
+            .finish_non_exhaustive()
+    }
+}
+
+impl ChainSourceState {
+    fn effective_kind(&self) -> ChainSourceKind {
+        self.kind.unwrap_or(ChainSourceKind::Embedded)
+    }
+}
+
+/// Shape consumed by the frontend chain-source panel. The bearer token itself
+/// is never echoed — only its presence.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChainSourceStatusDto {
+    pub source: String,
+    pub base_url: Option<String>,
+    pub has_bearer_token: bool,
+    pub tls_warning: bool,
+}
+
+/// Cleartext HTTP toward a non-loopback host exposes the wallet's scan
+/// pattern and bearer token on the network path; https and loopback are fine.
+pub fn chain_source_transport_warning(base_url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(base_url.trim()) else {
+        return true;
+    };
+    if parsed.scheme() == "https" {
+        return false;
+    }
+    if parsed.scheme() != "http" {
+        return true;
+    }
+    !matches!(
+        parsed.host(),
+        Some(url::Host::Domain("localhost"))
+            | Some(url::Host::Ipv4(std::net::Ipv4Addr::LOCALHOST))
+            | Some(url::Host::Ipv6(std::net::Ipv6Addr::LOCALHOST))
+    )
+}
+
+fn atomic_write_private_json(path: &Path, bytes: &[u8]) -> Result<(), CommandError> {
+    let parent = path.parent().ok_or(CommandError::Unavailable)?;
+    std::fs::create_dir_all(parent).map_err(|_| CommandError::Unavailable)?;
+    let temporary = parent.join(format!(".{}.tmp-{}", CHAIN_SOURCE_FILE_NAME, Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| {
+        use std::io::Write as _;
+        let mut output = options
+            .open(&temporary)
+            .map_err(|_| CommandError::Unavailable)?;
+        output
+            .write_all(bytes)
+            .and_then(|()| output.sync_all())
+            .map_err(|_| CommandError::Unavailable)?;
+        std::fs::rename(&temporary, path).map_err(|_| CommandError::Unavailable)?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| CommandError::Unavailable)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// Build the remote source and attach it to the service as the scan backend.
+/// Runs inside the sync worker as part of self-healing, so every failure is
+/// reported as a retriable `CommandError`.
+fn attach_remote_backend(
+    service: &mut WalletService,
+    chain_source: &Arc<Mutex<ChainSourceState>>,
+) -> Result<(), CommandError> {
+    let (base_url, bearer_token) = {
+        let state = chain_source.lock().map_err(|_| CommandError::Unavailable)?;
+        (
+            state
+                .base_url
+                .clone()
+                .ok_or(CommandError::InvalidInput("remote node URL is missing".into()))?,
+            state.bearer_token.clone(),
+        )
+    };
+    let remote = Arc::new(
+        RemoteNodeSource::new(&base_url, bearer_token.as_ref().map(|token| token.as_str()))
+            .map_err(|_| CommandError::InvalidInput("remote node URL is invalid".into()))?,
+    );
+    service
+        .start_remote_source(Arc::clone(&remote) as Arc<dyn WalletCoreApi + Send + Sync>)
+        .map_err(CommandError::from)?;
+    if let Ok(mut state) = chain_source.lock() {
+        state.active_remote = Some(remote);
+    }
+    Ok(())
+}
+
+/// Self-healing backend acquisition used by the sync worker. Embedded mode
+/// waits for the asynchronous node start (retriable `NodeNotReady`); remote
+/// mode (re)builds the remote source on demand.
+fn ensure_scan_backend(
+    service: &mut WalletService,
+    chain_source: &Arc<Mutex<ChainSourceState>>,
+) -> Result<(), CommandError> {
+    if service.has_backend() {
+        return Ok(());
+    }
+    let kind = chain_source
+        .lock()
+        .map_err(|_| CommandError::Unavailable)?
+        .effective_kind();
+    match kind {
+        ChainSourceKind::Embedded => Err(CommandError::NodeNotReady),
+        ChainSourceKind::Remote => attach_remote_backend(service, chain_source),
     }
 }
 
@@ -783,6 +1053,17 @@ pub struct RecoveryResultDto {
     pub legacy_outputs: u64,
     pub balance: BalanceProjection,
     pub warnings: Vec<String>,
+}
+
+/// Immediate result of the offline seed restore: the encrypted wallet exists
+/// and is ready to unlock while the canonical scan continues in background.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreStartedDto {
+    pub wallet: WalletSummary,
+    /// Always `true`: the background scan is pending or running; progress is
+    /// observable through `wallet_sync_status`.
+    pub scanning: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1083,62 +1364,53 @@ impl DesktopApplication {
             .map_err(CommandError::from)
     }
 
+    /// Seed restore is immediate and fully offline: the mnemonic is parsed,
+    /// the encrypted wallet is created at its destination bound to the
+    /// canonical Mainnet identity, and the command returns without consulting
+    /// any node. The canonical recovery scan runs afterwards on the normal
+    /// self-healing synchronization path (cursor and state commit atomically
+    /// per page).
+    ///
+    /// REGRESSION GUARD: restore must NEVER be gated on node readiness or any
+    /// synchronization state again. The v0.2.4 `ensure_seed_restore_node_ready`
+    /// gate (commit b7b17e7) made restore unusable during IBD and was removed
+    /// deliberately; see `regression_restore_is_immediate_offline_and_ungated`.
     pub fn wallet_restore_from_mnemonic(
         &self,
         path: impl AsRef<Path>,
         password: &str,
         mnemonic: &str,
-    ) -> Result<RecoveryResultDto, CommandError> {
+    ) -> Result<RestoreStartedDto, CommandError> {
         self.ensure_running()?;
-        let _activity = self.activities.try_begin(ActivityKind::Restore)?;
-        checked_password(password)?;
-        if mnemonic.len() > 4096 {
-            return Err(CommandError::InvalidInput(
-                "recovery phrase is invalid".into(),
-            ));
-        }
-        let path = path.as_ref();
-        if path.exists() {
-            return Err(CommandError::RestoreDestinationExists);
-        }
-        let node_status = self.embedded_node_status()?;
-        ensure_seed_restore_node_ready(&node_status)?;
-        let result: RecoveryRestoreResult = self
-            .lock_service()?
-            .restore_from_mnemonic(path, password, mnemonic)
-            .map_err(CommandError::from)?;
-        let completion = match result.recovery.completion {
-            dom_wallet_core_restore::SeedRestoreCompletion::OwnedOutputsRecovered => {
-                RecoveryCompletionDto::OwnedOutputsRecovered
+        let wallet = {
+            let _activity = self.activities.try_begin(ActivityKind::Restore)?;
+            checked_password(password)?;
+            if mnemonic.len() > 4096 {
+                return Err(CommandError::InvalidInput(
+                    "recovery phrase is invalid".into(),
+                ));
             }
-            dom_wallet_core_restore::SeedRestoreCompletion::NoOwnedOutputs => {
-                RecoveryCompletionDto::NoOwnedOutputs
+            // Diagnose before touching disk: a rejected phrase must leave the
+            // destination untouched (R3-R5).
+            if let Err(problem) = WalletService::diagnose_recovery_phrase(mnemonic) {
+                return Err(phrase_problem_error(problem));
             }
+            let path = path.as_ref();
+            if restore_destination_is_occupied(path)? {
+                return Err(CommandError::RestoreDestinationExists);
+            }
+            self.lock_service()?
+                .restore_from_mnemonic_offline(path, password, mnemonic)
+                .map_err(CommandError::from)?
         };
-        Ok(RecoveryResultDto {
-            wallet: result.wallet,
-            completion,
-            scanned_blocks: result.recovery.scanned_blocks,
-            scanned_outputs: result.recovery.scanned_outputs,
-            owned_outputs: result.recovery.owned_outputs,
-            spent_outputs: result.recovery.spent_outputs,
-            unspent_outputs: result.recovery.unspent_outputs,
-            coinbase_outputs: result.recovery.coinbase_outputs,
-            legacy_outputs: result.recovery.legacy_outputs,
-            balance: result.recovery.balance,
-            warnings: result
-                .recovery
-                .warnings
-                .into_iter()
-                .map(|warning| match warning {
-                    dom_wallet_core_restore::SeedRestoreWarning::LegacyBackupRequired => {
-                        "LEGACY_BACKUP_REQUIRED".into()
-                    }
-                    dom_wallet_core_restore::SeedRestoreWarning::OffChainMetadataNotRecoverableWithSeed => {
-                        "OFF_CHAIN_METADATA_NOT_RECOVERABLE_WITH_SEED".into()
-                    }
-                })
-                .collect(),
+        self.seed_restore_started.store(true, Ordering::Release);
+        // Kick the background scan immediately when a source is available;
+        // while the wallet stays locked (or the source is still starting) the
+        // self-healing worker simply retries with bounded backoff.
+        let _ = self.synchronization_start_live();
+        Ok(RestoreStartedDto {
+            wallet,
+            scanning: true,
         })
     }
 
@@ -1226,11 +1498,18 @@ impl DesktopApplication {
 
     pub fn wallet_unlock(&self, password: &str) -> Result<WalletSummary, CommandError> {
         self.ensure_running()?;
-        let _activity = self.activities.try_begin(ActivityKind::WalletLifecycle)?;
-        checked_password(password)?;
-        self.lock_service()?
-            .unlock(password)
-            .map_err(CommandError::from)
+        let summary = {
+            let _activity = self.activities.try_begin(ActivityKind::WalletLifecycle)?;
+            checked_password(password)?;
+            self.lock_service()?
+                .unlock(password)
+                .map_err(CommandError::from)?
+        };
+        // Self-healing background synchronization starts automatically after
+        // every unlock; a missing or busy chain source is retried by the
+        // worker, so a failure to start here is never surfaced to unlock.
+        let _ = self.synchronization_start_live();
+        Ok(summary)
     }
 
     pub fn wallet_lock(&self) -> Result<(), CommandError> {
@@ -1260,6 +1539,156 @@ impl DesktopApplication {
     pub fn account_summary(&self) -> Result<WalletSummary, CommandError> {
         self.wallet_summary()
     }
+
+    /// Bind the persistent app-config directory (chain source and embedded
+    /// node map size). Loads any previously saved chain-source selection.
+    pub fn configure_app_config_storage(
+        &self,
+        directory: impl Into<PathBuf>,
+    ) -> Result<(), CommandError> {
+        let directory = directory.into();
+        let mut state = self
+            .chain_source
+            .lock()
+            .map_err(|_| CommandError::Unavailable)?;
+        let persisted = std::fs::read(directory.join(CHAIN_SOURCE_FILE_NAME))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<PersistedChainSource>(&bytes).ok())
+            .filter(|value| value.schema_version == CHAIN_SOURCE_SCHEMA_VERSION);
+        if let Some(persisted) = persisted {
+            let kind = match persisted.source.as_str() {
+                "REMOTE" => Some(ChainSourceKind::Remote),
+                "EMBEDDED" => Some(ChainSourceKind::Embedded),
+                _ => None,
+            };
+            // A remote selection without a usable URL falls back to embedded
+            // instead of wedging the wallet on a corrupt config file.
+            let valid_remote = kind == Some(ChainSourceKind::Remote)
+                && persisted.base_url.as_deref().is_some_and(|base_url| {
+                    RemoteNodeSource::new(base_url, persisted.bearer_token.as_deref()).is_ok()
+                });
+            if kind == Some(ChainSourceKind::Embedded) {
+                state.kind = Some(ChainSourceKind::Embedded);
+            } else if valid_remote {
+                state.kind = Some(ChainSourceKind::Remote);
+                state.base_url = persisted.base_url;
+                state.bearer_token = persisted.bearer_token.map(Zeroizing::new);
+            }
+        }
+        state.storage_directory = Some(directory);
+        Ok(())
+    }
+
+    pub fn chain_source_get(&self) -> Result<ChainSourceStatusDto, CommandError> {
+        let state = self
+            .chain_source
+            .lock()
+            .map_err(|_| CommandError::Unavailable)?;
+        Ok(chain_source_status(&state))
+    }
+
+    /// Persist and activate a chain-source selection. The bearer token is
+    /// stored in the private config file and never echoed back.
+    pub fn chain_source_set(
+        &self,
+        source: &str,
+        base_url: Option<&str>,
+        bearer_token: Option<&str>,
+    ) -> Result<ChainSourceStatusDto, CommandError> {
+        self.ensure_running()?;
+        let kind = match source {
+            "EMBEDDED" => ChainSourceKind::Embedded,
+            "REMOTE" => ChainSourceKind::Remote,
+            _ => {
+                return Err(CommandError::InvalidInput(
+                    "chain source must be EMBEDDED or REMOTE".into(),
+                ))
+            }
+        };
+        let dto = {
+            let mut state = self
+                .chain_source
+                .lock()
+                .map_err(|_| CommandError::Unavailable)?;
+            let (next_base_url, next_token) = match kind {
+                ChainSourceKind::Embedded => (None, None),
+                ChainSourceKind::Remote => {
+                    let base_url = base_url
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| {
+                            CommandError::InvalidInput("remote node URL is required".into())
+                        })?
+                        .to_owned();
+                    // A token entered now always wins; an omitted token is
+                    // kept ONLY for the same URL so a stored secret can never
+                    // be replayed against a different host.
+                    let token = match bearer_token {
+                        Some(token) => Some(Zeroizing::new(token.trim().to_owned()))
+                            .filter(|token| !token.is_empty()),
+                        None => state
+                            .bearer_token
+                            .clone()
+                            .filter(|_| state.base_url.as_deref() == Some(base_url.as_str())),
+                    };
+                    // Validate URL and token shape without any network I/O.
+                    RemoteNodeSource::new(
+                        &base_url,
+                        token.as_ref().map(|token| token.as_str()),
+                    )
+                    .map_err(|_| {
+                        CommandError::InvalidInput("remote node URL is invalid".into())
+                    })?;
+                    (Some(base_url), token)
+                }
+            };
+            if let Some(directory) = state.storage_directory.as_ref() {
+                let bytes = serde_json::to_vec(&PersistedChainSource {
+                    schema_version: CHAIN_SOURCE_SCHEMA_VERSION,
+                    source: kind.name().into(),
+                    base_url: next_base_url.clone(),
+                    bearer_token: next_token
+                        .as_ref()
+                        .map(|token| token.as_str().to_owned()),
+                })
+                .map_err(|_| CommandError::Unavailable)?;
+                atomic_write_private_json(&directory.join(CHAIN_SOURCE_FILE_NAME), &bytes)?;
+            }
+            state.kind = Some(kind);
+            state.base_url = next_base_url;
+            state.bearer_token = next_token;
+            state.active_remote = None;
+            chain_source_status(&state)
+        };
+        // Switching sources retires the previous backend; the self-healing
+        // worker (or the embedded start path) acquires the new one.
+        self.stop_synchronization_worker()?;
+        self.remote_tip_alert.store(false, Ordering::Release);
+        {
+            let mut service = self.lock_service()?;
+            let _ = service.stop_embedded_core();
+        }
+        self.node_started.store(false, Ordering::Release);
+        if self
+            .lock_service()
+            .map(|service| service.summary().is_ok())
+            .unwrap_or(false)
+        {
+            let _ = self.synchronization_start_live();
+        }
+        Ok(dto)
+    }
+
+    /// Start the embedded Mainnet node WITHOUT blocking the calling thread.
+    ///
+    /// `DomNode::init` performs NTP sanity checks and `ChainState::open`, both
+    /// of which can take many seconds; they run on a dedicated thread that
+    /// never holds the `WalletService` lock. Until construction finishes this
+    /// command (and `embedded_node_status`) reports lifecycle `STARTING`.
+    ///
+    /// When initialization fails with the store's `LMDB_MAP_FULL` sentinel the
+    /// worker doubles the persisted map size (bounded by
+    /// [`MAX_LMDB_MAP_SIZE_BYTES`]) and retries automatically.
     pub fn embedded_node_start_mainnet(
         &self,
         data_directory: impl AsRef<Path>,
@@ -1267,6 +1696,10 @@ impl DesktopApplication {
     ) -> Result<EmbeddedNodeStatusDto, CommandError> {
         self.ensure_running()?;
         let _activity = self.activities.try_begin(ActivityKind::NodeLifecycle)?;
+        if self.node_starting.load(Ordering::Acquire) {
+            return Ok(starting_node_status());
+        }
+        self.reap_finished_node_start_worker();
         if self.node_started.load(Ordering::Acquire) {
             let status = self.embedded_node_status_inner()?;
             if !matches!(
@@ -1281,13 +1714,124 @@ impl DesktopApplication {
                 "automatic local node listener is invalid".into(),
             ));
         }
-        let configuration =
-            EmbeddedCoreConfiguration::mainnet(data_directory.as_ref(), listen_address);
-        self.lock_service()?
-            .start_embedded_core(configuration)
-            .map_err(CommandError::from)?;
-        self.node_started.store(true, Ordering::Release);
-        self.embedded_node_status_inner()
+        let mut runtime = self
+            .node_start
+            .lock()
+            .map_err(|_| CommandError::Unavailable)?;
+        if runtime.worker.is_some() {
+            return Ok(starting_node_status());
+        }
+        if let Ok(mut error) = self.node_start_error.lock() {
+            *error = None;
+        }
+        self.node_start_cancelled.store(false, Ordering::Release);
+        self.node_starting.store(true, Ordering::Release);
+        let data_directory = data_directory.as_ref().to_path_buf();
+        let service = Arc::clone(&self.service);
+        let starting = Arc::clone(&self.node_starting);
+        let cancelled = Arc::clone(&self.node_start_cancelled);
+        let error_slot = Arc::clone(&self.node_start_error);
+        let started_mirror = Arc::clone(&self.node_started);
+        let map_size_directory = self
+            .chain_source
+            .lock()
+            .ok()
+            .and_then(|state| state.storage_directory.clone());
+        let worker = std::thread::Builder::new()
+            .name("dom-wallet-node-start".into())
+            .spawn(move || {
+                let mut map_size = load_persisted_map_size(map_size_directory.as_deref())
+                    .unwrap_or_else(default_lmdb_map_size);
+                loop {
+                    if cancelled.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let configuration =
+                        EmbeddedCoreConfiguration::mainnet(&data_directory, listen_address)
+                            .with_lmdb_map_size(map_size);
+                    match ProductionWalletBackend::start(configuration, None) {
+                        Ok(backend) => {
+                            let attached = service
+                                .lock()
+                                .map_err(|_| ())
+                                .and_then(|mut wallet| {
+                                    if cancelled.load(Ordering::Acquire) {
+                                        return Err(());
+                                    }
+                                    wallet.attach_backend(backend).map(|_| ()).map_err(|_| ())
+                                });
+                            match attached {
+                                Ok(()) => started_mirror.store(true, Ordering::Release),
+                                Err(()) => {
+                                    // Either cancelled or rejected (identity /
+                                    // lifecycle); shut the fresh node down so
+                                    // no orphan process outlives the attempt.
+                                    if let Ok(mut wallet) = service.lock() {
+                                        let _ = wallet.stop_embedded_core();
+                                    }
+                                    if let Ok(mut error) = error_slot.lock() {
+                                        *error = Some("NODE_ATTACH_REJECTED");
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                        Err(error)
+                            if node_start_error_code(&error) == LMDB_MAP_FULL_ERROR_CODE
+                                && map_size < MAX_LMDB_MAP_SIZE_BYTES =>
+                        {
+                            // Grow-on-demand: double the LMDB map and persist
+                            // the new size so the next boot starts there.
+                            map_size = map_size
+                                .saturating_mul(2)
+                                .min(MAX_LMDB_MAP_SIZE_BYTES);
+                            persist_map_size(map_size_directory.as_deref(), map_size);
+                            continue;
+                        }
+                        Err(error) => {
+                            if let Ok(mut slot) = error_slot.lock() {
+                                *slot = Some(node_start_error_code(&error));
+                            }
+                            break;
+                        }
+                    }
+                }
+                starting.store(false, Ordering::Release);
+            });
+        match worker {
+            Ok(worker) => {
+                runtime.worker = Some(worker);
+                Ok(starting_node_status())
+            }
+            Err(_) => {
+                self.node_starting.store(false, Ordering::Release);
+                Err(CommandError::Unavailable)
+            }
+        }
+    }
+
+    /// Join a finished background node-start worker, if any.
+    fn reap_finished_node_start_worker(&self) {
+        if let Ok(mut runtime) = self.node_start.lock() {
+            if runtime.worker.as_ref().is_some_and(JoinHandle::is_finished) {
+                if let Some(worker) = runtime.worker.take() {
+                    let _ = worker.join();
+                }
+            }
+        }
+    }
+
+    /// Cancel and join an in-flight background node start.
+    fn cancel_node_start_worker(&self) {
+        self.node_start_cancelled.store(true, Ordering::Release);
+        let worker = self
+            .node_start
+            .lock()
+            .ok()
+            .and_then(|mut runtime| runtime.worker.take());
+        if let Some(worker) = worker {
+            let _ = worker.join();
+        }
     }
 
     pub fn embedded_node_status(&self) -> Result<EmbeddedNodeStatusDto, CommandError> {
@@ -1297,7 +1841,17 @@ impl DesktopApplication {
 
     fn embedded_node_status_inner(&self) -> Result<EmbeddedNodeStatusDto, CommandError> {
         if !self.node_started.load(Ordering::Acquire) {
-            return Ok(stopped_node_status());
+            if self.node_starting.load(Ordering::Acquire) {
+                return Ok(starting_node_status());
+            }
+            self.reap_finished_node_start_worker();
+            if self.node_started.load(Ordering::Acquire) {
+                // The background start finished between the two checks.
+            } else if let Some(code) = self.node_start_error.lock().ok().and_then(|slot| *slot) {
+                return Ok(failed_node_start_status(code));
+            } else {
+                return Ok(stopped_node_status());
+            }
         }
         let mut service = self.lock_service()?;
         let running = service.embedded_core_running().unwrap_or(false);
@@ -1389,6 +1943,7 @@ impl DesktopApplication {
     pub fn embedded_node_stop(&self) -> Result<EmbeddedNodeStatusDto, CommandError> {
         self.ensure_running()?;
         let _activity = self.activities.try_begin(ActivityKind::NodeLifecycle)?;
+        self.cancel_node_start_worker();
         self.stop_mining_worker()?;
         self.stop_synchronization_worker()?;
         self.lock_service()?
@@ -1459,14 +2014,35 @@ impl DesktopApplication {
         })
     }
 
+    fn sync_status_context(&self) -> SyncStatusContext {
+        SyncStatusContext {
+            paused: self.synchronization_paused.load(Ordering::Acquire),
+            remote_source: self.chain_source_kind() == ChainSourceKind::Remote,
+            seed_restore_latch: self.seed_restore_started.load(Ordering::Acquire),
+            remote_tip_alert: self.remote_tip_alert.load(Ordering::Acquire),
+        }
+    }
+
+    /// Active chain source (EMBEDDED when nothing was ever configured).
+    pub fn chain_source_kind(&self) -> ChainSourceKind {
+        self.chain_source
+            .lock()
+            .map(|state| state.effective_kind())
+            .unwrap_or(ChainSourceKind::Embedded)
+    }
+
     pub fn wallet_sync_status(&self) -> Result<WalletSyncStatusDto, CommandError> {
         self.reap_finished_sync_worker()?;
         match self.service.try_lock() {
             Ok(service) => {
-                let status = sync_status_from_service(
-                    &service,
-                    self.synchronization_paused.load(Ordering::Acquire),
-                );
+                let status = sync_status_from_service(&service, self.sync_status_context());
+                let summary_available = service.summary().is_ok();
+                drop(service);
+                if summary_available && !status.seed_restore_in_progress {
+                    // The durable state is authoritative again; retire the
+                    // shell-side restore latch.
+                    self.seed_restore_started.store(false, Ordering::Release);
+                }
                 if let Ok(runtime) = self.synchronization.lock() {
                     if let Ok(mut cached) = runtime.cached_status.lock() {
                         *cached = Some(status.clone());
@@ -1581,9 +2157,11 @@ impl DesktopApplication {
         let raw_state = mining.state.load(Ordering::Acquire);
         let attempts = mining.hash_attempts.load(Ordering::Relaxed);
         let started_at = mining.started_at.load(Ordering::Acquire);
+        // WAITING counts as uptime: the worker is alive and will resume on its
+        // own, so the session has not ended.
         let uptime = if matches!(
             raw_state,
-            MINING_STARTING | MINING_RUNNING | MINING_STOPPING
+            MINING_STARTING | MINING_RUNNING | MINING_STOPPING | MINING_WAITING
         ) && started_at > 0
         {
             unix_seconds().saturating_sub(started_at)
@@ -1683,7 +2261,7 @@ impl DesktopApplication {
         if mining.worker.is_some()
             || matches!(
                 mining.state.load(Ordering::Acquire),
-                MINING_STARTING | MINING_RUNNING | MINING_STOPPING
+                MINING_STARTING | MINING_RUNNING | MINING_STOPPING | MINING_WAITING
             )
         {
             return Err(CommandError::MiningRunning);
@@ -1731,6 +2309,10 @@ impl DesktopApplication {
                     node.metrics.mining_active.store(1, Ordering::Release);
                     state.store(MINING_RUNNING, Ordering::Release);
                     let mut coinbase_candidate = None;
+                    // Consecutive transient "node is not synchronized" answers.
+                    // Reset by any round that produces real work, which is what
+                    // makes mining resume by itself once the node catches up.
+                    let mut consecutive_not_ready = 0_u32;
                     while !stop.load(Ordering::Acquire) {
                         let height = node
                             .metrics
@@ -1769,27 +2351,52 @@ impl DesktopApplication {
                             Arc::clone(&attempts),
                         )) {
                             Ok(WalletMiningOutcome::Accepted { height }) => {
+                                consecutive_not_ready = 0;
                                 accepted.fetch_add(1, Ordering::Relaxed);
                                 accepted_height.store(height, Ordering::Release);
                                 coinbase_candidate = None;
+                                clear_mining_error(&state, &error_code);
                             }
                             Ok(WalletMiningOutcome::Rejected { .. }) => {
+                                consecutive_not_ready = 0;
                                 rejected.fetch_add(1, Ordering::Relaxed);
                                 coinbase_candidate = None;
+                                set_mining_notice(&error_code, "MINING_BLOCK_REJECTED");
                             }
                             Ok(WalletMiningOutcome::Stale { .. }) => {
+                                consecutive_not_ready = 0;
                                 rejected.fetch_add(1, Ordering::Relaxed);
                                 coinbase_candidate = None;
+                                set_mining_notice(&error_code, "MINING_TEMPLATE_STALE");
                             }
                             Ok(WalletMiningOutcome::TemplateExpired { .. }) => {
+                                consecutive_not_ready = 0;
                                 refreshes.fetch_add(1, Ordering::Relaxed);
+                                clear_mining_error(&state, &error_code);
                             }
                             Ok(WalletMiningOutcome::Stopped) => break,
-                            Err(_) => {
+                            // Transient: the node is still catching up. Back off
+                            // and keep the worker alive so mining resumes on its
+                            // own once synchronization recovers.
+                            Err(error) if error.is_transient() => {
+                                let delay =
+                                    synchronization_retry_backoff(consecutive_not_ready);
+                                consecutive_not_ready =
+                                    consecutive_not_ready.saturating_add(1);
+                                state.store(MINING_WAITING, Ordering::Release);
+                                set_mining_notice(&error_code, error.code());
+                                // A stale template must not be reused after the
+                                // node moves; rebuild it on the next round.
+                                coinbase_candidate = None;
+                                if wait_for_mining_retry(&stop, delay) {
+                                    break;
+                                }
+                            }
+                            Err(error) => {
                                 rejected.fetch_add(1, Ordering::Relaxed);
                                 state.store(MINING_ERROR, Ordering::Release);
-                                if let Ok(mut error) = error_code.lock() {
-                                    *error = Some("MINING_WORK_FAILED".into());
+                                if let Ok(mut slot) = error_code.lock() {
+                                    *slot = Some(error.code().into());
                                 }
                                 break;
                             }
@@ -1893,6 +2500,7 @@ impl DesktopApplication {
         }
         let result = (|| {
             let _activity = self.activities.try_begin(ActivityKind::Shutdown)?;
+            self.cancel_node_start_worker();
             self.stop_mining_worker()?;
             self.stop_synchronization_worker()?;
             self.sidecar
@@ -1959,6 +2567,9 @@ impl DesktopApplication {
         let error_code = Arc::clone(&runtime.error_code);
         let cached = Arc::clone(&runtime.cached_status);
         let activities = Arc::clone(&self.activities);
+        let chain_source = Arc::clone(&self.chain_source);
+        let remote_tip_alert = Arc::clone(&self.remote_tip_alert);
+        let seed_restore_started = Arc::clone(&self.seed_restore_started);
         let worker = std::thread::Builder::new()
             .name("dom-wallet-sync".into())
             .spawn(move || {
@@ -1973,8 +2584,38 @@ impl DesktopApplication {
                             };
                             let mut wallet =
                                 service.lock().map_err(|_| CommandError::RecoveryRequired)?;
-                            let result = wallet.synchronize_live().map_err(CommandError::from);
-                            let snapshot = sync_status_from_service(&wallet, false);
+                            // Self-healing: (re)acquire the configured chain
+                            // source before scanning; failures are retried by
+                            // the follow loop, never treated as terminal.
+                            let result = ensure_scan_backend(&mut wallet, &chain_source)
+                                .and_then(|()| {
+                                    wallet.synchronize_live().map_err(CommandError::from)
+                                });
+                            let remote_source = {
+                                let state = chain_source.lock().ok();
+                                let remote = state.as_ref().and_then(|state| {
+                                    state.active_remote.as_ref().map(Arc::clone)
+                                });
+                                let kind = state
+                                    .map(|state| state.effective_kind())
+                                    .unwrap_or(ChainSourceKind::Embedded);
+                                if let Some(remote) = remote {
+                                    if remote.tip_regression().is_some() {
+                                        remote_tip_alert.store(true, Ordering::Release);
+                                    }
+                                }
+                                kind == ChainSourceKind::Remote
+                            };
+                            let snapshot = sync_status_from_service(
+                                &wallet,
+                                SyncStatusContext {
+                                    paused: false,
+                                    remote_source,
+                                    seed_restore_latch: seed_restore_started
+                                        .load(Ordering::Acquire),
+                                    remote_tip_alert: remote_tip_alert.load(Ordering::Acquire),
+                                },
+                            );
                             let synchronized = snapshot.synchronized;
                             if let Ok(mut cached) = cached.lock() {
                                 *cached = Some(snapshot);
@@ -2562,34 +3203,88 @@ fn qr_reassembly_dto(assembly: Option<&SlateQrAssembly>) -> SlateQrReassemblyDto
     }
 }
 
-fn sync_status_from_service(service: &WalletService, paused: bool) -> WalletSyncStatusDto {
+/// Inputs owned by the shell (not the service) that shape the sync status.
+#[derive(Clone, Copy, Debug, Default)]
+struct SyncStatusContext {
+    paused: bool,
+    /// The active chain source is a remote node (no embedded peer surface).
+    remote_source: bool,
+    /// Shell latch set by an offline restore before the wallet is unlocked,
+    /// so the frontend keeps seeing `seed_restore_in_progress` while locked.
+    seed_restore_latch: bool,
+    /// Latched remote tip-regression alert.
+    remote_tip_alert: bool,
+}
+
+fn sync_status_from_service(
+    service: &WalletService,
+    context: SyncStatusContext,
+) -> WalletSyncStatusDto {
     let diagnostic = service.diagnostics();
-    let identity = service.embedded_core_identity().ok();
+    let summary = service.summary().ok();
+    // The remote path uses the cached (pinned) identity: the live tip is
+    // already tracked through committed scan batches, and a status poll must
+    // never issue a blocking network round-trip.
+    let identity = if context.remote_source {
+        service.embedded_core_cached_identity().ok()
+    } else {
+        service.embedded_core_identity().ok()
+    };
     let peers = service.embedded_peer_status().ok();
     let canonical_height = identity.as_ref().map(|value| value.current_tip.height);
     let canonical_hash = identity
         .as_ref()
         .map(|value| hex::encode(value.current_tip.hash));
-    let synchronized = cursor_is_authoritatively_synchronized(
-        diagnostic.cursor_height,
-        diagnostic.cursor_hash.as_deref(),
-        canonical_height,
-        canonical_hash.as_deref(),
-        peers.as_ref().map_or(0, |status| status.connected_total),
-        peers
-            .as_ref()
-            .filter(|status| status.connected_total > 0)
-            .map(|status| status.highest_known_peer_height),
-        diagnostic.last_error.as_deref(),
-    );
+    let tip_height = summary
+        .as_ref()
+        .and_then(|value| value.tip_height)
+        .or(canonical_height);
+    let cursor_height = diagnostic.cursor_height;
+    let scan_progress_percent = match (cursor_height, tip_height) {
+        (Some(cursor), Some(tip)) if tip > 0 => {
+            Some(((u128::from(cursor.min(tip)) * 100) / u128::from(tip)) as u64)
+        }
+        (Some(_), Some(_)) => Some(100),
+        _ => None,
+    };
+    let seed_restore_in_progress = match summary.as_ref() {
+        Some(summary) => summary.seed_restore_status.as_deref() == Some("in_progress"),
+        // Locked or closed wallet: fall back to the shell latch set by an
+        // offline restore so the frontend progress panel stays alive.
+        None => context.seed_restore_latch,
+    };
+    let synchronized = if context.remote_source {
+        cursor_height.is_some()
+            && cursor_height == tip_height
+            && diagnostic.cursor_hash.is_some()
+            && diagnostic.last_error.is_none()
+    } else {
+        cursor_is_authoritatively_synchronized(
+            cursor_height,
+            diagnostic.cursor_hash.as_deref(),
+            canonical_height,
+            canonical_hash.as_deref(),
+            peers.as_ref().map_or(0, |status| status.connected_total),
+            peers
+                .as_ref()
+                .filter(|status| status.connected_total > 0)
+                .map(|status| status.highest_known_peer_height),
+            diagnostic.last_error.as_deref(),
+        )
+    };
     WalletSyncStatusDto {
         state: diagnostic.application_state,
-        cursor_height: diagnostic.cursor_height,
+        cursor_height,
         cursor_hash: diagnostic.cursor_hash,
         canonical_height,
         canonical_hash,
+        tip_height,
+        scan_progress_percent,
+        seed_restore_in_progress,
+        partial_balance: summary.map(|value| value.balance),
+        remote_tip_alert: context.remote_tip_alert,
         synchronized,
-        paused,
+        paused: context.paused,
         last_result: if synchronized {
             "SUCCESS"
         } else {
@@ -2616,6 +3311,99 @@ fn cursor_is_authoritatively_synchronized(
         && cursor_hash.is_some()
         && cursor_hash == canonical_hash
         && last_error.is_none()
+}
+
+fn chain_source_status(state: &ChainSourceState) -> ChainSourceStatusDto {
+    let kind = state.effective_kind();
+    ChainSourceStatusDto {
+        source: kind.name().into(),
+        base_url: state.base_url.clone(),
+        has_bearer_token: state.bearer_token.is_some(),
+        tls_warning: kind == ChainSourceKind::Remote
+            && state
+                .base_url
+                .as_deref()
+                .map(chain_source_transport_warning)
+                .unwrap_or(true),
+    }
+}
+
+fn load_persisted_map_size(directory: Option<&Path>) -> Option<usize> {
+    let bytes = std::fs::read(directory?.join(NODE_MAP_SIZE_FILE_NAME)).ok()?;
+    let persisted: PersistedNodeMapSize = serde_json::from_slice(&bytes).ok()?;
+    if persisted.schema_version != 1 {
+        return None;
+    }
+    usize::try_from(persisted.map_size_bytes)
+        .ok()
+        .filter(|size| {
+            (dom_wallet_embedded_core::MINIMUM_LMDB_MAP_SIZE_BYTES..=MAX_LMDB_MAP_SIZE_BYTES)
+                .contains(size)
+        })
+}
+
+fn persist_map_size(directory: Option<&Path>, map_size: usize) {
+    let Some(directory) = directory else {
+        return;
+    };
+    if let Ok(bytes) = serde_json::to_vec(&PersistedNodeMapSize {
+        schema_version: 1,
+        map_size_bytes: map_size as u64,
+    }) {
+        let _ = atomic_write_private_json(&directory.join(NODE_MAP_SIZE_FILE_NAME), &bytes);
+    }
+}
+
+/// Redacted, typed code for a failed background node start.
+fn node_start_error_code<E: std::fmt::Debug>(error: &E) -> &'static str {
+    let rendered = format!("{error:?}");
+    if rendered.contains(LMDB_MAP_FULL_ERROR_CODE) {
+        LMDB_MAP_FULL_ERROR_CODE
+    } else {
+        "NODE_START_FAILED"
+    }
+}
+
+fn starting_node_status() -> EmbeddedNodeStatusDto {
+    EmbeddedNodeStatusDto {
+        lifecycle: WalletReadinessDto::Starting,
+        network: None,
+        chain_id: None,
+        genesis_hash: None,
+        canonical_tip_height: None,
+        canonical_tip_hash: None,
+        protocol_version: None,
+        range_proof_version: None,
+        ready: false,
+        error_code: None,
+        connected_peers: 0,
+        bootstrap_phase: "STARTING".into(),
+        highest_known_peer_height: None,
+        synchronization_progress_percent: None,
+        status_message: "Embedded node is initializing in the background".into(),
+        last_successful_status_at: None,
+    }
+}
+
+fn failed_node_start_status(code: &'static str) -> EmbeddedNodeStatusDto {
+    EmbeddedNodeStatusDto {
+        lifecycle: WalletReadinessDto::Failed,
+        network: None,
+        chain_id: None,
+        genesis_hash: None,
+        canonical_tip_height: None,
+        canonical_tip_hash: None,
+        protocol_version: None,
+        range_proof_version: None,
+        ready: false,
+        error_code: Some(code.into()),
+        connected_peers: 0,
+        bootstrap_phase: "FAILED".into(),
+        highest_known_peer_height: None,
+        synchronization_progress_percent: None,
+        status_message: "The embedded node failed to start; retry to relaunch it".into(),
+        last_successful_status_at: None,
+    }
 }
 
 fn stopped_node_status() -> EmbeddedNodeStatusDto {
@@ -2772,22 +3560,6 @@ fn node_synchronization_status(snapshot: NodeReadinessSnapshot) -> NodeSynchroni
     }
 }
 
-fn ensure_seed_restore_node_ready(status: &EmbeddedNodeStatusDto) -> Result<(), CommandError> {
-    let local_height = status.canonical_tip_height.unwrap_or(0);
-    let peer_height = status.highest_known_peer_height.unwrap_or(0);
-    let mainnet = status.network.as_deref() == Some("MAINNET");
-    let synchronized = status.lifecycle == WalletReadinessDto::Ready
-        && status.ready
-        && status.connected_peers > 0
-        && peer_height > 0
-        && local_height >= peer_height;
-    if mainnet && synchronized {
-        Ok(())
-    } else {
-        Err(CommandError::RestoreNodeSynchronizing)
-    }
-}
-
 fn core_network_name(network: CoreNetwork) -> &'static str {
     match network {
         CoreNetwork::Mainnet => "MAINNET",
@@ -2810,12 +3582,51 @@ fn unix_seconds() -> u64 {
         .as_secs()
 }
 
+/// Record a non-fatal mining diagnostic. The worker keeps running; the code is
+/// visible in status and logs so a stalled-looking miner can be explained.
+fn set_mining_notice(error_code: &Arc<Mutex<Option<String>>>, code: &'static str) {
+    if let Ok(mut slot) = error_code.lock() {
+        *slot = Some(code.into());
+    }
+}
+
+/// A round produced real work: clear any transient notice and return to
+/// RUNNING. This is what makes mining resume automatically after the node
+/// recovers, with no user action.
+fn clear_mining_error(state: &Arc<AtomicU64>, error_code: &Arc<Mutex<Option<String>>>) {
+    if let Ok(mut slot) = error_code.lock() {
+        *slot = None;
+    }
+    let _ = state.compare_exchange(
+        MINING_WAITING,
+        MINING_RUNNING,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+}
+
+/// Sleep between transient retries in short slices so a stop request is honored
+/// promptly instead of waiting out the whole backoff. Returns true when mining
+/// was asked to stop.
+fn wait_for_mining_retry(stop: &Arc<AtomicBool>, delay: std::time::Duration) -> bool {
+    const SLICE: std::time::Duration = std::time::Duration::from_millis(50);
+    let deadline = std::time::Instant::now() + delay;
+    while std::time::Instant::now() < deadline {
+        if stop.load(Ordering::Acquire) {
+            return true;
+        }
+        std::thread::sleep(SLICE.min(delay));
+    }
+    stop.load(Ordering::Acquire)
+}
+
 fn mining_state_name(state: u64, enabled: bool) -> &'static str {
     match state {
         MINING_STARTING => "STARTING",
         MINING_RUNNING => "RUNNING",
         MINING_STOPPING => "STOPPING",
         MINING_ERROR => "ERROR",
+        MINING_WAITING => "WAITING_FOR_SYNCHRONIZATION",
         MINING_READY if enabled => "READY",
         _ => "DISABLED",
     }
@@ -2912,6 +3723,11 @@ pub enum CommandError {
     Unavailable,
     #[error("wallet and Mainnet identities differ")]
     IdentityMismatch,
+    /// A recovery phrase was rejected, with the reason precise enough for the
+    /// form to point at it. Carries positions and counts only — never phrase
+    /// content, which would reach the log file.
+    #[error("recovery phrase rejected")]
+    RecoveryPhrase(PhraseProblem),
     #[error("embedded node is not ready")]
     NodeNotReady,
     #[error("seed restore requires a synchronized Mainnet node")]
@@ -2973,6 +3789,35 @@ impl From<CommandError> for CommandErrorDto {
                 category: "TEMPORARY".into(),
                 message: "The embedded wallet service is unavailable.".into(),
                 retryable: true,
+            },
+            // Distinct codes so the form can react per problem. The numbers in
+            // the message are positions and counts, never phrase content, and
+            // word positions are 1-based because the user counts from one.
+            CommandError::RecoveryPhrase(problem) => Self {
+                code: match problem {
+                    PhraseProblem::WrongWordCount { .. } => "RECOVERY_PHRASE_WORD_COUNT",
+                    PhraseProblem::UnknownWord { .. } => "RECOVERY_PHRASE_UNKNOWN_WORD",
+                    PhraseProblem::ChecksumMismatch => "RECOVERY_PHRASE_CHECKSUM",
+                    PhraseProblem::Malformed => "RECOVERY_PHRASE_INVALID",
+                }
+                .into(),
+                category: "VALIDATION".into(),
+                message: match problem {
+                    PhraseProblem::WrongWordCount { got } => format!(
+                        "The recovery phrase needs {CANONICAL_PHRASE_WORDS} words; {got} were entered."
+                    ),
+                    PhraseProblem::UnknownWord { index } => format!(
+                        "Word {} is not in the BIP-39 English word list.",
+                        index.saturating_add(1)
+                    ),
+                    PhraseProblem::ChecksumMismatch => {
+                        "Every word is valid but the phrase does not check out. Two words are \
+                         probably swapped, or one is the wrong word."
+                            .into()
+                    }
+                    PhraseProblem::Malformed => "The recovery phrase is invalid.".into(),
+                },
+                retryable: false,
             },
             CommandError::IdentityMismatch => Self {
                 code: "CHAIN_IDENTITY_MISMATCH".into(),
@@ -3244,6 +4089,43 @@ pub fn resolve_wallet_directory(wallets_root: &Path, name: &str) -> Result<PathB
         return Err(CommandError::ManagedWalletRejected);
     }
     Ok(wallets_root.join(name))
+}
+
+/// Whether a restore destination is genuinely taken.
+///
+/// A bare `path.exists()` was reported as a phantom `RESTORE_DESTINATION_EXISTS`
+/// on Windows: an aborted install or a creation that crashed before writing any
+/// wallet file leaves an EMPTY directory behind, and every later restore under
+/// that name was refused forever with no way for the user to recover.
+///
+/// The rules, in order of safety:
+/// - nothing on disk → free;
+/// - an empty directory → a leftover shell, removed and treated as free.
+///   `remove_dir` refuses non-empty directories, so this can never destroy
+///   wallet data even if the emptiness check raced;
+/// - anything else (a real wallet, foreign files, a file, a symlink) →
+///   occupied. Restore never overwrites content it did not create.
+fn phrase_problem_error(problem: PhraseProblem) -> CommandError {
+    CommandError::RecoveryPhrase(problem)
+}
+
+fn restore_destination_is_occupied(path: &Path) -> Result<bool, CommandError> {
+    let Ok(metadata) = path.symlink_metadata() else {
+        // No entry at all (or an unreadable parent): nothing is in the way.
+        return Ok(false);
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(true);
+    }
+    let Ok(mut entries) = std::fs::read_dir(path) else {
+        return Ok(true);
+    };
+    if entries.next().is_some() {
+        return Ok(true);
+    }
+    // Empty: reclaim the shell. A failure here (permissions, a racing writer)
+    // leaves the destination occupied rather than pretending it is free.
+    Ok(std::fs::remove_dir(path).is_err())
 }
 
 pub fn resolve_existing_managed_wallet(
@@ -3964,9 +4846,14 @@ mod tests {
         assert_eq!(cursor_height.get(), canonical_height.get());
         assert_eq!(cursor_height.get(), 10_010);
         assert_eq!(calls.get(), 5);
-        assert_eq!(
-            waits.borrow()[2],
-            std::time::Duration::from_millis(SYNC_NOT_READY_INITIAL_BACKOFF_MILLIS)
+        // The first transient failure retries at the initial backoff; jitter
+        // only ever adds to it, so the delay stays inside one jitter window.
+        let transient_delay = waits.borrow()[2].as_millis() as u64;
+        assert!(
+            (SYNC_RETRY_INITIAL_BACKOFF_MILLIS
+                ..SYNC_RETRY_INITIAL_BACKOFF_MILLIS + SYNC_RETRY_JITTER_MILLIS)
+                .contains(&transient_delay),
+            "unexpected transient retry delay: {transient_delay}ms"
         );
     }
 
@@ -3984,6 +4871,64 @@ mod tests {
         assert_eq!(waits.get(), 0);
     }
 
+    /// The follow loop's terminal/transient split must stay identical to the
+    /// `retryable` flag the frontend consumes. If they drift, either the UI
+    /// tells the user to retry something the worker already gave up on, or the
+    /// worker spins forever on a failure the UI calls permanent.
+    #[test]
+    fn regression_terminal_sync_errors_agree_with_the_retryable_contract() {
+        let variants = vec![
+            CommandError::InvalidInput("x".into()),
+            CommandError::Unavailable,
+            CommandError::IdentityMismatch,
+            CommandError::NodeNotReady,
+            CommandError::RestoreNodeSynchronizing,
+            CommandError::RestoreDestinationExists,
+            CommandError::RestoreStagingIncompatible,
+            CommandError::InvalidWalletName,
+            CommandError::ManagedWalletRejected,
+            CommandError::SynchronizationPaused,
+            CommandError::CursorInitializationFailed,
+            CommandError::MiningRunning,
+            CommandError::MiningDisabled,
+            CommandError::MiningConfirmationRequired,
+            CommandError::NoPeers,
+            CommandError::WorkerPanicked,
+            CommandError::RecoveryRequired,
+            CommandError::ActivityBusy,
+            CommandError::Wallet {
+                code: "WALLET_LOCKED",
+                message: "locked",
+                retryable: false,
+            },
+            CommandError::Wallet {
+                code: "WALLET_WRITER_ACTIVE",
+                message: "busy",
+                retryable: true,
+            },
+        ];
+
+        for error in variants {
+            let terminal = terminal_synchronization_error(&error);
+            let label = format!("{error:?}");
+            let dto = CommandErrorDto::from(error);
+            assert_eq!(
+                terminal, !dto.retryable,
+                "{label} is classified inconsistently: terminal={terminal}, retryable={}",
+                dto.retryable
+            );
+        }
+
+        // The classes the frozen-cursor regression depends on, stated outright:
+        // a busy or absent chain source can NEVER end the follow loop.
+        assert!(!terminal_synchronization_error(&CommandError::NodeNotReady));
+        assert!(!terminal_synchronization_error(
+            &CommandError::RestoreNodeSynchronizing
+        ));
+        // ...while a source that is not our chain must stop it immediately.
+        assert!(terminal_synchronization_error(&CommandError::IdentityMismatch));
+    }
+
     #[test]
     fn regression_a4_background_sync_keeps_status_and_mining_stop_responsive_without_timing() {
         let app = DesktopApplication::default();
@@ -3995,6 +4940,11 @@ mod tests {
                 cursor_hash: Some("11".repeat(32)),
                 canonical_height: Some(5),
                 canonical_hash: Some("22".repeat(32)),
+                tip_height: Some(5),
+                scan_progress_percent: Some(80),
+                seed_restore_in_progress: false,
+                partial_balance: None,
+                remote_tip_alert: false,
                 synchronized: false,
                 paused: false,
                 last_result: "NOT_SYNCHRONIZED".into(),
@@ -4191,58 +5141,6 @@ mod tests {
         ));
     }
 
-    fn restore_node_status(
-        lifecycle: WalletReadinessDto,
-        local_height: u64,
-        peer_height: Option<u64>,
-        connected_peers: u64,
-        ready: bool,
-    ) -> EmbeddedNodeStatusDto {
-        EmbeddedNodeStatusDto {
-            lifecycle,
-            network: Some("MAINNET".into()),
-            chain_id: Some("11".repeat(32)),
-            genesis_hash: Some("22".repeat(32)),
-            canonical_tip_height: Some(local_height),
-            canonical_tip_hash: Some("33".repeat(32)),
-            protocol_version: Some(1),
-            range_proof_version: Some(1),
-            ready,
-            error_code: None,
-            connected_peers,
-            bootstrap_phase: "CONNECTED".into(),
-            highest_known_peer_height: peer_height,
-            synchronization_progress_percent: None,
-            status_message: "test-only".into(),
-            last_successful_status_at: Some(1),
-        }
-    }
-
-    #[test]
-    fn seed_restore_app_gate_requires_a_confirmed_synchronized_peer_tip() {
-        let discovering = restore_node_status(WalletReadinessDto::Ready, 5_241, None, 0, true);
-        assert!(matches!(
-            ensure_seed_restore_node_ready(&discovering),
-            Err(CommandError::RestoreNodeSynchronizing)
-        ));
-
-        let behind = restore_node_status(
-            WalletReadinessDto::Synchronizing,
-            5_241,
-            Some(8_009),
-            2,
-            false,
-        );
-        assert!(matches!(
-            ensure_seed_restore_node_ready(&behind),
-            Err(CommandError::RestoreNodeSynchronizing)
-        ));
-
-        let synchronized =
-            restore_node_status(WalletReadinessDto::Ready, 8_009, Some(8_009), 2, true);
-        assert!(ensure_seed_restore_node_ready(&synchronized).is_ok());
-    }
-
     #[test]
     fn wallet_name_validation_fails_closed() {
         for valid in [
@@ -4406,18 +5304,33 @@ mod tests {
     fn seed_restore_app_reports_destination_and_sync_errors_without_node_mislabeling() {
         let app = DesktopApplication::default();
         let parent = tempfile::tempdir().unwrap();
+        // A destination holding real content is refused. (An EMPTY directory is
+        // deliberately NOT a destination — see
+        // `regression_restore_destination_ignores_empty_shells_but_never_overwrites`.)
+        // The phrase is validated before the destination is even looked at, so
+        // this case needs a phrase that passes.
+        let valid_phrase = format!("{}art", "abandon ".repeat(23));
         let existing = parent.path().join("existing");
         std::fs::create_dir(&existing).unwrap();
+        std::fs::write(existing.join("wallet.bin"), b"encrypted").unwrap();
         assert!(matches!(
-            app.wallet_restore_from_mnemonic(&existing, "correct-horse", "test-only"),
+            app.wallet_restore_from_mnemonic(&existing, "correct-horse", valid_phrase.as_str()),
             Err(CommandError::RestoreDestinationExists)
         ));
+        assert!(
+            existing.join("wallet.bin").exists(),
+            "the occupied destination is left untouched"
+        );
 
+        // No backend is attached and no node was ever started. The restore must
+        // still reach offline phrase validation instead of being turned away by
+        // a synchronization gate, and must leave nothing behind on disk.
         let not_yet_created = parent.path().join("new-wallet");
         assert!(matches!(
             app.wallet_restore_from_mnemonic(&not_yet_created, "correct-horse", "test-only"),
-            Err(CommandError::RestoreNodeSynchronizing)
+            Err(CommandError::RecoveryPhrase(PhraseProblem::WrongWordCount { got: 1 }))
         ));
+        assert!(!not_yet_created.exists());
 
         let destination: CommandErrorDto =
             CommandError::from(CoreError::Restore(SeedRestoreError::InvalidDestination)).into();
@@ -4430,6 +5343,237 @@ mod tests {
             CommandError::from(CoreError::Restore(SeedRestoreError::CoreBusy)).into();
         assert_eq!(busy.code, "RESTORE_NODE_SYNCHRONIZING");
         assert!(busy.retryable);
+    }
+
+    /// Mining must survive a synchronization dip on its own.
+    ///
+    /// A transient "node is not synchronized" used to store MINING_ERROR and
+    /// break the loop, so the worker died, uptime reset to 0 and the user had
+    /// to stop and start mining by hand — the same class of bug as the frozen
+    /// cursor: a recoverable condition treated as fatal.
+    #[test]
+    fn regression_mining_waiting_state_resumes_without_user_action() {
+        let state = Arc::new(AtomicU64::new(MINING_RUNNING));
+        let error_code: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+        // A transient failure parks the worker in WAITING with a specific code
+        // — NOT in ERROR, because nothing is broken and nobody must intervene.
+        state.store(MINING_WAITING, Ordering::Release);
+        set_mining_notice(&error_code, "MINING_NODE_NOT_SYNCHRONIZED");
+        assert_eq!(
+            mining_state_name(MINING_WAITING, true),
+            "WAITING_FOR_SYNCHRONIZATION"
+        );
+        assert_ne!(state.load(Ordering::Acquire), MINING_ERROR);
+        assert_eq!(
+            error_code.lock().unwrap().as_deref(),
+            Some("MINING_NODE_NOT_SYNCHRONIZED")
+        );
+
+        // The next round produces work: back to RUNNING, notice cleared.
+        clear_mining_error(&state, &error_code);
+        assert_eq!(state.load(Ordering::Acquire), MINING_RUNNING);
+        assert!(error_code.lock().unwrap().is_none());
+
+        // Clearing from RUNNING is a no-op, and never resurrects a real error.
+        clear_mining_error(&state, &error_code);
+        assert_eq!(state.load(Ordering::Acquire), MINING_RUNNING);
+        state.store(MINING_ERROR, Ordering::Release);
+        clear_mining_error(&state, &error_code);
+        assert_eq!(
+            state.load(Ordering::Acquire),
+            MINING_ERROR,
+            "a fatal error must not be cleared by a successful round"
+        );
+
+        // The backoff is bounded and grows, so a long outage does not spin.
+        let first = synchronization_retry_backoff(0);
+        let later = synchronization_retry_backoff(10);
+        assert!(first < later);
+        assert!(
+            later.as_millis() as u64
+                <= SYNC_RETRY_MAX_BACKOFF_MILLIS + SYNC_RETRY_JITTER_MILLIS
+        );
+
+        // A stop request is honored during the wait instead of sleeping it out.
+        let stop = Arc::new(AtomicBool::new(true));
+        let started = std::time::Instant::now();
+        assert!(wait_for_mining_retry(
+            &stop,
+            std::time::Duration::from_secs(5)
+        ));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "stop must not wait out the whole backoff"
+        );
+    }
+
+    /// R3/R4/R5: a rejected phrase says WHICH problem it is, and touches
+    /// nothing on disk. Before this, every variant collapsed into a single
+    /// "invalid phrase" and a user who mistyped one word had to re-read all 24.
+    #[test]
+    fn regression_recovery_phrase_problems_are_precise_and_touch_no_disk() {
+        let app = DesktopApplication::default();
+        let parent = tempfile::tempdir().unwrap();
+        let valid = format!("{}art", "abandon ".repeat(23));
+
+        let case = |phrase: &str, expected: PhraseProblem, code: &str| {
+            let destination = parent.path().join(format!("w-{code}"));
+            let error = app
+                .wallet_restore_from_mnemonic(&destination, "correct-horse", phrase)
+                .expect_err("the phrase must be rejected");
+            assert!(
+                matches!(error, CommandError::RecoveryPhrase(problem) if problem == expected),
+                "expected {expected:?}, got {error:?}"
+            );
+            assert!(
+                !destination.exists(),
+                "a rejected phrase must not create anything on disk"
+            );
+            let dto = CommandErrorDto::from(CommandError::RecoveryPhrase(expected));
+            assert_eq!(dto.code, code);
+            assert_eq!(dto.category, "VALIDATION");
+            assert!(!dto.retryable);
+            dto
+        };
+
+        // R4: 23 words.
+        let dto = case(
+            &format!("{}abandon", "abandon ".repeat(22)),
+            PhraseProblem::WrongWordCount { got: 23 },
+            "RECOVERY_PHRASE_WORD_COUNT",
+        );
+        assert!(dto.message.contains("23"));
+        assert!(dto.message.contains("24"));
+
+        // R3: a word that is not in the wordlist, at position 17 (1-based).
+        let mut words: Vec<&str> = valid.split_whitespace().collect();
+        words[16] = "zzzznotaword";
+        let dto = case(
+            &words.join(" "),
+            PhraseProblem::UnknownWord { index: 16 },
+            "RECOVERY_PHRASE_UNKNOWN_WORD",
+        );
+        assert!(
+            dto.message.contains("17"),
+            "positions are reported 1-based: {}",
+            dto.message
+        );
+        assert!(
+            !dto.message.contains("zzzznotaword"),
+            "the phrase content must never travel in an error: {}",
+            dto.message
+        );
+
+        // R5: every word real, last one swapped for another valid word.
+        let mut words: Vec<&str> = valid.split_whitespace().collect();
+        words[23] = "zoo";
+        case(
+            &words.join(" "),
+            PhraseProblem::ChecksumMismatch,
+            "RECOVERY_PHRASE_CHECKSUM",
+        );
+    }
+
+    /// The pre-flight diagnosis must accept exactly what the real parser
+    /// accepts. If it were stricter the UI would reject a good phrase; if it
+    /// were looser the precise error would be replaced by a generic one from
+    /// deeper in the restore.
+    #[test]
+    fn diagnose_phrase_agrees_with_restore() {
+        let valid = format!("{}art", "abandon ".repeat(23));
+        assert!(WalletService::diagnose_recovery_phrase(&valid).is_ok());
+
+        for bad in [
+            String::new(),
+            "abandon".into(),
+            format!("{}abandon", "abandon ".repeat(22)),
+            format!("{}zoo", "abandon ".repeat(23)),
+            format!("{}art", "abandon ".repeat(24)),
+        ] {
+            assert!(
+                WalletService::diagnose_recovery_phrase(&bad).is_err(),
+                "diagnosis must reject what the parser rejects: {bad:?}"
+            );
+        }
+    }
+
+    /// R6/R7: an empty leftover directory is not a wallet. An aborted install
+    /// or a creation that crashed before writing anything used to poison that
+    /// name forever with a phantom RESTORE_DESTINATION_EXISTS, while a real
+    /// wallet — or any foreign content — must still be refused untouched.
+    #[test]
+    fn regression_restore_destination_ignores_empty_shells_but_never_overwrites() {
+        let parent = tempfile::tempdir().unwrap();
+
+        // R6: nothing on disk, and the empty leftover shell.
+        let absent = parent.path().join("absent");
+        assert!(!restore_destination_is_occupied(&absent).unwrap());
+
+        let empty_shell = parent.path().join("empty-shell");
+        std::fs::create_dir(&empty_shell).unwrap();
+        assert!(
+            !restore_destination_is_occupied(&empty_shell).unwrap(),
+            "an empty directory must not block a restore"
+        );
+        assert!(!empty_shell.exists(), "the empty shell is reclaimed");
+
+        // R7: a directory holding anything at all stays occupied and intact.
+        let occupied = parent.path().join("occupied");
+        std::fs::create_dir(&occupied).unwrap();
+        std::fs::write(occupied.join("wallet.bin"), b"encrypted").unwrap();
+        assert!(restore_destination_is_occupied(&occupied).unwrap());
+        assert!(
+            occupied.join("wallet.bin").exists(),
+            "occupied destinations are never touched"
+        );
+
+        // A plain file under the wallet name is occupied, not a shell.
+        let file = parent.path().join("a-file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(restore_destination_is_occupied(&file).unwrap());
+        assert!(file.exists());
+    }
+
+    /// The v0.2.4 gate (`ensure_seed_restore_node_ready`, commit b7b17e7) made
+    /// restore wait for a full IBD — over an hour on a real Mainnet node — and
+    /// was removed. Restore is key derivation: it must complete against an
+    /// application that has no backend, no node and no network at all.
+    #[test]
+    fn regression_restore_is_immediate_offline_and_ungated() {
+        let app = DesktopApplication::default();
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("ungated");
+        // BIP-39 24-word test vector (zero entropy).
+        let phrase = format!("{}art", "abandon ".repeat(23));
+
+        assert!(
+            !app.service.lock().unwrap().has_backend(),
+            "the fixture must start with no chain source whatsoever"
+        );
+        assert!(!app.node_started.load(Ordering::Acquire));
+
+        let started = app
+            .wallet_restore_from_mnemonic(&destination, "correct-horse", phrase.as_str())
+            .expect("restore completes with no chain source attached");
+
+        assert!(started.scanning, "the scan is deferred, not skipped");
+        assert_eq!(started.wallet.state, "LOCKED");
+        assert_eq!(
+            started.wallet.seed_restore_status.as_deref(),
+            Some("in_progress")
+        );
+        // Nothing was scanned yet: no cursor, no observed tip, empty balance.
+        assert!(started.wallet.cursor_height.is_none());
+        assert!(started.wallet.tip_height.is_none());
+        assert_eq!(started.wallet.balance, BalanceProjection::default());
+        assert!(destination.exists(), "the encrypted wallet is on disk");
+
+        // The decisive assertion: restore never acquired a chain source.
+        assert!(
+            !app.service.lock().unwrap().has_backend(),
+            "restore must never attach or wait on a chain source"
+        );
     }
 
     #[test]
