@@ -125,6 +125,31 @@ test("mining controls remain disabled until the real node is ready", () => {
   });
 });
 
+test("mining waiting for synchronization is not an idle miner the user must restart", () => {
+  const ready = { lifecycle: "READY", ready: true, status_message: null };
+  const waiting = miningPresentation(
+    {
+      status: "WAITING_FOR_SYNCHRONIZATION",
+      enabled: true,
+      running: false,
+      current_height: 10_191,
+    },
+    ready,
+  );
+  // The worker is alive and resumes by itself, so Start must stay disabled —
+  // offering it would read as "mining is off" and the backend rejects it as
+  // MINING_RUNNING anyway.
+  assert.equal(waiting.status, "WAITING_FOR_SYNCHRONIZATION");
+  assert.equal(waiting.canStart, false);
+
+  // A genuinely stopped miner at the same height can still be started.
+  const stopped = miningPresentation(
+    { status: "READY", enabled: true, running: false, current_height: 10_191 },
+    ready,
+  );
+  assert.equal(stopped.canStart, true);
+});
+
 test("node status text exposes live heights and progress", () => {
   const text = nodeStatusText({
     status_message: "Synchronizing 1008 / 6684 (15%)",

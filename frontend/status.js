@@ -318,7 +318,12 @@ export function miningPresentation(mining, node) {
   }
   return {
     status: mining.status,
-    canStart: mining.enabled === true && mining.running !== true,
+    // WAITING_FOR_SYNCHRONIZATION means the worker is alive and will resume on
+    // its own, so Start must stay disabled — the backend rejects it as
+    // MINING_RUNNING anyway, and offering it would look like mining is off.
+    canStart: mining.enabled === true
+      && mining.running !== true
+      && mining.status !== "WAITING_FOR_SYNCHRONIZATION",
     warning: mining.current_height === 0
       ? "Starting mining may produce the first post-genesis Mainnet block."
       : null,

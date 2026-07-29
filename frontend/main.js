@@ -453,7 +453,12 @@ const renderMining = (value, node) => {
   byId("mining-warning").hidden = presentation.warning == null;
   byId("mining-warning").textContent = presentation.warning ?? "";
   byId("mining-start").disabled = !presentation.canStart;
-  byId("mining-stop").disabled = !value.running && value.status !== "ERROR";
+  // The worker is also alive while it waits out a synchronization dip, so Stop
+  // must stay available — otherwise mining could only be stopped in the exact
+  // moments it happened to be hashing.
+  byId("mining-stop").disabled = !value.running
+    && value.status !== "ERROR"
+    && value.status !== "WAITING_FOR_SYNCHRONIZATION";
 };
 const renderMiningUnavailable = (node) => {
   byId("mining-status").textContent = node?.lifecycle === "SYNCHRONIZING"
