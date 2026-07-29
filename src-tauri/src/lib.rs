@@ -8,9 +8,10 @@
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use dom_wallet_core::{
-    BackupStatus, CoreError, DiagnosticSnapshot, FeeEstimate, PhraseProblem,
-    ProductionWalletBackend, RecoveryCreateResult, SlateExport, TransactionSummary, WalletService,
-    WalletSummary, CANONICAL_PHRASE_WORDS, MAINNET_CHAIN_ID_HEX, MAINNET_GENESIS_HASH_HEX,
+    mainnet_network_identity, BackupStatus, CoreError, DiagnosticSnapshot, FeeEstimate,
+    PhraseProblem, ProductionWalletBackend, RecoveryCreateResult, SlateExport, TransactionSummary,
+    WalletService, WalletSummary, CANONICAL_PHRASE_WORDS, MAINNET_CHAIN_ID_HEX,
+    MAINNET_GENESIS_HASH_HEX,
 };
 use dom_wallet_core_api::{CoreNetwork, WalletCoreApi};
 use dom_wallet_core_restore::SeedRestoreError;
@@ -1329,9 +1330,13 @@ impl DesktopApplication {
         self.ensure_running()?;
         let _activity = self.activities.try_begin(ActivityKind::Restore)?;
         checked_password(password)?;
+        // Creation is bound to the same frozen Mainnet identity as offline
+        // restore and must not race the asynchronous embedded-node startup.
+        // The backend attaches later and independently verifies that identity.
+        let identity = mainnet_network_identity().map_err(CommandError::from)?;
         let result: RecoveryCreateResult = self
             .lock_service()?
-            .create_recoverable_for_embedded(path, password)
+            .create_recoverable(path, password, identity)
             .map_err(CommandError::from)?;
         Ok(RecoveryCreateDto {
             wallet: result.wallet,
@@ -4269,6 +4274,23 @@ mod tests {
         let error = app.wallet_unlock("password-1").unwrap_err();
         assert!(!format!("{error}").contains("password-1"));
         assert!(app.application_status().experimental);
+    }
+
+    #[test]
+    fn recoverable_mainnet_creation_does_not_wait_for_the_embedded_node() {
+        let directory = tempfile::tempdir().expect("temporary wallet parent");
+        let app = DesktopApplication::default();
+        let created = app
+            .wallet_create_recoverable(directory.path().join("wallet"), "password-1")
+            .expect("Mainnet wallet creation is offline");
+
+        assert_eq!(created.wallet.network, Network::Mainnet);
+        assert_eq!(
+            created.mnemonic.split_whitespace().count(),
+            CANONICAL_PHRASE_WORDS
+        );
+        assert!(!app.node_started.load(Ordering::Acquire));
+        assert!(!app.node_starting.load(Ordering::Acquire));
     }
 
     #[test]
