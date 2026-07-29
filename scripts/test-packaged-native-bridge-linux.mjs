@@ -296,29 +296,34 @@ try {
   }
   assert.ok(peerStatus.total_connected_peers > 0, "packaged node did not register a Mainnet peer");
 
-  let genesisSyncStatus;
+  // Node startup and the first wallet scan are asynchronous. A live peer may
+  // advance the fresh local chain before this gate observes it, so require a
+  // coherent cursor at the actual canonical height instead of assuming zero.
+  let initialSyncStatus;
   for (let attempt = 0; attempt < synchronizationAttemptLimit; attempt += 1) {
     const syncStart = await nativeResult("wallet_sync_start", {});
     if (!syncStart.ok && syncStart.error?.retryable !== true) {
-      throw new Error(`packaged genesis synchronization failed: ${JSON.stringify(syncStart.error)}`);
+      throw new Error(`packaged initial synchronization failed: ${JSON.stringify(syncStart.error)}`);
     }
-    genesisSyncStatus = await nativeResult("wallet_sync_status", {});
-    if (!genesisSyncStatus.ok) throw new Error("packaged genesis synchronization diagnostics failed");
+    initialSyncStatus = await nativeResult("wallet_sync_status", {});
+    if (!initialSyncStatus.ok) throw new Error("packaged initial synchronization diagnostics failed");
     if (
-      genesisSyncStatus.value.synchronized
-      && genesisSyncStatus.value.cursor_height === 0
-      && genesisSyncStatus.value.cursor_hash === genesisSyncStatus.value.canonical_hash
+      initialSyncStatus.value.synchronized
+      && Number.isSafeInteger(initialSyncStatus.value.canonical_height)
+      && initialSyncStatus.value.cursor_height === initialSyncStatus.value.canonical_height
+      && initialSyncStatus.value.cursor_hash === initialSyncStatus.value.canonical_hash
     ) break;
-    await new Promise((done) => setTimeout(done, 100));
+    await new Promise((done) => setTimeout(done, 500));
   }
-  assert.ok(genesisSyncStatus, "packaged genesis synchronization status was not observed");
+  assert.ok(initialSyncStatus, "packaged initial synchronization status was not observed");
   assert.equal(
-    genesisSyncStatus.value.synchronized,
+    initialSyncStatus.value.synchronized,
     true,
-    `packaged genesis synchronization did not reach READY: ${JSON.stringify(genesisSyncStatus.value)}`,
+    `packaged initial synchronization did not reach READY: ${JSON.stringify(initialSyncStatus.value)}`,
   );
-  assert.equal(genesisSyncStatus.value.cursor_height, 0);
-  assert.equal(genesisSyncStatus.value.cursor_hash, genesisSyncStatus.value.canonical_hash);
+  assert.match(initialSyncStatus.value.canonical_hash, /^[0-9a-f]{64}$/i);
+  assert.equal(initialSyncStatus.value.cursor_height, initialSyncStatus.value.canonical_height);
+  assert.equal(initialSyncStatus.value.cursor_hash, initialSyncStatus.value.canonical_hash);
 
   const liveDashboard = await execute(`
     document.querySelector('[data-screen="dashboard"]').click();
