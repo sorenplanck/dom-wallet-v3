@@ -15,6 +15,7 @@ dom-wallet-domain = { path = "../crates/dom-wallet-domain" }
 dom-wallet-embedded-core = { path = "../crates/dom-wallet-embedded-core" }
 dom-wallet-updater = { path = "../crates/dom-wallet-updater" }
 dom-wallet-node-manager = { path = "../crates/dom-wallet-node-manager" }
+dom-wallet-remote-source = { path = "../crates/dom-wallet-remote-source" }
 dom-wallet-storage = { path = "../crates/dom-wallet-storage" }
 hex.workspace = true
 serde.workspace = true
@@ -26,6 +27,7 @@ time.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
 tracing.workspace = true
+url.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
 tauri.workspace = true
