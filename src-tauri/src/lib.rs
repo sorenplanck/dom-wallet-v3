@@ -15,7 +15,9 @@ use dom_wallet_core::{
 };
 use dom_wallet_core_api::{CoreNetwork, WalletCoreApi};
 use dom_wallet_core_restore::SeedRestoreError;
-use dom_wallet_domain::{BalanceProjection, Network, NetworkIdentity};
+use dom_wallet_domain::BalanceProjection;
+#[cfg(test)]
+use dom_wallet_domain::{Network, NetworkIdentity};
 use dom_wallet_embedded_core::{
     default_lmdb_map_size, mine_wallet_block, EmbeddedCoreConfiguration, WalletMiningOutcome,
     LMDB_MAP_FULL_ERROR_CODE, MAINNET_DNS_SEEDS, MAINNET_P2P_PORT,
@@ -1450,11 +1452,10 @@ impl DesktopApplication {
         checked_password(backup_password)?;
         checked_password(password)?;
         let mut service = self.lock_service()?;
-        let identity = domain_identity(
-            &service
-                .embedded_core_identity()
-                .map_err(CommandError::from)?,
-        );
+        // Backup import is an offline storage operation. Validate the backup
+        // against the frozen Mainnet identity instead of racing the
+        // asynchronous embedded-node restart after `wallet_close`.
+        let identity = mainnet_network_identity().map_err(CommandError::from)?;
         service
             .backup_import(
                 destination,
@@ -3653,18 +3654,6 @@ fn require_mining_cursor_gate(
     Ok(())
 }
 
-fn domain_identity(identity: &dom_wallet_core_sync::CoreChainIdentity) -> NetworkIdentity {
-    NetworkIdentity {
-        network: match identity.network {
-            CoreNetwork::Mainnet => Network::Mainnet,
-            CoreNetwork::Testnet => Network::PublicTestnet,
-            CoreNetwork::Regtest => Network::PrivateTestnet,
-        },
-        chain_id: identity.chain_id,
-        genesis_id: identity.genesis_hash,
-    }
-}
-
 fn submission_result(transaction: TransactionSummary) -> SubmissionResultDto {
     let (outcome, retryable, accepted, relayed) = match transaction.state.as_str() {
         "SUBMITTED" => (SubmissionOutcomeDto::Accepted, false, true, Some(true)),
@@ -4289,6 +4278,38 @@ mod tests {
             created.mnemonic.split_whitespace().count(),
             CANONICAL_PHRASE_WORDS
         );
+        assert!(!app.node_started.load(Ordering::Acquire));
+        assert!(!app.node_starting.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn encrypted_backup_import_does_not_wait_for_the_embedded_node() {
+        let directory = tempfile::tempdir().expect("temporary wallet parent");
+        let wallet_path = directory.path().join("wallet");
+        let backup_path = directory.path().join("wallet.dombackup");
+        let imported_path = directory.path().join("imported");
+        let app = DesktopApplication::default();
+        let created = app
+            .wallet_create_recoverable(&wallet_path, "password-1")
+            .expect("Mainnet wallet creation is offline");
+        app.wallet_recovery_phrase_confirm("password-1")
+            .expect("recovery phrase confirmation");
+        app.wallet_unlock("password-1").expect("wallet unlock");
+        app.wallet_backup_export(&backup_path, "backup-password")
+            .expect("encrypted backup export");
+        app.wallet_close().expect("wallet close");
+
+        let imported = app
+            .wallet_backup_import(
+                &imported_path,
+                &backup_path,
+                "backup-password",
+                "password-2",
+            )
+            .expect("backup import is offline");
+
+        assert_eq!(imported.wallet_id, created.wallet.wallet_id);
+        assert_eq!(imported.network, Network::Mainnet);
         assert!(!app.node_started.load(Ordering::Acquire));
         assert!(!app.node_starting.load(Ordering::Acquire));
     }

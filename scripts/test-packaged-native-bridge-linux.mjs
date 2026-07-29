@@ -86,7 +86,9 @@ try {
     sessionId = sessions?.at(-1)?.id;
   }
   assert.ok(sessionId, "WebDriver session was not created");
-  await request(`/session/${sessionId}/timeouts`, { script: 120_000 });
+  // Individual UI gates enforce their own tighter deadlines. Keep the driver
+  // deadline above the longest gate so its domain-specific failure wins.
+  await request(`/session/${sessionId}/timeouts`, { script: 300_000 });
 
   const execute = (script, args = []) => request(`/session/${sessionId}/execute/sync`, { script, args });
   const screenshotDirectory = process.env.PACKAGED_SCREENSHOT_DIR

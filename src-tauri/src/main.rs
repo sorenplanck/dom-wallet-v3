@@ -1104,6 +1104,19 @@ fn application_builder() -> tauri::Builder<tauri::Wry> {
                         .configure_app_config_storage(config_directory);
                 }
             }
+            // The embedded validating node starts with the application, not
+            // with wallet creation. A saved remote scan-only source remains
+            // authoritative and does not start the local node unnecessarily.
+            if app
+                .state::<DesktopApplication>()
+                .chain_source_get()
+                .map(|source| source.source == "EMBEDDED")
+                .unwrap_or(true)
+            {
+                let handle = app.handle().clone();
+                let application = app.state::<DesktopApplication>();
+                let _ = ensure_mainnet_node(&handle, &application);
+            }
             let runtime_root = app
                 .path()
                 .app_local_data_dir()?
