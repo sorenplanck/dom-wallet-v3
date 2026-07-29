@@ -2,13 +2,22 @@ import QRCode from "qrcode";
 import QrScanner from "qr-scanner";
 import { nativeBridge } from "./bridge.js";
 import {
+  chainSourcePresentation,
+  chainSourceTlsWarning,
   formatDomFromNoms,
   liveStatusProjection,
   miningPresentation,
   nodeStatusText,
+  remoteTipAlertPresentation,
   restoreReadinessPresentation,
+  restoreScanPresentation,
   synchronizationPresentation,
 } from "./status.js";
+
+// Prefilled suggestion for the remote chain source URL. Deployment builds may
+// replace this constant; the authoritative value always comes from
+// chain_source_get once the user saved a configuration.
+const DEFAULT_REMOTE_NODE_URL = "https://rpc.dom-mainnet.example";
 
 const invoke = async (command, args = {}) => {
   const bridge = await nativeBridge.initialize();
@@ -30,6 +39,8 @@ let qrAnimationTimer;
 let phrasePending = false;
 let latestSynchronizationPresentation;
 let latestEmbeddedNodeStatus;
+let restoreScanTimer;
+let remoteTipAlertMessage;
 
 export const clearPasswords = (form) => form?.querySelectorAll('input[type="password"]').forEach((input) => { input.value = ""; });
 export const redactedError = (error) => error?.message && !/password|mnemonic|seed|secret|key|token|credential|:\/\//i.test(error.message)
@@ -96,6 +107,7 @@ document.querySelectorAll("[data-gate-panel]").forEach((button) => button.addEve
     }).catch((error) => show(redactedError(error), true));
   }
   if (panel === "open-form") refreshWalletList().catch((error) => show(redactedError(error), true));
+  if (panel === "chain-source-form") refreshChainSource().catch((error) => show(redactedError(error), true));
 }));
 const refreshWalletList = async () => {
   const names = await invoke("wallet_list");
@@ -120,10 +132,10 @@ const renderOnboardingNode = (node) => {
   byId("onboarding-node-local").textContent = presentation.localHeight;
   byId("onboarding-node-peer").textContent = presentation.peerHeight ?? "—";
   byId("onboarding-node-peers").textContent = presentation.connectedPeers;
-  byId("restore-submit").disabled = !presentation.ready;
-  byId("restore-readiness-note").textContent = presentation.ready
-    ? "The synchronized canonical Mainnet chain will be scanned from genesis."
-    : "Restore unlocks automatically after the Mainnet node reaches the peer tip.";
+  byId("restore-submit").disabled = !presentation.submitEnabled;
+  byId("restore-readiness-note").textContent = presentation.badge === "READY"
+    ? "The Mainnet node is synchronized. Restore scans the canonical chain immediately."
+    : "Restore is always available. The wallet scans the chain in the background while the node synchronizes.";
   return presentation;
 };
 const refreshOnboardingNode = async () => {
@@ -132,6 +144,89 @@ const refreshOnboardingNode = async () => {
   renderOnboardingNode(node);
   return node;
 };
+
+const renderRemoteTipAlert = (presentation) => {
+  if (presentation.active) remoteTipAlertMessage = presentation.message;
+  for (const id of ["remote-tip-alert", "gate-remote-tip-alert"]) {
+    const node = byId(id);
+    node.hidden = remoteTipAlertMessage == null;
+    node.textContent = remoteTipAlertMessage ?? "";
+  }
+};
+
+const stopRestoreScanPolling = () => { clearTimeout(restoreScanTimer); restoreScanTimer = undefined; };
+const pollRestoreScan = async () => {
+  restoreScanTimer = undefined;
+  try {
+    const synchronization = await invoke("wallet_sync_status");
+    renderRemoteTipAlert(remoteTipAlertPresentation(synchronization));
+    const scan = restoreScanPresentation(synchronization);
+    if (!scan.active) {
+      byId("restore-progress-message").textContent = "Restore scan completed. Unlock the wallet to continue.";
+      byId("restore-progress-bar").value = 100;
+      show("Restore scan completed. Unlock the wallet to continue.");
+      return;
+    }
+    byId("restore-progress-message").textContent = scan.message;
+    byId("restore-progress-bar").value = scan.progress;
+    byId("restore-progress-balance").textContent = scan.partialBalanceText;
+  } catch {
+    // Transient status failures never stop the background scan presentation.
+  }
+  restoreScanTimer = setTimeout(pollRestoreScan, 2000);
+};
+const beginRestoreScanPolling = () => {
+  stopRestoreScanPolling();
+  document.querySelectorAll(".gate-panel").forEach((node) => { node.hidden = node.id !== "restore-progress"; });
+  byId("restore-progress-message").textContent = "Restored — preparing the chain scan…";
+  byId("restore-progress-bar").value = 0;
+  byId("restore-progress-balance").textContent = "Partial balance: unavailable";
+  pollRestoreScan();
+};
+
+const updateChainSourceTlsWarning = () => {
+  const form = byId("chain-source-form");
+  const remote = new FormData(form).get("source") === "REMOTE";
+  byId("chain-source-remote-fields").hidden = !remote;
+  byId("chain-source-tls-warning").hidden = !(remote && chainSourceTlsWarning(byId("chain-source-url").value));
+};
+const renderChainSource = (value) => {
+  const presentation = chainSourcePresentation(value);
+  const form = byId("chain-source-form");
+  for (const radio of form.querySelectorAll('input[name="source"]')) {
+    radio.checked = radio.value === presentation.source;
+  }
+  const url = byId("chain-source-url");
+  if (url.value.trim() === "") url.value = presentation.baseUrl ?? DEFAULT_REMOTE_NODE_URL;
+  byId("chain-source-token-note").hidden = !presentation.hasBearerToken;
+  byId("chain-source-current").textContent = presentation.message;
+  byId("settings-chain-source").textContent = presentation.message;
+  byId("settings-chain-source-warning").hidden = !presentation.tlsWarning;
+  updateChainSourceTlsWarning();
+  return presentation;
+};
+const refreshChainSource = async () => renderChainSource(await invoke("chain_source_get"));
+byId("chain-source-form").addEventListener("change", updateChainSourceTlsWarning);
+byId("chain-source-url").addEventListener("input", updateChainSourceTlsWarning);
+byId("chain-source-form").addEventListener("submit", async (event) => {
+  event.preventDefault(); const form = event.currentTarget; const data = new FormData(form);
+  const source = data.get("source") === "REMOTE" ? "REMOTE" : "EMBEDDED";
+  const baseUrl = String(data.get("base_url") ?? "").trim();
+  const bearerToken = String(data.get("bearer_token") ?? "");
+  try {
+    if (source === "REMOTE" && baseUrl === "") throw new Error("Enter the remote node URL first.");
+    const result = await run(() => invoke("chain_source_set", {
+      source,
+      base_url: source === "REMOTE" ? baseUrl : null,
+      bearer_token: source === "REMOTE" && bearerToken !== "" ? bearerToken : null,
+    }));
+    clearPasswords(form);
+    const presentation = renderChainSource(result);
+    show(presentation.source === "REMOTE"
+      ? "Chain source saved: remote node (fast)."
+      : "Chain source saved: local full node.");
+  } catch (error) { clearPasswords(form); show(redactedError(error), true); }
+});
 
 const clearPhrase = () => {
   byId("recovery-phrase").textContent = "";
@@ -165,10 +260,15 @@ byId("create-form").addEventListener("submit", async (event) => {
 byId("restore-form").addEventListener("submit", async (event) => {
   event.preventDefault(); const form = event.currentTarget; const data = new FormData(form);
   try {
-    show("Restore: initializing Mainnet node.");
+    show("Restoring the wallet from the recovery phrase…");
     const result = await run(() => invoke("wallet_restore_from_mnemonic", { name: data.get("name"), password: data.get("password"), mnemonic: data.get("mnemonic") }));
     form.querySelector('textarea[name="mnemonic"]').value = ""; clearPasswords(form);
-    show(`Restore completed: ${result.owned_outputs} owned outputs, ${result.balance.confirmed} confirmed noms.`);
+    if (result?.scanning === true) {
+      beginRestoreScanPolling();
+      show("Wallet restored. The chain scan continues in the background.");
+    } else {
+      show("Wallet restored.");
+    }
   } catch (error) { form.querySelector('textarea[name="mnemonic"]').value = ""; clearPasswords(form); show(redactedError(error), true); }
 });
 byId("restore-abort").addEventListener("click", async () => {
@@ -298,6 +398,9 @@ const refreshSummary = async () => {
   byId("canonical-height").textContent = liveStatus.canonicalHeight ?? "—";
   byId("cursor-height").textContent = liveStatus.cursorHeight ?? "Not initialized";
   byId("sync-status").textContent = liveStatus.message;
+  const restoreScan = restoreScanPresentation(synchronization);
+  if (restoreScan.active) byId("sync-status").textContent = restoreScan.message;
+  renderRemoteTipAlert(remoteTipAlertPresentation(synchronization));
   byId("settings-chain-id").textContent = liveStatus.chainId ?? "—";
   byId("settings-genesis").textContent = liveStatus.genesisHash ?? "—";
   if (liveStatus.dataDirectory) byId("settings-node-data").textContent = liveStatus.dataDirectory;
@@ -641,6 +744,7 @@ document.documentElement.dataset.nativeBridge = nativeBridge.state;
 nativeBridge.initialize()
   .then(() => {
     document.documentElement.dataset.nativeBridge = nativeBridge.state;
+    refreshChainSource().catch(() => { /* configuration is loaded on demand in the panel */ });
     return Promise.all([invoke("application_status"), refreshOnboardingNode()]);
   })
   .then(([result]) => show(`Application state: ${result.state}.`))
@@ -658,4 +762,4 @@ const refresh = async () => {
   refreshTimer = setTimeout(refresh, gateVisible ? 5000 : 15000);
 };
 refreshTimer = setTimeout(refresh, 15000);
-window.addEventListener("beforeunload", () => { clearTimeout(refreshTimer); stopQrAnimation(); clearPhrase(); clearSecretForms(); stopScanner(); }, { once: true });
+window.addEventListener("beforeunload", () => { clearTimeout(refreshTimer); stopRestoreScanPolling(); stopQrAnimation(); clearPhrase(); clearSecretForms(); stopScanner(); }, { once: true });

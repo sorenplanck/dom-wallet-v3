@@ -12,6 +12,7 @@
       <div class="gate-body">
         <header class="gate-title" data-screen-contract="welcome"><h1>DOM Wallet</h1><p class="sub">Secure desktop wallet</p></header>
         <p id="status" class="status" role="status" aria-live="polite">Initializing native desktop bridge…</p>
+        <p id="gate-remote-tip-alert" class="warning" role="alert" hidden></p>
         <section id="onboarding" class="screen card">
           <section id="onboarding-node" class="onboarding-node" aria-labelledby="onboarding-node-title">
             <div class="section-row"><h2 id="onboarding-node-title">Mainnet node</h2><span id="onboarding-node-badge" class="pill">STARTING</span></div>
@@ -34,6 +35,7 @@
               <button class="btn ghost w-full" type="button" data-gate-panel="create-form">Create wallet</button>
               <button class="btn ghost w-full" type="button" data-gate-panel="restore-form">Restore wallet</button>
               <button class="btn ghost w-full" type="button" data-gate-panel="open-form">Open wallet</button>
+              <button class="btn ghost w-full" type="button" data-gate-panel="chain-source-form">Chain source</button>
               <button id="gate-close-wallet" class="btn ghost w-full" type="button">Close / switch wallet</button>
             </div>
           </div>
@@ -56,9 +58,29 @@
             <label>Recovery phrase <textarea name="mnemonic" rows="4" autocomplete="off" autocapitalize="none" spellcheck="false" required></textarea></label>
             <label>New wallet name <input name="name" autocomplete="off" required></label>
             <label>New password <input name="password" type="password" autocomplete="new-password" required></label>
-            <p id="restore-readiness-note" class="readonly-note">Wait for the Mainnet node above to synchronize before restoring.</p>
+            <p id="restore-readiness-note" class="readonly-note">Restore is always available. The wallet scans the chain in the background while the node synchronizes.</p>
             <p id="restore-staging-note" class="readonly-note">Checking for interrupted restores…</p>
-            <div class="btn-row"><button id="restore-submit" class="btn" type="submit" disabled>Restore / resume wallet</button><button id="restore-abort" class="btn ghost" type="button">Abort interrupted restore</button><button class="btn ghost" type="button" data-gate-panel="">Back</button></div>
+            <div class="btn-row"><button id="restore-submit" class="btn" type="submit">Restore / resume wallet</button><button id="restore-abort" class="btn ghost" type="button">Abort interrupted restore</button><button class="btn ghost" type="button" data-gate-panel="">Back</button></div>
+          </form>
+          <section id="restore-progress" class="gate-panel" hidden aria-labelledby="restore-progress-title">
+            <h2 id="restore-progress-title">Wallet restored</h2><p class="sub">The canonical chain scan continues in the background.</p>
+            <p id="restore-progress-message" class="muted" role="status" aria-live="polite">Restored — preparing the chain scan…</p>
+            <progress id="restore-progress-bar" max="100" value="0" aria-label="Restore scan progress"></progress>
+            <p id="restore-progress-balance" class="readonly-note">Partial balance: unavailable</p>
+            <div class="btn-row"><button class="btn ghost" type="button" data-gate-panel="">Back</button></div>
+          </section>
+          <form id="chain-source-form" class="gate-panel" hidden data-screen-contract="chain-source">
+            <h2>Chain source</h2><p class="sub">Choose how this wallet reads the DOM Mainnet chain.</p>
+            <label class="check"><input type="radio" name="source" value="EMBEDDED" checked> Local full node (default) — validates the entire chain on this device.</label>
+            <label class="check"><input type="radio" name="source" value="REMOTE"> Remote node (fast) — reads blocks from a DOM node you trust.</label>
+            <div id="chain-source-remote-fields" hidden>
+              <label>Remote node URL <input id="chain-source-url" name="base_url" autocomplete="off" spellcheck="false" placeholder="https://…"></label>
+              <label>Access token (optional) <input id="chain-source-token" name="bearer_token" type="password" autocomplete="off"></label>
+              <p id="chain-source-token-note" class="readonly-note" hidden>An access token is already stored. Leave the field empty to keep it.</p>
+            </div>
+            <p id="chain-source-tls-warning" class="warning" hidden>This URL is not HTTPS and not localhost. Traffic to the remote node can be observed or tampered with.</p>
+            <p id="chain-source-current" class="readonly-note">Checking the current chain source…</p>
+            <div class="btn-row"><button class="btn" type="submit">Save chain source</button><button class="btn ghost" type="button" data-gate-panel="">Back</button></div>
           </form>
           <section id="recovery-ceremony" class="gate-panel" hidden aria-labelledby="recovery-ceremony-title">
             <h2 id="recovery-ceremony-title">Write down your recovery phrase</h2><p class="sub">Keep these words offline. DOM Wallet will not show this phrase again.</p>
@@ -87,6 +109,7 @@
         <div class="foot"><div class="motto">“Not a store of value.<br>A means of exchange.”</div><button id="lock" class="theme-toggle">Lock wallet</button><button id="close" class="theme-toggle mt6">Close wallet</button></div>
       </aside>
       <main class="main">
+        <p id="remote-tip-alert" class="warning" role="alert" hidden></p>
         <section id="dashboard" class="screen" data-screen-contract="dashboard">
           <header class="screen-head"><div><h1>Dashboard</h1><p class="sub">Your DOM wallet at a glance.</p></div><span id="network-identity" class="pill">Wallet locked</span></header>
           <div class="card balance-card"><div class="balance-main" id="balance-total">0 <span class="unit">DOM</span></div><div id="balance-cards" class="balance-sub"></div></div>
@@ -119,7 +142,9 @@
             <div><span>Connected peers</span><strong id="settings-peer-count">0</strong></div>
             <div><span>Bootstrap state</span><strong id="settings-bootstrap">Starting</strong></div>
             <div><span>Cursor / canonical height</span><strong id="settings-heights">— / —</strong></div>
+            <div><span>Chain source</span><strong id="settings-chain-source">Local full node (default): the embedded node validates the entire chain.</strong></div>
           </div>
+          <p id="settings-chain-source-warning" class="warning" hidden>The configured remote chain source URL is not HTTPS and not localhost. Change it on the lock screen under “Chain source”.</p>
           <div class="card">
             <div class="section-row"><h2>Wallet updates</h2><span id="update-mode" class="pill">Checking</span></div>
             <div class="readonly-settings">

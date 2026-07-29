@@ -1,11 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  chainSourcePresentation,
+  chainSourceTlsWarning,
   formatDomFromNoms,
   liveStatusProjection,
   miningPresentation,
   nodeStatusText,
+  remoteTipAlertPresentation,
   restoreReadinessPresentation,
+  restoreScanPresentation,
   synchronizationPresentation,
 } from "../status.js";
 
@@ -140,26 +144,38 @@ test("node status text exposes live heights and progress", () => {
   assert.doesNotMatch(text, /CORE_NOT_READY/);
 });
 
-test("onboarding restore gate exposes live Mainnet synchronization and unlocks only at tip", () => {
-  assert.deepEqual(
-    restoreReadinessPresentation({
-      network: "MAINNET",
-      lifecycle: "READY",
-      ready: true,
-      canonical_tip_height: 5_241,
-      highest_known_peer_height: 0,
-      connected_peers: 0,
-    }),
-    {
-      ready: false,
-      badge: "DISCOVERING",
-      message: "Discovering Mainnet peers at local height 5241.",
-      localHeight: 5_241,
-      peerHeight: null,
-      connectedPeers: 0,
-      progress: 0,
-    },
-  );
+test("regression_restore_submit_is_enabled_in_every_node_state", () => {
+  const states = [
+    { network: "MAINNET", lifecycle: "READY", ready: true, canonical_tip_height: 5_241, highest_known_peer_height: 0, connected_peers: 0 },
+    { network: "MAINNET", lifecycle: "SYNCHRONIZING", ready: false, canonical_tip_height: 5_241, highest_known_peer_height: 8_009, connected_peers: 2 },
+    { network: "MAINNET", lifecycle: "READY", ready: true, canonical_tip_height: 8_009, highest_known_peer_height: 8_009, connected_peers: 2 },
+    { network: "MAINNET", lifecycle: "STARTING", ready: false, canonical_tip_height: 0, highest_known_peer_height: 0, connected_peers: 0 },
+    { network: "MAINNET", lifecycle: "FAILED", ready: false, canonical_tip_height: 0, highest_known_peer_height: 0, connected_peers: 0 },
+    undefined,
+  ];
+  for (const node of states) {
+    assert.equal(restoreReadinessPresentation(node).submitEnabled, true);
+  }
+});
+
+test("onboarding restore panel keeps informational Mainnet status without gating submit", () => {
+  const discovering = restoreReadinessPresentation({
+    network: "MAINNET",
+    lifecycle: "READY",
+    ready: true,
+    canonical_tip_height: 5_241,
+    highest_known_peer_height: 0,
+    connected_peers: 0,
+  });
+  assert.deepEqual(discovering, {
+    submitEnabled: true,
+    badge: "DISCOVERING",
+    message: "Discovering Mainnet peers at local height 5241.",
+    localHeight: 5_241,
+    peerHeight: null,
+    connectedPeers: 0,
+    progress: 0,
+  });
 
   const syncing = restoreReadinessPresentation({
     network: "MAINNET",
@@ -169,7 +185,7 @@ test("onboarding restore gate exposes live Mainnet synchronization and unlocks o
     highest_known_peer_height: 8_009,
     connected_peers: 2,
   });
-  assert.equal(syncing.ready, false);
+  assert.equal(syncing.submitEnabled, true);
   assert.equal(syncing.badge, "SYNCHRONIZING");
   assert.equal(syncing.message, "Synchronizing 5241 / 8009 (65%).");
 
@@ -181,7 +197,7 @@ test("onboarding restore gate exposes live Mainnet synchronization and unlocks o
     highest_known_peer_height: 8_009,
     connected_peers: 2,
   });
-  assert.equal(ready.ready, true);
+  assert.equal(ready.submitEnabled, true);
   assert.equal(ready.badge, "READY");
   assert.equal(ready.progress, 100);
 });
@@ -260,7 +276,7 @@ test("recovery and backup inputs are transient and use no browser persistence", 
   assert.equal(html.includes('name="mnemonic"'), true);
   assert.equal(js.includes("clearPhrase"), true);
   assert.equal(js.includes("textarea[name=\"mnemonic\"]"), true);
-  assert.equal(js.includes('byId("restore-submit").disabled = !presentation.ready'), true);
+  assert.equal(js.includes('byId("restore-submit").disabled = !presentation.submitEnabled'), true);
   assert.equal(js.includes('invoke("embedded_node_status")'), true);
   assert.equal(js.includes("localStorage"), false);
 });
@@ -312,4 +328,139 @@ test("QR exchange stays local, uses canonical native frames, and releases camera
   assert.equal(source.includes("stopScanner"), true);
   assert.equal(source.includes("fetch("), false);
   assert.equal(source.includes("localStorage"), false);
+});
+
+test("restore scan presentation reports block progress and partial balance", () => {
+  const result = restoreScanPresentation({
+    seed_restore_in_progress: true,
+    cursor_height: 1_200,
+    tip_height: 8_000,
+    scan_progress_percent: 15,
+    partial_balance: 250_000_000,
+  });
+  assert.equal(result.active, true);
+  assert.equal(result.message, "Restored — scanning block 1200 of 8000 (15%)");
+  assert.equal(result.progress, 15);
+  assert.equal(result.cursorHeight, 1_200);
+  assert.equal(result.tipHeight, 8_000);
+  assert.equal(result.partialBalanceText, "Partial balance: 2.50000000 DOM");
+});
+
+test("restore scan presentation derives progress when percent is missing", () => {
+  const result = restoreScanPresentation({
+    seed_restore_in_progress: true,
+    cursor_height: 2_000,
+    tip_height: 8_000,
+    partial_balance: { confirmed: 0 },
+  });
+  assert.equal(result.progress, 25);
+  assert.equal(result.message, "Restored — scanning block 2000 of 8000 (25%)");
+  assert.equal(result.partialBalanceText, "Partial balance: 0.00000000 DOM");
+});
+
+test("restore scan presentation handles an unknown tip and missing balance", () => {
+  const result = restoreScanPresentation({
+    seed_restore_in_progress: true,
+    cursor_height: 42,
+  });
+  assert.equal(result.active, true);
+  assert.equal(result.message, "Restored — scanning block 42");
+  assert.equal(result.partialBalanceText, "Partial balance: unavailable");
+});
+
+test("regression_restore_scan_presentation_is_inactive_after_seed_restore_completes", () => {
+  const result = restoreScanPresentation({
+    seed_restore_in_progress: false,
+    cursor_height: 8_000,
+    tip_height: 8_000,
+    partial_balance: 250_000_000,
+  });
+  assert.equal(result.active, false);
+  assert.equal(result.message, null);
+  assert.equal(result.partialBalanceText, null);
+  assert.equal(restoreScanPresentation(undefined).active, false);
+});
+
+test("remote tip regression raises a persistent alert presentation", () => {
+  const alert = remoteTipAlertPresentation({ remote_tip_alert: true });
+  assert.equal(alert.active, true);
+  assert.match(alert.message, /regressed or is inconsistent/);
+  assert.deepEqual(remoteTipAlertPresentation({ remote_tip_alert: false }), { active: false, message: null });
+  assert.equal(remoteTipAlertPresentation(undefined).active, false);
+});
+
+test("chain source TLS warning triggers only for cleartext non-local URLs", () => {
+  assert.equal(chainSourceTlsWarning("https://node.example:8443"), false);
+  assert.equal(chainSourceTlsWarning("http://localhost:8080"), false);
+  assert.equal(chainSourceTlsWarning("http://127.0.0.1:8080"), false);
+  assert.equal(chainSourceTlsWarning("http://[::1]:8080"), false);
+  assert.equal(chainSourceTlsWarning("http://node.example:8080"), true);
+  assert.equal(chainSourceTlsWarning("not a url"), true);
+  assert.equal(chainSourceTlsWarning(""), false);
+  assert.equal(chainSourceTlsWarning(undefined), false);
+});
+
+test("chain source presentation defaults to embedded and flags cleartext remote", () => {
+  const embedded = chainSourcePresentation({ source: "EMBEDDED", base_url: null, has_bearer_token: false, tls_warning: false });
+  assert.equal(embedded.source, "EMBEDDED");
+  assert.equal(embedded.tlsWarning, false);
+  assert.match(embedded.message, /Local full node/);
+
+  const remote = chainSourcePresentation({ source: "REMOTE", base_url: "http://node.example:8080", has_bearer_token: true, tls_warning: false });
+  assert.equal(remote.source, "REMOTE");
+  assert.equal(remote.hasBearerToken, true);
+  assert.equal(remote.tlsWarning, true);
+  assert.match(remote.message, /Remote node \(fast\): http:\/\/node\.example:8080/);
+
+  assert.equal(chainSourcePresentation(undefined).source, "EMBEDDED");
+  assert.equal(chainSourcePresentation({ source: "REMOTE", base_url: "https://node.example", has_bearer_token: false, tls_warning: false }).tlsWarning, false);
+});
+
+test("restore flow returns immediately and polls the background scan", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const [html, js] = await Promise.all([
+    readFile(new URL("../index.html", import.meta.url), "utf8"),
+    readFile(new URL("../main.js", import.meta.url), "utf8"),
+  ]);
+  for (const id of ["restore-progress", "restore-progress-message", "restore-progress-bar", "restore-progress-balance"]) {
+    assert.equal(html.includes(`id="${id}"`), true, `missing ${id}`);
+  }
+  assert.equal(html.includes('id="restore-submit" class="btn" type="submit" disabled'), false);
+  assert.equal(js.includes("restoreScanPresentation"), true);
+  assert.equal(js.includes('invoke("wallet_sync_status")'), true);
+  assert.equal(js.includes("result?.scanning === true"), true);
+  assert.equal(js.includes("beginRestoreScanPolling"), true);
+  assert.equal(js.includes("stopRestoreScanPolling"), true);
+  assert.equal(js.includes("owned_outputs"), false);
+});
+
+test("chain source panel persists through the typed bridge without echoing the token", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const [html, js] = await Promise.all([
+    readFile(new URL("../index.html", import.meta.url), "utf8"),
+    readFile(new URL("../main.js", import.meta.url), "utf8"),
+  ]);
+  for (const id of ["chain-source-form", "chain-source-url", "chain-source-token", "chain-source-tls-warning", "chain-source-current", "settings-chain-source", "settings-chain-source-warning"]) {
+    assert.equal(html.includes(`id="${id}"`), true, `missing ${id}`);
+  }
+  assert.equal(html.includes('data-gate-panel="chain-source-form"'), true);
+  assert.equal(html.includes('value="EMBEDDED" checked'), true);
+  assert.equal(html.includes('id="chain-source-token" name="bearer_token" type="password"'), true);
+  assert.equal(js.includes('"chain_source_get"'), true);
+  assert.equal(js.includes('"chain_source_set"'), true);
+  assert.equal(js.includes("chainSourceTlsWarning"), true);
+  assert.equal(js.includes("DEFAULT_REMOTE_NODE_URL"), true);
+  assert.equal(js.includes('byId("chain-source-token").value ='), false);
+});
+
+test("remote tip alert banners exist on the gate and in the application shell", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const [html, js] = await Promise.all([
+    readFile(new URL("../index.html", import.meta.url), "utf8"),
+    readFile(new URL("../main.js", import.meta.url), "utf8"),
+  ]);
+  assert.equal(html.includes('id="remote-tip-alert"'), true);
+  assert.equal(html.includes('id="gate-remote-tip-alert"'), true);
+  assert.equal(js.includes("remoteTipAlertPresentation"), true);
+  assert.equal(js.includes("remoteTipAlertMessage"), true);
 });

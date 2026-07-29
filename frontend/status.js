@@ -99,18 +99,18 @@ export function restoreReadinessPresentation(node) {
   const progress = peerHeight > 0
     ? Math.min(100, Math.floor((localHeight * 100) / peerHeight))
     : 0;
-  const ready = node?.network === "MAINNET"
+  const synchronized = node?.network === "MAINNET"
     && node?.lifecycle === "READY"
     && node?.ready === true
     && connectedPeers > 0
     && peerHeight > 0
     && localHeight >= peerHeight;
 
-  if (ready) {
+  if (synchronized) {
     return {
-      ready: true,
+      submitEnabled: true,
       badge: "READY",
-      message: `Mainnet synchronized at height ${localHeight}. Seed restore is available.`,
+      message: `Mainnet node synchronized at height ${localHeight}.`,
       localHeight,
       peerHeight,
       connectedPeers,
@@ -119,7 +119,7 @@ export function restoreReadinessPresentation(node) {
   }
   if (connectedPeers === 0) {
     return {
-      ready: false,
+      submitEnabled: true,
       badge: "DISCOVERING",
       message: `Discovering Mainnet peers at local height ${localHeight}.`,
       localHeight,
@@ -130,7 +130,7 @@ export function restoreReadinessPresentation(node) {
   }
   if (peerHeight > localHeight) {
     return {
-      ready: false,
+      submitEnabled: true,
       badge: "SYNCHRONIZING",
       message: `Synchronizing ${localHeight} / ${peerHeight} (${progress}%).`,
       localHeight,
@@ -140,13 +140,101 @@ export function restoreReadinessPresentation(node) {
     };
   }
   return {
-    ready: false,
+    submitEnabled: true,
     badge: "FINALIZING",
     message: `Validating Mainnet state at height ${localHeight}.`,
     localHeight,
     peerHeight: peerHeight || null,
     connectedPeers,
     progress,
+  };
+}
+
+export function restoreScanPresentation(synchronization) {
+  const active = synchronization?.seed_restore_in_progress === true;
+  const cursorHeight = Number.isSafeInteger(synchronization?.cursor_height)
+    ? synchronization.cursor_height
+    : 0;
+  const tipHeight = Number.isSafeInteger(synchronization?.tip_height)
+    ? synchronization.tip_height
+    : null;
+  const reportedPercent = synchronization?.scan_progress_percent;
+  const progress = Number.isSafeInteger(reportedPercent)
+    ? Math.min(100, Math.max(0, reportedPercent))
+    : tipHeight != null && tipHeight > 0
+      ? Math.min(100, Math.floor((cursorHeight * 100) / tipHeight))
+      : 0;
+  const partial = synchronization?.partial_balance;
+  const partialNoms = Number.isSafeInteger(partial)
+    ? partial
+    : Number.isSafeInteger(partial?.confirmed)
+      ? partial.confirmed
+      : Number.isSafeInteger(partial?.total)
+        ? partial.total
+        : null;
+  if (!active) {
+    return {
+      active: false,
+      message: null,
+      progress,
+      cursorHeight,
+      tipHeight,
+      partialBalanceText: null,
+    };
+  }
+  return {
+    active: true,
+    message: tipHeight != null
+      ? `Restored — scanning block ${cursorHeight} of ${tipHeight} (${progress}%)`
+      : `Restored — scanning block ${cursorHeight}`,
+    progress,
+    cursorHeight,
+    tipHeight,
+    partialBalanceText: partialNoms == null
+      ? "Partial balance: unavailable"
+      : `Partial balance: ${formatDomFromNoms(partialNoms)}`,
+  };
+}
+
+export function remoteTipAlertPresentation(synchronization) {
+  const active = synchronization?.remote_tip_alert === true;
+  return {
+    active,
+    message: active
+      ? "Remote node alert: the reported chain tip regressed or is inconsistent. Verify your remote node before trusting balances."
+      : null,
+  };
+}
+
+export function chainSourceTlsWarning(baseUrl) {
+  if (typeof baseUrl !== "string" || baseUrl.trim() === "") return false;
+  let parsed;
+  try {
+    parsed = new URL(baseUrl.trim());
+  } catch {
+    return true;
+  }
+  if (parsed.protocol === "https:") return false;
+  const host = parsed.hostname.toLowerCase();
+  const isLocal = host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]";
+  return !isLocal;
+}
+
+export function chainSourcePresentation(value) {
+  const source = value?.source === "REMOTE" ? "REMOTE" : "EMBEDDED";
+  const baseUrl = typeof value?.base_url === "string" && value.base_url !== ""
+    ? value.base_url
+    : null;
+  const tlsWarning = value?.tls_warning === true
+    || (source === "REMOTE" && chainSourceTlsWarning(baseUrl ?? ""));
+  return {
+    source,
+    baseUrl,
+    hasBearerToken: value?.has_bearer_token === true,
+    tlsWarning,
+    message: source === "REMOTE"
+      ? `Remote node (fast): ${baseUrl ?? "no URL configured"}`
+      : "Local full node (default): the embedded node validates the entire chain.",
   };
 }
 
