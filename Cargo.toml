@@ -11,6 +11,7 @@ members = [
     "crates/dom-wallet-core-protocol",
     "crates/dom-wallet-core-recovery",
     "crates/dom-wallet-core-restore",
+    "crates/dom-wallet-remote-source",
     "crates/dom-wallet-updater",
     "crates/dom-wallet-node-manager",
     "crates/dom-wallet-production-backend",
