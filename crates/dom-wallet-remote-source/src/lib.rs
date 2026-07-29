@@ -1114,6 +1114,178 @@ mod tests {
         }
     }
 
+    /// The in-memory projection an embedded node produces for the block that
+    /// [`block_json`] describes on the wire. Built structurally by hand — NOT
+    /// by parsing the same JSON — so the comparison actually proves the wire
+    /// format lands on the embedded shape instead of comparing the parser to
+    /// itself.
+    fn embedded_projection(height: u64, hash_byte: u8, previous_byte: u8) -> ScanBlock {
+        ScanBlock {
+            height,
+            block_hash: [hash_byte; 32],
+            previous_block_hash: [previous_byte; 32],
+            timestamp: 1_753_660_800 + height,
+            canonical_marker: [hash_byte; 32],
+            outputs: vec![ScanOutput {
+                commitment: [0xA0 ^ hash_byte; 33],
+                range_proof: vec![7u8; 40],
+                recovery_capsule: vec![9u8; 16],
+                recovery_version: 1,
+                is_coinbase: true,
+                block_height: height,
+                block_hash: [hash_byte; 32],
+                output_position: 0,
+            }],
+            inputs: vec![ScanInput {
+                spent_commitment: [0xC0 ^ hash_byte; 33],
+            }],
+            kernels: vec![ScanKernel {
+                excess: [0xB0 ^ hash_byte; 33],
+                features: 0,
+                fee: 0,
+                lock_height: 0,
+            }],
+            coinbase: CoinbaseScanMetadata {
+                output_commitment: [0xA0 ^ hash_byte; 33],
+                explicit_value: 5_000_000_000,
+                kernel_excess: [0xB0 ^ hash_byte; 33],
+            },
+            total_fees_noms: 0,
+            protocol_version: 1,
+            range_proof_serialization_version: 1,
+        }
+    }
+
+    /// Acceptance (a): a remote scan must hand the scan loop EXACTLY what the
+    /// embedded node hands it for the same chain. The loop, cursor rules and
+    /// recovery all sit above this boundary, so identical projections here are
+    /// what makes a remote restore reach the same balance as a local one.
+    #[test]
+    fn acceptance_a_remote_projection_is_identical_to_the_embedded_one() {
+        let blocks = vec![
+            block_json(1, 0x31, &h32(0x30)),
+            block_json(2, 0x32, &h32(0x31)),
+            block_json(3, 0x33, &h32(0x32)),
+        ];
+        let server = MockServer::start(move |request| {
+            if request.path.starts_with("/chain/scan/full") {
+                CannedResponse::json(200, full_scan_json(1, 3, 3, 0x33, blocks.clone()))
+            } else {
+                CannedResponse::json(404, json!({"error": "unexpected path"}))
+            }
+        });
+
+        let result = source_for(&server)
+            .scan_range(scan_request(1, 3))
+            .expect("remote scan succeeds");
+
+        let expected = vec![
+            embedded_projection(1, 0x31, 0x30),
+            embedded_projection(2, 0x32, 0x31),
+            embedded_projection(3, 0x33, 0x32),
+        ];
+        assert_eq!(
+            result.blocks, expected,
+            "the remote projection diverged from the embedded one"
+        );
+        assert_eq!(result.tip.height, 3);
+        assert_eq!(result.tip.hash, [0x33; 32]);
+        // Caught up with the tip: nothing left to continue from.
+        assert!(result.continuation.is_none());
+    }
+
+    /// Acceptance (c): when the remote node reorganizes under a live scan, the
+    /// cursor must be reported invalid — that is the signal the shared
+    /// reconciliation path needs to rewind and converge on the canonical chain.
+    /// Silently accepting the stale cursor would strand the wallet on a dead
+    /// fork with a balance that never corrects itself.
+    #[test]
+    fn acceptance_c_remote_reorg_invalidates_the_cursor_instead_of_diverging() {
+        // The anchor the wallet committed at height 2.
+        let anchor = BlockRef {
+            height: 2,
+            hash: [0x32; 32],
+        };
+        let cursor = WalletScanCursor::new(CoreNetwork::Regtest, [0x11; 32], 3, anchor);
+
+        // Same height, different block: the chain reorganized under us.
+        let reorged = MockServer::start(move |request| {
+            if request.path.starts_with("/block/2") {
+                CannedResponse::json(200, json!({"height": 2, "hash": h32(0xF2)}))
+            } else if request.path.starts_with("/chain/scan/full") {
+                CannedResponse::json(200, full_scan_json(1, 0, 9, 0xF9, Vec::new()))
+            } else {
+                CannedResponse::json(404, json!({"error": "unexpected path"}))
+            }
+        });
+
+        let validation = source_for(&reorged).validate_cursor(cursor);
+        assert!(
+            matches!(&validation, Ok(check) if !check.valid) || validation.is_err(),
+            "a reorged anchor must never validate: {validation:?}"
+        );
+
+        // The unchanged chain still validates, so the check is not simply
+        // rejecting everything.
+        let intact = MockServer::start(move |request| {
+            if request.path.starts_with("/block/2") {
+                CannedResponse::json(200, json!({"height": 2, "hash": h32(0x32)}))
+            } else if request.path.starts_with("/chain/scan/full") {
+                CannedResponse::json(200, full_scan_json(1, 0, 9, 0xF9, Vec::new()))
+            } else {
+                CannedResponse::json(404, json!({"error": "unexpected path"}))
+            }
+        });
+        let validation = source_for(&intact)
+            .validate_cursor(cursor)
+            .expect("an intact anchor validates");
+        assert!(validation.valid);
+    }
+
+    /// Acceptance (d): a busy remote node must never freeze the cursor. Every
+    /// busy answer has to come back retriable so the scan loop backs off and
+    /// tries again; classifying it as terminal is precisely the frozen-cursor
+    /// regression.
+    #[test]
+    fn acceptance_d_busy_remote_is_retriable_and_the_scan_then_advances() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = Arc::clone(&attempts);
+        let server = MockServer::start(move |request| {
+            if !request.path.starts_with("/chain/scan/full") {
+                return CannedResponse::json(404, json!({"error": "unexpected path"}));
+            }
+            // The first three attempts find a contended chain lock.
+            if server_attempts.fetch_add(1, Ordering::SeqCst) < 3 {
+                CannedResponse::json(503, json!({"error": "overloaded: chain busy; retry"}))
+            } else {
+                CannedResponse::json(
+                    200,
+                    full_scan_json(1, 1, 1, 0x31, vec![block_json(1, 0x31, &h32(0x30))]),
+                )
+            }
+        });
+        let source = source_for(&server);
+
+        for attempt in 0..3 {
+            let error = source
+                .scan_range(scan_request(1, 1))
+                .expect_err("a busy chain must fail this attempt");
+            assert!(
+                matches!(error, WalletCoreError::NodeNotReady(_)),
+                "attempt {attempt} must stay retriable, got {error:?}"
+            );
+        }
+
+        // Once the lock frees the very same cursor advances — no reset, no
+        // manual intervention, no terminal state in between.
+        let result = source
+            .scan_range(scan_request(1, 1))
+            .expect("the scan proceeds once the remote is free");
+        assert_eq!(result.blocks.len(), 1);
+        assert_eq!(result.blocks[0].height, 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 4);
+    }
+
     fn scan_error_of(response: CannedResponse) -> WalletCoreError {
         let server = MockServer::start(move |_| response.clone());
         let source = source_for(&server);
