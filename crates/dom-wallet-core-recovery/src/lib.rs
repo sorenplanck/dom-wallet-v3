@@ -37,6 +37,30 @@ pub const CANONICAL_TRANSACTION_OUTPUT_SIZE: usize = 33 + 4 + 835;
 /// Frozen proof envelope size.
 pub const RECOVERY_PROOF_ENVELOPE_SIZE: usize = RANGE_PROOF_SIZE + RECOVERY_CAPSULE_SIZE;
 
+/// Canonical word count for every Wallet V3 recovery phrase.
+pub const CANONICAL_PHRASE_WORDS: usize = 24;
+
+/// Why a recovery phrase was rejected, precise enough for the UI to point at
+/// the problem instead of saying "invalid phrase" and leaving the user to
+/// re-read 24 words.
+///
+/// SECURITY: a diagnosis carries positions and counts, NEVER phrase content.
+/// Command errors reach the log file, and a word the user typed — even a
+/// misspelled one — is one keystroke away from real seed material. The caller
+/// already holds the input and can highlight the word at `index` itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhraseProblem {
+    /// Wrong number of words; `got` is what the user supplied.
+    WrongWordCount { got: usize },
+    /// The zero-based word at `index` is not in the BIP-39 English wordlist.
+    UnknownWord { index: usize },
+    /// Every word is real but the phrase's checksum does not verify — almost
+    /// always two words swapped, or one word replaced by another valid word.
+    ChecksumMismatch,
+    /// Structurally unusable for reasons the user cannot act on individually.
+    Malformed,
+}
+
 /// Canonical English 24-word BIP-39 seed boundary.
 pub struct CanonicalWalletSeed {
     mnemonic: Mnemonic,
@@ -70,10 +94,38 @@ impl CanonicalWalletSeed {
     pub fn parse(phrase: &str) -> Result<Self, RecoveryMaterialError> {
         let mnemonic = Mnemonic::parse_in(Language::English, phrase)
             .map_err(|_| RecoveryMaterialError::InvalidMnemonic)?;
-        if mnemonic.word_count() != 24 || mnemonic.to_entropy().len() != 32 {
+        if mnemonic.word_count() != CANONICAL_PHRASE_WORDS || mnemonic.to_entropy().len() != 32 {
             return Err(RecoveryMaterialError::InvalidMnemonic);
         }
         Self::from_mnemonic(mnemonic)
+    }
+
+    /// Diagnose a phrase without constructing any seed material.
+    ///
+    /// Returns `Ok(())` exactly when [`CanonicalWalletSeed::parse`] would
+    /// succeed, so the UI can rely on this as a pre-flight check that agrees
+    /// with the real parser. Nothing derived from the phrase is retained.
+    pub fn diagnose_phrase(phrase: &str) -> Result<(), PhraseProblem> {
+        // The BIP-39 word count is checked first so a truncated phrase reports
+        // its length instead of an unknown-word index the user cannot act on.
+        let words = phrase.split_whitespace().count();
+        if words != CANONICAL_PHRASE_WORDS {
+            return Err(PhraseProblem::WrongWordCount { got: words });
+        }
+        match Mnemonic::parse_in(Language::English, phrase) {
+            Ok(mnemonic) => {
+                if mnemonic.word_count() != CANONICAL_PHRASE_WORDS
+                    || mnemonic.to_entropy().len() != 32
+                {
+                    return Err(PhraseProblem::Malformed);
+                }
+                Ok(())
+            }
+            Err(bip39::Error::UnknownWord(index)) => Err(PhraseProblem::UnknownWord { index }),
+            Err(bip39::Error::InvalidChecksum) => Err(PhraseProblem::ChecksumMismatch),
+            Err(bip39::Error::BadWordCount(got)) => Err(PhraseProblem::WrongWordCount { got }),
+            Err(_) => Err(PhraseProblem::Malformed),
+        }
     }
 
     fn from_mnemonic(mnemonic: Mnemonic) -> Result<Self, RecoveryMaterialError> {

@@ -33,9 +33,10 @@ use dom_wallet_domain::{
     TransactionRole, TransactionTransitionEvidence, WalletState, RECOVERY_SCHEME_BIP39_256_V1,
 };
 use dom_wallet_embedded_core::{EmbeddedCoreConfiguration, EmbeddedPeerStatus};
-use dom_wallet_production_backend::{
-    ProductionBackendError, ProductionWalletBackend, PRODUCTION_BACKEND_KIND,
-};
+use dom_wallet_production_backend::{ProductionBackendError, PRODUCTION_BACKEND_KIND};
+pub use dom_wallet_core_recovery::{PhraseProblem, CANONICAL_PHRASE_WORDS};
+pub use dom_wallet_production_backend::{ProductionWalletBackend, REMOTE_BACKEND_KIND};
+use std::sync::Arc;
 use dom_wallet_storage::{
     default_node_configuration, StorageError, WalletDirectory, WalletMetadata,
 };
@@ -368,7 +369,7 @@ impl WalletService {
         result
     }
 
-    /// Start the sole production backend. No remote endpoint is consulted.
+    /// Start the embedded production backend. No remote endpoint is consulted.
     pub fn start_embedded_core(
         &mut self,
         configuration: EmbeddedCoreConfiguration,
@@ -376,14 +377,49 @@ impl WalletService {
         if self.backend.is_some() {
             return Err(CoreError::InvalidLifecycleState);
         }
-        let expected = self.unlocked.as_ref().map(|state| &state.identity);
         let backend = ProductionWalletBackend::start(configuration, None)?;
-        if let Some(expected) = expected {
-            require_domain_identity(expected, backend.identity())?;
+        self.attach_backend(backend)
+    }
+
+    /// Start a remote scan-only backend over an already constructed frozen
+    /// `WalletCoreApi` (e.g. `dom-wallet-remote-source::RemoteNodeSource`).
+    ///
+    /// The chain adapter, cursor rules and atomic commit path are identical to
+    /// the embedded backend; submission, fees, peers and mining stay
+    /// embedded-only and return a typed "requires the embedded node" error.
+    pub fn start_remote_source(
+        &mut self,
+        api: Arc<dyn dom_wallet_core_api::WalletCoreApi + Send + Sync>,
+    ) -> Result<ProbeResult, CoreError> {
+        if self.backend.is_some() {
+            return Err(CoreError::InvalidLifecycleState);
+        }
+        let backend = ProductionWalletBackend::start_remote(api, None)?;
+        self.attach_backend(backend)
+    }
+
+    /// Install an externally constructed backend (embedded or remote).
+    ///
+    /// This exists so slow construction — `DomNode::init` performs NTP checks
+    /// and `ChainState::open` — can run on a dedicated thread WITHOUT holding
+    /// the `WalletService` lock; only this short attach step needs the lock.
+    pub fn attach_backend(
+        &mut self,
+        backend: ProductionWalletBackend,
+    ) -> Result<ProbeResult, CoreError> {
+        if self.backend.is_some() {
+            return Err(CoreError::InvalidLifecycleState);
+        }
+        if let Some(state) = self.unlocked.as_ref() {
+            require_domain_identity(&state.identity, backend.identity())?;
         }
         let identity = backend.identity().clone();
         let result = ProbeResult {
-            source_identity: PRODUCTION_BACKEND_KIND.into(),
+            source_identity: if backend.is_embedded() {
+                PRODUCTION_BACKEND_KIND.into()
+            } else {
+                REMOTE_BACKEND_KIND.into()
+            },
             network: map_network(identity.network),
             tip_height: identity.current_tip.height,
             connected: true,
@@ -391,6 +427,19 @@ impl WalletService {
         self.backend = Some(backend);
         self.observed_tip_height = Some(identity.current_tip.height);
         Ok(result)
+    }
+
+    /// Whether any chain-source backend (embedded or remote) is attached.
+    pub fn has_backend(&self) -> bool {
+        self.backend.is_some()
+    }
+
+    /// Whether the attached backend owns the embedded node (false when the
+    /// backend is a remote scan-only source or absent).
+    pub fn backend_is_embedded(&self) -> bool {
+        self.backend
+            .as_ref()
+            .is_some_and(ProductionWalletBackend::is_embedded)
     }
 
     pub fn embedded_core_identity(&self) -> Result<CoreChainIdentity, CoreError> {
@@ -521,6 +570,14 @@ impl WalletService {
         )
         .map(|value| value.encode())
         .map_err(CoreError::from)
+    }
+
+    /// Diagnose a recovery phrase without touching disk, the network or any
+    /// wallet state, so the shell can report which word is wrong instead of a
+    /// blanket "invalid phrase". Agreement with the real parser is guaranteed
+    /// by `diagnose_phrase_agrees_with_restore` in the shell test suite.
+    pub fn diagnose_recovery_phrase(phrase: &str) -> Result<(), PhraseProblem> {
+        dom_wallet_core_recovery::CanonicalWalletSeed::diagnose_phrase(phrase)
     }
 
     /// Immediate offline restore: parse the mnemonic and create the encrypted
@@ -2914,6 +2971,67 @@ mod tests {
             Err(CoreError::RecoveryPhraseInvalid)
         ));
         assert!(!temp.path().join("invalid").exists());
+    }
+
+    /// R8: the process dies between the restore and the first scan batch.
+    ///
+    /// A graceful `close()` is the easy path and is already covered above; this
+    /// covers the ugly one — the `WalletService` is dropped with no shutdown at
+    /// all, the way a kill or a power cut leaves things. Reopening must find a
+    /// complete wallet, no half-written staging sibling, and a restore that
+    /// resumes from zero rather than reporting itself finished.
+    #[test]
+    fn regression_offline_restore_survives_a_crash_before_the_first_batch() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("crashed");
+        let phrase = CanonicalWalletSeed::from_entropy(&[0x33; 32])
+            .unwrap()
+            .mnemonic_text();
+
+        {
+            let mut service = test_service();
+            service
+                .restore_from_mnemonic_offline_with_identity(
+                    &path,
+                    "password-1",
+                    phrase.as_str(),
+                    backup_identity(),
+                )
+                .unwrap();
+            // No close(), no shutdown: the process simply stops existing here,
+            // before a single block was ever scanned.
+        }
+
+        // The atomic create left no staging sibling behind to poison the name.
+        let staging = temp.path().join(".crashed.create-staging");
+        assert!(
+            !staging.exists(),
+            "a crashed restore must not leave an orphan staging directory"
+        );
+        let orphans: Vec<_> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "crashed")
+            .collect();
+        assert!(orphans.is_empty(), "unexpected leftovers: {orphans:?}");
+
+        // A fresh service reopens the wallet the crashed one created.
+        let mut reopened = test_service();
+        let summary = reopened.open(&path).unwrap();
+        assert_eq!(summary.state, "LOCKED");
+        let unlocked = reopened.unlock("password-1").unwrap();
+        assert_eq!(unlocked.state, "READY");
+
+        // The scan resumes from the beginning: still in progress, no cursor,
+        // nothing counted as recovered.
+        assert_eq!(unlocked.seed_restore_status.as_deref(), Some("in_progress"));
+        assert!(unlocked.cursor_height.is_none());
+        assert!(unlocked.tip_height.is_none());
+        assert_eq!(unlocked.balance, BalanceProjection::default());
+        let state = reopened.unlocked.as_ref().unwrap();
+        assert_eq!(state.sync_status, SyncStatus::Synchronizing);
+        assert!(state.core_scan_cursor.is_none());
     }
 
     #[test]
