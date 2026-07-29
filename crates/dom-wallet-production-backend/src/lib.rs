@@ -25,6 +25,9 @@ use std::{fmt, path::Path, sync::Arc};
 use thiserror::Error;
 
 pub const PRODUCTION_BACKEND_KIND: &str = "EMBEDDED_WALLET_CORE_API_ONLY";
+/// Backend kind for a remote, scan-only chain source consumed through the same
+/// frozen `WalletCoreApi` contract. Spending and mining stay embedded-only.
+pub const REMOTE_BACKEND_KIND: &str = "REMOTE_WALLET_CORE_API_SCAN_ONLY";
 pub const DEFAULT_SCAN_BATCH_BLOCKS: u64 = 256;
 pub const DEFAULT_REORG_DEPTH: u64 = 1_024;
 
@@ -42,6 +45,10 @@ pub enum ProductionBackendError {
     Recovery,
     #[error("seed-only restore failed")]
     Restore(#[from] SeedRestoreError),
+    /// The requested operation is only served by the embedded node; a remote
+    /// scan-only source can never perform it (submission, fees, mining, peers).
+    #[error("this operation requires the embedded node")]
+    EmbeddedNodeRequired,
 }
 
 impl ProductionBackendError {
@@ -52,12 +59,19 @@ impl ProductionBackendError {
     }
 }
 
-/// Explicit owner of the embedded node and every Wallet-facing frozen adapter.
+/// Explicit owner of the chain source and every Wallet-facing frozen adapter.
+///
+/// Two constructions exist:
+/// - [`ProductionWalletBackend::start`]: the embedded node (default). Owns the
+///   node lifecycle plus submission and fee-policy adapters.
+/// - [`ProductionWalletBackend::start_remote`]: a remote scan-only source.
+///   `lifecycle`, `submission` and `fees` are absent and every operation that
+///   would need them returns [`ProductionBackendError::EmbeddedNodeRequired`].
 pub struct ProductionWalletBackend {
-    lifecycle: EmbeddedCoreLifecycle,
+    lifecycle: Option<EmbeddedCoreLifecycle>,
     chain: CoreChainAdapter,
-    submission: CoreSubmissionService,
-    fees: CoreFeePolicyService,
+    submission: Option<CoreSubmissionService>,
+    fees: Option<CoreFeePolicyService>,
     identity: CoreChainIdentity,
     api: Arc<dyn WalletCoreApi + Send + Sync>,
 }
@@ -66,7 +80,7 @@ impl fmt::Debug for ProductionWalletBackend {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ProductionWalletBackend")
-            .field("kind", &PRODUCTION_BACKEND_KIND)
+            .field("kind", &self.kind())
             .field("network", &self.identity.network)
             .field("chain_id", &"[PUBLIC CHAIN ID]")
             .finish_non_exhaustive()
@@ -91,13 +105,52 @@ impl ProductionWalletBackend {
         let submission = CoreSubmissionService::connect(Arc::clone(&api), identity.clone())?;
         let fees = CoreFeePolicyService::connect(Arc::clone(&api), identity.clone())?;
         Ok(Self {
-            lifecycle,
+            lifecycle: Some(lifecycle),
             chain,
-            submission,
-            fees,
+            submission: Some(submission),
+            fees: Some(fees),
             identity,
             api,
         })
+    }
+
+    /// Start a remote scan-only backend over an already constructed frozen
+    /// `WalletCoreApi` (e.g. `dom-wallet-remote-source`). The chain adapter is
+    /// identical to the embedded one — cursor rules, reorg depth and paging are
+    /// byte-for-byte the same — but no submission or fee surface exists.
+    pub fn start_remote(
+        api: Arc<dyn WalletCoreApi + Send + Sync>,
+        expected_identity: Option<&CoreChainIdentity>,
+    ) -> Result<Self, ProductionBackendError> {
+        let chain = CoreChainAdapter::connect(
+            Arc::clone(&api),
+            expected_identity,
+            DEFAULT_SCAN_BATCH_BLOCKS,
+            DEFAULT_REORG_DEPTH,
+        )?;
+        let identity = chain.identity().clone();
+        Ok(Self {
+            lifecycle: None,
+            chain,
+            submission: None,
+            fees: None,
+            identity,
+            api,
+        })
+    }
+
+    /// Stable backend kind: embedded node or remote scan-only source.
+    pub fn kind(&self) -> &'static str {
+        if self.lifecycle.is_some() {
+            PRODUCTION_BACKEND_KIND
+        } else {
+            REMOTE_BACKEND_KIND
+        }
+    }
+
+    /// Whether this backend owns the embedded node.
+    pub fn is_embedded(&self) -> bool {
+        self.lifecycle.is_some()
     }
 
     pub fn identity(&self) -> &CoreChainIdentity {
@@ -105,7 +158,14 @@ impl ProductionWalletBackend {
     }
 
     pub fn is_running(&self) -> bool {
-        self.lifecycle.state() == dom_wallet_embedded_core::EmbeddedCoreLifecycleState::Running
+        match &self.lifecycle {
+            Some(lifecycle) => {
+                lifecycle.state() == dom_wallet_embedded_core::EmbeddedCoreLifecycleState::Running
+            }
+            // A remote source has no process to die; outages surface as
+            // retriable scan errors instead.
+            None => true,
+        }
     }
 
     /// Refresh the canonical tip while requiring every immutable chain identity
@@ -115,15 +175,26 @@ impl ProductionWalletBackend {
     }
 
     pub fn is_ready(&self) -> Result<bool, ProductionBackendError> {
-        Ok(self.lifecycle.is_ready_for_wallet_operations()?)
+        match &self.lifecycle {
+            Some(lifecycle) => Ok(lifecycle.is_ready_for_wallet_operations()?),
+            // Remote readiness is a cheap identity probe; transport outages
+            // report "not ready" (retriable) rather than an error.
+            None => Ok(self.api.is_ready_for_wallet_operations().unwrap_or(false)),
+        }
     }
 
     pub fn peer_status(&self) -> Result<EmbeddedPeerStatus, ProductionBackendError> {
-        Ok(self.lifecycle.peer_status()?)
+        match &self.lifecycle {
+            Some(lifecycle) => Ok(lifecycle.peer_status()?),
+            None => Err(ProductionBackendError::EmbeddedNodeRequired),
+        }
     }
 
     pub fn node_handle(&self) -> Result<Arc<dom_node::node::DomNode>, ProductionBackendError> {
-        Ok(self.lifecycle.node_handle()?)
+        match &self.lifecycle {
+            Some(lifecycle) => Ok(lifecycle.node_handle()?),
+            None => Err(ProductionBackendError::EmbeddedNodeRequired),
+        }
     }
 
     pub fn reconcile_once<S: CoreScanTransactionSink>(
@@ -149,14 +220,26 @@ impl ProductionWalletBackend {
         &self,
         shape: WalletTransactionShape,
     ) -> Result<WalletFeeEstimate, ProductionBackendError> {
-        Ok(self.fees.minimum_fee(shape)?)
+        Ok(self.fee_service()?.minimum_fee(shape)?)
     }
 
     pub fn recommended_fee(
         &self,
         shape: WalletTransactionShape,
     ) -> Result<WalletFeeEstimate, ProductionBackendError> {
-        Ok(self.fees.recommended_fee(shape)?)
+        Ok(self.fee_service()?.recommended_fee(shape)?)
+    }
+
+    fn fee_service(&self) -> Result<&CoreFeePolicyService, ProductionBackendError> {
+        self.fees
+            .as_ref()
+            .ok_or(ProductionBackendError::EmbeddedNodeRequired)
+    }
+
+    fn submission_service(&self) -> Result<&CoreSubmissionService, ProductionBackendError> {
+        self.submission
+            .as_ref()
+            .ok_or(ProductionBackendError::EmbeddedNodeRequired)
     }
 
     pub fn output_builder(
@@ -171,28 +254,30 @@ impl ProductionWalletBackend {
         &self,
         transaction: &CanonicalTransactionSubmission,
     ) -> Result<WalletSubmissionOutcome, ProductionBackendError> {
-        Ok(self.submission.submit_transaction(transaction)?)
+        Ok(self.submission_service()?.submit_transaction(transaction)?)
     }
 
     pub fn rebroadcast(
         &self,
         identifier: WalletTransactionIdentifier,
     ) -> Result<WalletSubmissionOutcome, ProductionBackendError> {
-        Ok(self.submission.rebroadcast_transaction(identifier)?)
+        Ok(self
+            .submission_service()?
+            .rebroadcast_transaction(identifier)?)
     }
 
     pub fn query_submission(
         &self,
         identifier: WalletTransactionIdentifier,
     ) -> Result<WalletSubmissionQuery, ProductionBackendError> {
-        Ok(self.submission.query_submission(identifier)?)
+        Ok(self.submission_service()?.query_submission(identifier)?)
     }
 
     pub fn transaction_status(
         &self,
         identifier: WalletTransactionIdentifier,
     ) -> Result<WalletTransactionStatus, ProductionBackendError> {
-        Ok(self.submission.transaction_status(identifier)?)
+        Ok(self.submission_service()?.transaction_status(identifier)?)
     }
 
     pub fn restore(
@@ -212,8 +297,10 @@ impl ProductionWalletBackend {
     }
 
     pub fn shutdown(&mut self) -> Result<(), ProductionBackendError> {
-        self.lifecycle.request_shutdown()?;
-        self.lifecycle.wait_for_shutdown()?;
+        if let Some(lifecycle) = self.lifecycle.as_mut() {
+            lifecycle.request_shutdown()?;
+            lifecycle.wait_for_shutdown()?;
+        }
         Ok(())
     }
 }
