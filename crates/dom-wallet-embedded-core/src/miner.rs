@@ -8,8 +8,8 @@ use dom_core::{BlockHeight, Hash256, Timestamp};
 use dom_node::node::DomNode;
 use dom_pow::{
     compute_expected_target, fast_pow_hash, hash_meets_target, pow_validation_mode_for_network,
-    randomx_pool, randomx_seed_height, target_to_compact, target_to_difficulty, CompactTarget,
-    PowValidationMode,
+    randomx_pool, randomx_seed_height, target_to_compact,
+    target_to_difficulty_for_network_height, CompactTarget, PowValidationMode,
 };
 use dom_serialization::{DomDeserialize, DomSerialize};
 use std::sync::{
@@ -32,12 +32,45 @@ pub enum WalletMiningOutcome {
 
 #[derive(Debug, Error)]
 pub enum WalletMiningError {
+    /// The node cannot serve work *right now* — it is still catching up or has
+    /// no authoritative peer height yet. Retriable: the caller must back off
+    /// and try again, NEVER stop mining. Treating this as fatal is why mining
+    /// died permanently on the first synchronization dip.
+    #[error("wallet mining is waiting for node synchronization ({0})")]
+    NotReady(&'static str),
+    /// Preparation failed for a reason retrying cannot fix (missing seed index,
+    /// unusable target, bad PoW mode, arithmetic overflow, PMMR failure).
     #[error("wallet mining preparation failed ({0})")]
     Preparation(&'static str),
     #[error("wallet mining worker failed")]
     Worker,
     #[error("wallet mined block validation failed")]
     Validation,
+}
+
+impl WalletMiningError {
+    /// Whether the caller should back off and retry instead of stopping.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::NotReady(_))
+    }
+
+    /// Stable, redacted diagnostic code for status and logs. Carries no height,
+    /// hash, address or any other chain- or wallet-identifying material.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NotReady(_) => "MINING_NODE_NOT_SYNCHRONIZED",
+            Self::Preparation(stage) => match *stage {
+                "SEED_INDEX" => "MINING_PREPARATION_SEED_INDEX",
+                "TARGET" => "MINING_PREPARATION_TARGET",
+                "POW_MODE" => "MINING_PREPARATION_POW_MODE",
+                "DIFFICULTY" => "MINING_PREPARATION_DIFFICULTY",
+                "PMMR_ROOTS" => "MINING_PREPARATION_PMMR_ROOTS",
+                _ => "MINING_PREPARATION_FAILED",
+            },
+            Self::Worker => "MINING_WORKER_FAILED",
+            Self::Validation => "MINING_BLOCK_VALIDATION_FAILED",
+        }
+    }
 }
 
 /// Mine one candidate made by the Wallet's recovery-capable coinbase builder.
@@ -89,7 +122,18 @@ pub async fn mine_wallet_block(
             .map_err(|_| WalletMiningError::Preparation("POW_MODE"))?,
         PowValidationMode::FastDevOnly
     );
-    let difficulty = target_to_difficulty(&target);
+    // CONSENSUS: per-block work is network- and height-dependent. Mainnet at or
+    // above MAINNET_ASERT_RESCUE_HEIGHT uses a different work numerator, and
+    // `ChainState` recomputes `expected_total` with this exact function and
+    // rejects any header that disagrees ("total_difficulty mismatch"). The
+    // plain `target_to_difficulty` used here before produced a valid-looking
+    // header that the canonical validator refused at every post-rescue height.
+    let difficulty = target_to_difficulty_for_network_height(
+        node.config.network.magic(),
+        BlockHeight(height),
+        &target,
+    )
+    .map_err(|_| WalletMiningError::Preparation("DIFFICULTY"))?;
     let total_difficulty = checked_accumulated_difficulty(tip_difficulty, difficulty)
         .map_err(|_| WalletMiningError::Preparation("DIFFICULTY"))?;
     let transactions = Vec::new();
@@ -206,7 +250,9 @@ pub async fn mine_wallet_block(
                 node.metrics.best_known_peer_height.load(Ordering::Acquire),
             )
         {
-            Err(WalletMiningError::Preparation("NODE_NOT_SYNCHRONIZED"))
+            // Transient by construction: the node is behind its peers or has no
+            // authoritative peer height yet. Both recover on their own.
+            Err(WalletMiningError::NotReady("NODE_NOT_SYNCHRONIZED"))
         } else if node.metrics.chain_height.load(Ordering::Acquire) != tip_height.0 {
             Ok(WalletMiningOutcome::Stale { height })
         } else if template_started.elapsed() >= TEMPLATE_REFRESH_INTERVAL {
@@ -277,6 +323,167 @@ fn now_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dom_core::{NETWORK_MAGIC_MAINNET, NETWORK_MAGIC_REGTEST};
+    use dom_pow::MAINNET_ASERT_RESCUE_HEIGHT;
+
+    /// CONSENSUS REGRESSION.
+    ///
+    /// The Wallet used to compute per-block work with the plain
+    /// `target_to_difficulty`, which ignores network and height. Mainnet at or
+    /// above `MAINNET_ASERT_RESCUE_HEIGHT` uses a different work numerator, so
+    /// every block the Wallet mined there carried a `total_difficulty` that
+    /// `ChainState` recomputed differently and rejected outright with
+    /// "total_difficulty mismatch" — Mainnet mining was simply broken, and the
+    /// live chain is thousands of blocks past the rescue height.
+    ///
+    /// This asserts the Wallet's header field equals, bit for bit, what the
+    /// canonical validator derives for the same target, across the activation
+    /// boundary. It is the deterministic half of "a post-ASERT Mainnet block
+    /// created by the Wallet connects": real end-to-end connection needs live
+    /// RandomX work and belongs to a manual Mainnet run.
+    #[test]
+    fn regression_wallet_block_work_matches_the_canonical_validator_across_asert() {
+        // Just below, exactly at, and just above the activation height, plus a
+        // height far past it (where live Mainnet actually is).
+        let boundary = [
+            MAINNET_ASERT_RESCUE_HEIGHT - 1,
+            MAINNET_ASERT_RESCUE_HEIGHT,
+            MAINNET_ASERT_RESCUE_HEIGHT + 1,
+            10_191,
+        ];
+        // A non-zero parent total, built through the canonical accumulator so
+        // the test never has to name the U256 type directly.
+        let tip_difficulty = checked_accumulated_difficulty(Default::default(), 1_234_567)
+            .expect("seed tip difficulty");
+
+        for height in boundary {
+            let timestamp = Timestamp(1_753_660_800 + height);
+            let target =
+                compute_expected_target(NETWORK_MAGIC_MAINNET, timestamp, BlockHeight(height))
+                    .expect("canonical target");
+
+            // What the Wallet now puts in the header.
+            let wallet_work = target_to_difficulty_for_network_height(
+                NETWORK_MAGIC_MAINNET,
+                BlockHeight(height),
+                &target,
+            )
+            .expect("wallet work");
+            let wallet_total = checked_accumulated_difficulty(tip_difficulty, wallet_work)
+                .expect("wallet total");
+
+            // What `ChainState::validate` recomputes and demands.
+            let expected_work = target_to_difficulty_for_network_height(
+                NETWORK_MAGIC_MAINNET,
+                BlockHeight(height),
+                &target,
+            )
+            .expect("validator work");
+            let expected_total = checked_accumulated_difficulty(tip_difficulty, expected_work)
+                .expect("validator total");
+
+            assert_eq!(
+                wallet_total, expected_total,
+                "total_difficulty diverges from the validator at height {height}"
+            );
+
+            // The height-blind computation is what used to be written. Past the
+            // activation height it MUST differ, otherwise this test would pass
+            // even with the bug still in place.
+            let height_blind = dom_pow::target_to_difficulty(&target);
+            if height >= MAINNET_ASERT_RESCUE_HEIGHT {
+                assert_ne!(
+                    wallet_work, height_blind,
+                    "post-rescue work must not equal the height-blind value at {height}"
+                );
+            } else {
+                assert_eq!(
+                    wallet_work, height_blind,
+                    "pre-rescue heights must be unchanged at {height}"
+                );
+            }
+        }
+    }
+
+    /// Regtest is unaffected: the rescue numerator is Mainnet-only, so local
+    /// and test mining keep producing exactly the same work as before.
+    #[test]
+    fn regression_non_mainnet_work_is_unchanged_by_the_asert_rescue() {
+        for height in [1u64, MAINNET_ASERT_RESCUE_HEIGHT, 10_191] {
+            let timestamp = Timestamp(1_753_660_800 + height);
+            let target =
+                compute_expected_target(NETWORK_MAGIC_REGTEST, timestamp, BlockHeight(height))
+                    .expect("regtest target");
+            assert_eq!(
+                target_to_difficulty_for_network_height(
+                    NETWORK_MAGIC_REGTEST,
+                    BlockHeight(height),
+                    &target
+                )
+                .expect("regtest work"),
+                dom_pow::target_to_difficulty(&target),
+                "regtest work changed at height {height}"
+            );
+        }
+    }
+
+    /// Only a node that is still catching up is retriable. Every other failure
+    /// must stop mining, and every one must carry its own redacted code — the
+    /// single opaque `MINING_WORK_FAILED` made a transient dip and a corrupt
+    /// seed index indistinguishable.
+    #[test]
+    fn regression_mining_error_classes_are_distinct_and_redacted() {
+        let transient = WalletMiningError::NotReady("NODE_NOT_SYNCHRONIZED");
+        assert!(transient.is_transient());
+        assert_eq!(transient.code(), "MINING_NODE_NOT_SYNCHRONIZED");
+
+        let fatal = [
+            (
+                WalletMiningError::Preparation("SEED_INDEX"),
+                "MINING_PREPARATION_SEED_INDEX",
+            ),
+            (
+                WalletMiningError::Preparation("TARGET"),
+                "MINING_PREPARATION_TARGET",
+            ),
+            (
+                WalletMiningError::Preparation("POW_MODE"),
+                "MINING_PREPARATION_POW_MODE",
+            ),
+            (
+                WalletMiningError::Preparation("DIFFICULTY"),
+                "MINING_PREPARATION_DIFFICULTY",
+            ),
+            (
+                WalletMiningError::Preparation("PMMR_ROOTS"),
+                "MINING_PREPARATION_PMMR_ROOTS",
+            ),
+            (WalletMiningError::Worker, "MINING_WORKER_FAILED"),
+            (
+                WalletMiningError::Validation,
+                "MINING_BLOCK_VALIDATION_FAILED",
+            ),
+        ];
+        let mut codes = vec![transient.code()];
+        for (error, expected) in fatal {
+            assert!(!error.is_transient(), "{expected} must stop mining");
+            assert_eq!(error.code(), expected);
+            codes.push(error.code());
+        }
+
+        // Distinct, and free of any chain- or wallet-identifying material.
+        let unique: std::collections::BTreeSet<_> = codes.iter().collect();
+        assert_eq!(unique.len(), codes.len(), "diagnostic codes must be unique");
+        for code in codes {
+            assert!(
+                code.starts_with("MINING_")
+                    && code
+                        .chars()
+                        .all(|character| character.is_ascii_uppercase() || character == '_'),
+                "unexpected diagnostic shape: {code}"
+            );
+        }
+    }
 
     #[test]
     fn template_lifecycle_rejects_stale_unsynced_and_expired_work() {
