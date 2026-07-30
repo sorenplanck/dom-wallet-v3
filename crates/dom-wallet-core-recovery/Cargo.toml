@@ -16,6 +16,7 @@ dom-serialization.workspace = true
 dom-slate.workspace = true
 dom-tx.workspace = true
 dom-wallet-core-api.workspace = true
+dom-wallet-keys.workspace = true
 dom-wallet-recovery.workspace = true
 dom-node.workspace = true
 dom-wallet-core-protocol = { path = "../dom-wallet-core-protocol" }

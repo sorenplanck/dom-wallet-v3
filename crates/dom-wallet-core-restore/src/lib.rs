@@ -2,7 +2,10 @@
 
 #![forbid(unsafe_code)]
 
-use dom_crypto::recovery::{OutputRecoveryDomain, RecoveryChainContext};
+use dom_crypto::{
+    pedersen::{BlindingFactor, Commitment},
+    recovery::{OutputRecoveryDomain, RecoveryChainContext},
+};
 use dom_tx::InputSource;
 use dom_wallet_core_api::{
     CoinbaseScanMetadata, CoreNetwork, ScanBlock, ScanInput, ScanKernel, ScanOutput, WalletCoreApi,
@@ -19,7 +22,7 @@ use dom_wallet_domain::{
     RecoveryAllocationFloors, RecoveryCanonicalBlock, RecoveryMetadata, SeedRestoreStatus,
     SyncStatus, WalletState, MAX_ACCOUNTS, RECOVERY_SCHEME_BIP39_256_V1,
 };
-use dom_wallet_recovery::RestoreError;
+use dom_wallet_recovery::{RestoreError, RestoredOutput};
 use dom_wallet_storage::{default_node_configuration, StorageError, WalletDirectory};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -576,6 +579,17 @@ pub fn apply_recovery_batch(
             identity.coinbase_maturity,
         )?;
     }
+    for block in &batch.blocks {
+        if let Some((restored_output, output_position)) = restore_legacy_coinbase(seed, block)? {
+            merge_restored_output(
+                state,
+                &restored_output,
+                output_position,
+                batch.observed_tip.height,
+                identity.coinbase_maturity,
+            )?;
+        }
+    }
 
     migrate_durable_scan_counters(state)?;
     let mut page_inputs = BTreeSet::new();
@@ -652,6 +666,56 @@ pub fn apply_recovery_batch(
     prune_recovery_canonical_window(state);
     refresh_maturity(state, batch.observed_tip.height, identity.coinbase_maturity)?;
     Ok(())
+}
+
+/// Recognize a pre-Recovery-Capsule deterministic coinbase without broadening
+/// legacy recovery claims to ordinary proof-only outputs.
+///
+/// The legacy wallet used one BIP-32 blinding per height and the block's
+/// consensus-explicit coinbase value. The canonical scanner has already
+/// validated this metadata, so equality of the recomputed commitment is the
+/// ownership test used by the historical `dom-wallet` restore implementation.
+fn restore_legacy_coinbase(
+    seed: &CanonicalWalletSeed,
+    block: &dom_wallet_core_sync::CoreScanBlock,
+) -> Result<Option<(RestoredOutput, u32)>, SeedRestoreError> {
+    let Some(output) = block.outputs.iter().find(|output| {
+        output.is_coinbase
+            && output.recovery_version == 0
+            && output.recovery_capsule.is_empty()
+            && output.commitment == block.coinbase.output_commitment
+    }) else {
+        return Ok(None);
+    };
+    if output.block_height != block.height || output.block_hash != block.block_hash {
+        return Err(SeedRestoreError::MalformedRecovery);
+    }
+
+    let blinding = seed
+        .legacy_coinbase_blinding(block.height)
+        .map_err(|_| SeedRestoreError::MalformedRecovery)?;
+    let factor =
+        BlindingFactor::from_bytes(*blinding).map_err(|_| SeedRestoreError::MalformedRecovery)?;
+    let candidate = Commitment::commit(block.coinbase.explicit_value, &factor);
+    if candidate.as_bytes() != &output.commitment {
+        return Ok(None);
+    }
+
+    Ok(Some((
+        RestoredOutput {
+            commitment: output.commitment,
+            value: block.coinbase.explicit_value,
+            blinding: *blinding,
+            account: 0,
+            derivation_index: block.height,
+            domain: OutputRecoveryDomain::Coinbase,
+            block_height: block.height,
+            block_hash: block.block_hash,
+            is_coinbase: true,
+            spent_at_height: None,
+        },
+        output.output_position,
+    )))
 }
 
 /// Migrate a pre-window state that still carries its complete canonical block

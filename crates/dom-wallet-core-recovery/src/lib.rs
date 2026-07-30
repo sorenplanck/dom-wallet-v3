@@ -26,6 +26,7 @@ use dom_wallet_core_sync::CoreChainIdentity;
 use dom_wallet_domain::{
     RecoveryOutputClass, ReservedRecoveryCoordinate, WalletState, RECOVERY_SCHEME_BIP39_256_V1,
 };
+use dom_wallet_keys::{coinbase_blinding, ExtendedPrivKey};
 use dom_wallet_recovery::{restore_from_canonical_scan, RestoreError, RestoredWalletState};
 use rand::RngCore;
 use std::fmt;
@@ -65,6 +66,7 @@ pub enum PhraseProblem {
 pub struct CanonicalWalletSeed {
     mnemonic: Mnemonic,
     seed: Zeroizing<[u8; 64]>,
+    legacy_root: ExtendedPrivKey,
 }
 
 impl fmt::Debug for CanonicalWalletSeed {
@@ -133,7 +135,13 @@ impl CanonicalWalletSeed {
             return Err(RecoveryMaterialError::InvalidMnemonic);
         }
         let seed = Zeroizing::new(mnemonic.to_seed(""));
-        Ok(Self { mnemonic, seed })
+        let legacy_root = ExtendedPrivKey::from_seed(seed.as_slice())
+            .map_err(|_| RecoveryMaterialError::LegacyCoinbaseDerivation)?;
+        Ok(Self {
+            mnemonic,
+            seed,
+            legacy_root,
+        })
     }
 
     /// Copy entropy into the caller's encrypted-state buffer.
@@ -162,6 +170,20 @@ impl CanonicalWalletSeed {
         blocks: &[ScanBlock],
     ) -> Result<RestoredWalletState, RestoreError> {
         restore_from_canonical_scan(self.seed.as_slice(), chain, blocks)
+    }
+
+    /// Derive the historical DOM wallet coinbase blinding for `height`.
+    ///
+    /// Wallets released before Recovery Capsule v1 used the frozen
+    /// `m/44'/330'/0'/1'/height'` path. Keeping this compatibility derivation
+    /// here lets seed restore recognize old mining rewards without exposing the
+    /// BIP-39 seed or changing the recovery-capable format used by new outputs.
+    pub fn legacy_coinbase_blinding(
+        &self,
+        height: u64,
+    ) -> Result<Zeroizing<[u8; 32]>, RecoveryMaterialError> {
+        coinbase_blinding(&self.legacy_root, height)
+            .map_err(|_| RecoveryMaterialError::LegacyCoinbaseDerivation)
     }
 }
 
@@ -894,6 +916,8 @@ pub enum RecoveryMaterialError {
     InvalidMnemonic,
     #[error("recovery root derivation failed")]
     RecoveryRootDerivation,
+    #[error("legacy coinbase derivation failed")]
+    LegacyCoinbaseDerivation,
     #[error("Core chain identity is incompatible")]
     ChainIdentityMismatch,
     #[error("output value is outside the frozen proof range")]
@@ -938,4 +962,23 @@ pub fn frozen_versions() -> (u16, u8) {
 /// Public kind for a Wallet output class.
 pub fn public_output_kind(class: RecoveryOutputClass) -> PublicOutputKind {
     domain_for_class(class).public_kind()
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::CanonicalWalletSeed;
+    use dom_wallet_keys::{Bip39Seed, SeedAcceptance};
+
+    #[test]
+    fn shared_phrase_derives_byte_identical_bip39_seed_in_legacy_and_v3() {
+        let canonical = CanonicalWalletSeed::from_entropy(&[0x2a; 32]).unwrap();
+        let phrase = canonical.mnemonic_text();
+        let legacy = Bip39Seed::from_phrase(&phrase, SeedAcceptance::NewWallet).unwrap();
+
+        assert_eq!(
+            canonical.seed.as_slice(),
+            legacy.seed_bytes(),
+            "the same test phrase must produce the same 64-byte BIP-39 secret"
+        );
+    }
 }

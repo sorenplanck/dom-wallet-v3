@@ -1075,6 +1075,92 @@ fn window_hash(height: u64, tag: u8) -> [u8; 32] {
     hash
 }
 
+#[test]
+fn regression_known_phrase_mines_legacy_coinbase_then_v3_restore_has_balance() {
+    use dom_wallet::{Bip39Seed, SeedAcceptance, Wallet};
+    use dom_wallet_embedded_core::{
+        mine_wallet_block, EmbeddedCoreConfiguration, EmbeddedCoreLifecycle, EmbeddedCoreNetwork,
+        WalletMiningOutcome,
+    };
+    use std::{
+        net::TcpListener,
+        sync::{
+            atomic::{AtomicBool, AtomicU64},
+            Arc,
+        },
+    };
+
+    let temp = TempDir::new().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let mut lifecycle = EmbeddedCoreLifecycle::new(EmbeddedCoreConfiguration::new(
+        EmbeddedCoreNetwork::Regtest,
+        temp.path().join("core"),
+        address,
+    ));
+    lifecycle.start().unwrap();
+
+    let adapter = CoreChainAdapter::connect(lifecycle.wallet_api().unwrap(), None, 8, 8).unwrap();
+    let identity = adapter.identity().clone();
+    let v3_seed = CanonicalWalletSeed::from_entropy(&[0x2b; 32]).unwrap();
+    let phrase = v3_seed.mnemonic_text();
+    let legacy_seed = Bip39Seed::from_phrase(&phrase, SeedAcceptance::NewWallet).unwrap();
+    let genesis = dom_crypto::Hash256::from_bytes(identity.genesis_hash);
+    let mut legacy_wallet = Wallet::create_from_seed(
+        &temp.path().join("legacy-wallet.dat"),
+        "test-password",
+        dom_wallet::Network::Regtest,
+        &genesis,
+        &legacy_seed,
+    )
+    .unwrap();
+    let coinbase = legacy_wallet
+        .build_coinbase(dom_core::BlockHeight(1), 0)
+        .unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mined = runtime
+        .block_on(mine_wallet_block(
+            lifecycle.node_handle().unwrap(),
+            &coinbase,
+            1,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+        ))
+        .unwrap();
+    assert_eq!(mined, WalletMiningOutcome::Accepted { height: 1 });
+
+    let batch = adapter.scan_from_height(0, 8).unwrap();
+    assert_eq!(batch.observed_tip.height, 1);
+    let chain = RecoveryChainContext {
+        network_magic: identity.network_magic,
+        chain_id: identity.chain_id,
+    };
+    let mut restored = offline_restore_state(
+        &v3_seed,
+        NetworkIdentity {
+            network: Network::PrivateTestnet,
+            chain_id: identity.chain_id,
+            genesis_id: identity.genesis_hash,
+        },
+    );
+    apply_recovery_batch(&v3_seed, chain, &identity, &mut restored, &batch).unwrap();
+
+    let reward = dom_core::block_reward(dom_core::BlockHeight(1)).noms();
+    assert_eq!(restored.balance().total, reward);
+    assert_eq!(restored.outputs.len(), 1);
+    assert_eq!(
+        restored.outputs[0].commitment,
+        Some(*coinbase.output.commitment.as_bytes())
+    );
+
+    lifecycle.request_shutdown().unwrap();
+    lifecycle.wait_for_shutdown().unwrap();
+}
+
 fn window_block(height: u64, tag: u8, previous_block_hash: [u8; 32]) -> CoreScanBlock {
     let block_hash = window_hash(height, tag);
     CoreScanBlock {

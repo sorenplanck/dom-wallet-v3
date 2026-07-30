@@ -24,4 +24,7 @@ zeroize.workspace = true
 [dev-dependencies]
 dom-consensus.workspace = true
 dom-core.workspace = true
+dom-wallet.workspace = true
+dom-wallet-embedded-core = { path = "../dom-wallet-embedded-core" }
 tempfile.workspace = true
+tokio.workspace = true

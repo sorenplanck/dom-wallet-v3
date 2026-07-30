@@ -69,7 +69,9 @@ dom-config = { git = "https://github.com/sorenplanck/dom-protocol", rev = "387b7
 dom-chain = { git = "https://github.com/sorenplanck/dom-protocol", rev = "387b744474d2414f9d2d0e542bc654096ce2f8ed" }
 dom-node = { git = "https://github.com/sorenplanck/dom-protocol", rev = "387b744474d2414f9d2d0e542bc654096ce2f8ed" }
 dom-pow = { git = "https://github.com/sorenplanck/dom-protocol", rev = "387b744474d2414f9d2d0e542bc654096ce2f8ed" }
+dom-wallet = { git = "https://github.com/sorenplanck/dom-protocol", rev = "387b744474d2414f9d2d0e542bc654096ce2f8ed" }
 dom-wallet-core-api = { git = "https://github.com/sorenplanck/dom-protocol", rev = "387b744474d2414f9d2d0e542bc654096ce2f8ed" }
+dom-wallet-keys = { git = "https://github.com/sorenplanck/dom-protocol", rev = "387b744474d2414f9d2d0e542bc654096ce2f8ed" }
 dom-wallet-recovery = { git = "https://github.com/sorenplanck/dom-protocol", rev = "387b744474d2414f9d2d0e542bc654096ce2f8ed" }
 
 # Sidecar release authentication and atomic pointer handling are deliberately
