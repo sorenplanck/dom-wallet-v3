@@ -389,7 +389,10 @@ fn scan_block(height: u64) -> ScanBlock {
             kernel_excess: commitment(marker.wrapping_add(40)),
         },
         total_fees_noms: height,
-        protocol_version: dom_core::PROTOCOL_VERSION,
+        protocol_version: dom_core::required_block_version_for_network(
+            CoreNetwork::Regtest.magic(),
+            height,
+        ),
         range_proof_serialization_version: dom_crypto::RANGE_PROOF_SERIALIZATION_VERSION,
     }
 }

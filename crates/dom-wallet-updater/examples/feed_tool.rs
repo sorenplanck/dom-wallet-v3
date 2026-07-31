@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 /// Pinned primary DOM release signing key (Minisign key ID 74197A95CA309CF0).
 const RELEASE_PUBLIC_KEY: &str = "RWTwnDDKlXoZdG3obVRiLPfVRHr17E0Fj2GN8IZ2rBkipRZvIIW6PLJ3";
 /// Version of the embedded `dom-node` crate at [`EMBEDDED_NODE_REVISION`].
-const EMBEDDED_NODE_VERSION: &str = "0.1.0";
+const EMBEDDED_NODE_VERSION: &str = "0.2.0";
 /// Feed validity window; re-author and re-sign before it lapses.
 const EXPIRY_DAYS: i64 = 30;
 

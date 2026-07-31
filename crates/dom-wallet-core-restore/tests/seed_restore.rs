@@ -401,7 +401,10 @@ fn empty_block(height: u64) -> ScanBlock {
             kernel_excess: public_commitment(marker.wrapping_add(40)),
         },
         total_fees_noms: 0,
-        protocol_version: dom_core::PROTOCOL_VERSION,
+        protocol_version: dom_core::required_block_version_for_network(
+            CoreNetwork::Regtest.magic(),
+            height,
+        ),
         range_proof_serialization_version: RANGE_PROOF_SERIALIZATION_VERSION,
     }
 }
@@ -1178,7 +1181,10 @@ fn window_block(height: u64, tag: u8, previous_block_hash: [u8; 32]) -> CoreScan
             kernel_excess: public_commitment(2),
         },
         total_fees_noms: 0,
-        protocol_version: dom_core::PROTOCOL_VERSION,
+        protocol_version: dom_core::required_block_version_for_network(
+            CoreNetwork::Regtest.magic(),
+            height,
+        ),
         range_proof_serialization_version: RANGE_PROOF_SERIALIZATION_VERSION,
     }
 }

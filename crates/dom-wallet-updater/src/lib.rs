@@ -34,7 +34,7 @@ pub const NODE_UPDATE_ENDPOINT: &str =
 pub const PEER_UPDATE_ENDPOINT: &str =
     "https://github.com/sorenplanck/dom-wallet-v3/releases/latest/download/mainnet-peers.json";
 /// Pinned DOM Protocol revision compiled into this Wallet.
-pub const EMBEDDED_NODE_REVISION: &str = "b5a86a2049986f90558cae12a859759ed0db5c36";
+pub const EMBEDDED_NODE_REVISION: &str = "fbb8044d03ccf8df7d30503b7ac6410c570f97c3";
 /// First immutable DOM Protocol revision with authenticated build-info and shutdown.
 pub const MANAGED_NODE_CONTROL_REVISION: &str = "28ba3cefc9fbc913f126336482662528c68a7d8c";
 /// Stable update channel.

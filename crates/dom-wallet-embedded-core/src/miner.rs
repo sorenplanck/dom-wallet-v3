@@ -141,7 +141,7 @@ pub async fn mine_wallet_block(
         compute_block_pmmr_roots(BlockHeight(height), coinbase, &transactions)
             .map_err(|_| WalletMiningError::Preparation("PMMR_ROOTS"))?;
     let template = BlockHeader {
-        version: dom_core::PROTOCOL_VERSION,
+        version: dom_core::required_block_version_for_network(node.config.network.magic(), height),
         prev_hash: tip_hash,
         height: BlockHeight(height),
         timestamp,

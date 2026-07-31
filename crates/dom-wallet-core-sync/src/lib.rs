@@ -941,7 +941,9 @@ fn map_block(
             code: "NONCANONICAL_BLOCK",
         });
     }
-    if block.protocol_version != identity.protocol_version {
+    if block.protocol_version
+        != dom_core::required_block_version_for_network(identity.network_magic, block.height)
+    {
         return Err(CoreScanError::InvalidScan {
             code: "PROTOCOL_VERSION",
         });
