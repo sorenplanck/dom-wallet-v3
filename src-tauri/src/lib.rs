@@ -19,7 +19,7 @@ use dom_wallet_domain::BalanceProjection;
 #[cfg(test)]
 use dom_wallet_domain::{Network, NetworkIdentity};
 use dom_wallet_embedded_core::{
-    default_lmdb_map_size, mine_wallet_block, EmbeddedCoreConfiguration, WalletMiningOutcome,
+    default_lmdb_map_size, EmbeddedCoreConfiguration, WalletMiner, WalletMiningOutcome,
     LMDB_MAP_FULL_ERROR_CODE, MAINNET_DNS_SEEDS, MAINNET_P2P_PORT,
 };
 use dom_wallet_node_manager::{
@@ -33,7 +33,7 @@ use dom_wallet_updater::{
 };
 use serde::{ser::SerializeStruct, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex, MutexGuard,
@@ -628,6 +628,61 @@ const MINING_ERROR: u64 = 5;
 /// is deliberately NOT `MINING_ERROR`: the worker is still running and resumes
 /// by itself, so the UI must not present it as a failure the user has to fix.
 const MINING_WAITING: u64 = 6;
+const HASHRATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+const HASHRATE_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[derive(Clone, Copy)]
+struct HashrateSample {
+    at: std::time::Instant,
+    attempts: u64,
+}
+
+struct HashrateWindow {
+    samples: VecDeque<HashrateSample>,
+}
+
+impl HashrateWindow {
+    fn new() -> Self {
+        Self {
+            samples: VecDeque::new(),
+        }
+    }
+
+    fn reset(&mut self, at: std::time::Instant, attempts: u64) {
+        self.samples.clear();
+        self.samples.push_back(HashrateSample { at, attempts });
+    }
+
+    fn record(&mut self, at: std::time::Instant, attempts: u64) -> f64 {
+        if self
+            .samples
+            .back()
+            .is_some_and(|sample| attempts < sample.attempts)
+        {
+            self.reset(at, attempts);
+            return 0.0;
+        }
+        match self.samples.back() {
+            Some(last) if at.duration_since(last.at) < HASHRATE_SAMPLE_INTERVAL => {}
+            _ => self.samples.push_back(HashrateSample { at, attempts }),
+        }
+        // Retain the closest sample just before the window boundary. This
+        // avoids both lifetime averaging and a jagged rate when status polling
+        // does not land exactly on the 30-second cutoff.
+        while self.samples.len() > 1 && at.duration_since(self.samples[1].at) >= HASHRATE_WINDOW {
+            self.samples.pop_front();
+        }
+        let Some(first) = self.samples.front() else {
+            return 0.0;
+        };
+        let elapsed = at.duration_since(first.at).as_secs_f64();
+        if elapsed > 0.0 {
+            attempts.saturating_sub(first.attempts) as f64 / elapsed
+        } else {
+            0.0
+        }
+    }
+}
 
 struct MiningRuntime {
     state: Arc<AtomicU64>,
@@ -639,6 +694,7 @@ struct MiningRuntime {
     last_candidate_time: Arc<AtomicU64>,
     last_accepted_height: Arc<AtomicU64>,
     started_at: Arc<AtomicU64>,
+    hashrate_window: Arc<Mutex<HashrateWindow>>,
     cached_current_height: AtomicU64,
     cached_connected_peers: AtomicU64,
     error_code: Arc<Mutex<Option<String>>>,
@@ -659,6 +715,7 @@ impl Default for MiningRuntime {
             last_candidate_time: Arc::new(AtomicU64::new(0)),
             last_accepted_height: Arc::new(AtomicU64::new(u64::MAX)),
             started_at: Arc::new(AtomicU64::new(0)),
+            hashrate_window: Arc::new(Mutex::new(HashrateWindow::new())),
             cached_current_height: AtomicU64::new(0),
             cached_connected_peers: AtomicU64::new(0),
             error_code: Arc::new(Mutex::new(None)),
@@ -2171,6 +2228,18 @@ impl DesktopApplication {
         } else {
             0
         };
+        let hashrate_hps = if matches!(
+            raw_state,
+            MINING_STARTING | MINING_RUNNING | MINING_STOPPING | MINING_WAITING
+        ) {
+            mining
+                .hashrate_window
+                .lock()
+                .map_err(|_| CommandError::Unavailable)?
+                .record(std::time::Instant::now(), attempts)
+        } else {
+            0.0
+        };
         let (current_height, connected_peers) = match self.service.try_lock() {
             Ok(service) => {
                 let peer_status = service.embedded_peer_status().map_err(CommandError::from)?;
@@ -2200,11 +2269,7 @@ impl DesktopApplication {
             cpu_threads: config.cpu_threads,
             mining_address: config.mining_address,
             hash_attempts: attempts,
-            hashrate_hps: if uptime > 0 {
-                attempts as f64 / uptime as f64
-            } else {
-                0.0
-            },
+            hashrate_hps,
             current_height,
             connected_peers,
             accepted_blocks: mining.accepted_blocks.load(Ordering::Relaxed),
@@ -2272,6 +2337,11 @@ impl DesktopApplication {
         let activity = self.activities.try_begin(ActivityKind::Mining)?;
         mining.stop.store(false, Ordering::Release);
         mining.hash_attempts.store(0, Ordering::Release);
+        mining
+            .hashrate_window
+            .lock()
+            .map_err(|_| CommandError::Unavailable)?
+            .reset(std::time::Instant::now(), 0);
         mining.accepted_blocks.store(0, Ordering::Release);
         mining.rejected_work.store(0, Ordering::Release);
         mining.template_refreshes.store(0, Ordering::Release);
@@ -2293,11 +2363,34 @@ impl DesktopApplication {
         let accepted_height = Arc::clone(&mining.last_accepted_height);
         let state = Arc::clone(&mining.state);
         let error_code = Arc::clone(&mining.error_code);
+        let hashrate_window = Arc::clone(&mining.hashrate_window);
         let threads = config.cpu_threads;
         let worker = std::thread::Builder::new()
             .name("dom-wallet-cpu-miner".into())
             .spawn(move || {
                 let _activity = activity;
+                let sampler_stop = Arc::new(AtomicBool::new(false));
+                let sampler_stop_worker = Arc::clone(&sampler_stop);
+                let sampler_attempts = Arc::clone(&attempts);
+                let hashrate_sampler = std::thread::Builder::new()
+                    .name("dom-wallet-hashrate-sampler".into())
+                    .spawn(move || {
+                        while !sampler_stop_worker.load(Ordering::Acquire) {
+                            if let Ok(mut window) = hashrate_window.lock() {
+                                window.record(
+                                    std::time::Instant::now(),
+                                    sampler_attempts.load(Ordering::Relaxed),
+                                );
+                            }
+                            for _ in 0..10 {
+                                if sampler_stop_worker.load(Ordering::Acquire) {
+                                    return;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                            }
+                        }
+                    })
+                    .ok();
                 let worker_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
@@ -2311,6 +2404,21 @@ impl DesktopApplication {
                     };
                     node.metrics.mining_active.store(1, Ordering::Release);
                     state.store(MINING_RUNNING, Ordering::Release);
+                    let mut miner = match WalletMiner::new(
+                        Arc::clone(&node),
+                        threads,
+                        Arc::clone(&stop),
+                        Arc::clone(&attempts),
+                    ) {
+                        Ok(miner) => miner,
+                        Err(error) => {
+                            state.store(MINING_ERROR, Ordering::Release);
+                            if let Ok(mut slot) = error_code.lock() {
+                                *slot = Some(error.code().into());
+                            }
+                            return;
+                        }
+                    };
                     let mut coinbase_candidate = None;
                     // Consecutive transient "node is not synchronized" answers.
                     // Reset by any round that produces real work, which is what
@@ -2346,13 +2454,7 @@ impl DesktopApplication {
                             }
                             break;
                         };
-                        match runtime.block_on(mine_wallet_block(
-                            Arc::clone(&node),
-                            coinbase,
-                            threads,
-                            Arc::clone(&stop),
-                            Arc::clone(&attempts),
-                        )) {
+                        match runtime.block_on(miner.mine_block(coinbase)) {
                             Ok(WalletMiningOutcome::Accepted { height }) => {
                                 consecutive_not_ready = 0;
                                 accepted.fetch_add(1, Ordering::Relaxed);
@@ -2404,6 +2506,10 @@ impl DesktopApplication {
                         }
                     }
                 }));
+                sampler_stop.store(true, Ordering::Release);
+                if let Some(sampler) = hashrate_sampler {
+                    let _ = sampler.join();
+                }
                 node.metrics.mining_active.store(0, Ordering::Release);
                 if worker_result.is_err() {
                     state.store(MINING_ERROR, Ordering::Release);
@@ -4271,6 +4377,34 @@ impl From<SeedRestoreError> for CommandError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mining_hashrate_uses_only_the_recent_window() {
+        let started = std::time::Instant::now();
+        let mut window = HashrateWindow::new();
+        window.reset(started, 0);
+
+        assert_eq!(
+            window.record(started + std::time::Duration::from_secs(10), 100),
+            10.0
+        );
+        assert_eq!(
+            window.record(started + std::time::Duration::from_secs(20), 400),
+            20.0
+        );
+        // Session average is 25 H/s here. The retained recent boundary sample
+        // is t=10s, so the displayed 30-second window correctly reports 30.
+        assert_eq!(
+            window.record(started + std::time::Duration::from_secs(40), 1_000),
+            30.0
+        );
+        // With no new work the recent rate decays to zero instead of keeping a
+        // non-zero lifetime average while mining waits for synchronization.
+        assert_eq!(
+            window.record(started + std::time::Duration::from_secs(70), 1_000),
+            0.0
+        );
+    }
 
     #[test]
     fn command_errors_and_status_do_not_expose_passwords() {

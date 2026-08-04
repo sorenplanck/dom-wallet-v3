@@ -16,6 +16,7 @@ dom-node.workspace = true
 dom-pow.workspace = true
 dom-serialization.workspace = true
 dom-wallet-core-api.workspace = true
+randomx-rs.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

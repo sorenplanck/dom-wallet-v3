@@ -8,14 +8,16 @@ use dom_core::{BlockHeight, Hash256, Timestamp};
 use dom_node::node::DomNode;
 use dom_pow::{
     compute_expected_target, fast_pow_hash, hash_meets_target, pow_validation_mode_for_network,
-    randomx_pool, randomx_seed_height, target_to_compact, target_to_difficulty_for_network_height,
-    CompactTarget, PowValidationMode,
+    randomx_seed_height, target_to_compact, target_to_difficulty_for_network_height, CompactTarget,
+    MinerVm, PowValidationMode,
 };
 use dom_serialization::{DomDeserialize, DomSerialize};
+use randomx_rs::RandomXFlag;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc, Arc,
 };
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -46,6 +48,109 @@ pub enum WalletMiningError {
     Worker,
     #[error("wallet mined block validation failed")]
     Validation,
+}
+
+struct WorkerWork {
+    template: BlockHeader,
+    target: [u8; 32],
+    seed_hash: [u8; 32],
+    deterministic_dev_mode: bool,
+    tip_height: u64,
+    require_network_ready: bool,
+    template_started: Instant,
+    round_stop: Arc<AtomicBool>,
+}
+
+type WorkerResult = Result<Option<BlockHeader>, ()>;
+
+struct MiningWorker {
+    sender: mpsc::Sender<Option<WorkerWork>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+/// Long-lived RandomX worker set for one Wallet mining session.
+///
+/// Every worker owns one persistent `MinerVm`. The VM is replaced only when
+/// the RandomX epoch seed changes; the protocol's `MinerPool` keeps the full
+/// dataset behind all of those VMs shared and seed-keyed.
+pub struct WalletMiner {
+    node: Arc<DomNode>,
+    stop_requested: Arc<AtomicBool>,
+    threads: usize,
+    workers: Vec<MiningWorker>,
+    results: mpsc::Receiver<WorkerResult>,
+}
+
+impl WalletMiner {
+    pub fn new(
+        node: Arc<DomNode>,
+        threads: usize,
+        stop_requested: Arc<AtomicBool>,
+        hash_attempts: Arc<AtomicU64>,
+    ) -> Result<Self, WalletMiningError> {
+        if threads == 0 {
+            return Err(WalletMiningError::Worker);
+        }
+        let (result_sender, results) = mpsc::channel();
+        let mut workers = Vec::with_capacity(threads);
+        for worker_id in 0..threads {
+            let (sender, receiver) = mpsc::channel();
+            let worker_node = Arc::clone(&node);
+            let worker_stop = Arc::clone(&stop_requested);
+            let attempts = Arc::clone(&hash_attempts);
+            let results = result_sender.clone();
+            let handle = std::thread::Builder::new()
+                .name(format!("dom-wallet-miner-{worker_id}"))
+                .spawn(move || {
+                    run_worker(
+                        worker_id,
+                        threads,
+                        worker_node,
+                        worker_stop,
+                        attempts,
+                        receiver,
+                        results,
+                    );
+                })
+                .map_err(|_| WalletMiningError::Worker)?;
+            workers.push(MiningWorker {
+                sender,
+                handle: Some(handle),
+            });
+        }
+        Ok(Self {
+            node,
+            stop_requested,
+            threads,
+            workers,
+            results,
+        })
+    }
+
+    pub async fn mine_block(
+        &mut self,
+        coinbase: &CoinbaseTransaction,
+    ) -> Result<WalletMiningOutcome, WalletMiningError> {
+        if self.stop_requested.load(Ordering::Acquire) {
+            return Ok(WalletMiningOutcome::Stopped);
+        }
+        let node = Arc::clone(&self.node);
+        let stop_requested = Arc::clone(&self.stop_requested);
+        mine_wallet_block_with_workers(self, node, coinbase, &stop_requested).await
+    }
+}
+
+impl Drop for WalletMiner {
+    fn drop(&mut self) {
+        for worker in &self.workers {
+            let _ = worker.sender.send(None);
+        }
+        for worker in &mut self.workers {
+            if let Some(handle) = worker.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
 }
 
 impl WalletMiningError {
@@ -87,6 +192,21 @@ pub async fn mine_wallet_block(
     if threads == 0 || stop_requested.load(Ordering::Acquire) {
         return Ok(WalletMiningOutcome::Stopped);
     }
+    let mut miner = WalletMiner::new(
+        Arc::clone(&node),
+        threads,
+        Arc::clone(&stop_requested),
+        hash_attempts,
+    )?;
+    miner.mine_block(coinbase).await
+}
+
+async fn mine_wallet_block_with_workers(
+    miner: &mut WalletMiner,
+    node: Arc<DomNode>,
+    coinbase: &CoinbaseTransaction,
+    stop_requested: &AtomicBool,
+) -> Result<WalletMiningOutcome, WalletMiningError> {
     let (tip_hash, tip_height, tip_difficulty, parent_timestamp, seed_hash) = {
         let chain = node.chain.lock().await;
         let parent_timestamp = chain
@@ -117,7 +237,7 @@ pub async fn mine_wallet_block(
     let target =
         compute_expected_target(node.config.network.magic(), timestamp, BlockHeight(height))
             .map_err(|_| WalletMiningError::Preparation("TARGET"))?;
-    let fast_mode = matches!(
+    let deterministic_dev_mode = matches!(
         pow_validation_mode_for_network(node.config.network.magic())
             .map_err(|_| WalletMiningError::Preparation("POW_MODE"))?,
         PowValidationMode::FastDevOnly
@@ -160,85 +280,45 @@ pub async fn mine_wallet_block(
     let round_stop = Arc::new(AtomicBool::new(false));
     let template_started = Instant::now();
     let require_network_ready = node.config.network == dom_config::Network::Mainnet;
-    let (sender, receiver) = mpsc::channel();
-    let mut workers = Vec::with_capacity(threads);
-    for worker_id in 0..threads {
-        let worker_template = template.clone();
-        let worker_target = target;
-        let worker_seed = seed_hash;
-        let worker_fast_mode = fast_mode;
-        let worker_stop = Arc::clone(&round_stop);
-        let external_stop = Arc::clone(&stop_requested);
-        let attempts = Arc::clone(&hash_attempts);
-        let result_sender = sender.clone();
-        let worker_node = Arc::clone(&node);
-        workers.push(
-            std::thread::Builder::new()
-                .name(format!("dom-wallet-miner-{worker_id}"))
-                .spawn(move || {
-                    let mut header = worker_template;
-                    let mut nonce = worker_id as u64;
-                    let stride = threads as u64;
-                    while !worker_stop.load(Ordering::Acquire)
-                        && !external_stop.load(Ordering::Acquire)
-                        && template_is_current(
-                            tip_height.0,
-                            worker_node.metrics.chain_height.load(Ordering::Acquire),
-                            worker_node.metrics.peer_count.load(Ordering::Acquire),
-                            worker_node
-                                .metrics
-                                .best_known_peer_height
-                                .load(Ordering::Acquire),
-                            require_network_ready,
-                            template_started.elapsed(),
-                        )
-                    {
-                        header.pow.nonce = nonce;
-                        let preimage = header.pow_preimage();
-                        let hash = if worker_fast_mode {
-                            fast_pow_hash(&worker_seed, &preimage)
-                        } else {
-                            match randomx_pool::randomx_hash(&worker_seed, &preimage) {
-                                Ok(hash) => hash,
-                                Err(_) => {
-                                    let _ = result_sender.send(Err(()));
-                                    return;
-                                }
-                            }
-                        };
-                        attempts.fetch_add(1, Ordering::Relaxed);
-                        if hash_meets_target(&hash, &worker_target) {
-                            header.pow.randomx_hash = Hash256::from_bytes(hash);
-                            worker_stop.store(true, Ordering::Release);
-                            let _ = result_sender.send(Ok(header));
-                            return;
-                        }
-                        nonce = nonce.wrapping_add(stride);
-                    }
-                })
-                .map_err(|_| WalletMiningError::Worker)?,
-        );
+    for worker in &miner.workers {
+        worker
+            .sender
+            .send(Some(WorkerWork {
+                template: template.clone(),
+                target,
+                seed_hash,
+                deterministic_dev_mode,
+                tip_height: tip_height.0,
+                require_network_ready,
+                template_started,
+                round_stop: Arc::clone(&round_stop),
+            }))
+            .map_err(|_| WalletMiningError::Worker)?;
     }
-    drop(sender);
 
     let mut winning_header = None;
-    while !stop_requested.load(Ordering::Acquire) {
-        match receiver.recv_timeout(Duration::from_millis(100)) {
-            Ok(Ok(header)) => {
-                winning_header = Some(header);
-                break;
-            }
-            Ok(Err(())) => {
+    let mut failed = false;
+    let mut completed = 0;
+    while completed < miner.threads {
+        match miner.results.recv_timeout(Duration::from_millis(100)) {
+            Ok(Ok(Some(header))) => {
+                completed += 1;
+                winning_header.get_or_insert(header);
                 round_stop.store(true, Ordering::Release);
-                break;
+            }
+            Ok(Ok(None)) => completed += 1,
+            Ok(Err(())) => {
+                completed += 1;
+                failed = true;
+                round_stop.store(true, Ordering::Release);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(WalletMiningError::Worker),
         }
     }
     round_stop.store(true, Ordering::Release);
-    for worker in workers {
-        let _ = worker.join();
+    if failed && winning_header.is_none() {
+        return Err(WalletMiningError::Worker);
     }
     let Some(header) = winning_header else {
         return if stop_requested.load(Ordering::Acquire) {
@@ -289,6 +369,177 @@ pub async fn mine_wallet_block(
     } else {
         Ok(WalletMiningOutcome::Rejected { height })
     }
+}
+
+fn run_worker(
+    worker_id: usize,
+    threads: usize,
+    node: Arc<DomNode>,
+    stop_requested: Arc<AtomicBool>,
+    hash_attempts: Arc<AtomicU64>,
+    commands: mpsc::Receiver<Option<WorkerWork>>,
+    results: mpsc::Sender<WorkerResult>,
+) {
+    let mut vm: Option<([u8; 32], MinerVm)> = None;
+    let mut logged_dev_mode = false;
+    while let Ok(command) = commands.recv() {
+        let Some(work) = command else {
+            break;
+        };
+
+        if work.deterministic_dev_mode {
+            vm = None;
+            if worker_id == 0 && !logged_dev_mode {
+                tracing::info!(
+                    mode = "fast-dev-only",
+                    runtime_flags = "not-applicable",
+                    effective_flags = "not-applicable",
+                    large_pages_obtained = "not-applicable",
+                    workers = threads,
+                    "RandomX wallet miner initialized"
+                );
+                logged_dev_mode = true;
+            }
+        } else {
+            logged_dev_mode = false;
+            let seed_changed = vm
+                .as_ref()
+                .is_none_or(|(current_seed, _)| current_seed != &work.seed_hash);
+            if seed_changed {
+                // Drop only the worker-local VM. `dom_pow`'s seed-keyed
+                // MinerPool retains the single shared dataset until the epoch
+                // seed changes, at which point its capacity-1 entry rotates.
+                vm = None;
+                let new_vm = match MinerVm::new(&work.seed_hash) {
+                    Ok(vm) => vm,
+                    Err(error) => {
+                        tracing::error!(worker_id, %error, "RandomX mining VM initialization failed");
+                        work.round_stop.store(true, Ordering::Release);
+                        let _ = results.send(Err(()));
+                        continue;
+                    }
+                };
+                vm = Some((work.seed_hash, new_vm));
+                if worker_id == 0 {
+                    log_randomx_initialization(threads);
+                }
+            }
+        }
+
+        let mut header = work.template;
+        let mut nonce = worker_id as u64;
+        let stride = threads as u64;
+        let result = loop {
+            if work.round_stop.load(Ordering::Acquire)
+                || stop_requested.load(Ordering::Acquire)
+                || !template_is_current(
+                    work.tip_height,
+                    node.metrics.chain_height.load(Ordering::Acquire),
+                    node.metrics.peer_count.load(Ordering::Acquire),
+                    node.metrics.best_known_peer_height.load(Ordering::Acquire),
+                    work.require_network_ready,
+                    work.template_started.elapsed(),
+                )
+            {
+                break Ok(None);
+            }
+            header.pow.nonce = nonce;
+            let preimage = header.pow_preimage();
+            let hash = if work.deterministic_dev_mode {
+                fast_pow_hash(&work.seed_hash, &preimage)
+            } else {
+                match vm
+                    .as_ref()
+                    .expect("RandomX VM initialized")
+                    .1
+                    .hash(&preimage)
+                {
+                    Ok(hash) => hash,
+                    Err(error) => {
+                        tracing::error!(worker_id, %error, "RandomX hash failed");
+                        work.round_stop.store(true, Ordering::Release);
+                        break Err(());
+                    }
+                }
+            };
+            hash_attempts.fetch_add(1, Ordering::Relaxed);
+            if hash_meets_target(&hash, &work.target) {
+                header.pow.randomx_hash = Hash256::from_bytes(hash);
+                work.round_stop.store(true, Ordering::Release);
+                break Ok(Some(header));
+            }
+            nonce = nonce.wrapping_add(stride);
+        };
+        if results.send(result).is_err() {
+            break;
+        }
+    }
+}
+
+fn log_randomx_initialization(threads: usize) {
+    let runtime_flags = RandomXFlag::get_recommended_flags();
+    let effective_flags = runtime_flags | RandomXFlag::FLAG_FULL_MEM;
+    tracing::info!(
+        mode = "fast",
+        runtime_flags = %describe_randomx_flags(runtime_flags),
+        effective_flags = %describe_randomx_flags(effective_flags),
+        large_pages_obtained = large_pages_obtained(),
+        workers = threads,
+        "RandomX wallet miner initialized"
+    );
+}
+
+fn describe_randomx_flags(flags: RandomXFlag) -> String {
+    let mut names = Vec::new();
+    if flags.contains(RandomXFlag::FLAG_LARGE_PAGES) {
+        names.push("LARGE_PAGES");
+    }
+    if flags.contains(RandomXFlag::FLAG_HARD_AES) {
+        names.push("HARD_AES");
+    }
+    if flags.contains(RandomXFlag::FLAG_FULL_MEM) {
+        names.push("FULL_MEM");
+    }
+    if flags.contains(RandomXFlag::FLAG_JIT) {
+        names.push("JIT");
+    }
+    if flags.contains(RandomXFlag::FLAG_SECURE) {
+        names.push("SECURE");
+    }
+    match flags.bits() & RandomXFlag::FLAG_ARGON2.bits() {
+        bits if bits == RandomXFlag::FLAG_ARGON2_SSSE3.bits() => names.push("ARGON2_SSSE3"),
+        bits if bits == RandomXFlag::FLAG_ARGON2_AVX2.bits() => names.push("ARGON2_AVX2"),
+        bits if bits == RandomXFlag::FLAG_ARGON2.bits() => names.push("ARGON2"),
+        _ => {}
+    }
+    if flags.bits() == 0 {
+        names.push("DEFAULT");
+    }
+    format!("0x{:02x} [{}]", flags.bits(), names.join("|"))
+}
+
+#[cfg(target_os = "linux")]
+fn large_pages_obtained() -> bool {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status.lines().find_map(|line| {
+                line.strip_prefix("HugetlbPages:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse::<u64>()
+                    .ok()
+            })
+        })
+        .is_some_and(|kilobytes| kilobytes > 0)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn large_pages_obtained() -> bool {
+    // The pinned RandomX wrapper does not expose dataset allocation flags.
+    // Other supported targets therefore report false instead of claiming an
+    // optimization that cannot be confirmed at runtime.
+    false
 }
 
 fn template_is_current(

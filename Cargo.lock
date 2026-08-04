@@ -1563,6 +1563,7 @@ dependencies = [
  "dom-pow",
  "dom-serialization",
  "dom-wallet-core-api",
+ "randomx-rs",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
