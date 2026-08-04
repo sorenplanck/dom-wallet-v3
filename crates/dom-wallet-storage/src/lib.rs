@@ -1151,6 +1151,7 @@ mod tests {
             WalletState::new(identity(), [6; 32], default_node_configuration(identity()));
         let transaction_id = Uuid::new_v4();
         let output_id = Uuid::new_v4();
+        let finalized_transaction_bytes = vec![0x44; 256];
         state.outputs.push(OutputRecord {
             id: output_id,
             account_id: state.default_account.id,
@@ -1177,7 +1178,7 @@ mod tests {
             reserved_output_ids: vec![output_id],
             request_bytes: Vec::new(),
             response_bytes: Vec::new(),
-            finalized_transaction_bytes: Vec::new(),
+            finalized_transaction_bytes: finalized_transaction_bytes.clone(),
             transaction_hash: Some([5; 32]),
             attempt_count: 1,
             private_context: None,
@@ -1197,6 +1198,10 @@ mod tests {
         let transaction = &restarted.transactions[0];
         assert_eq!(transaction.lifecycle, TransactionLifecycle::Submitting);
         assert_eq!(transaction.exposure, BroadcastExposure::SubmissionStarted);
+        assert_eq!(
+            transaction.finalized_transaction_bytes, finalized_transaction_bytes,
+            "exact finalized bytes must survive an encrypted storage restart"
+        );
         assert_eq!(
             cancellation_decision(transaction.exposure),
             CancellationDecision::RequireReconciliation

@@ -371,6 +371,8 @@ pub struct LocalTransactionIntent {
     pub request_bytes: Vec<u8>,
     #[serde(default)]
     pub response_bytes: Vec<u8>,
+    /// Durable canonical transaction bytes. Once populated, submission and
+    /// recovery after restart do not depend on the disposable Slate envelope.
     #[serde(default)]
     pub finalized_transaction_bytes: Vec<u8>,
     #[serde(default)]

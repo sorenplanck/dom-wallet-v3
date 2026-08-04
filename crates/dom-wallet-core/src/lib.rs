@@ -52,8 +52,10 @@ use thiserror::Error;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-/// Explicit maximum lifetime for an interactive transaction, measured from
-/// the authoritative canonical tip observed at each operation boundary.
+/// Explicit maximum lifetime for interactive Slate negotiation, measured from
+/// the authoritative canonical tip observed at each negotiation boundary.
+/// This does not expire a finalized transaction: its independently persisted
+/// bytes remain valid, and a kernel `lock_height` may legitimately be later.
 pub const MAX_TRANSACTION_LIFETIME_BLOCKS: u64 = 1_440;
 
 pub const MAINNET_CHAIN_ID_HEX: &str =
@@ -1602,6 +1604,10 @@ impl WalletService {
             return Err(CoreError::MixedOutputRegime);
         }
         let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        // The envelope is disposable after signing. Persist the exact canonical
+        // transaction bytes in the encrypted generation before exposing the
+        // Finalized lifecycle; restart/rebroadcast/refund must never depend on
+        // recovering the negotiation envelope.
         state.transactions[index].finalized_transaction_bytes = finalized.canonical_bytes;
         state.transactions[index].transaction_hash = Some(finalized.transaction_hash);
         state.transactions[index].kernel_excess = finalized.kernel_excess.to_vec();
@@ -1659,12 +1665,6 @@ impl WalletService {
         retry: bool,
     ) -> Result<TransactionSummary, CoreError> {
         self.ensure_phrase_confirmed()?;
-        let identity = self
-            .backend
-            .as_ref()
-            .ok_or(CoreError::EmbeddedCoreRequired)?
-            .identity()
-            .clone();
         let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
         let index = find_transaction_index(&state, slate_id, TransactionRole::Sender)?;
         let tx = &state.transactions[index];
@@ -1677,17 +1677,10 @@ impl WalletService {
         {
             return Err(CoreError::InvalidTransactionTransition);
         }
-        let expiry = if tx.expires_at_height == 0 {
-            CanonicalSlate::from_recovery_bytes(
-                &tx.request_bytes,
-                &identity,
-                identity.current_tip.height,
-            )?
-            .expires_at_height()
-        } else {
-            tx.expires_at_height
-        };
-        validate_transaction_expiry(expiry, identity.current_tip.height)?;
+        // Finalization ends Slate negotiation. Do not re-validate the disposable
+        // envelope here: these persisted transaction bytes may be broadcast or
+        // rebroadcast after `expires_at_height`, including when their kernel is
+        // HEIGHT_LOCKED beyond the former envelope lifetime.
         let transaction = Transaction::from_bytes(&tx.finalized_transaction_bytes)
             .map_err(|_| CoreError::ProtocolRejected)?;
         let hash = tx.transaction_hash.ok_or(CoreError::ProtocolRejected)?;
@@ -2049,6 +2042,9 @@ pub fn validate_transaction_expiry(
     expires_at_height: u64,
     canonical_tip_height: u64,
 ) -> Result<(), CoreError> {
+    // `expires_at_height` bounds only the interactive negotiation envelope.
+    // It is deliberately unrelated to the finalized kernel's `lock_height`,
+    // which may exceed it; finalized transaction validity is consensus-owned.
     if expires_at_height <= canonical_tip_height {
         return Err(CoreError::TransactionExpired);
     }
