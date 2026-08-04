@@ -1162,6 +1162,8 @@ mod tests {
         });
         state.transactions.push(LocalTransactionIntent {
             id: transaction_id,
+            created_at_height: 0,
+            created_at_unix_seconds: 0,
             kernel_excess: vec![4; 33],
             lifecycle: TransactionLifecycle::Submitting,
             submitted: false,

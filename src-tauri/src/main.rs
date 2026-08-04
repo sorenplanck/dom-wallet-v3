@@ -1030,6 +1030,15 @@ fn transaction_cancel(
         .map_err(Into::into)
 }
 #[tauri::command]
+fn slate_cancel(
+    app: tauri::State<'_, DesktopApplication>,
+    slate_id: uuid::Uuid,
+    confirm_exported: bool,
+) -> Result<dom_wallet_core::TransactionSummary, dom_wallet_tauri_shell::CommandErrorDto> {
+    app.slate_cancel(slate_id, confirm_exported)
+        .map_err(Into::into)
+}
+#[tauri::command]
 fn transaction_list(
     app: tauri::State<'_, DesktopApplication>,
 ) -> Result<Vec<dom_wallet_core::TransactionSummary>, dom_wallet_tauri_shell::CommandErrorDto> {
@@ -1174,6 +1183,7 @@ mod tests {
         assert!(dom_wallet_tauri_shell::COMMAND_NAMES.contains(&"native_bridge_status"));
         assert!(dom_wallet_tauri_shell::COMMAND_NAMES.contains(&"check_updates_now"));
         assert!(dom_wallet_tauri_shell::COMMAND_NAMES.contains(&"embedded_node_stop"));
+        assert!(dom_wallet_tauri_shell::COMMAND_NAMES.contains(&"slate_cancel"));
     }
 
     #[test]

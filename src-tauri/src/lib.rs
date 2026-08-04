@@ -201,6 +201,7 @@ macro_rules! wallet_command_registry {
             transaction_retry_submission,
             transaction_reconcile_submission,
             transaction_cancel,
+            slate_cancel,
             transaction_list,
             transaction_detail_redacted,
             slate_qr_encode,
@@ -3025,6 +3026,20 @@ impl DesktopApplication {
             .map_err(CommandError::from)
     }
 
+    pub fn slate_cancel(
+        &self,
+        slate_id: uuid::Uuid,
+        confirm_exported: bool,
+    ) -> Result<TransactionSummary, CommandError> {
+        self.ensure_running()?;
+        let _activity = self
+            .activities
+            .try_begin(ActivityKind::CriticalTransaction)?;
+        self.lock_service()?
+            .slate_cancel(slate_id, confirm_exported)
+            .map_err(CommandError::from)
+    }
+
     pub fn transaction_list(&self) -> Result<Vec<TransactionSummary>, CommandError> {
         self.ensure_running()?;
         self.lock_service()?
@@ -5632,6 +5647,7 @@ mod tests {
             "transaction_submit",
             "transaction_retry_submission",
             "transaction_cancel",
+            "slate_cancel",
             "transaction_list",
             "transaction_detail_redacted",
         ] {

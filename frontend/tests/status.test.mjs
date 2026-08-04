@@ -329,11 +329,25 @@ test("manual slate controls use only the production invoke adapter and clear pas
     "transaction_fee_estimate", "transaction_send_create", "slate_request_export",
     "slate_request_import", "slate_response_create", "slate_response_export",
     "slate_response_import", "slate_summary_redacted", "transaction_finalize",
-    "transaction_submit", "transaction_retry_submission", "transaction_reconcile_submission", "transaction_cancel",
+    "transaction_submit", "transaction_retry_submission", "transaction_reconcile_submission", "transaction_cancel", "slate_cancel",
     "transaction_list", "transaction_detail_redacted"
   ]) assert.equal(source.includes(`"${command}"`) || registry.includes(command), true);
   assert.equal(source.includes("clearSecretForms"), true);
   assert.equal(source.includes("/wallet/spend"), false);
+});
+
+test("pending payment history exposes age and cancellation that releases the reserved input", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const [js, registry] = await Promise.all([
+    readFile(new URL("../main.js", import.meta.url), "utf8"),
+    readFile(new URL("../../src-tauri/src/lib.rs", import.meta.url), "utf8"),
+  ]);
+  assert.equal(registry.includes("slate_cancel"), true);
+  assert.equal(js.includes('invoke("slate_cancel"'), true);
+  assert.equal(js.includes("blocks old"), true);
+  assert.equal(js.includes("seconds old"), true);
+  assert.equal(js.includes("entire reserved input will return"), true);
+  assert.equal(js.includes("wallet rescan will not reserve it again"), true);
 });
 
 test("QR exchange stays local, uses canonical native frames, and releases camera state", async () => {

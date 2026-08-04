@@ -42,7 +42,11 @@ use dom_wallet_storage::{
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::{fmt, path::Path};
+use std::{
+    fmt,
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use thiserror::Error;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -114,6 +118,8 @@ pub struct ProbeResult {
 pub struct TransactionSummary {
     pub id: Uuid,
     pub slate_id: Option<Uuid>,
+    pub created_at_height: Option<u64>,
+    pub created_at_unix_seconds: Option<u64>,
     pub role: Option<String>,
     pub state: String,
     pub amount: u64,
@@ -121,6 +127,9 @@ pub struct TransactionSummary {
     pub kernel_excess: Option<String>,
     pub transaction_hash: Option<String>,
     pub attempt_count: u32,
+    pub expires_at_height: u64,
+    pub has_finalized_transaction: bool,
+    pub manual_cancel_allowed: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1172,6 +1181,8 @@ impl WalletService {
         let public_slate_id = uuid_from_protocol_id(slate_id);
         state.transactions.push(LocalTransactionIntent {
             id: transaction_id,
+            created_at_height: identity.current_tip.height,
+            created_at_unix_seconds: unix_seconds(),
             kernel_excess: Vec::new(),
             lifecycle: TransactionLifecycle::InputsReserved,
             submitted: false,
@@ -1365,6 +1376,8 @@ impl WalletService {
         let id = Uuid::new_v4();
         state.transactions.push(LocalTransactionIntent {
             id,
+            created_at_height: identity.current_tip.height,
+            created_at_unix_seconds: unix_seconds(),
             kernel_excess: Vec::new(),
             lifecycle: TransactionLifecycle::RequestImported,
             submitted: false,
@@ -1753,6 +1766,16 @@ impl WalletService {
         let id = state.transactions[index].id;
         self.commit(state)?;
         self.transaction_summary(id)
+    }
+
+    /// Desktop-facing name retained for the manual Slate workflow. The
+    /// durable cancellation semantics live in `transaction_cancel`.
+    pub fn slate_cancel(
+        &mut self,
+        slate_id: Uuid,
+        confirm_exported: bool,
+    ) -> Result<TransactionSummary, CoreError> {
+        self.transaction_cancel(slate_id, confirm_exported)
     }
 
     pub fn transaction_list(&self) -> Result<Vec<TransactionSummary>, CoreError> {
@@ -2261,6 +2284,10 @@ fn transaction_summary_from(transaction: &LocalTransactionIntent) -> Transaction
     TransactionSummary {
         id: transaction.id,
         slate_id: transaction.slate_id,
+        created_at_height: (transaction.created_at_height != 0)
+            .then_some(transaction.created_at_height),
+        created_at_unix_seconds: (transaction.created_at_unix_seconds != 0)
+            .then_some(transaction.created_at_unix_seconds),
         role: transaction.role.as_ref().map(|role| match role {
             TransactionRole::Sender => "SENDER".into(),
             TransactionRole::Recipient => "RECIPIENT".into(),
@@ -2272,7 +2299,28 @@ fn transaction_summary_from(transaction: &LocalTransactionIntent) -> Transaction
             .then(|| hex::encode(&transaction.kernel_excess)),
         transaction_hash: transaction.transaction_hash.map(hex::encode),
         attempt_count: transaction.attempt_count,
+        expires_at_height: transaction.expires_at_height,
+        has_finalized_transaction: !transaction.finalized_transaction_bytes.is_empty(),
+        manual_cancel_allowed: transaction.exposure == BroadcastExposure::NeverBroadcast
+            && !matches!(
+                transaction.lifecycle,
+                TransactionLifecycle::Cancelled
+                    | TransactionLifecycle::Confirmed { .. }
+                    | TransactionLifecycle::Submitting
+                    | TransactionLifecycle::Submitted
+                    | TransactionLifecycle::AcceptedNotRelayed
+                    | TransactionLifecycle::InMempool
+                    | TransactionLifecycle::Reorged
+                    | TransactionLifecycle::RetransmitRequired
+                    | TransactionLifecycle::ReconciliationRequired
+            ),
     }
+}
+
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 fn transaction_state_name(state: &TransactionLifecycle) -> &'static str {
@@ -2543,6 +2591,8 @@ mod tests {
         );
         state.transactions.push(LocalTransactionIntent {
             id: Uuid::nil(),
+            created_at_height: 0,
+            created_at_unix_seconds: 0,
             kernel_excess: Vec::new(),
             lifecycle: TransactionLifecycle::InputsReserved,
             submitted: false,
@@ -2571,6 +2621,101 @@ mod tests {
     }
 
     #[test]
+    fn abandoned_round_one_cancel_survives_restart_and_genesis_rescan() {
+        let temp = tempfile::tempdir().unwrap();
+        let wallet_path = temp.path().join("wallet");
+        let password = "password-1";
+        let mut service = test_service();
+        service
+            .create_recoverable(&wallet_path, password, backup_identity())
+            .unwrap();
+        service.recovery_phrase_confirmed(password).unwrap();
+        service.unlock(password).unwrap();
+
+        let transaction_id = Uuid::new_v4();
+        let slate_id = Uuid::new_v4();
+        let output_id = Uuid::new_v4();
+        let mut state = service.unlocked.as_ref().unwrap().clone();
+        state.outputs.push(OutputRecord {
+            id: output_id,
+            account_id: state.default_account.id,
+            commitment: Some([3; 33]),
+            value: 33_000_000_000,
+            state: OutputState::PendingOutgoing,
+            discovered_height: 1,
+            reserved_by: Some(transaction_id),
+        });
+        state.remember_output_blinding(output_id, [4; 32]);
+        state.transactions.push(LocalTransactionIntent {
+            id: transaction_id,
+            created_at_height: 10,
+            created_at_unix_seconds: 1_700_000_000,
+            kernel_excess: Vec::new(),
+            lifecycle: TransactionLifecycle::InputsReserved,
+            submitted: false,
+            exposure: BroadcastExposure::NeverBroadcast,
+            slate_id: Some(slate_id),
+            role: Some(TransactionRole::Sender),
+            amount: 1_000_000_000,
+            fee: 1,
+            reserved_output_ids: vec![output_id],
+            request_bytes: Vec::new(),
+            response_bytes: Vec::new(),
+            finalized_transaction_bytes: Vec::new(),
+            transaction_hash: None,
+            attempt_count: 0,
+            private_context: None,
+            recipient_output_id: None,
+            change_output_id: None,
+            expires_at_height: 20,
+        });
+        service.commit(state).unwrap();
+        assert_eq!(
+            service.summary().unwrap().balance.pending_outgoing,
+            33_000_000_000
+        );
+
+        // Dropping without `close` models process death after the durable
+        // ROUND 1 reservation and before any lifecycle cleanup can run.
+        drop(service);
+        let mut restarted = test_service();
+        restarted.open(&wallet_path).unwrap();
+        restarted.unlock(password).unwrap();
+        let cancelled = restarted.slate_cancel(slate_id, true).unwrap();
+        assert_eq!(cancelled.state, "CANCELLED");
+        let state = restarted.unlocked.as_ref().unwrap();
+        assert_eq!(state.outputs[0].reserved_by, None);
+        assert_eq!(state.outputs[0].state, OutputState::Confirmed);
+        assert_eq!(state.balance().confirmed, 33_000_000_000);
+        assert_eq!(state.balance().spendable, 33_000_000_000);
+        assert_eq!(spendable_outputs(state).len(), 1);
+
+        // This is the same state rewind used by `rescan_from_genesis`; the
+        // CANCELLED intent is a durable tombstone and cannot reserve again.
+        let mut rescanned = state.clone();
+        rewind_recovery_state(&mut rescanned, 1, 20);
+        assert_eq!(
+            rescanned.transactions[0].lifecycle,
+            TransactionLifecycle::Cancelled
+        );
+        assert_eq!(rescanned.outputs[0].reserved_by, None);
+        assert_eq!(rescanned.balance().spendable, 33_000_000_000);
+        restarted.commit(rescanned).unwrap();
+        drop(restarted);
+
+        let mut reopened_after_rescan = test_service();
+        reopened_after_rescan.open(&wallet_path).unwrap();
+        reopened_after_rescan.unlock(password).unwrap();
+        let state = reopened_after_rescan.unlocked.as_ref().unwrap();
+        assert_eq!(
+            state.transactions[0].lifecycle,
+            TransactionLifecycle::Cancelled
+        );
+        assert_eq!(state.outputs[0].reserved_by, None);
+        assert_eq!(spendable_outputs(state).len(), 1);
+    }
+
+    #[test]
     fn regression_c4_export_is_read_only_after_submitted_mempool_and_confirmed() {
         let _: fn(&WalletService, Uuid) -> Result<SlateExport, CoreError> =
             WalletService::slate_request_export;
@@ -2596,6 +2741,8 @@ mod tests {
             });
             state.transactions.push(LocalTransactionIntent {
                 id: Uuid::new_v4(),
+                created_at_height: 0,
+                created_at_unix_seconds: 0,
                 kernel_excess: vec![2; 33],
                 lifecycle,
                 submitted: true,

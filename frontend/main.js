@@ -647,7 +647,11 @@ tx("transaction-finalize", "transaction_finalize");
 tx("transaction-submit", "transaction_submit");
 tx("transaction-retry", "transaction_retry_submission");
 tx("transaction-reconcile", "transaction_reconcile_submission");
-tx("transaction-cancel", "transaction_cancel", () => ({ slateId: requiredId(), confirmExported: window.confirm("Cancel this payment and retain its consumed recovery coordinate?") }));
+tx("transaction-cancel", "slate_cancel", () => {
+  const confirmed = window.confirm("Cancel this pending payment? The entire reserved input will become available again, and a wallet rescan will keep this payment cancelled.");
+  if (!confirmed) throw new Error("Cancellation was not confirmed.");
+  return { slateId: requiredId(), confirmExported: true };
+});
 
 const receiveText = byId("receive-transaction-text");
 const receiveId = byId("receive-transaction-slate-id");
@@ -672,11 +676,47 @@ byId("response-export").addEventListener("click", async () => {
 });
 
 const renderHistory = async () => {
-  const transactions = await invoke("transaction_list");
+  const [transactions, summary] = await Promise.all([invoke("transaction_list"), invoke("wallet_summary")]);
+  const pendingStates = new Set([
+    "INPUTS_RESERVED", "REQUEST_EXPORTED", "RESPONSE_IMPORTED", "FINALIZED",
+    "SUBMITTING", "SUBMITTED", "ACCEPTED_NOT_RELAYED", "IN_MEMPOOL",
+    "REORGED", "RETRANSMIT_REQUIRED", "RECONCILIATION_REQUIRED",
+  ]);
   const nodes = transactions.map((transaction) => {
     const node = document.createElement("article");
     node.className = "history-item";
-    node.textContent = `${transaction.state} · ${transaction.amount} noms · ${transaction.slate_id ?? transaction.id}`;
+    const title = document.createElement("strong");
+    title.textContent = `${transaction.state} · ${transaction.amount} noms`;
+    const identifier = document.createElement("code");
+    identifier.textContent = transaction.slate_id ?? transaction.id;
+    const details = document.createElement("p");
+    details.className = "muted";
+    const blockAge = transaction.created_at_height == null || summary.tip_height == null
+      ? "unknown block age"
+      : `${Math.max(0, summary.tip_height - transaction.created_at_height)} blocks old`;
+    const timeAge = transaction.created_at_unix_seconds == null
+      ? "unknown time age"
+      : `${Math.max(0, Math.floor(Date.now() / 1000) - transaction.created_at_unix_seconds)} seconds old`;
+    details.textContent = `${blockAge} · ${timeAge}`;
+    node.append(title, identifier, details);
+    if (pendingStates.has(transaction.state) && transaction.manual_cancel_allowed) {
+      const cancel = document.createElement("button");
+      cancel.className = "btn ghost transaction-cancel-pending";
+      cancel.type = "button";
+      cancel.textContent = "Cancel and release input";
+      cancel.addEventListener("click", async () => {
+        const confirmed = window.confirm("Cancel this pending payment? The entire reserved input will return to your confirmed, available balance. A wallet rescan will not reserve it again.");
+        if (!confirmed) return;
+        try {
+          await run(() => invoke("slate_cancel", { slateId: transaction.slate_id, confirmExported: true }));
+          await Promise.all([renderHistory(), refreshSummary()]);
+          show("Payment cancelled. The reserved input is available again.");
+        } catch (error) {
+          show(redactedError(error), true);
+        }
+      });
+      node.append(cancel);
+    }
     return node;
   });
   if (!nodes.length) {

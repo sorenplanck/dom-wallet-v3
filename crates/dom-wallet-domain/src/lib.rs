@@ -327,6 +327,14 @@ impl std::fmt::Debug for PrivateOutputBlinding {
 #[serde(deny_unknown_fields)]
 pub struct LocalTransactionIntent {
     pub id: Uuid,
+    /// Canonical height at which the local intent first reserved its inputs.
+    /// Legacy intents use zero and expose their age as unknown.
+    #[serde(default)]
+    pub created_at_height: u64,
+    /// Wall-clock creation time used only for presentation. Consensus and
+    /// expiry decisions always use canonical heights.
+    #[serde(default)]
+    pub created_at_unix_seconds: u64,
     /// Exactly 33 canonical commitment bytes. This is persisted before an
     /// external submission and is the only kernel-to-wallet association.
     pub kernel_excess: Vec<u8>,
@@ -1513,6 +1521,8 @@ mod tests {
     fn transaction_in(lifecycle: TransactionLifecycle) -> LocalTransactionIntent {
         LocalTransactionIntent {
             id: Uuid::nil(),
+            created_at_height: 0,
+            created_at_unix_seconds: 0,
             kernel_excess: Vec::new(),
             lifecycle,
             submitted: false,
@@ -1759,6 +1769,8 @@ mod tests {
         let mut state = WalletState::new(identity(), [7; 32], configuration());
         state.transactions.push(LocalTransactionIntent {
             id: Uuid::new_v4(),
+            created_at_height: 0,
+            created_at_unix_seconds: 0,
             kernel_excess: vec![3; 33],
             lifecycle: TransactionLifecycle::Submitted,
             submitted: true,
@@ -1811,6 +1823,8 @@ mod tests {
         });
         state.transactions.push(LocalTransactionIntent {
             id: Uuid::new_v4(),
+            created_at_height: 0,
+            created_at_unix_seconds: 0,
             kernel_excess: Vec::new(),
             lifecycle: TransactionLifecycle::ResponseExported,
             submitted: false,
