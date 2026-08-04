@@ -10,7 +10,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use dom_consensus::{validate_balance_equation, validate_transaction_structure};
 use dom_crypto::bp2_verify;
 use dom_serialization::{DomDeserialize, DomSerialize, Reader, Writer};
-use dom_slate::{build_send, finalize, respond_receive, SlateInput};
+use dom_slate::{build_send_with_lock_height, finalize, respond_receive, SlateInput};
 use dom_tx::slate::Slate;
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
@@ -144,6 +144,8 @@ pub enum ProtocolAdapterError {
     FeeTooLow,
     #[error("transaction input material is invalid")]
     InvalidInput,
+    #[error("kernel feature and lock height are inconsistent")]
+    InvalidKernelConfiguration,
     #[error("DOM protocol rejected slate construction")]
     ProtocolRejected,
     #[error("manual slate envelope is malformed")]
@@ -182,6 +184,8 @@ pub fn build_sender(
     amount: u64,
     fee: u64,
     chain_id: [u8; 32],
+    kernel_features: Option<u8>,
+    lock_height: Option<u64>,
 ) -> Result<SenderBuild, ProtocolAdapterError> {
     if inputs.is_empty()
         || inputs.len() > MAX_INPUTS
@@ -204,7 +208,8 @@ pub fn build_sender(
     let change_value = total
         .checked_sub(required)
         .ok_or(ProtocolAdapterError::InvalidAmountOrFee)?;
-    let built = build_send(
+    let lock_height = resolve_kernel_lock(kernel_features, lock_height)?;
+    let built = build_send_with_lock_height(
         &inputs
             .iter()
             .map(|input| SlateInput {
@@ -216,6 +221,7 @@ pub fn build_sender(
         amount,
         fee,
         chain_id,
+        lock_height,
     )
     .map_err(|_| ProtocolAdapterError::ProtocolRejected)?;
     let slate_bytes = encode_slate(&built.slate)?;
@@ -231,6 +237,19 @@ pub fn build_sender(
             blinding: change.blinding,
         }),
     })
+}
+
+fn resolve_kernel_lock(
+    kernel_features: Option<u8>,
+    lock_height: Option<u64>,
+) -> Result<u64, ProtocolAdapterError> {
+    let lock_height = lock_height.unwrap_or(0);
+    match kernel_features {
+        None => Ok(lock_height),
+        Some(dom_core::KERNEL_FEAT_PLAIN) if lock_height == 0 => Ok(0),
+        Some(dom_core::KERNEL_FEAT_HEIGHT_LOCKED) if lock_height != 0 => Ok(lock_height),
+        _ => Err(ProtocolAdapterError::InvalidKernelConfiguration),
+    }
 }
 
 pub fn create_recipient_response(
@@ -767,6 +786,8 @@ mod tests {
             400_000,
             50_000,
             [9; 32],
+            None,
+            None,
         )
         .unwrap();
         let response = create_recipient_response(&sender.slate_bytes, [9; 32]).unwrap();
@@ -803,6 +824,54 @@ mod tests {
             completed = reassembler.push(frame).unwrap().complete_text.or(completed);
         }
         assert_eq!(completed.unwrap(), text);
+    }
+
+    #[test]
+    fn height_locked_sender_plumbs_feature_and_height_to_final_transaction() {
+        let blind = BlindingFactor::from_bytes([8; 32]).unwrap();
+        let (_, commitment) = bp2_prove(500_000, &blind).unwrap();
+        let sender = build_sender(
+            &[InputMaterial {
+                commitment,
+                blinding: [8; 32],
+                value: 500_000,
+            }],
+            400_000,
+            50_000,
+            [9; 32],
+            Some(dom_core::KERNEL_FEAT_HEIGHT_LOCKED),
+            Some(4242),
+        )
+        .unwrap();
+        assert_eq!(decode_slate(&sender.slate_bytes).unwrap().lock_height, 4242);
+
+        let response = create_recipient_response(&sender.slate_bytes, [9; 32]).unwrap();
+        let finalized = finalize_sender(
+            &response.slate_bytes,
+            &sender.slate_bytes,
+            &sender.secrets,
+            [9; 32],
+        )
+        .unwrap();
+        let tx = decode_transaction(&finalized.bytes).unwrap();
+        assert_eq!(tx.kernels[0].features, dom_core::KERNEL_FEAT_HEIGHT_LOCKED);
+        assert_eq!(tx.kernels[0].lock_height, 4242);
+    }
+
+    #[test]
+    fn kernel_options_fail_closed_on_inconsistent_pairs() {
+        assert_eq!(
+            resolve_kernel_lock(Some(dom_core::KERNEL_FEAT_PLAIN), Some(1))
+                .unwrap_err()
+                .to_string(),
+            ProtocolAdapterError::InvalidKernelConfiguration.to_string()
+        );
+        assert_eq!(
+            resolve_kernel_lock(Some(dom_core::KERNEL_FEAT_HEIGHT_LOCKED), None)
+                .unwrap_err()
+                .to_string(),
+            ProtocolAdapterError::InvalidKernelConfiguration.to_string()
+        );
     }
 
     #[test]

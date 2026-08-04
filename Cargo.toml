@@ -59,20 +59,20 @@ tauri-plugin-updater = "=2.10.1"
 # sole authority for slate construction, transaction serialization, proof and
 # signature validation.  These are deliberately revision pinned rather than
 # copied into this wallet workspace.
-dom-core = { git = "https://github.com/sorenplanck/dom-protocol", rev = "fbb8044d03ccf8df7d30503b7ac6410c570f97c3" }
-dom-crypto = { git = "https://github.com/sorenplanck/dom-protocol", rev = "fbb8044d03ccf8df7d30503b7ac6410c570f97c3" }
-dom-consensus = { git = "https://github.com/sorenplanck/dom-protocol", rev = "fbb8044d03ccf8df7d30503b7ac6410c570f97c3" }
-dom-serialization = { git = "https://github.com/sorenplanck/dom-protocol", rev = "fbb8044d03ccf8df7d30503b7ac6410c570f97c3" }
-dom-tx = { git = "https://github.com/sorenplanck/dom-protocol", rev = "fbb8044d03ccf8df7d30503b7ac6410c570f97c3" }
-dom-slate = { git = "https://github.com/sorenplanck/dom-protocol", rev = "fbb8044d03ccf8df7d30503b7ac6410c570f97c3" }
-dom-config = { git = "https://github.com/sorenplanck/dom-protocol", rev = "fbb8044d03ccf8df7d30503b7ac6410c570f97c3" }
-dom-chain = { git = "https://github.com/sorenplanck/dom-protocol", rev = "fbb8044d03ccf8df7d30503b7ac6410c570f97c3" }
-dom-node = { git = "https://github.com/sorenplanck/dom-protocol", rev = "fbb8044d03ccf8df7d30503b7ac6410c570f97c3" }
-dom-pow = { git = "https://github.com/sorenplanck/dom-protocol", rev = "fbb8044d03ccf8df7d30503b7ac6410c570f97c3" }
-dom-wallet = { git = "https://github.com/sorenplanck/dom-protocol", rev = "fbb8044d03ccf8df7d30503b7ac6410c570f97c3" }
-dom-wallet-core-api = { git = "https://github.com/sorenplanck/dom-protocol", rev = "fbb8044d03ccf8df7d30503b7ac6410c570f97c3" }
-dom-wallet-keys = { git = "https://github.com/sorenplanck/dom-protocol", rev = "fbb8044d03ccf8df7d30503b7ac6410c570f97c3" }
-dom-wallet-recovery = { git = "https://github.com/sorenplanck/dom-protocol", rev = "fbb8044d03ccf8df7d30503b7ac6410c570f97c3" }
+dom-core = { git = "https://github.com/sorenplanck/dom-protocol", rev = "19c191f06240cb73c5aa03128d36c6774d257b6a" }
+dom-crypto = { git = "https://github.com/sorenplanck/dom-protocol", rev = "19c191f06240cb73c5aa03128d36c6774d257b6a" }
+dom-consensus = { git = "https://github.com/sorenplanck/dom-protocol", rev = "19c191f06240cb73c5aa03128d36c6774d257b6a" }
+dom-serialization = { git = "https://github.com/sorenplanck/dom-protocol", rev = "19c191f06240cb73c5aa03128d36c6774d257b6a" }
+dom-tx = { git = "https://github.com/sorenplanck/dom-protocol", rev = "19c191f06240cb73c5aa03128d36c6774d257b6a" }
+dom-slate = { git = "https://github.com/sorenplanck/dom-protocol", rev = "19c191f06240cb73c5aa03128d36c6774d257b6a" }
+dom-config = { git = "https://github.com/sorenplanck/dom-protocol", rev = "19c191f06240cb73c5aa03128d36c6774d257b6a" }
+dom-chain = { git = "https://github.com/sorenplanck/dom-protocol", rev = "19c191f06240cb73c5aa03128d36c6774d257b6a" }
+dom-node = { git = "https://github.com/sorenplanck/dom-protocol", rev = "19c191f06240cb73c5aa03128d36c6774d257b6a" }
+dom-pow = { git = "https://github.com/sorenplanck/dom-protocol", rev = "19c191f06240cb73c5aa03128d36c6774d257b6a" }
+dom-wallet = { git = "https://github.com/sorenplanck/dom-protocol", rev = "19c191f06240cb73c5aa03128d36c6774d257b6a" }
+dom-wallet-core-api = { git = "https://github.com/sorenplanck/dom-protocol", rev = "19c191f06240cb73c5aa03128d36c6774d257b6a" }
+dom-wallet-keys = { git = "https://github.com/sorenplanck/dom-protocol", rev = "19c191f06240cb73c5aa03128d36c6774d257b6a" }
+dom-wallet-recovery = { git = "https://github.com/sorenplanck/dom-protocol", rev = "19c191f06240cb73c5aa03128d36c6774d257b6a" }
 
 # Sidecar release authentication and atomic pointer handling are deliberately
 # consumed from their reviewed protocol commit. This does not move the wallet's
