@@ -517,7 +517,7 @@ impl RestoreSink<'_> {
         let expected_generation = state.generation;
         let result = (|| {
             if let Some(anchor) = reorg_anchor {
-                rewind_recovery_state(&mut state, anchor.height, batch.observed_tip.height);
+                rewind_recovery_state(&mut state, anchor.height, batch.observed_tip.height)?;
             }
             apply_recovery_batch(self.seed, self.chain, self.identity, &mut state, batch)?;
             state.core_scan_cursor = Some(cursor.as_bytes().to_vec());
@@ -883,7 +883,11 @@ fn refresh_maturity(
 /// reorg search bound is at most `RECOVERY_CANONICAL_WINDOW_BLOCKS`, so the
 /// durable scan counters can be decremented exactly; the replacement batch
 /// re-increments them when the reorganized heights are scanned again.
-pub fn rewind_recovery_state(state: &mut WalletState, safe_height: u64, tip_height: u64) {
+pub fn rewind_recovery_state(
+    state: &mut WalletState,
+    safe_height: u64,
+    tip_height: u64,
+) -> Result<(), SeedRestoreError> {
     let removed_ids = state
         .outputs
         .iter()
@@ -927,7 +931,10 @@ pub fn rewind_recovery_state(state: &mut WalletState, safe_height: u64, tip_heig
             output.state = OutputState::Confirmed;
         }
     }
-    let _ = refresh_maturity(state, tip_height, 0);
+    refresh_maturity(state, tip_height, 0)?;
+    state
+        .rollback_confirmations_after_height(safe_height)
+        .map_err(|_| SeedRestoreError::MalformedRecovery)
 }
 
 fn account_id_for(

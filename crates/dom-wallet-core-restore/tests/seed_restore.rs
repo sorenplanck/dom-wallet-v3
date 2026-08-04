@@ -934,7 +934,7 @@ impl PageSink<'_> {
     ) -> Result<(), SeedRestoreError> {
         let mut next = self.state.clone();
         if let Some(anchor) = reorg_anchor {
-            rewind_recovery_state(&mut next, anchor.height, batch.observed_tip.height);
+            rewind_recovery_state(&mut next, anchor.height, batch.observed_tip.height)?;
         }
         apply_recovery_batch(self.seed, self.chain, self.identity, &mut next, batch)?;
         next.core_scan_cursor = Some(cursor.as_bytes().to_vec());
@@ -1278,7 +1278,7 @@ fn regression_reorg_window_prunes_blocks_and_keeps_durable_counters() {
         .iter()
         .any(|block| block.height == 5));
 
-    rewind_recovery_state(&mut state, safe_height, total - 1);
+    rewind_recovery_state(&mut state, safe_height, total - 1).unwrap();
     assert_eq!(state.recovery_scanned_blocks, total - 3);
     assert_eq!(state.recovery_scanned_outputs, 1);
     assert_eq!(state.legacy_proof_only_outputs, 1);

@@ -350,6 +350,17 @@ test("pending payment history exposes age and cancellation that releases the res
   assert.equal(js.includes("wallet rescan will not reserve it again"), true);
 });
 
+test("expired Slate presentation distinguishes safe auto-cancel from finalized risk", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const js = await readFile(new URL("../main.js", import.meta.url), "utf8");
+  assert.equal(js.includes("EXPIRED_BEFORE_FINALIZATION"), true);
+  assert.equal(js.includes("cancelled automatically and its input is available again"), true);
+  assert.equal(js.includes("Awaiting broadcast/confirmation"), true);
+  assert.equal(js.includes("never cancelled automatically"), true);
+  assert.equal(js.includes("counterparty may still broadcast it"), true);
+  assert.equal(js.includes("double spend"), true);
+});
+
 test("QR exchange stays local, uses canonical native frames, and releases camera state", async () => {
   const { readFile } = await import("node:fs/promises");
   const [source, registry] = await Promise.all([

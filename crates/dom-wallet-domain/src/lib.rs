@@ -289,6 +289,13 @@ pub enum TransactionRole {
     Recipient,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TransactionCancellationReason {
+    Manual,
+    ExpiredBeforeFinalization,
+}
+
 /// Secrets required to continue an interactive DOM slate. This object is
 /// encrypted as part of `WalletState`; it is deliberately redacted from Debug
 /// so it cannot reach command errors or application logs.
@@ -335,6 +342,12 @@ pub struct LocalTransactionIntent {
     /// expiry decisions always use canonical heights.
     #[serde(default)]
     pub created_at_unix_seconds: u64,
+    /// Durable tombstone metadata. `ExpiredBeforeFinalization` is written only
+    /// when no finalized transaction bytes exist and the envelope has expired.
+    #[serde(default)]
+    pub cancellation_reason: Option<TransactionCancellationReason>,
+    #[serde(default)]
+    pub cancelled_at_height: Option<u64>,
     /// Exactly 33 canonical commitment bytes. This is persisted before an
     /// external submission and is the only kernel-to-wallet association.
     pub kernel_excess: Vec<u8>,
@@ -1251,6 +1264,54 @@ impl WalletState {
                 )?;
             }
         }
+        self.restore_reorged_reservations()?;
+        Ok(())
+    }
+
+    pub fn rollback_confirmations_after_height(
+        &mut self,
+        safe_height: u64,
+    ) -> Result<(), DomainError> {
+        for transaction in &mut self.transactions {
+            if matches!(
+                transaction.lifecycle,
+                TransactionLifecycle::Confirmed { height, .. } if height > safe_height
+            ) {
+                transaction.transition(
+                    TransactionLifecycle::Reorged,
+                    TransactionTransitionEvidence::ReorgEvidence,
+                )?;
+            }
+        }
+        self.restore_reorged_reservations()
+    }
+
+    fn restore_reorged_reservations(&mut self) -> Result<(), DomainError> {
+        let reservations = self
+            .transactions
+            .iter()
+            .filter(|transaction| transaction.lifecycle == TransactionLifecycle::Reorged)
+            .map(|transaction| (transaction.id, transaction.reserved_output_ids.clone()))
+            .collect::<Vec<_>>();
+        for (transaction_id, output_ids) in reservations {
+            for output in self
+                .outputs
+                .iter_mut()
+                .filter(|output| output_ids.contains(&output.id))
+            {
+                if matches!(output.state, OutputState::Spent { .. }) {
+                    continue;
+                }
+                if output
+                    .reserved_by
+                    .is_some_and(|owner| owner != transaction_id)
+                {
+                    return Err(DomainError::InvalidState);
+                }
+                output.reserved_by = Some(transaction_id);
+                output.state = OutputState::PendingOutgoing;
+            }
+        }
         Ok(())
     }
 
@@ -1523,6 +1584,8 @@ mod tests {
             id: Uuid::nil(),
             created_at_height: 0,
             created_at_unix_seconds: 0,
+            cancellation_reason: None,
+            cancelled_at_height: None,
             kernel_excess: Vec::new(),
             lifecycle,
             submitted: false,
@@ -1771,6 +1834,8 @@ mod tests {
             id: Uuid::new_v4(),
             created_at_height: 0,
             created_at_unix_seconds: 0,
+            cancellation_reason: None,
+            cancelled_at_height: None,
             kernel_excess: vec![3; 33],
             lifecycle: TransactionLifecycle::Submitted,
             submitted: true,
@@ -1825,6 +1890,8 @@ mod tests {
             id: Uuid::new_v4(),
             created_at_height: 0,
             created_at_unix_seconds: 0,
+            cancellation_reason: None,
+            cancelled_at_height: None,
             kernel_excess: Vec::new(),
             lifecycle: TransactionLifecycle::ResponseExported,
             submitted: false,
@@ -1944,6 +2011,23 @@ mod tests {
         assert_eq!(decoded.recovery_scanned_blocks, 0);
         assert_eq!(decoded.recovery_scanned_outputs, 0);
         decoded.validate().unwrap();
+
+        let mut legacy_transaction =
+            serde_json::to_value(transaction_in(TransactionLifecycle::InputsReserved)).unwrap();
+        let transaction = legacy_transaction.as_object_mut().unwrap();
+        for field in [
+            "created_at_height",
+            "created_at_unix_seconds",
+            "cancellation_reason",
+            "cancelled_at_height",
+        ] {
+            transaction.remove(field);
+        }
+        let decoded: LocalTransactionIntent = serde_json::from_value(legacy_transaction).unwrap();
+        assert_eq!(decoded.created_at_height, 0);
+        assert_eq!(decoded.created_at_unix_seconds, 0);
+        assert!(decoded.cancellation_reason.is_none());
+        assert!(decoded.cancelled_at_height.is_none());
     }
 
     #[test]

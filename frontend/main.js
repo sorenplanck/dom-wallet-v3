@@ -41,6 +41,7 @@ let latestSynchronizationPresentation;
 let latestEmbeddedNodeStatus;
 let restoreScanTimer;
 let remoteTipAlertMessage;
+const seenAutomaticCancellations = new Set();
 
 export const clearPasswords = (form) => form?.querySelectorAll('input[type="password"]').forEach((input) => { input.value = ""; });
 export const redactedError = (error) => error?.message && !/password|mnemonic|seed|secret|key|token|credential|:\/\//i.test(error.message)
@@ -648,7 +649,7 @@ tx("transaction-submit", "transaction_submit");
 tx("transaction-retry", "transaction_retry_submission");
 tx("transaction-reconcile", "transaction_reconcile_submission");
 tx("transaction-cancel", "slate_cancel", () => {
-  const confirmed = window.confirm("Cancel this pending payment? The entire reserved input will become available again, and a wallet rescan will keep this payment cancelled.");
+  const confirmed = window.confirm("Cancel this payment manually? If a finalized transaction exists, the counterparty may still broadcast it; releasing the input can create a double-spend risk. Otherwise, the entire reserved input becomes available again.");
   if (!confirmed) throw new Error("Cancellation was not confirmed.");
   return { slateId: requiredId(), confirmExported: true };
 });
@@ -680,7 +681,7 @@ const renderHistory = async () => {
   const pendingStates = new Set([
     "INPUTS_RESERVED", "REQUEST_EXPORTED", "RESPONSE_IMPORTED", "FINALIZED",
     "SUBMITTING", "SUBMITTED", "ACCEPTED_NOT_RELAYED", "IN_MEMPOOL",
-    "REORGED", "RETRANSMIT_REQUIRED", "RECONCILIATION_REQUIRED",
+    "REORGED", "RETRANSMIT_REQUIRED", "RECONCILIATION_REQUIRED", "FAILED",
   ]);
   const nodes = transactions.map((transaction) => {
     const node = document.createElement("article");
@@ -699,13 +700,35 @@ const renderHistory = async () => {
       : `${Math.max(0, Math.floor(Date.now() / 1000) - transaction.created_at_unix_seconds)} seconds old`;
     details.textContent = `${blockAge} · ${timeAge}`;
     node.append(title, identifier, details);
+    if (transaction.awaiting_broadcast_confirmation) {
+      const waiting = document.createElement("p");
+      waiting.className = "warning";
+      waiting.textContent = `Awaiting broadcast/confirmation · envelope expiry height ${transaction.expires_at_height}. This finalized transaction is never cancelled automatically.`;
+      node.append(waiting);
+    }
+    if (transaction.cancellation_reason === "EXPIRED_BEFORE_FINALIZATION") {
+      const automatic = document.createElement("p");
+      automatic.className = "automatic-cancellation-event";
+      automatic.textContent = `Automatically cancelled at height ${transaction.cancelled_at_height}: the envelope expired before finalization, so the reserved input was released.`;
+      node.append(automatic);
+      const key = transaction.slate_id ?? transaction.id;
+      if (!seenAutomaticCancellations.has(key)) {
+        seenAutomaticCancellations.add(key);
+        show("An expired, unfinalized payment was cancelled automatically and its input is available again.");
+      }
+    }
     if (pendingStates.has(transaction.state) && transaction.manual_cancel_allowed) {
       const cancel = document.createElement("button");
       cancel.className = "btn ghost transaction-cancel-pending";
       cancel.type = "button";
-      cancel.textContent = "Cancel and release input";
+      cancel.textContent = transaction.manual_cancel_warning
+        ? "Cancel manually (double-spend risk)"
+        : "Cancel and release input";
       cancel.addEventListener("click", async () => {
-        const confirmed = window.confirm("Cancel this pending payment? The entire reserved input will return to your confirmed, available balance. A wallet rescan will not reserve it again.");
+        const message = transaction.manual_cancel_warning
+          ? "A finalized transaction is persisted and the counterparty may still broadcast it. Cancelling releases the input and can create a double spend. Cancel at your own risk?"
+          : "Cancel this pending payment? The entire reserved input will return to your confirmed, available balance. A wallet rescan will not reserve it again.";
+        const confirmed = window.confirm(message);
         if (!confirmed) return;
         try {
           await run(() => invoke("slate_cancel", { slateId: transaction.slate_id, confirmExported: true }));
@@ -803,6 +826,7 @@ const refresh = async () => {
     ? [refreshOnboardingNode()]
     : [refreshSummary(), refreshNode(), refreshMining()];
   if (!gateVisible && !byId("diagnostics").hidden) tasks.push(refreshUpdates());
+  if (!gateVisible && !byId("history").hidden) tasks.push(renderHistory());
   await Promise.allSettled(tasks);
   refreshTimer = setTimeout(refresh, gateVisible ? 5000 : 15000);
 };

@@ -30,8 +30,9 @@ use dom_wallet_domain::{
     cancellation_decision, BalanceProjection, BroadcastExposure, CancellationDecision,
     LocalTransactionIntent, MiningPreferences, Network, NetworkIdentity, NodeConfiguration,
     OutputRecord, OutputState, PrivateTransactionContext, RecoveryMetadata, RecoveryOutputClass,
-    RedactedNodeConfiguration, SeedRestoreStatus, SyncStatus, TransactionLifecycle,
-    TransactionRole, TransactionTransitionEvidence, WalletState, RECOVERY_SCHEME_BIP39_256_V1,
+    RedactedNodeConfiguration, SeedRestoreStatus, SyncStatus, TransactionCancellationReason,
+    TransactionLifecycle, TransactionRole, TransactionTransitionEvidence, WalletState,
+    RECOVERY_SCHEME_BIP39_256_V1,
 };
 use dom_wallet_embedded_core::{EmbeddedCoreConfiguration, EmbeddedPeerStatus};
 use dom_wallet_production_backend::{ProductionBackendError, PRODUCTION_BACKEND_KIND};
@@ -130,6 +131,10 @@ pub struct TransactionSummary {
     pub expires_at_height: u64,
     pub has_finalized_transaction: bool,
     pub manual_cancel_allowed: bool,
+    pub manual_cancel_warning: bool,
+    pub awaiting_broadcast_confirmation: bool,
+    pub cancellation_reason: Option<String>,
+    pub cancelled_at_height: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -987,7 +992,7 @@ impl WalletService {
             .current_tip
             .height;
         let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
-        rewind_recovery_state(&mut state, 0, tip);
+        rewind_recovery_state(&mut state, 0, tip)?;
         state.core_scan_cursor = None;
         state.recovery_canonical_blocks.clear();
         // A genesis rescan restarts the whole-history totals. This also clears
@@ -1183,6 +1188,8 @@ impl WalletService {
             id: transaction_id,
             created_at_height: identity.current_tip.height,
             created_at_unix_seconds: unix_seconds(),
+            cancellation_reason: None,
+            cancelled_at_height: None,
             kernel_excess: Vec::new(),
             lifecycle: TransactionLifecycle::InputsReserved,
             submitted: false,
@@ -1378,6 +1385,8 @@ impl WalletService {
             id,
             created_at_height: identity.current_tip.height,
             created_at_unix_seconds: unix_seconds(),
+            cancellation_reason: None,
+            cancelled_at_height: None,
             kernel_excess: Vec::new(),
             lifecycle: TransactionLifecycle::RequestImported,
             submitted: false,
@@ -1743,10 +1752,13 @@ impl WalletService {
                 return Err(CoreError::CannotCancelTransaction);
             }
         }
-        if matches!(
+        if (matches!(
             state.transactions[index].lifecycle,
             TransactionLifecycle::RequestExported | TransactionLifecycle::ResponseExported
-        ) && !confirm_exported
+        ) || !state.transactions[index]
+            .finalized_transaction_bytes
+            .is_empty())
+            && !confirm_exported
         {
             return Err(CoreError::ConfirmationRequired);
         }
@@ -1763,6 +1775,8 @@ impl WalletService {
             TransactionLifecycle::Cancelled,
             TransactionTransitionEvidence::Cancellation,
         )?;
+        state.transactions[index].cancellation_reason = Some(TransactionCancellationReason::Manual);
+        state.transactions[index].cancelled_at_height = None;
         let id = state.transactions[index].id;
         self.commit(state)?;
         self.transaction_summary(id)
@@ -1932,7 +1946,7 @@ impl WalletRecoverySink {
     ) -> Result<(), CoreError> {
         let mut next = self.state.clone();
         if let Some(anchor) = reorg {
-            rewind_recovery_state(&mut next, anchor.height, batch.observed_tip.height);
+            rewind_recovery_state(&mut next, anchor.height, batch.observed_tip.height)?;
         }
         apply_recovery_batch(
             &self.seed,
@@ -1944,6 +1958,22 @@ impl WalletRecoverySink {
             &mut next,
             batch,
         )?;
+        for transaction_id in
+            cancel_expired_unfinalized_reservations(&mut next, batch.observed_tip.height)?
+        {
+            let transaction = next
+                .transactions
+                .iter()
+                .find(|transaction| transaction.id == transaction_id)
+                .ok_or(CoreError::TransactionNotFound)?;
+            tracing::info!(
+                %transaction_id,
+                slate_id = ?transaction.slate_id,
+                expires_at_height = transaction.expires_at_height,
+                canonical_tip_height = batch.observed_tip.height,
+                "automatically cancelled expired unfinalized Slate reservation"
+            );
+        }
         next.core_scan_cursor = Some(cursor.as_bytes().to_vec());
         // An offline-restored wallet completes its seed restore the moment the
         // committed cursor anchor catches up with the observed canonical tip.
@@ -2314,7 +2344,79 @@ fn transaction_summary_from(transaction: &LocalTransactionIntent) -> Transaction
                     | TransactionLifecycle::RetransmitRequired
                     | TransactionLifecycle::ReconciliationRequired
             ),
+        manual_cancel_warning: !transaction.finalized_transaction_bytes.is_empty()
+            && transaction.exposure == BroadcastExposure::NeverBroadcast
+            && !matches!(
+                transaction.lifecycle,
+                TransactionLifecycle::Cancelled | TransactionLifecycle::Confirmed { .. }
+            ),
+        awaiting_broadcast_confirmation: !transaction.finalized_transaction_bytes.is_empty()
+            && !matches!(
+                transaction.lifecycle,
+                TransactionLifecycle::Cancelled | TransactionLifecycle::Confirmed { .. }
+            ),
+        cancellation_reason: transaction.cancellation_reason.map(|reason| match reason {
+            TransactionCancellationReason::Manual => "MANUAL".into(),
+            TransactionCancellationReason::ExpiredBeforeFinalization => {
+                "EXPIRED_BEFORE_FINALIZATION".into()
+            }
+        }),
+        cancelled_at_height: transaction.cancelled_at_height,
     }
+}
+
+fn cancel_expired_unfinalized_reservations(
+    state: &mut WalletState,
+    canonical_tip_height: u64,
+) -> Result<Vec<Uuid>, CoreError> {
+    let expiring = state
+        .transactions
+        .iter()
+        .enumerate()
+        .filter(|(_, transaction)| {
+            transaction.role == Some(TransactionRole::Sender)
+                && !transaction.reserved_output_ids.is_empty()
+                && transaction.finalized_transaction_bytes.is_empty()
+                && transaction.expires_at_height != 0
+                && transaction.expires_at_height <= canonical_tip_height
+                && transaction.exposure == BroadcastExposure::NeverBroadcast
+                && !matches!(
+                    transaction.lifecycle,
+                    TransactionLifecycle::Cancelled
+                        | TransactionLifecycle::Confirmed { .. }
+                        | TransactionLifecycle::Submitting
+                        | TransactionLifecycle::Submitted
+                        | TransactionLifecycle::AcceptedNotRelayed
+                        | TransactionLifecycle::InMempool
+                        | TransactionLifecycle::Reorged
+                        | TransactionLifecycle::RetransmitRequired
+                        | TransactionLifecycle::ReconciliationRequired
+                )
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let mut cancelled = Vec::with_capacity(expiring.len());
+    for index in expiring {
+        let transaction_id = state.transactions[index].id;
+        let reserved = state.transactions[index].reserved_output_ids.clone();
+        for output in &mut state.outputs {
+            if reserved.contains(&output.id) && output.reserved_by == Some(transaction_id) {
+                output.reserved_by = None;
+                if matches!(output.state, OutputState::PendingOutgoing) {
+                    output.state = OutputState::Confirmed;
+                }
+            }
+        }
+        state.transactions[index].transition(
+            TransactionLifecycle::Cancelled,
+            TransactionTransitionEvidence::Cancellation,
+        )?;
+        state.transactions[index].cancellation_reason =
+            Some(TransactionCancellationReason::ExpiredBeforeFinalization);
+        state.transactions[index].cancelled_at_height = Some(canonical_tip_height);
+        cancelled.push(transaction_id);
+    }
+    Ok(cancelled)
 }
 
 fn unix_seconds() -> u64 {
@@ -2593,6 +2695,8 @@ mod tests {
             id: Uuid::nil(),
             created_at_height: 0,
             created_at_unix_seconds: 0,
+            cancellation_reason: None,
+            cancelled_at_height: None,
             kernel_excess: Vec::new(),
             lifecycle: TransactionLifecycle::InputsReserved,
             submitted: false,
@@ -2650,6 +2754,8 @@ mod tests {
             id: transaction_id,
             created_at_height: 10,
             created_at_unix_seconds: 1_700_000_000,
+            cancellation_reason: None,
+            cancelled_at_height: None,
             kernel_excess: Vec::new(),
             lifecycle: TransactionLifecycle::InputsReserved,
             submitted: false,
@@ -2693,7 +2799,7 @@ mod tests {
         // This is the same state rewind used by `rescan_from_genesis`; the
         // CANCELLED intent is a durable tombstone and cannot reserve again.
         let mut rescanned = state.clone();
-        rewind_recovery_state(&mut rescanned, 1, 20);
+        rewind_recovery_state(&mut rescanned, 1, 20).unwrap();
         assert_eq!(
             rescanned.transactions[0].lifecycle,
             TransactionLifecycle::Cancelled
@@ -2713,6 +2819,188 @@ mod tests {
         );
         assert_eq!(state.outputs[0].reserved_by, None);
         assert_eq!(spendable_outputs(state).len(), 1);
+    }
+
+    fn reserved_sender_state(finalized: bool) -> (WalletState, Uuid, Uuid, Uuid) {
+        let mut state = WalletState::new(
+            backup_identity(),
+            [7; 32],
+            default_node_configuration(backup_identity()),
+        );
+        let transaction_id = Uuid::new_v4();
+        let slate_id = Uuid::new_v4();
+        let output_id = Uuid::new_v4();
+        state.outputs.push(OutputRecord {
+            id: output_id,
+            account_id: state.default_account.id,
+            commitment: Some([9; 33]),
+            value: 33_000_000_000,
+            state: OutputState::PendingOutgoing,
+            discovered_height: 1,
+            reserved_by: Some(transaction_id),
+        });
+        state.remember_output_blinding(output_id, [8; 32]);
+        state.transactions.push(LocalTransactionIntent {
+            id: transaction_id,
+            created_at_height: 90,
+            created_at_unix_seconds: 1_700_000_000,
+            cancellation_reason: None,
+            cancelled_at_height: None,
+            kernel_excess: if finalized { vec![7; 33] } else { Vec::new() },
+            lifecycle: if finalized {
+                TransactionLifecycle::Finalized
+            } else {
+                TransactionLifecycle::InputsReserved
+            },
+            submitted: false,
+            exposure: BroadcastExposure::NeverBroadcast,
+            slate_id: Some(slate_id),
+            role: Some(TransactionRole::Sender),
+            amount: 1_000_000_000,
+            fee: 1,
+            reserved_output_ids: vec![output_id],
+            request_bytes: vec![1],
+            response_bytes: if finalized { vec![2] } else { Vec::new() },
+            finalized_transaction_bytes: if finalized { vec![3] } else { Vec::new() },
+            transaction_hash: finalized.then_some([6; 32]),
+            attempt_count: 0,
+            private_context: None,
+            recipient_output_id: None,
+            change_output_id: None,
+            expires_at_height: 100,
+        });
+        (state, transaction_id, slate_id, output_id)
+    }
+
+    #[test]
+    fn expired_unfinalized_envelope_is_cancelled_automatically_once() {
+        let (mut state, transaction_id, _, output_id) = reserved_sender_state(false);
+        assert_eq!(
+            cancel_expired_unfinalized_reservations(&mut state, 100).unwrap(),
+            vec![transaction_id]
+        );
+        assert_eq!(
+            state.transactions[0].lifecycle,
+            TransactionLifecycle::Cancelled
+        );
+        assert_eq!(
+            state.transactions[0].cancellation_reason,
+            Some(TransactionCancellationReason::ExpiredBeforeFinalization)
+        );
+        assert_eq!(state.transactions[0].cancelled_at_height, Some(100));
+        assert_eq!(state.outputs[0].id, output_id);
+        assert_eq!(state.outputs[0].reserved_by, None);
+        assert_eq!(state.outputs[0].state, OutputState::Confirmed);
+        assert_eq!(state.balance().spendable, 33_000_000_000);
+        assert!(cancel_expired_unfinalized_reservations(&mut state, 101)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn finalized_transaction_is_never_cancelled_automatically() {
+        let (mut state, transaction_id, _, _) = reserved_sender_state(true);
+        assert!(cancel_expired_unfinalized_reservations(&mut state, 101)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            state.transactions[0].lifecycle,
+            TransactionLifecycle::Finalized
+        );
+        assert_eq!(state.outputs[0].reserved_by, Some(transaction_id));
+        assert_eq!(state.outputs[0].state, OutputState::PendingOutgoing);
+        let summary = transaction_summary_from(&state.transactions[0]);
+        assert!(summary.awaiting_broadcast_confirmation);
+        assert!(summary.manual_cancel_warning);
+        assert!(summary.manual_cancel_allowed);
+        assert_eq!(summary.expires_at_height, 100);
+    }
+
+    #[test]
+    fn finalized_manual_cancel_requires_warning_confirmation_and_releases_reservation() {
+        let temp = tempfile::tempdir().unwrap();
+        let wallet_path = temp.path().join("wallet");
+        let password = "password-1";
+        let mut service = test_service();
+        service
+            .create_recoverable(&wallet_path, password, backup_identity())
+            .unwrap();
+        service.recovery_phrase_confirmed(password).unwrap();
+        service.unlock(password).unwrap();
+        let (mut transaction_state, transaction_id, slate_id, output_id) =
+            reserved_sender_state(true);
+        let mut state = service.unlocked.as_ref().unwrap().clone();
+        transaction_state.outputs[0].account_id = state.default_account.id;
+        state.outputs.append(&mut transaction_state.outputs);
+        state
+            .private_output_blindings
+            .append(&mut transaction_state.private_output_blindings);
+        state
+            .transactions
+            .append(&mut transaction_state.transactions);
+        service.commit(state).unwrap();
+
+        let warning = service.transaction_summary(transaction_id).unwrap();
+        assert!(warning.manual_cancel_warning);
+        assert!(matches!(
+            service.slate_cancel(slate_id, false),
+            Err(CoreError::ConfirmationRequired)
+        ));
+        let cancelled = service.slate_cancel(slate_id, true).unwrap();
+        assert_eq!(cancelled.state, "CANCELLED");
+        assert_eq!(cancelled.cancellation_reason.as_deref(), Some("MANUAL"));
+        let state = service.unlocked.as_ref().unwrap();
+        assert_eq!(
+            state
+                .outputs
+                .iter()
+                .find(|output| output.id == output_id)
+                .unwrap()
+                .reserved_by,
+            None
+        );
+        assert_eq!(state.balance().spendable, 33_000_000_000);
+    }
+
+    #[test]
+    fn one_block_reorg_restores_exact_finalized_reservation_without_duplication() {
+        let (mut state, transaction_id, _, output_id) = reserved_sender_state(true);
+        state.transactions[0].lifecycle = TransactionLifecycle::Confirmed {
+            height: 11,
+            block_hash: [1; 32],
+        };
+        state.transactions[0].exposure = BroadcastExposure::Confirmed;
+        state.outputs[0].state = OutputState::Spent { spent_height: 11 };
+        state.outputs[0].reserved_by = None;
+
+        rewind_recovery_state(&mut state, 10, 10).unwrap();
+        assert_eq!(
+            state.transactions[0].lifecycle,
+            TransactionLifecycle::Reorged
+        );
+        assert_eq!(state.outputs.len(), 1);
+        assert_eq!(state.outputs[0].id, output_id);
+        assert_eq!(state.outputs[0].reserved_by, Some(transaction_id));
+        assert_eq!(state.outputs[0].state, OutputState::PendingOutgoing);
+        assert_eq!(state.balance().pending_outgoing, 33_000_000_000);
+        assert_eq!(state.balance().spendable, 0);
+
+        rewind_recovery_state(&mut state, 10, 10).unwrap();
+        assert_eq!(state.outputs.len(), 1);
+        assert_eq!(state.outputs[0].reserved_by, Some(transaction_id));
+        assert!(state.mark_known_output_spent(&[9; 33], 11));
+        state
+            .apply_kernel_evidence(11, [2; 32], &[[7; 33]])
+            .unwrap();
+        assert_eq!(
+            state.transactions[0].lifecycle,
+            TransactionLifecycle::Confirmed {
+                height: 11,
+                block_hash: [2; 32]
+            }
+        );
+        assert_eq!(state.outputs[0].reserved_by, None);
+        assert_eq!(state.balance().total, 0);
     }
 
     #[test]
@@ -2743,6 +3031,8 @@ mod tests {
                 id: Uuid::new_v4(),
                 created_at_height: 0,
                 created_at_unix_seconds: 0,
+                cancellation_reason: None,
+                cancelled_at_height: None,
                 kernel_excess: vec![2; 33],
                 lifecycle,
                 submitted: true,

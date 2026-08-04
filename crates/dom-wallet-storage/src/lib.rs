@@ -1164,6 +1164,8 @@ mod tests {
             id: transaction_id,
             created_at_height: 0,
             created_at_unix_seconds: 0,
+            cancellation_reason: None,
+            cancelled_at_height: None,
             kernel_excess: vec![4; 33],
             lifecycle: TransactionLifecycle::Submitting,
             submitted: false,
