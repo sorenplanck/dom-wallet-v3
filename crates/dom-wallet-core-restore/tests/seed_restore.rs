@@ -1,18 +1,23 @@
-use dom_consensus::{Transaction, TransactionInput};
+use dom_consensus::{
+    Block, BlockHeader, Transaction, TransactionInput, TransactionKernel, TransactionOutput,
+};
+use dom_core::{Amount, BlockHeight, Hash256, Timestamp, KERNEL_FEAT_PLAIN};
 use dom_crypto::{
-    pedersen::BlindingFactor,
+    pedersen::{BlindingFactor, Commitment},
     range_proof_prove_bytes,
-    recovery::{RecoveryChainContext, RECOVERY_VERSION},
+    recovery::RecoveryChainContext,
     RANGE_PROOF_SERIALIZATION_VERSION,
 };
+use dom_serialization::{DomDeserialize, DomSerialize};
 use dom_tx::{InputSource, SpendBuilder};
 use dom_wallet_core_api::{
     BlockRef, BlockSelector, BlockSummary, ChainIdentity, CoinbaseScanMetadata, CoreNetwork,
     CursorValidation, FeeBreakdown, FeeEstimate, FeeEstimateRequest, FeePolicySnapshot,
     FeeValidation, KernelQueryResult, MempoolPolicySnapshot, ScanBlock, ScanInput, ScanKernel,
-    ScanOutput, ScanRequest, ScanResult, ScanStart, SubmissionResult, SubmitTransactionRequest,
-    SyncStatus, TransactionIdentifier, TransactionShape, TransactionStatus, TransactionWeight,
-    UtxoQueryResult, WalletCoreApi, WalletCoreError, WalletScanCursor,
+    ScanOutput, ScanRequest, ScanResult, ScanStart, ScanTransaction, SubmissionResult,
+    SubmitTransactionRequest, SyncStatus, TransactionIdentifier, TransactionLocation,
+    TransactionShape, TransactionStatus, TransactionWeight, UtxoQueryResult, WalletCoreApi,
+    WalletCoreError, WalletScanCursor,
 };
 use dom_wallet_core_recovery::{CanonicalWalletSeed, RecoverableOutputBuilder};
 use dom_wallet_core_restore::{
@@ -33,7 +38,7 @@ use dom_wallet_domain::{
 use dom_wallet_storage::{default_node_configuration, WalletDirectory};
 use std::{
     fs,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 use tempfile::TempDir;
@@ -84,17 +89,26 @@ impl FakeCore {
         } else {
             state.blocks[(height - 1) as usize].block_hash
         };
-        for block in state.blocks.iter_mut().skip(height as usize) {
-            block.block_hash = [marker.wrapping_add(block.height as u8); 32];
-            block.previous_block_hash = previous;
-            block.canonical_marker = block.block_hash;
+        for projected in state.blocks.iter_mut().skip(height as usize) {
+            let mut block = consensus_block_from_scan(projected);
             if clear_inputs {
-                block.inputs.clear();
+                for transaction in &mut block.transactions {
+                    transaction.inputs.clear();
+                }
             }
-            for output in &mut block.outputs {
-                output.block_hash = block.block_hash;
-            }
-            previous = block.block_hash;
+            let branch_marker = marker.wrapping_add(block.header.height.0 as u8);
+            block.header.prev_hash = Hash256::from_bytes(previous);
+            block.header.timestamp = Timestamp(
+                block
+                    .header
+                    .timestamp
+                    .0
+                    .saturating_add(u64::from(branch_marker) + 1),
+            );
+            block.header.pow.nonce = u64::from(branch_marker);
+            refresh_body_roots(&mut block);
+            *projected = project_block(&block);
+            previous = projected.block_hash;
         }
         let tip = state.blocks.last().unwrap();
         state.identity.current_tip = BlockRef {
@@ -104,9 +118,16 @@ impl FakeCore {
     }
 
     fn clear_outputs_at(&self, height: u64) {
-        self.state.lock().unwrap().blocks[height as usize]
-            .outputs
-            .clear();
+        let mut state = self.state.lock().unwrap();
+        let projected = &mut state.blocks[height as usize];
+        let mut block = consensus_block_from_scan(projected);
+        for transaction in &mut block.transactions {
+            transaction.outputs.clear();
+        }
+        block.header.timestamp = Timestamp(block.header.timestamp.0.saturating_add(1));
+        block.header.pow.nonce = block.header.pow.nonce.saturating_add(1);
+        refresh_body_roots(&mut block);
+        *projected = project_block(&block);
     }
 }
 
@@ -286,7 +307,7 @@ struct Fixture {
 fn fixture() -> Fixture {
     let seed = CanonicalWalletSeed::from_entropy(&[0x41; 32]).unwrap();
     let unrelated = CanonicalWalletSeed::from_entropy(&[0x52; 32]).unwrap();
-    let identity = identity();
+    let mut identity = identity();
     let domain_identity = NetworkIdentity {
         network: Network::PrivateTestnet,
         chain_id: identity.chain_id,
@@ -320,37 +341,79 @@ fn fixture() -> Fixture {
         .reserve_recovery_coordinate(0, RecoveryOutputClass::ReceiveSlate)
         .unwrap();
     let unrelated_output = unrelated_builder.build(700, unrelated_coordinate).unwrap();
-    let legacy_blinding = BlindingFactor::from_bytes([7; 32]).unwrap();
-    let (legacy_proof, legacy_commitment) = range_proof_prove_bytes(800, &legacy_blinding).unwrap();
-
-    let mut blocks = (0..5).map(empty_block).collect::<Vec<_>>();
-    blocks[0].outputs.push(scan_output(&built[0].2, 0, 0));
-    blocks[1].outputs.push(scan_output(&built[1].2, 1, 0));
-    blocks[1].outputs.push(scan_output(&unrelated_output, 1, 1));
-    blocks[2].outputs.push(scan_output(&built[2].2, 2, 0));
-    blocks[2].outputs.push(scan_output(&built[3].2, 2, 1));
-    let block_two_hash = blocks[2].block_hash;
-    blocks[2].outputs.push(ScanOutput {
-        commitment: legacy_commitment,
-        range_proof: legacy_proof,
-        recovery_capsule: Vec::new(),
-        recovery_version: 0,
-        is_coinbase: false,
-        block_height: 2,
-        block_hash: block_two_hash,
-        output_position: 2,
-    });
-    blocks[3].outputs.push(scan_output(&built[4].2, 3, 0));
-    blocks[3].coinbase.output_commitment = built[4].2.commitment;
-    blocks[3].coinbase.explicit_value = 500;
-    blocks[4].inputs = vec![
-        ScanInput {
-            spent_commitment: built[0].2.commitment,
-        },
-        ScanInput {
-            spent_commitment: built[2].2.commitment,
-        },
-    ];
+    let mut unrelated_allocation = WalletState::new(
+        domain_identity.clone(),
+        [0; 32],
+        default_node_configuration(domain_identity),
+    );
+    let unrelated_coinbases = (0..4)
+        .map(|_| {
+            let coordinate = unrelated_allocation
+                .reserve_recovery_coordinate(0, RecoveryOutputClass::Coinbase)
+                .unwrap();
+            unrelated_builder.build(0, coordinate).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let legacy_output = legacy_transaction_output(800, 7);
+    let mut blocks = Vec::with_capacity(5);
+    let mut previous_hash = [0; 32];
+    for height in 0..5 {
+        let (coinbase, outputs, inputs) = match height {
+            0 => (
+                Some((unrelated_coinbases[0].output.clone(), 0)),
+                vec![built[0].2.output.clone()],
+                Vec::new(),
+            ),
+            1 => (
+                Some((unrelated_coinbases[1].output.clone(), 0)),
+                vec![built[1].2.output.clone(), unrelated_output.output.clone()],
+                Vec::new(),
+            ),
+            2 => (
+                Some((unrelated_coinbases[2].output.clone(), 0)),
+                vec![
+                    built[2].2.output.clone(),
+                    built[3].2.output.clone(),
+                    legacy_output.clone(),
+                ],
+                Vec::new(),
+            ),
+            3 => (
+                Some((built[4].2.output.clone(), 500)),
+                Vec::new(),
+                Vec::new(),
+            ),
+            4 => (
+                Some((unrelated_coinbases[3].output.clone(), 0)),
+                Vec::new(),
+                vec![
+                    TransactionInput {
+                        commitment: Commitment::from_compressed_bytes(&built[0].2.commitment)
+                            .unwrap(),
+                    },
+                    TransactionInput {
+                        commitment: Commitment::from_compressed_bytes(&built[2].2.commitment)
+                            .unwrap(),
+                    },
+                ],
+            ),
+            _ => unreachable!(),
+        };
+        let block = canonical_scan_block(
+            height,
+            previous_hash,
+            height as u8 + 1,
+            coinbase,
+            outputs,
+            inputs,
+        );
+        previous_hash = block.block_hash;
+        blocks.push(block);
+    }
+    identity.current_tip = CoreBlockReference {
+        height: 4,
+        hash: previous_hash,
+    };
     Fixture {
         phrase: seed.mnemonic_text(),
         identity,
@@ -375,54 +438,240 @@ fn identity() -> CoreChainIdentity {
     }
 }
 
-fn empty_block(height: u64) -> ScanBlock {
-    let marker = height as u8 + 1;
+fn canonical_genesis_template() -> &'static Block {
+    static GENESIS: OnceLock<Block> = OnceLock::new();
+    GENESIS.get_or_init(|| {
+        dom_chain::build_canonical_genesis(CoreNetwork::Regtest.magic(), &[8; 32])
+            .expect("regtest genesis")
+            .block
+            .expect("regtest has a canonical block")
+    })
+}
+
+fn legacy_transaction_output(value: u64, marker: u8) -> TransactionOutput {
+    let blinding = BlindingFactor::from_bytes([marker.max(1); 32]).expect("test blinding");
+    let (proof, commitment) = range_proof_prove_bytes(value, &blinding).expect("range proof");
+    TransactionOutput {
+        commitment: Commitment::from_compressed_bytes(&commitment).expect("commitment"),
+        proof: proof.to_vec(),
+    }
+}
+
+fn canonical_scan_block(
+    height: u64,
+    previous_hash: [u8; 32],
+    marker: u8,
+    coinbase: Option<(TransactionOutput, u64)>,
+    outputs: Vec<TransactionOutput>,
+    inputs: Vec<TransactionInput>,
+) -> ScanBlock {
+    let mut block = canonical_genesis_template().clone();
+    let (coinbase_output, explicit_value) =
+        coinbase.unwrap_or_else(|| (legacy_transaction_output(0, marker.wrapping_add(80)), 0));
+    block.coinbase.output = coinbase_output.clone();
+    block.coinbase.kernel.explicit_value = explicit_value;
+    block.coinbase.kernel.excess = coinbase_output.commitment.clone();
+    block.coinbase.kernel.excess_signature = [marker.wrapping_add(90); 65];
+    block.coinbase.offset = [0; 32];
+
+    let mut offset = [0; 32];
+    offset[31] = marker.max(1);
+    block.transactions = if inputs.is_empty() && outputs.is_empty() {
+        Vec::new()
+    } else {
+        vec![Transaction {
+            inputs,
+            outputs,
+            kernels: vec![TransactionKernel {
+                features: KERNEL_FEAT_PLAIN,
+                fee: Amount::from_noms(0).expect("zero fee"),
+                lock_height: 0,
+                excess: coinbase_output.commitment,
+                excess_signature: [marker.wrapping_add(60); 65],
+            }],
+            offset,
+        }]
+    };
+    block.header.version =
+        dom_core::required_block_version_for_network(CoreNetwork::Regtest.magic(), height);
+    block.header.height = BlockHeight(height);
+    block.header.prev_hash = Hash256::from_bytes(previous_hash);
+    block.header.timestamp = Timestamp(1_800_000_000 + height + u64::from(marker));
+    block.header.total_kernel_offset = if block.transactions.is_empty() {
+        [0; 32]
+    } else {
+        offset
+    };
+    block.header.pow.nonce = u64::from(marker);
+    refresh_body_roots(&mut block);
+    project_block(&block)
+}
+
+fn refresh_body_roots(block: &mut Block) {
+    let (output_root, kernel_root, rangeproof_root) = dom_consensus::compute_block_pmmr_roots(
+        block.header.height,
+        &block.coinbase,
+        &block.transactions,
+    )
+    .expect("canonical body roots");
+    block.header.output_root = output_root;
+    block.header.kernel_root = kernel_root;
+    block.header.rangeproof_root = rangeproof_root;
+}
+
+fn project_output(
+    output: &TransactionOutput,
+    is_coinbase: bool,
+    height: u64,
+    block_hash: [u8; 32],
+    position: u32,
+) -> ScanOutput {
+    let capsule = output.recovery_capsule().expect("output envelope");
+    ScanOutput {
+        commitment: *output.commitment.as_bytes(),
+        range_proof: output.range_proof_bytes().expect("range proof").to_vec(),
+        recovery_capsule: capsule
+            .as_ref()
+            .map(|value| value.as_bytes().to_vec())
+            .unwrap_or_default(),
+        recovery_version: capsule.as_ref().map_or(0, |value| value.version()),
+        is_coinbase,
+        block_height: height,
+        block_hash,
+        output_position: position,
+    }
+}
+
+fn project_block(block: &Block) -> ScanBlock {
+    let canonical_header_bytes = block.header.to_bytes().expect("header bytes");
+    let block_hash = *dom_chain::canonical_header_identifier(
+        CoreNetwork::Regtest.magic(),
+        &canonical_header_bytes,
+    )
+    .expect("header identifier")
+    .as_bytes();
+    let coinbase_output = project_output(
+        &block.coinbase.output,
+        true,
+        block.header.height.0,
+        block_hash,
+        0,
+    );
+    let coinbase_kernel = ScanKernel {
+        excess: *block.coinbase.kernel.excess.as_bytes(),
+        features: block.coinbase.kernel.features,
+        fee: 0,
+        lock_height: 0,
+        excess_signature: block.coinbase.kernel.excess_signature,
+    };
+    let mut outputs = vec![coinbase_output];
+    let mut inputs = Vec::new();
+    let mut kernels = vec![coinbase_kernel];
+    let mut transactions = Vec::new();
+    let mut output_position = 1u32;
+    for (transaction_index, transaction) in block.transactions.iter().enumerate() {
+        let tx_inputs = transaction
+            .inputs
+            .iter()
+            .map(|input| ScanInput {
+                spent_commitment: *input.commitment.as_bytes(),
+            })
+            .collect::<Vec<_>>();
+        let tx_outputs = transaction
+            .outputs
+            .iter()
+            .map(|output| {
+                let projected = project_output(
+                    output,
+                    false,
+                    block.header.height.0,
+                    block_hash,
+                    output_position,
+                );
+                output_position += 1;
+                projected
+            })
+            .collect::<Vec<_>>();
+        let tx_kernels = transaction
+            .kernels
+            .iter()
+            .map(|kernel| ScanKernel {
+                excess: *kernel.excess.as_bytes(),
+                features: kernel.features,
+                fee: kernel.fee.noms(),
+                lock_height: kernel.lock_height,
+                excess_signature: kernel.excess_signature,
+            })
+            .collect::<Vec<_>>();
+        let canonical_bytes = transaction.to_bytes().expect("transaction bytes");
+        inputs.extend(tx_inputs.iter().copied());
+        outputs.extend(tx_outputs.iter().cloned());
+        kernels.extend(tx_kernels.iter().cloned());
+        transactions.push(ScanTransaction {
+            location: TransactionLocation {
+                block_height: block.header.height.0,
+                block_hash,
+                transaction_index: transaction_index as u32,
+            },
+            tx_hash: *dom_crypto::blake2b_256(&canonical_bytes).as_bytes(),
+            canonical_bytes,
+            inputs: tx_inputs,
+            outputs: tx_outputs,
+            kernels: tx_kernels,
+            offset: transaction.offset,
+        });
+    }
     ScanBlock {
-        height,
-        block_hash: [marker; 32],
-        previous_block_hash: if height == 0 {
-            [0; 32]
-        } else {
-            [marker - 1; 32]
-        },
-        timestamp: 1_800_000_000 + height,
-        canonical_marker: [marker; 32],
-        outputs: Vec::new(),
-        inputs: Vec::new(),
-        kernels: vec![ScanKernel {
-            excess: public_commitment(marker.wrapping_add(40)),
-            features: 0,
-            fee: 0,
-            lock_height: 0,
-        }],
+        height: block.header.height.0,
+        block_hash,
+        previous_block_hash: *block.header.prev_hash.as_bytes(),
+        canonical_header_bytes,
+        timestamp: block.header.timestamp.0,
+        canonical_marker: block_hash,
+        outputs,
+        inputs,
+        kernels,
+        transactions,
         coinbase: CoinbaseScanMetadata {
-            output_commitment: public_commitment(marker.wrapping_add(20)),
-            explicit_value: 0,
-            kernel_excess: public_commitment(marker.wrapping_add(40)),
+            output_commitment: *block.coinbase.output.commitment.as_bytes(),
+            explicit_value: block.coinbase.kernel.explicit_value,
+            kernel_excess: *block.coinbase.kernel.excess.as_bytes(),
+            kernel_features: block.coinbase.kernel.features,
+            kernel_excess_signature: block.coinbase.kernel.excess_signature,
+            offset: block.coinbase.offset,
+            output_proof_envelope: block.coinbase.output.proof.clone(),
         },
-        total_fees_noms: 0,
-        protocol_version: dom_core::required_block_version_for_network(
-            CoreNetwork::Regtest.magic(),
-            height,
-        ),
+        total_fees_noms: block.total_fees().expect("total fees"),
+        protocol_version: block.header.version,
         range_proof_serialization_version: RANGE_PROOF_SERIALIZATION_VERSION,
     }
 }
 
-fn scan_output(
-    output: &dom_wallet_core_recovery::RecoverableOutputResult,
-    height: u64,
-    position: u32,
-) -> ScanOutput {
-    ScanOutput {
-        commitment: output.commitment,
-        range_proof: output.range_proof.to_vec(),
-        recovery_capsule: output.recovery_capsule.to_vec(),
-        recovery_version: RECOVERY_VERSION,
-        is_coinbase: output.class == RecoveryOutputClass::Coinbase,
-        block_height: height,
-        block_hash: [height as u8 + 1; 32],
-        output_position: position,
+fn consensus_block_from_scan(block: &ScanBlock) -> Block {
+    Block {
+        header: BlockHeader::from_bytes(&block.canonical_header_bytes).expect("header"),
+        coinbase: dom_consensus::CoinbaseTransaction {
+            output: TransactionOutput {
+                commitment: Commitment::from_compressed_bytes(&block.coinbase.output_commitment)
+                    .expect("coinbase commitment"),
+                proof: block.coinbase.output_proof_envelope.clone(),
+            },
+            kernel: dom_consensus::CoinbaseKernel {
+                features: block.coinbase.kernel_features,
+                explicit_value: block.coinbase.explicit_value,
+                excess: Commitment::from_compressed_bytes(&block.coinbase.kernel_excess)
+                    .expect("coinbase excess"),
+                excess_signature: block.coinbase.kernel_excess_signature,
+            },
+            offset: block.coinbase.offset,
+        },
+        transactions: block
+            .transactions
+            .iter()
+            .map(|transaction| {
+                Transaction::from_bytes(&transaction.canonical_bytes).expect("transaction")
+            })
+            .collect(),
     }
 }
 
@@ -467,7 +716,9 @@ fn seed_only_restore_decisive_e2e() {
     assert_eq!(result.unspent_outputs, 3);
     assert_eq!(result.coinbase_outputs, 1);
     assert_eq!(result.legacy_outputs, 1);
-    assert_eq!(result.scanned_outputs, 7);
+    // Full-fidelity scans include the five canonical coinbase outputs in
+    // addition to the six ordinary outputs in this fixture.
+    assert_eq!(result.scanned_outputs, 11);
     assert_eq!(result.balance.total, 1_100);
     assert_eq!(result.balance.spendable, 600);
     assert_eq!(result.balance.confirmed, 600);
@@ -626,19 +877,19 @@ fn malformed_wrong_seed_chain_and_tampering_fail_closed() {
     ));
 
     let mut capsule_blocks = fixture.blocks.clone();
-    capsule_blocks[0].outputs[0].recovery_capsule[20] ^= 1;
+    capsule_blocks[0].outputs[1].recovery_capsule[20] ^= 1;
     let capsule_fake = FakeCore::new(capsule_blocks, fixture.identity.clone());
-    let capsule_result = service(&capsule_fake, &fixture.identity)
-        .restore(
+    assert!(matches!(
+        service(&capsule_fake, &fixture.identity).restore(
             &fixture.phrase,
             &password,
             temp.path().join("tampered-capsule"),
-        )
-        .unwrap();
-    assert_eq!(capsule_result.owned_outputs, 4);
+        ),
+        Err(SeedRestoreError::CanonicalScan | SeedRestoreError::MalformedRecovery)
+    ));
 
     let mut proof_blocks = fixture.blocks.clone();
-    proof_blocks[0].outputs[0].range_proof[20] ^= 1;
+    proof_blocks[0].outputs[1].range_proof[20] ^= 1;
     let proof_fake = FakeCore::new(proof_blocks, fixture.identity.clone());
     assert!(matches!(
         service(&proof_fake, &fixture.identity).restore(
@@ -651,16 +902,16 @@ fn malformed_wrong_seed_chain_and_tampering_fail_closed() {
     assert!(!temp.path().join("tampered-proof").exists());
 
     let mut commitment_blocks = fixture.blocks.clone();
-    commitment_blocks[0].outputs[0].commitment[10] ^= 1;
+    commitment_blocks[0].outputs[1].commitment[10] ^= 1;
     let commitment_fake = FakeCore::new(commitment_blocks, fixture.identity.clone());
-    let commitment_result = service(&commitment_fake, &fixture.identity)
-        .restore(
+    assert!(matches!(
+        service(&commitment_fake, &fixture.identity).restore(
             &fixture.phrase,
             &password,
             temp.path().join("tampered-commitment"),
-        )
-        .unwrap();
-    assert_eq!(commitment_result.owned_outputs, 4);
+        ),
+        Err(SeedRestoreError::CanonicalScan | SeedRestoreError::MalformedRecovery)
+    ));
 }
 
 #[test]
@@ -696,7 +947,7 @@ fn canonical_gaps_noncanonical_blocks_and_conflicting_duplicates_fail_closed() {
             &password,
             temp.path().join("conflicting-duplicate")
         ),
-        Err(SeedRestoreError::ConflictingOutput)
+        Err(SeedRestoreError::CanonicalScan)
     ));
 
     let mut duplicate_input = fixture.blocks.clone();
@@ -709,21 +960,21 @@ fn canonical_gaps_noncanonical_blocks_and_conflicting_duplicates_fail_closed() {
             &password,
             temp.path().join("duplicate-input")
         ),
-        Err(SeedRestoreError::ConflictingOutput)
+        Err(SeedRestoreError::CanonicalScan)
     ));
 
     let mut exact_duplicate = fixture.blocks.clone();
     let repeated_output = exact_duplicate[0].outputs[0].clone();
     exact_duplicate[0].outputs.push(repeated_output);
     let exact_duplicate_fake = FakeCore::new(exact_duplicate, fixture.identity.clone());
-    let exact = service(&exact_duplicate_fake, &fixture.identity)
-        .restore(
+    assert!(matches!(
+        service(&exact_duplicate_fake, &fixture.identity).restore(
             &fixture.phrase,
             &password,
             temp.path().join("exact-duplicate"),
-        )
-        .unwrap();
-    assert_eq!(exact.owned_outputs, 5);
+        ),
+        Err(SeedRestoreError::CanonicalScan)
+    ));
 }
 
 #[test]
@@ -1058,7 +1309,7 @@ fn regression_offline_restore_wallet_syncs_outputs_via_normal_page_path() {
     let synced = directory.load(&password).unwrap();
     assert_eq!(synced.outputs.len(), 5);
     assert_eq!(synced.recovery_scanned_blocks, 5);
-    assert_eq!(synced.recovery_scanned_outputs, 7);
+    assert_eq!(synced.recovery_scanned_outputs, 11);
     assert_eq!(synced.legacy_proof_only_outputs, 1);
     assert_eq!(synced.balance().total, 1_100);
     assert_eq!(synced.core_scan_cursor.as_ref().unwrap().len(), 86);

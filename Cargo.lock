@@ -1483,9 +1483,11 @@ dependencies = [
 name = "dom-wallet-core-restore"
 version = "0.3.2"
 dependencies = [
+ "dom-chain",
  "dom-consensus",
  "dom-core",
  "dom-crypto",
+ "dom-serialization",
  "dom-tx",
  "dom-wallet",
  "dom-wallet-core-api",
@@ -1674,8 +1676,11 @@ dependencies = [
 name = "dom-wallet-remote-source"
 version = "0.3.2"
 dependencies = [
- "base64 0.22.1",
+ "dom-chain",
  "dom-consensus",
+ "dom-core",
+ "dom-crypto",
+ "dom-serialization",
  "dom-wallet-core-api",
  "hex",
  "reqwest 0.12.28",

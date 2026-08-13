@@ -4,9 +4,10 @@
 //! over synchronous HTTP against a remote DOM node, so `CoreChainAdapter` and
 //! `SeedRestoreService` consume a remote node exactly like the embedded one:
 //!
-//! - `GET /chain/scan/full?from&to` (Bearer) serves identity, tip, and V3
-//!   block projections (range proofs + recovery capsules) — schema pinned in
-//!   `reports/REMOTE_SCAN_V3_SCHEMA.md`, wire `schema_version` 1.
+//! - `GET /chain/scan/scriptless/v1?from&to` (Bearer) serves identity, a
+//!   chain-locked tip, exact canonical headers and transactions, signed kernels,
+//!   range proofs, and recovery capsules. The endpoint is the frozen F7 scanner
+//!   authority supplied by the pinned DOM revision.
 //! - `GET /block/:height` (public) serves canonical headers for
 //!   [`WalletCoreApi::canonical_hash_at_height`] and client-side
 //!   [`WalletCoreApi::validate_cursor`].
@@ -27,7 +28,7 @@
 //!   timeout / connection / DNS / TLS failures →
 //!   [`WalletCoreError::TemporaryFailure`].
 //! - Terminal: HTTP 401/403 (bad bearer configuration), HTTP 404 (remote node
-//!   lacks `/chain/scan/full`), and any wire-schema violation →
+//!   lacks `/chain/scan/scriptless/v1`), and any wire-schema violation →
 //!   [`WalletCoreError::InternalFailure`]; identity drift →
 //!   [`WalletCoreError::CursorChainMismatch`]; stable `canonical_gap` code →
 //!   [`WalletCoreError::CanonicalGap`].
@@ -37,16 +38,16 @@
 
 #![forbid(unsafe_code)]
 
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine as _;
-use dom_consensus::Transaction;
+use dom_consensus::{BlockHeader, Transaction};
+use dom_serialization::{DomDeserialize, DomSerialize};
 use dom_wallet_core_api::{
     BlockRef, BlockSelector, BlockSummary, ChainIdentity, CoinbaseScanMetadata, CoreNetwork,
     CursorValidation, FeeBreakdown, FeeEstimate, FeeEstimateRequest, FeePolicySnapshot,
     FeeValidation, KernelQueryResult, MempoolPolicySnapshot, ScanBlock, ScanInput, ScanKernel,
-    ScanOutput, ScanRequest, ScanResult, ScanStart, SubmissionResult, SubmitTransactionRequest,
-    SyncStatus, TransactionIdentifier, TransactionShape, TransactionStatus, TransactionWeight,
-    UtxoQueryResult, WalletCoreApi, WalletCoreError, WalletScanCursor,
+    ScanOutput, ScanRequest, ScanResult, ScanStart, ScanTransaction, SubmissionResult,
+    SubmitTransactionRequest, SyncStatus, TransactionIdentifier, TransactionLocation,
+    TransactionShape, TransactionStatus, TransactionWeight, UtxoQueryResult, WalletCoreApi,
+    WalletCoreError, WalletScanCursor,
 };
 use serde::Deserialize;
 use std::fmt;
@@ -61,14 +62,13 @@ pub const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// 30 s, so a slower answer will never arrive anyway.
 pub const REMOTE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// `/chain/scan/full` wire schema version this client understands. Any other
+/// `/chain/scan/scriptless/v1` wire schema version this client understands. Any other
 /// version on the wire is a terminal schema violation.
 pub const REMOTE_FULL_SCAN_SCHEMA_VERSION: u32 = 1;
 
-/// Server-side clamp of one `/chain/scan/full` page
-/// (`MAX_FULL_SCAN_RANGE = MAX_SCAN_RANGE = 1000` in `dom-rpc`). A response
+/// Server-side bound of one `/chain/scan/scriptless/v1` page. A response
 /// spanning more heights than this is a schema violation.
-pub const REMOTE_MAX_FULL_SCAN_RANGE: u64 = 1_000;
+pub const REMOTE_MAX_FULL_SCAN_RANGE: u64 = 64;
 
 /// Configuration errors raised while constructing a [`RemoteNodeSource`].
 #[derive(Debug, Error)]
@@ -227,16 +227,50 @@ impl RemoteNodeSource {
         Ok(HttpReply { status, body })
     }
 
-    /// Fetch and fully validate one `/chain/scan/full` page.
+    /// Fetch and fully validate one `/chain/scan/scriptless/v1` page.
     ///
     /// PRIVACY: the request carries only a height range — never an output or
     /// commitment selector — and the response carries all blocks of the range.
-    fn fetch_full_scan(&self, from: u64, to: u64) -> Result<ParsedFullScan, WalletCoreError> {
-        let reply = self.http_get(&format!("/chain/scan/full?from={from}&to={to}"), true)?;
+    fn fetch_full_scan(
+        &self,
+        from: u64,
+        to: u64,
+        expected_network_magic: Option<u32>,
+        expected_chain_id: Option<[u8; 32]>,
+        anchor: Option<BlockRef>,
+    ) -> Result<ParsedFullScan, WalletCoreError> {
+        if from > to || (from == 0) != anchor.is_none() {
+            return Err(WalletCoreError::InvalidScanRequest(
+                "scriptless scan requires a non-empty range and an anchor exactly when from > 0"
+                    .to_string(),
+            ));
+        }
+        let mut query = format!("/chain/scan/scriptless/v1?from={from}&to={to}");
+        if let (Some(network_magic), Some(chain_id)) = (expected_network_magic, expected_chain_id) {
+            query.push_str(&format!(
+                "&expected_network_magic={}&expected_chain_id={}",
+                network_magic,
+                hex::encode(chain_id)
+            ));
+        } else if expected_network_magic.is_some() || expected_chain_id.is_some() {
+            return Err(WalletCoreError::InvalidScanRequest(
+                "scriptless scan chain expectations must be supplied together".to_string(),
+            ));
+        }
+        if let Some(anchor) = anchor {
+            if anchor.height != from - 1 {
+                return Err(WalletCoreError::InvalidScanRequest(
+                    "scriptless scan anchor height is not from - 1".to_string(),
+                ));
+            }
+            query.push_str("&anchor_hash=");
+            query.push_str(&hex::encode(anchor.hash));
+        }
+        let reply = self.http_get(&query, true)?;
         if reply.status != 200 {
             return Err(map_full_scan_status(reply.status, &reply.body));
         }
-        parse_full_scan(from, to, &reply.body)
+        parse_full_scan(from, to, anchor, &reply.body)
     }
 
     /// Pin the session identity on first sight; afterwards require every
@@ -292,9 +326,9 @@ impl RemoteNodeSource {
 
 impl WalletCoreApi for RemoteNodeSource {
     fn chain_identity(&self) -> Result<ChainIdentity, WalletCoreError> {
-        // Cheap identity probe: `from > to` yields an empty page that still
-        // carries identity and tip — one try_lock on the node, no block loads.
-        let parsed = self.fetch_full_scan(1, 0)?;
+        // Height zero needs no prior anchor and returns the identity and the
+        // chain-locked snapshot tip in the same authenticated response.
+        let parsed = self.fetch_full_scan(0, 0, None, None, None)?;
         self.observe_identity(&parsed.identity)?;
         Ok(parsed.identity)
     }
@@ -312,20 +346,65 @@ impl WalletCoreApi for RemoteNodeSource {
                 "max_blocks must be greater than zero".to_string(),
             ));
         }
-        let start_height = match &request.start {
-            ScanStart::Height(height) => *height,
+        let (start_height, supplied_anchor) = match &request.start {
+            ScanStart::Height(height) => (*height, None),
             ScanStart::Cursor(cursor) => {
                 // Mirrors the embedded node: a stale anchor is CursorReorg.
                 self.validate_cursor(*cursor)?;
-                cursor.next_height
+                (
+                    cursor.next_height,
+                    Some(BlockRef {
+                        height: cursor.anchor_height,
+                        hash: cursor.anchor_hash,
+                    }),
+                )
             }
         };
-        let span_end = start_height.saturating_add(request.max_blocks - 1);
+        let stop_height = request.stop_height.unwrap_or(u64::MAX);
+        if start_height > stop_height {
+            let identity = self.session_identity_or_probe()?;
+            if request.network != identity.network || request.chain_id != identity.chain_id {
+                return Err(WalletCoreError::CursorChainMismatch(
+                    "request identity does not match remote node identity".to_string(),
+                ));
+            }
+            self.observe_identity(&identity)?;
+            return Ok(ScanResult {
+                tip: identity.current_tip,
+                blocks: Vec::new(),
+                continuation: None,
+            });
+        }
+        // The authoritative RPC rejects pages wider than 64 blocks. Keep the
+        // WalletCoreApi contract by paging large wallet requests instead of
+        // forwarding an invalid range.
+        let page_blocks = request.max_blocks.min(REMOTE_MAX_FULL_SCAN_RANGE);
+        let span_end = start_height.saturating_add(page_blocks - 1);
         let wire_to = match request.stop_height {
             Some(stop) => span_end.min(stop),
             None => span_end,
         };
-        let parsed = self.fetch_full_scan(start_height, wire_to)?;
+        let anchor = if start_height == 0 {
+            None
+        } else if let Some(anchor) = supplied_anchor {
+            Some(anchor)
+        } else {
+            Some(BlockRef {
+                height: start_height - 1,
+                hash: self.fetch_block_hash(start_height - 1)?.ok_or_else(|| {
+                    WalletCoreError::CanonicalGap(
+                        "remote scan start has no canonical predecessor".to_string(),
+                    )
+                })?,
+            })
+        };
+        let parsed = self.fetch_full_scan(
+            start_height,
+            wire_to,
+            Some(request.network.magic()),
+            Some(request.chain_id),
+            anchor,
+        )?;
         // Mirrors EmbeddedWalletCoreApi::validate_request_identity.
         if request.network != parsed.identity.network
             || request.chain_id != parsed.identity.chain_id
@@ -495,7 +574,8 @@ struct HttpReply {
     body: String,
 }
 
-/// Fully validated `/chain/scan/full` page mapped to the frozen Core types.
+/// Fully validated `/chain/scan/scriptless/v1` page mapped to frozen Core types.
+#[derive(Debug)]
 struct ParsedFullScan {
     identity: ChainIdentity,
     blocks: Vec<ScanBlock>,
@@ -523,7 +603,7 @@ fn map_transport_error(error: reqwest::Error) -> WalletCoreError {
     WalletCoreError::TemporaryFailure(format!("remote transport failure: {error}"))
 }
 
-/// Map a non-200 `/chain/scan/full` status per the pinned contract.
+/// Map a non-200 `/chain/scan/scriptless/v1` status per the pinned contract.
 fn map_full_scan_status(status: u16, body: &str) -> WalletCoreError {
     match status {
         503 => WalletCoreError::NodeNotReady(format!("remote chain busy: {}", body_snippet(body))),
@@ -532,8 +612,12 @@ fn map_full_scan_status(status: u16, body: &str) -> WalletCoreError {
             "remote unauthorized: check the configured bearer token".to_string(),
         ),
         404 => WalletCoreError::InternalFailure(
-            "remote node lacks /chain/scan/full: upgrade the remote node".to_string(),
+            "remote node lacks /chain/scan/scriptless/v1: upgrade the remote node".to_string(),
         ),
+        409 => WalletCoreError::CursorReorg(format!(
+            "remote scriptless scan anchor is no longer canonical: {}",
+            body_snippet(body)
+        )),
         400 => WalletCoreError::InvalidScanRequest(format!(
             "remote rejected scan query: {}",
             body_snippet(body)
@@ -597,16 +681,21 @@ fn same_immutable_identity(expected: &ChainIdentity, actual: &ChainIdentity) -> 
         && expected.coinbase_maturity == actual.coinbase_maturity
 }
 
-// ── Wire schema (reports/REMOTE_SCAN_V3_SCHEMA.md §3) ───────────────────────
+// ── Frozen F7 scriptless scanner wire schema ────────────────────────────────────
 
 #[derive(Deserialize)]
 struct WireFullScan {
-    schema_version: u32,
+    schema_version: u16,
+    status: String,
+    canonical: bool,
     identity: WireIdentity,
-    tip: WireTip,
-    from: u64,
-    to: u64,
+    requested_from: u64,
+    requested_to: u64,
+    served_from: u64,
+    served_to: Option<u64>,
+    request_anchor: Option<WireAnchor>,
     blocks: Vec<WireBlock>,
+    continuation: Option<WireContinuation>,
 }
 
 #[derive(Deserialize)]
@@ -618,12 +707,14 @@ struct WireIdentity {
     protocol_version: u32,
     range_proof_serialization_version: u8,
     coinbase_maturity: u64,
+    tip_height: u64,
+    tip_hash: String,
 }
 
 #[derive(Deserialize)]
-struct WireTip {
+struct WireAnchor {
     height: u64,
-    hash: String,
+    block_hash: String,
 }
 
 #[derive(Deserialize)]
@@ -631,15 +722,14 @@ struct WireBlock {
     height: u64,
     block_hash: String,
     previous_block_hash: String,
+    canonical_header_bytes: String,
     timestamp: u64,
     canonical_marker: String,
+    transactions: Vec<WireTransaction>,
     protocol_version: u32,
     range_proof_serialization_version: u8,
     total_fees_noms: u64,
     coinbase: WireCoinbase,
-    outputs: Vec<WireOutput>,
-    inputs: Vec<String>,
-    kernels: Vec<WireKernel>,
 }
 
 #[derive(Deserialize)]
@@ -647,6 +737,28 @@ struct WireCoinbase {
     output_commitment: String,
     explicit_value: u64,
     kernel_excess: String,
+    kernel_features: u8,
+    kernel_excess_signature: String,
+    offset: String,
+    output_proof_envelope: String,
+}
+
+#[derive(Deserialize)]
+struct WireTransaction {
+    block_height: u64,
+    block_hash: String,
+    transaction_index: u32,
+    tx_hash: String,
+    canonical_bytes: String,
+    inputs: Vec<WireInput>,
+    outputs: Vec<WireOutput>,
+    kernels: Vec<WireKernel>,
+    offset: String,
+}
+
+#[derive(Deserialize)]
+struct WireInput {
+    spent_commitment: String,
 }
 
 #[derive(Deserialize)]
@@ -656,6 +768,8 @@ struct WireOutput {
     recovery_capsule: String,
     recovery_version: u16,
     is_coinbase: bool,
+    block_height: u64,
+    block_hash: String,
     output_position: u32,
 }
 
@@ -665,6 +779,15 @@ struct WireKernel {
     features: u8,
     fee: u64,
     lock_height: u64,
+    excess_signature: String,
+}
+
+#[derive(Deserialize)]
+struct WireContinuation {
+    next_height: u64,
+    anchor: WireAnchor,
+    snapshot_tip_height: u64,
+    snapshot_tip_hash: String,
 }
 
 #[derive(Deserialize)]
@@ -673,14 +796,21 @@ struct WireBlockHeader {
     hash: String,
 }
 
-fn decode_hash32(text: &str, code: &str) -> Result<[u8; 32], WalletCoreError> {
+fn decode_fixed<const N: usize>(text: &str, code: &str) -> Result<[u8; N], WalletCoreError> {
     let bytes = hex::decode(text).map_err(|_| schema_violation(code))?;
     bytes.try_into().map_err(|_| schema_violation(code))
 }
 
+fn decode_hash32(text: &str, code: &str) -> Result<[u8; 32], WalletCoreError> {
+    decode_fixed(text, code)
+}
+
 fn decode_commitment33(text: &str, code: &str) -> Result<[u8; 33], WalletCoreError> {
-    let bytes = hex::decode(text).map_err(|_| schema_violation(code))?;
-    bytes.try_into().map_err(|_| schema_violation(code))
+    decode_fixed(text, code)
+}
+
+fn decode_hex_blob(text: &str, code: &str) -> Result<Vec<u8>, WalletCoreError> {
+    hex::decode(text).map_err(|_| schema_violation(code))
 }
 
 fn decode_network(name: &str) -> Result<CoreNetwork, WalletCoreError> {
@@ -698,11 +828,15 @@ fn decode_network(name: &str) -> Result<CoreNetwork, WalletCoreError> {
 fn parse_full_scan(
     requested_from: u64,
     requested_to: u64,
+    expected_anchor: Option<BlockRef>,
     body: &str,
 ) -> Result<ParsedFullScan, WalletCoreError> {
     let wire: WireFullScan =
         serde_json::from_str(body).map_err(|_| schema_violation("JSON_DECODE"))?;
-    if wire.schema_version != REMOTE_FULL_SCAN_SCHEMA_VERSION {
+    if u32::from(wire.schema_version) != REMOTE_FULL_SCAN_SCHEMA_VERSION
+        || wire.status != "ok"
+        || !wire.canonical
+    {
         return Err(schema_violation("SCHEMA_VERSION"));
     }
 
@@ -716,48 +850,75 @@ fn parse_full_scan(
         range_proof_serialization_version: wire.identity.range_proof_serialization_version,
         coinbase_maturity: wire.identity.coinbase_maturity,
         current_tip: BlockRef {
-            height: wire.tip.height,
-            hash: decode_hash32(&wire.tip.hash, "TIP_HASH_HEX")?,
+            height: wire.identity.tip_height,
+            hash: decode_hash32(&wire.identity.tip_hash, "TIP_HASH_HEX")?,
         },
     };
 
-    if wire.from != requested_from {
-        return Err(schema_violation("FROM_ECHO"));
+    if wire.requested_from != requested_from
+        || wire.requested_to != requested_to
+        || wire.served_from != requested_from
+    {
+        return Err(schema_violation("REQUEST_ECHO"));
     }
-    // The server only ever clamps the range down, never widens it.
-    if wire.to > requested_to {
-        return Err(schema_violation("TO_ECHO"));
+    let request_anchor = wire
+        .request_anchor
+        .map(|anchor| {
+            Ok(BlockRef {
+                height: anchor.height,
+                hash: decode_hash32(&anchor.block_hash, "REQUEST_ANCHOR_HASH")?,
+            })
+        })
+        .transpose()?;
+    if request_anchor != expected_anchor {
+        return Err(schema_violation("REQUEST_ANCHOR"));
     }
-
-    if wire.to >= wire.from {
-        if wire.to > identity.current_tip.height {
-            return Err(schema_violation("TO_BEYOND_TIP"));
-        }
-        let span = wire.to - wire.from + 1;
-        if span > REMOTE_MAX_FULL_SCAN_RANGE {
-            return Err(schema_violation("RANGE_TOO_WIDE"));
-        }
-        let pre_genesis_empty = wire.blocks.is_empty()
-            && wire.from == 0
-            && identity.current_tip.height == 0
-            && identity.current_tip.hash == [0u8; 32];
-        if !pre_genesis_empty && wire.blocks.len() as u64 != span {
-            return Err(schema_violation("BLOCK_COUNT"));
-        }
-    } else if !wire.blocks.is_empty() {
-        return Err(schema_violation("BLOCKS_OUTSIDE_RANGE"));
+    if wire.blocks.len() as u64 > REMOTE_MAX_FULL_SCAN_RANGE {
+        return Err(schema_violation("RANGE_TOO_WIDE"));
+    }
+    let served_to = wire.blocks.last().map(|block| block.height);
+    if wire.served_to != served_to
+        || served_to
+            .is_some_and(|height| height > requested_to || height > identity.current_tip.height)
+    {
+        return Err(schema_violation("SERVED_RANGE"));
     }
 
     let mut blocks = Vec::with_capacity(wire.blocks.len());
-    let mut previous_hash: Option<[u8; 32]> = None;
+    let mut previous_hash = expected_anchor.map(|anchor| anchor.hash);
     for (index, block) in wire.blocks.into_iter().enumerate() {
-        let expected_height = wire.from.saturating_add(index as u64);
+        let expected_height = requested_from
+            .checked_add(index as u64)
+            .ok_or_else(|| schema_violation("HEIGHT_OVERFLOW"))?;
         if block.height != expected_height {
             return Err(schema_violation("NONCONSECUTIVE_HEIGHT"));
         }
         let block_hash = decode_hash32(&block.block_hash, "BLOCK_HASH_HEX")?;
         let previous_block_hash = decode_hash32(&block.previous_block_hash, "PREVIOUS_HASH_HEX")?;
         let canonical_marker = decode_hash32(&block.canonical_marker, "CANONICAL_MARKER_HEX")?;
+        let canonical_header_bytes =
+            decode_hex_blob(&block.canonical_header_bytes, "CANONICAL_HEADER_HEX")?;
+        let header = BlockHeader::from_bytes(&canonical_header_bytes)
+            .map_err(|_| schema_violation("CANONICAL_HEADER_DECODE"))?;
+        if header
+            .to_bytes()
+            .map_err(|_| schema_violation("CANONICAL_HEADER_REENCODE"))?
+            != canonical_header_bytes
+            || *dom_chain::canonical_header_identifier(
+                identity.network_magic,
+                &canonical_header_bytes,
+            )
+            .map_err(|_| schema_violation("CANONICAL_HEADER_IDENTIFIER"))?
+            .as_bytes()
+                != block_hash
+            || header.height.0 != block.height
+            || *header.prev_hash.as_bytes() != previous_block_hash
+            || header.timestamp.0 != block.timestamp
+            || header.version != block.protocol_version
+            || canonical_marker != block_hash
+        {
+            return Err(schema_violation("CANONICAL_HEADER"));
+        }
         if let Some(expected_previous) = previous_hash {
             if previous_block_hash != expected_previous {
                 return Err(schema_violation("PREVIOUS_HASH_CHAIN"));
@@ -765,6 +926,12 @@ fn parse_full_scan(
         }
         previous_hash = Some(block_hash);
 
+        let coinbase_proof_envelope = decode_hex_blob(
+            &block.coinbase.output_proof_envelope,
+            "COINBASE_PROOF_ENVELOPE_HEX",
+        )?;
+        let (coinbase_range_proof, coinbase_recovery_capsule, coinbase_recovery_version) =
+            split_proof_envelope(&coinbase_proof_envelope)?;
         let coinbase = CoinbaseScanMetadata {
             output_commitment: decode_commitment33(
                 &block.coinbase.output_commitment,
@@ -775,61 +942,161 @@ fn parse_full_scan(
                 &block.coinbase.kernel_excess,
                 "COINBASE_EXCESS_HEX",
             )?,
+            kernel_features: block.coinbase.kernel_features,
+            kernel_excess_signature: decode_fixed(
+                &block.coinbase.kernel_excess_signature,
+                "COINBASE_SIGNATURE_HEX",
+            )?,
+            offset: decode_fixed(&block.coinbase.offset, "COINBASE_OFFSET_HEX")?,
+            output_proof_envelope: coinbase_proof_envelope,
         };
 
-        // With no filters the projection always leads with the coinbase
-        // output at position 0 and contiguous positions afterwards.
-        if block.outputs.is_empty() {
-            return Err(schema_violation("COINBASE_PROJECTION"));
-        }
-        let mut outputs = Vec::with_capacity(block.outputs.len());
-        for (position, output) in block.outputs.into_iter().enumerate() {
-            if output.output_position != position as u32 {
-                return Err(schema_violation("OUTPUT_POSITION"));
-            }
-            let commitment = decode_commitment33(&output.commitment, "OUTPUT_COMMITMENT_HEX")?;
-            let is_first = position == 0;
-            if output.is_coinbase != is_first
-                || (is_first && commitment != coinbase.output_commitment)
+        let mut outputs = vec![ScanOutput {
+            commitment: coinbase.output_commitment,
+            range_proof: coinbase_range_proof,
+            recovery_capsule: coinbase_recovery_capsule,
+            recovery_version: coinbase_recovery_version,
+            is_coinbase: true,
+            block_height: block.height,
+            block_hash,
+            output_position: 0,
+        }];
+        let mut inputs = Vec::new();
+        let mut kernels = vec![ScanKernel {
+            excess: coinbase.kernel_excess,
+            features: coinbase.kernel_features,
+            fee: 0,
+            lock_height: 0,
+            excess_signature: coinbase.kernel_excess_signature,
+        }];
+        let mut transactions = Vec::with_capacity(block.transactions.len());
+        let mut next_output_position = 1_u32;
+        for (transaction_index, transaction) in block.transactions.into_iter().enumerate() {
+            let transaction_first_output_position = next_output_position;
+            if transaction.block_height != block.height
+                || decode_hash32(&transaction.block_hash, "TX_BLOCK_HASH_HEX")? != block_hash
+                || transaction.transaction_index != transaction_index as u32
             {
-                return Err(schema_violation("COINBASE_PROJECTION"));
+                return Err(schema_violation("TRANSACTION_LOCATION"));
             }
-            let range_proof = BASE64
-                .decode(output.range_proof.as_bytes())
-                .map_err(|_| schema_violation("RANGE_PROOF_BASE64"))?;
-            let recovery_capsule = BASE64
-                .decode(output.recovery_capsule.as_bytes())
-                .map_err(|_| schema_violation("CAPSULE_BASE64"))?;
-            if recovery_capsule.is_empty() != (output.recovery_version == 0) {
-                return Err(schema_violation("CAPSULE_VERSION"));
+            let canonical_bytes =
+                decode_hex_blob(&transaction.canonical_bytes, "TX_CANONICAL_BYTES_HEX")?;
+            if canonical_bytes.is_empty() {
+                return Err(schema_violation("TX_CANONICAL_BYTES"));
             }
-            outputs.push(ScanOutput {
-                commitment,
-                range_proof,
-                recovery_capsule,
-                recovery_version: output.recovery_version,
-                is_coinbase: output.is_coinbase,
-                // Deliberately omitted from the wire: reconstructed from the
-                // enclosing block.
-                block_height: block.height,
-                block_hash,
-                output_position: output.output_position,
-            });
-        }
-
-        let mut inputs = Vec::with_capacity(block.inputs.len());
-        for input in &block.inputs {
-            inputs.push(ScanInput {
-                spent_commitment: decode_commitment33(input, "INPUT_COMMITMENT_HEX")?,
-            });
-        }
-        let mut kernels = Vec::with_capacity(block.kernels.len());
-        for kernel in block.kernels {
-            kernels.push(ScanKernel {
-                excess: decode_commitment33(&kernel.excess, "KERNEL_EXCESS_HEX")?,
-                features: kernel.features,
-                fee: kernel.fee,
-                lock_height: kernel.lock_height,
+            let tx_hash = decode_hash32(&transaction.tx_hash, "TX_HASH_HEX")?;
+            let parsed_tx = Transaction::from_bytes(&canonical_bytes)
+                .map_err(|_| schema_violation("TX_CANONICAL_DECODE"))?;
+            if parsed_tx
+                .to_bytes()
+                .map_err(|_| schema_violation("TX_CANONICAL_REENCODE"))?
+                != canonical_bytes
+                || *dom_crypto::blake2b_256(&canonical_bytes).as_bytes() != tx_hash
+            {
+                return Err(schema_violation("TX_HASH_BINDING"));
+            }
+            let tx_inputs = transaction
+                .inputs
+                .into_iter()
+                .map(|input| {
+                    Ok(ScanInput {
+                        spent_commitment: decode_commitment33(
+                            &input.spent_commitment,
+                            "INPUT_COMMITMENT_HEX",
+                        )?,
+                    })
+                })
+                .collect::<Result<Vec<_>, WalletCoreError>>()?;
+            let mut tx_outputs = Vec::with_capacity(transaction.outputs.len());
+            for output in transaction.outputs {
+                if output.block_height != block.height
+                    || decode_hash32(&output.block_hash, "OUTPUT_BLOCK_HASH_HEX")? != block_hash
+                    || output.output_position != next_output_position
+                    || output.is_coinbase
+                {
+                    return Err(schema_violation("OUTPUT_LOCATION"));
+                }
+                let parsed = parse_output(output)?;
+                outputs.push(parsed.clone());
+                tx_outputs.push(parsed);
+                next_output_position = next_output_position
+                    .checked_add(1)
+                    .ok_or_else(|| schema_violation("OUTPUT_POSITION_OVERFLOW"))?;
+            }
+            let tx_kernels = transaction
+                .kernels
+                .into_iter()
+                .map(parse_kernel)
+                .collect::<Result<Vec<_>, WalletCoreError>>()?;
+            let canonical_inputs = parsed_tx
+                .inputs
+                .iter()
+                .map(|input| ScanInput {
+                    spent_commitment: *input.commitment.as_bytes(),
+                })
+                .collect::<Vec<_>>();
+            let canonical_outputs = parsed_tx
+                .outputs
+                .iter()
+                .enumerate()
+                .map(|(position, output)| {
+                    let capsule = output
+                        .recovery_capsule()
+                        .map_err(|_| schema_violation("TX_OUTPUT_ENVELOPE"))?;
+                    let position = u32::try_from(position)
+                        .map_err(|_| schema_violation("TX_OUTPUT_POSITION"))?;
+                    Ok(ScanOutput {
+                        commitment: *output.commitment.as_bytes(),
+                        range_proof: output
+                            .range_proof_bytes()
+                            .map_err(|_| schema_violation("TX_RANGE_PROOF"))?
+                            .to_vec(),
+                        recovery_capsule: capsule
+                            .as_ref()
+                            .map(|value| value.as_bytes().to_vec())
+                            .unwrap_or_default(),
+                        recovery_version: capsule.as_ref().map_or(0, |value| value.version()),
+                        is_coinbase: false,
+                        block_height: block.height,
+                        block_hash,
+                        output_position: transaction_first_output_position
+                            .checked_add(position)
+                            .ok_or_else(|| schema_violation("TX_OUTPUT_POSITION"))?,
+                    })
+                })
+                .collect::<Result<Vec<_>, WalletCoreError>>()?;
+            let canonical_kernels = parsed_tx
+                .kernels
+                .iter()
+                .map(|kernel| ScanKernel {
+                    excess: *kernel.excess.as_bytes(),
+                    features: kernel.features,
+                    fee: kernel.fee.noms(),
+                    lock_height: kernel.lock_height,
+                    excess_signature: kernel.excess_signature,
+                })
+                .collect::<Vec<_>>();
+            if canonical_inputs != tx_inputs
+                || canonical_outputs != tx_outputs
+                || canonical_kernels != tx_kernels
+                || parsed_tx.offset != decode_fixed(&transaction.offset, "TX_OFFSET_HEX")?
+            {
+                return Err(schema_violation("TX_PROJECTION_MISMATCH"));
+            }
+            inputs.extend(tx_inputs.iter().copied());
+            kernels.extend(tx_kernels.iter().cloned());
+            transactions.push(ScanTransaction {
+                location: TransactionLocation {
+                    block_height: block.height,
+                    block_hash,
+                    transaction_index: transaction_index as u32,
+                },
+                tx_hash,
+                canonical_bytes,
+                inputs: tx_inputs,
+                outputs: tx_outputs,
+                kernels: tx_kernels,
+                offset: parsed_tx.offset,
             });
         }
 
@@ -837,11 +1104,13 @@ fn parse_full_scan(
             height: block.height,
             block_hash,
             previous_block_hash,
+            canonical_header_bytes,
             timestamp: block.timestamp,
             canonical_marker,
             outputs,
             inputs,
             kernels,
+            transactions,
             coinbase,
             total_fees_noms: block.total_fees_noms,
             protocol_version: block.protocol_version,
@@ -849,7 +1118,88 @@ fn parse_full_scan(
         });
     }
 
+    validate_continuation(wire.continuation, &identity, blocks.last())?;
+
     Ok(ParsedFullScan { identity, blocks })
+}
+
+fn parse_output(output: WireOutput) -> Result<ScanOutput, WalletCoreError> {
+    let range_proof = decode_hex_blob(&output.range_proof, "RANGE_PROOF_HEX")?;
+    if range_proof.len() != dom_crypto::RANGE_PROOF_SIZE {
+        return Err(schema_violation("RANGE_PROOF_LENGTH"));
+    }
+    let recovery_capsule = decode_hex_blob(&output.recovery_capsule, "CAPSULE_HEX")?;
+    if recovery_capsule.is_empty() != (output.recovery_version == 0) {
+        return Err(schema_violation("CAPSULE_VERSION"));
+    }
+    if !recovery_capsule.is_empty()
+        && dom_crypto::recovery::RecoveryCapsule::from_bytes(&recovery_capsule)
+            .map_err(|_| schema_violation("CAPSULE_CANONICAL"))?
+            .version()
+            != output.recovery_version
+    {
+        return Err(schema_violation("CAPSULE_VERSION"));
+    }
+    Ok(ScanOutput {
+        commitment: decode_commitment33(&output.commitment, "OUTPUT_COMMITMENT_HEX")?,
+        range_proof,
+        recovery_capsule,
+        recovery_version: output.recovery_version,
+        is_coinbase: output.is_coinbase,
+        block_height: output.block_height,
+        block_hash: decode_hash32(&output.block_hash, "OUTPUT_BLOCK_HASH_HEX")?,
+        output_position: output.output_position,
+    })
+}
+
+fn parse_kernel(kernel: WireKernel) -> Result<ScanKernel, WalletCoreError> {
+    Ok(ScanKernel {
+        excess: decode_commitment33(&kernel.excess, "KERNEL_EXCESS_HEX")?,
+        features: kernel.features,
+        fee: kernel.fee,
+        lock_height: kernel.lock_height,
+        excess_signature: decode_fixed(&kernel.excess_signature, "KERNEL_SIGNATURE_HEX")?,
+    })
+}
+
+fn split_proof_envelope(envelope: &[u8]) -> Result<(Vec<u8>, Vec<u8>, u16), WalletCoreError> {
+    let proof_size = dom_crypto::RANGE_PROOF_SIZE;
+    match envelope.len() {
+        length if length == proof_size => Ok((envelope.to_vec(), Vec::new(), 0)),
+        length if length == proof_size + dom_crypto::recovery::RECOVERY_CAPSULE_SIZE => {
+            let capsule =
+                dom_crypto::recovery::RecoveryCapsule::from_bytes(&envelope[proof_size..])
+                    .map_err(|_| schema_violation("COINBASE_CAPSULE_CANONICAL"))?;
+            Ok((
+                envelope[..proof_size].to_vec(),
+                capsule.as_bytes().to_vec(),
+                capsule.version(),
+            ))
+        }
+        _ => Err(schema_violation("COINBASE_PROOF_ENVELOPE_LENGTH")),
+    }
+}
+
+fn validate_continuation(
+    continuation: Option<WireContinuation>,
+    identity: &ChainIdentity,
+    last: Option<&ScanBlock>,
+) -> Result<(), WalletCoreError> {
+    let Some(continuation) = continuation else {
+        return Ok(());
+    };
+    let last = last.ok_or_else(|| schema_violation("CONTINUATION_WITHOUT_BLOCK"))?;
+    if continuation.next_height != last.height.saturating_add(1)
+        || continuation.anchor.height != last.height
+        || decode_hash32(&continuation.anchor.block_hash, "CONTINUATION_ANCHOR_HASH")?
+            != last.block_hash
+        || continuation.snapshot_tip_height != identity.current_tip.height
+        || decode_hash32(&continuation.snapshot_tip_hash, "CONTINUATION_TIP_HASH")?
+            != identity.current_tip.hash
+    {
+        return Err(schema_violation("CONTINUATION"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1017,809 +1367,1546 @@ mod tests {
 
     // ── Wire fixtures ───────────────────────────────────────────────────
 
-    fn h32(byte: u8) -> String {
-        hex::encode([byte; 32])
-    }
+    mod scriptless_wire_tests {
+        use super::*;
+        use dom_consensus::{Block, TransactionInput, TransactionKernel, TransactionOutput};
+        use std::sync::OnceLock;
 
-    fn h33(byte: u8) -> String {
-        hex::encode([byte; 33])
-    }
-
-    fn b64_of(bytes: &[u8]) -> String {
-        BASE64.encode(bytes)
-    }
-
-    fn identity_json() -> Value {
-        json!({
-            "network": "regtest",
-            "network_magic": CoreNetwork::Regtest.magic(),
-            "chain_id": h32(0x11),
-            "genesis_hash": h32(0x22),
-            "protocol_version": 1,
-            "range_proof_serialization_version": 1,
-            "coinbase_maturity": 1440,
-        })
-    }
-
-    fn block_json(height: u64, hash_byte: u8, previous: &str) -> Value {
-        let coinbase_commitment = h33(0xA0 ^ hash_byte);
-        json!({
-            "height": height,
-            "block_hash": h32(hash_byte),
-            "previous_block_hash": previous,
-            "timestamp": 1_753_660_800u64 + height,
-            "canonical_marker": h32(hash_byte),
-            "protocol_version": 1,
-            "range_proof_serialization_version": 1,
-            "total_fees_noms": 0,
-            "coinbase": {
-                "output_commitment": coinbase_commitment,
-                "explicit_value": 5_000_000_000u64,
-                "kernel_excess": h33(0xB0 ^ hash_byte),
-            },
-            "outputs": [{
-                "commitment": coinbase_commitment,
-                "range_proof": b64_of(&[7u8; 40]),
-                "recovery_capsule": b64_of(&[9u8; 16]),
-                "recovery_version": 1,
-                "is_coinbase": true,
-                "output_position": 0,
-            }],
-            "inputs": [h33(0xC0 ^ hash_byte)],
-            "kernels": [{
-                "excess": h33(0xB0 ^ hash_byte),
-                "features": 0,
-                "fee": 0,
-                "lock_height": 0,
-            }],
-        })
-    }
-
-    fn full_scan_json(
-        from: u64,
-        to: u64,
-        tip_height: u64,
-        tip_hash_byte: u8,
-        blocks: Vec<Value>,
-    ) -> Value {
-        json!({
-            "schema_version": 1,
-            "identity": identity_json(),
-            "tip": { "height": tip_height, "hash": h32(tip_hash_byte) },
-            "from": from,
-            "to": to,
-            "blocks": blocks,
-        })
-    }
-
-    fn identity_probe_response(tip_height: u64, tip_hash_byte: u8) -> CannedResponse {
-        CannedResponse::json(
-            200,
-            full_scan_json(1, 0, tip_height, tip_hash_byte, Vec::new()),
-        )
-    }
-
-    fn source_for(server: &MockServer) -> RemoteNodeSource {
-        RemoteNodeSource::new(&server.base_url(), Some(TOKEN)).expect("remote source")
-    }
-
-    fn scan_request(start_height: u64, max_blocks: u64) -> ScanRequest {
-        ScanRequest {
-            network: CoreNetwork::Regtest,
-            chain_id: [0x11; 32],
-            start: ScanStart::Height(start_height),
-            max_blocks,
-            stop_height: None,
-            commitment_filters: Vec::new(),
+        fn source_for(server: &MockServer) -> RemoteNodeSource {
+            RemoteNodeSource::new(&server.base_url(), Some(TOKEN)).expect("remote source")
         }
-    }
 
-    /// The in-memory projection an embedded node produces for the block that
-    /// [`block_json`] describes on the wire. Built structurally by hand — NOT
-    /// by parsing the same JSON — so the comparison actually proves the wire
-    /// format lands on the embedded shape instead of comparing the parser to
-    /// itself.
-    fn embedded_projection(height: u64, hash_byte: u8, previous_byte: u8) -> ScanBlock {
-        ScanBlock {
-            height,
-            block_hash: [hash_byte; 32],
-            previous_block_hash: [previous_byte; 32],
-            timestamp: 1_753_660_800 + height,
-            canonical_marker: [hash_byte; 32],
-            outputs: vec![ScanOutput {
-                commitment: [0xA0 ^ hash_byte; 33],
-                range_proof: vec![7u8; 40],
-                recovery_capsule: vec![9u8; 16],
-                recovery_version: 1,
-                is_coinbase: true,
-                block_height: height,
-                block_hash: [hash_byte; 32],
-                output_position: 0,
-            }],
-            inputs: vec![ScanInput {
-                spent_commitment: [0xC0 ^ hash_byte; 33],
-            }],
-            kernels: vec![ScanKernel {
-                excess: [0xB0 ^ hash_byte; 33],
-                features: 0,
+        fn genesis() -> &'static Block {
+            static GENESIS: OnceLock<Block> = OnceLock::new();
+            GENESIS.get_or_init(|| {
+                dom_chain::build_canonical_genesis(CoreNetwork::Regtest.magic(), &[8; 32])
+                    .expect("regtest genesis")
+                    .block
+                    .expect("regtest canonical block")
+            })
+        }
+
+        fn chain_identity(tip: BlockRef) -> ChainIdentity {
+            let genesis_hash = dom_chain::canonical_header_identifier(
+                CoreNetwork::Regtest.magic(),
+                &genesis().header.to_bytes().expect("genesis header"),
+            )
+            .expect("genesis id");
+            ChainIdentity {
+                network: CoreNetwork::Regtest,
+                network_magic: CoreNetwork::Regtest.magic(),
+                chain_id: *dom_consensus::derive_chain_id(
+                    CoreNetwork::Regtest.magic(),
+                    &genesis_hash,
+                )
+                .as_bytes(),
+                genesis_hash: *genesis_hash.as_bytes(),
+                protocol_version: 1,
+                range_proof_serialization_version: dom_crypto::RANGE_PROOF_SERIALIZATION_VERSION,
+                coinbase_maturity: 1440,
+                current_tip: tip,
+            }
+        }
+
+        fn next_block(previous: &ScanBlock, marker: u8) -> Block {
+            let mut block = genesis().clone();
+            let height = previous.height + 1;
+            let mut offset = [0u8; 32];
+            offset[31] = marker.max(1);
+            let transaction = Transaction {
+                inputs: vec![TransactionInput {
+                    commitment: block.coinbase.output.commitment.clone(),
+                }],
+                outputs: vec![TransactionOutput {
+                    commitment: block.coinbase.output.commitment.clone(),
+                    proof: block.coinbase.output.proof.clone(),
+                }],
+                kernels: vec![TransactionKernel {
+                    features: dom_core::KERNEL_FEAT_PLAIN,
+                    fee: dom_core::Amount::from_noms(height).expect("fee"),
+                    lock_height: 0,
+                    excess: block.coinbase.kernel.excess.clone(),
+                    excess_signature: [marker; 65],
+                }],
+                offset,
+            };
+            block.header.version =
+                dom_core::required_block_version_for_network(CoreNetwork::Regtest.magic(), height);
+            block.header.height = dom_core::BlockHeight(height);
+            block.header.prev_hash = dom_core::Hash256::from_bytes(previous.block_hash);
+            block.header.timestamp = dom_core::Timestamp(previous.timestamp + 60);
+            block.header.total_kernel_offset = offset;
+            block.header.pow.nonce = u64::from(marker);
+            block.transactions = vec![transaction];
+            let (output_root, kernel_root, rangeproof_root) =
+                dom_consensus::compute_block_pmmr_roots(
+                    dom_core::BlockHeight(height),
+                    &block.coinbase,
+                    &block.transactions,
+                )
+                .expect("body roots");
+            block.header.output_root = output_root;
+            block.header.kernel_root = kernel_root;
+            block.header.rangeproof_root = rangeproof_root;
+            block
+        }
+
+        fn project_output(
+            output: &TransactionOutput,
+            is_coinbase: bool,
+            block_height: u64,
+            block_hash: [u8; 32],
+            output_position: u32,
+        ) -> ScanOutput {
+            let capsule = output.recovery_capsule().expect("output envelope");
+            ScanOutput {
+                commitment: *output.commitment.as_bytes(),
+                range_proof: output.range_proof_bytes().expect("range proof").to_vec(),
+                recovery_capsule: capsule
+                    .as_ref()
+                    .map(|value| value.as_bytes().to_vec())
+                    .unwrap_or_default(),
+                recovery_version: capsule.as_ref().map_or(0, |value| value.version()),
+                is_coinbase,
+                block_height,
+                block_hash,
+                output_position,
+            }
+        }
+
+        fn project_block(block: &Block) -> ScanBlock {
+            let canonical_header_bytes = block.header.to_bytes().expect("header bytes");
+            let block_hash = *dom_chain::canonical_header_identifier(
+                CoreNetwork::Regtest.magic(),
+                &canonical_header_bytes,
+            )
+            .expect("header id")
+            .as_bytes();
+            let coinbase_output = project_output(
+                &block.coinbase.output,
+                true,
+                block.header.height.0,
+                block_hash,
+                0,
+            );
+            let coinbase_kernel = ScanKernel {
+                excess: *block.coinbase.kernel.excess.as_bytes(),
+                features: block.coinbase.kernel.features,
                 fee: 0,
                 lock_height: 0,
-            }],
-            coinbase: CoinbaseScanMetadata {
-                output_commitment: [0xA0 ^ hash_byte; 33],
-                explicit_value: 5_000_000_000,
-                kernel_excess: [0xB0 ^ hash_byte; 33],
-            },
-            total_fees_noms: 0,
-            protocol_version: 1,
-            range_proof_serialization_version: 1,
+                excess_signature: block.coinbase.kernel.excess_signature,
+            };
+            let mut outputs = vec![coinbase_output];
+            let mut inputs = Vec::new();
+            let mut kernels = vec![coinbase_kernel];
+            let mut transactions = Vec::new();
+            let mut output_position = 1_u32;
+            for (transaction_index, transaction) in block.transactions.iter().enumerate() {
+                let tx_inputs = transaction
+                    .inputs
+                    .iter()
+                    .map(|input| ScanInput {
+                        spent_commitment: *input.commitment.as_bytes(),
+                    })
+                    .collect::<Vec<_>>();
+                let tx_outputs = transaction
+                    .outputs
+                    .iter()
+                    .map(|output| {
+                        let projected = project_output(
+                            output,
+                            false,
+                            block.header.height.0,
+                            block_hash,
+                            output_position,
+                        );
+                        output_position += 1;
+                        projected
+                    })
+                    .collect::<Vec<_>>();
+                let tx_kernels = transaction
+                    .kernels
+                    .iter()
+                    .map(|kernel| ScanKernel {
+                        excess: *kernel.excess.as_bytes(),
+                        features: kernel.features,
+                        fee: kernel.fee.noms(),
+                        lock_height: kernel.lock_height,
+                        excess_signature: kernel.excess_signature,
+                    })
+                    .collect::<Vec<_>>();
+                let canonical_bytes = transaction.to_bytes().expect("transaction bytes");
+                inputs.extend(tx_inputs.iter().copied());
+                outputs.extend(tx_outputs.iter().cloned());
+                kernels.extend(tx_kernels.iter().cloned());
+                transactions.push(ScanTransaction {
+                    location: TransactionLocation {
+                        block_height: block.header.height.0,
+                        block_hash,
+                        transaction_index: transaction_index as u32,
+                    },
+                    tx_hash: *dom_crypto::blake2b_256(&canonical_bytes).as_bytes(),
+                    canonical_bytes,
+                    inputs: tx_inputs,
+                    outputs: tx_outputs,
+                    kernels: tx_kernels,
+                    offset: transaction.offset,
+                });
+            }
+            ScanBlock {
+                height: block.header.height.0,
+                block_hash,
+                previous_block_hash: *block.header.prev_hash.as_bytes(),
+                canonical_header_bytes,
+                timestamp: block.header.timestamp.0,
+                canonical_marker: block_hash,
+                outputs,
+                inputs,
+                kernels,
+                transactions,
+                coinbase: CoinbaseScanMetadata {
+                    output_commitment: *block.coinbase.output.commitment.as_bytes(),
+                    explicit_value: block.coinbase.kernel.explicit_value,
+                    kernel_excess: *block.coinbase.kernel.excess.as_bytes(),
+                    kernel_features: block.coinbase.kernel.features,
+                    kernel_excess_signature: block.coinbase.kernel.excess_signature,
+                    offset: block.coinbase.offset,
+                    output_proof_envelope: block.coinbase.output.proof.clone(),
+                },
+                total_fees_noms: block.total_fees().expect("fees"),
+                protocol_version: block.header.version,
+                range_proof_serialization_version: dom_crypto::RANGE_PROOF_SERIALIZATION_VERSION,
+            }
+        }
+
+        fn output_json(output: &ScanOutput) -> Value {
+            json!({
+                "commitment": hex::encode(output.commitment),
+                "range_proof": hex::encode(&output.range_proof),
+                "recovery_capsule": hex::encode(&output.recovery_capsule),
+                "recovery_version": output.recovery_version,
+                "is_coinbase": output.is_coinbase,
+                "block_height": output.block_height,
+                "block_hash": hex::encode(output.block_hash),
+                "output_position": output.output_position,
+            })
+        }
+
+        fn kernel_json(kernel: &ScanKernel) -> Value {
+            json!({
+                "excess": hex::encode(kernel.excess),
+                "features": kernel.features,
+                "fee": kernel.fee,
+                "lock_height": kernel.lock_height,
+                "excess_signature": hex::encode(kernel.excess_signature),
+            })
+        }
+
+        fn block_json(block: &ScanBlock) -> Value {
+            json!({
+                "height": block.height,
+                "block_hash": hex::encode(block.block_hash),
+                "previous_block_hash": hex::encode(block.previous_block_hash),
+                "canonical_header_bytes": hex::encode(&block.canonical_header_bytes),
+                "timestamp": block.timestamp,
+                "canonical_marker": hex::encode(block.canonical_marker),
+                "transactions": block.transactions.iter().map(|transaction| json!({
+                    "block_height": transaction.location.block_height,
+                    "block_hash": hex::encode(transaction.location.block_hash),
+                    "transaction_index": transaction.location.transaction_index,
+                    "tx_hash": hex::encode(transaction.tx_hash),
+                    "canonical_bytes": hex::encode(&transaction.canonical_bytes),
+                    "inputs": transaction.inputs.iter().map(|input| json!({
+                        "spent_commitment": hex::encode(input.spent_commitment),
+                    })).collect::<Vec<_>>(),
+                    "outputs": transaction.outputs.iter().map(output_json).collect::<Vec<_>>(),
+                    "kernels": transaction.kernels.iter().map(kernel_json).collect::<Vec<_>>(),
+                    "offset": hex::encode(transaction.offset),
+                })).collect::<Vec<_>>(),
+                "coinbase": {
+                    "output_commitment": hex::encode(block.coinbase.output_commitment),
+                    "explicit_value": block.coinbase.explicit_value,
+                    "kernel_excess": hex::encode(block.coinbase.kernel_excess),
+                    "kernel_features": block.coinbase.kernel_features,
+                    "kernel_excess_signature": hex::encode(block.coinbase.kernel_excess_signature),
+                    "offset": hex::encode(block.coinbase.offset),
+                    "output_proof_envelope": hex::encode(&block.coinbase.output_proof_envelope),
+                },
+                "total_fees_noms": block.total_fees_noms,
+                "protocol_version": block.protocol_version,
+                "range_proof_serialization_version": block.range_proof_serialization_version,
+            })
+        }
+
+        fn response_json(
+            requested_from: u64,
+            requested_to: u64,
+            blocks: &[ScanBlock],
+            identity: &ChainIdentity,
+            request_anchor: Option<BlockRef>,
+        ) -> Value {
+            let served_to = blocks.last().map(|block| block.height);
+            let continuation = blocks.last().and_then(|last| {
+                (last.height < identity.current_tip.height).then(|| {
+                    json!({
+                        "next_height": last.height + 1,
+                        "anchor": {
+                            "height": last.height,
+                            "block_hash": hex::encode(last.block_hash),
+                        },
+                        "snapshot_tip_height": identity.current_tip.height,
+                        "snapshot_tip_hash": hex::encode(identity.current_tip.hash),
+                    })
+                })
+            });
+            json!({
+                "schema_version": 1,
+                "status": "ok",
+                "canonical": true,
+                "identity": {
+                    "network": "regtest",
+                    "network_magic": identity.network_magic,
+                    "chain_id": hex::encode(identity.chain_id),
+                    "genesis_hash": hex::encode(identity.genesis_hash),
+                    "protocol_version": identity.protocol_version,
+                    "range_proof_serialization_version": identity.range_proof_serialization_version,
+                    "coinbase_maturity": identity.coinbase_maturity,
+                    "tip_height": identity.current_tip.height,
+                    "tip_hash": hex::encode(identity.current_tip.hash),
+                },
+                "requested_from": requested_from,
+                "requested_to": requested_to,
+                "served_from": requested_from,
+                "served_to": served_to,
+                "request_anchor": request_anchor.map(|anchor| json!({
+                    "height": anchor.height,
+                    "block_hash": hex::encode(anchor.hash),
+                })),
+                "blocks": blocks.iter().map(block_json).collect::<Vec<_>>(),
+                "continuation": continuation,
+            })
+        }
+
+        fn request(start: ScanStart, max_blocks: u64, identity: &ChainIdentity) -> ScanRequest {
+            ScanRequest {
+                network: identity.network,
+                chain_id: identity.chain_id,
+                start,
+                max_blocks,
+                stop_height: None,
+                commitment_filters: Vec::new(),
+            }
+        }
+
+        #[test]
+        fn real_scriptless_schema_roundtrips_full_canonical_projection() {
+            let first = project_block(genesis());
+            let second = project_block(&next_block(&first, 7));
+            let blocks = vec![first.clone(), second.clone()];
+            let identity = chain_identity(BlockRef {
+                height: second.height,
+                hash: second.block_hash,
+            });
+            let body = response_json(0, 1, &blocks, &identity, None);
+            let expected_chain_id = identity.chain_id;
+            let server = MockServer::start(move |request| {
+                assert_eq!(request.path, "/chain/scan/scriptless/v1");
+                assert!(request.query.contains("from=0&to=1"));
+                assert!(request.query.contains(&format!(
+                    "expected_chain_id={}",
+                    hex::encode(expected_chain_id)
+                )));
+                assert_eq!(request.authorization.as_deref(), Some("Bearer test-token"));
+                CannedResponse::json(200, body.clone())
+            });
+            let result = source_for(&server)
+                .scan_range(request(ScanStart::Height(0), 2, &identity))
+                .expect("scriptless scan");
+            assert_eq!(result.blocks, blocks);
+            assert_eq!(result.tip, identity.current_tip);
+            assert!(result.continuation.is_none());
+        }
+
+        #[test]
+        fn canonical_bytes_hash_and_projection_tampering_fail_closed() {
+            let first = project_block(genesis());
+            let second = project_block(&next_block(&first, 9));
+            let identity = chain_identity(BlockRef {
+                height: second.height,
+                hash: second.block_hash,
+            });
+            let valid = response_json(0, 1, &[first, second], &identity, None);
+            let mut cases = Vec::new();
+            let mut header = valid.clone();
+            header["blocks"][1]["canonical_header_bytes"] = json!("00");
+            cases.push(header);
+            let mut tx_hash = valid.clone();
+            tx_hash["blocks"][1]["transactions"][0]["tx_hash"] = json!(hex::encode([1; 32]));
+            cases.push(tx_hash);
+            let mut signature = valid.clone();
+            signature["blocks"][1]["transactions"][0]["kernels"][0]["excess_signature"] =
+                json!(hex::encode([2; 65]));
+            cases.push(signature);
+            let mut location = valid;
+            location["blocks"][1]["transactions"][0]["block_height"] = json!(99);
+            cases.push(location);
+            for body in cases {
+                let result = parse_full_scan(0, 1, None, &body.to_string());
+                assert!(
+                    matches!(result, Err(WalletCoreError::InternalFailure(_))),
+                    "tampered evidence must fail closed"
+                );
+            }
+        }
+
+        #[test]
+        fn large_requests_page_at_the_authoritative_rpc_limit() {
+            let first = project_block(genesis());
+            let second = project_block(&next_block(&first, 12));
+            let blocks = vec![first.clone(), second.clone()];
+            let identity = chain_identity(BlockRef {
+                height: second.height,
+                hash: second.block_hash,
+            });
+            let body = response_json(0, 63, &blocks, &identity, None);
+            let server = MockServer::start(move |request| {
+                assert!(request.query.contains("from=0&to=63"));
+                CannedResponse::json(200, body.clone())
+            });
+
+            let result = source_for(&server)
+                .scan_range(request(ScanStart::Height(0), 1_000, &identity))
+                .expect("large request is paged");
+            assert_eq!(result.blocks, blocks);
+            assert!(result.continuation.is_none());
+        }
+
+        #[test]
+        fn stop_before_start_returns_empty_after_identity_validation() {
+            let first = project_block(genesis());
+            let identity = chain_identity(BlockRef {
+                height: first.height,
+                hash: first.block_hash,
+            });
+            let body = response_json(0, 0, std::slice::from_ref(&first), &identity, None);
+            let server = MockServer::start(move |request| {
+                assert!(request.query.contains("from=0&to=0"));
+                CannedResponse::json(200, body.clone())
+            });
+            let mut scan = request(ScanStart::Height(2), 64, &identity);
+            scan.stop_height = Some(1);
+
+            let result = source_for(&server).scan_range(scan).expect("empty range");
+            assert!(result.blocks.is_empty());
+            assert!(result.continuation.is_none());
+            assert_eq!(result.tip, identity.current_tip);
+            assert_eq!(server.hits(), 1);
+        }
+
+        #[test]
+        fn cursor_anchor_is_sent_and_reorg_conflict_is_typed() {
+            let first = project_block(genesis());
+            let identity = chain_identity(BlockRef {
+                height: first.height,
+                hash: first.block_hash,
+            });
+            let cursor = WalletScanCursor::new(
+                identity.network,
+                identity.chain_id,
+                1,
+                BlockRef {
+                    height: 0,
+                    hash: first.block_hash,
+                },
+            );
+            let block_hash = first.block_hash;
+            let identity_body = response_json(0, 0, &[first], &identity, None);
+            let server = MockServer::start(move |request| match request.path.as_str() {
+                "/chain/scan/scriptless/v1" if request.query.contains("from=0&to=0") => {
+                    CannedResponse::json(200, identity_body.clone())
+                }
+                "/block/0" => {
+                    CannedResponse::json(200, json!({"height": 0, "hash": hex::encode(block_hash)}))
+                }
+                "/chain/scan/scriptless/v1" => {
+                    assert!(request
+                        .query
+                        .contains(&format!("anchor_hash={}", hex::encode(block_hash))));
+                    CannedResponse::json(409, json!({"error": "anchor changed"}))
+                }
+                path => panic!("unexpected path {path}"),
+            });
+            let error = source_for(&server)
+                .scan_range(request(ScanStart::Cursor(cursor), 1, &identity))
+                .expect_err("reorg conflict");
+            assert!(matches!(error, WalletCoreError::CursorReorg(_)));
+        }
+
+        #[test]
+        fn remote_failures_and_privacy_boundary_remain_fail_closed() {
+            assert!(matches!(
+                map_full_scan_status(503, "busy"),
+                WalletCoreError::NodeNotReady(_)
+            ));
+            assert!(matches!(
+                map_full_scan_status(409, "reorg"),
+                WalletCoreError::CursorReorg(_)
+            ));
+            assert!(matches!(
+                map_full_scan_status(401, "unauthorized"),
+                WalletCoreError::InternalFailure(_)
+            ));
+            let server = MockServer::start(|_| CannedResponse::text(500, "must not be called"));
+            let source = source_for(&server);
+            let identity = chain_identity(BlockRef {
+                height: 0,
+                hash: [0; 32],
+            });
+            let mut filtered = request(ScanStart::Height(0), 1, &identity);
+            filtered.commitment_filters.push([3; 33]);
+            assert!(matches!(
+                source.scan_range(filtered),
+                Err(WalletCoreError::InvalidScanRequest(_))
+            ));
+            assert_eq!(server.hits(), 0);
         }
     }
 
-    /// Acceptance (a): a remote scan must hand the scan loop EXACTLY what the
-    /// embedded node hands it for the same chain. The loop, cursor rules and
-    /// recovery all sit above this boundary, so identical projections here are
-    /// what makes a remote restore reach the same balance as a local one.
-    #[test]
-    fn acceptance_a_remote_projection_is_identical_to_the_embedded_one() {
-        let blocks = vec![
-            block_json(1, 0x31, &h32(0x30)),
-            block_json(2, 0x32, &h32(0x31)),
-            block_json(3, 0x33, &h32(0x32)),
-        ];
-        let server = MockServer::start(move |request| {
-            if request.path.starts_with("/chain/scan/full") {
-                CannedResponse::json(200, full_scan_json(1, 3, 3, 0x33, blocks.clone()))
-            } else {
-                CannedResponse::json(404, json!({"error": "unexpected path"}))
-            }
-        });
+    mod scriptless_wire_contract_regressions {
+        use super::*;
+        use std::sync::OnceLock;
 
-        let result = source_for(&server)
-            .scan_range(scan_request(1, 3))
-            .expect("remote scan succeeds");
+        fn h32(byte: u8) -> String {
+            hex::encode([byte; 32])
+        }
 
-        let expected = vec![
-            embedded_projection(1, 0x31, 0x30),
-            embedded_projection(2, 0x32, 0x31),
-            embedded_projection(3, 0x33, 0x32),
-        ];
-        assert_eq!(
-            result.blocks, expected,
-            "the remote projection diverged from the embedded one"
-        );
-        assert_eq!(result.tip.height, 3);
-        assert_eq!(result.tip.hash, [0x33; 32]);
-        // Caught up with the tip: nothing left to continue from.
-        assert!(result.continuation.is_none());
-    }
-
-    /// Acceptance (c): when the remote node reorganizes under a live scan, the
-    /// cursor must be reported invalid — that is the signal the shared
-    /// reconciliation path needs to rewind and converge on the canonical chain.
-    /// Silently accepting the stale cursor would strand the wallet on a dead
-    /// fork with a balance that never corrects itself.
-    #[test]
-    fn acceptance_c_remote_reorg_invalidates_the_cursor_instead_of_diverging() {
-        // The anchor the wallet committed at height 2.
-        let anchor = BlockRef {
-            height: 2,
-            hash: [0x32; 32],
-        };
-        let cursor = WalletScanCursor::new(CoreNetwork::Regtest, [0x11; 32], 3, anchor);
-
-        // Same height, different block: the chain reorganized under us.
-        let reorged = MockServer::start(move |request| {
-            if request.path.starts_with("/block/2") {
-                CannedResponse::json(200, json!({"height": 2, "hash": h32(0xF2)}))
-            } else if request.path.starts_with("/chain/scan/full") {
-                CannedResponse::json(200, full_scan_json(1, 0, 9, 0xF9, Vec::new()))
-            } else {
-                CannedResponse::json(404, json!({"error": "unexpected path"}))
-            }
-        });
-
-        let validation = source_for(&reorged).validate_cursor(cursor);
-        assert!(
-            matches!(&validation, Ok(check) if !check.valid) || validation.is_err(),
-            "a reorged anchor must never validate: {validation:?}"
-        );
-
-        // The unchanged chain still validates, so the check is not simply
-        // rejecting everything.
-        let intact = MockServer::start(move |request| {
-            if request.path.starts_with("/block/2") {
-                CannedResponse::json(200, json!({"height": 2, "hash": h32(0x32)}))
-            } else if request.path.starts_with("/chain/scan/full") {
-                CannedResponse::json(200, full_scan_json(1, 0, 9, 0xF9, Vec::new()))
-            } else {
-                CannedResponse::json(404, json!({"error": "unexpected path"}))
-            }
-        });
-        let validation = source_for(&intact)
-            .validate_cursor(cursor)
-            .expect("an intact anchor validates");
-        assert!(validation.valid);
-    }
-
-    /// Acceptance (d): a busy remote node must never freeze the cursor. Every
-    /// busy answer has to come back retriable so the scan loop backs off and
-    /// tries again; classifying it as terminal is precisely the frozen-cursor
-    /// regression.
-    #[test]
-    fn acceptance_d_busy_remote_is_retriable_and_the_scan_then_advances() {
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let server_attempts = Arc::clone(&attempts);
-        let server = MockServer::start(move |request| {
-            if !request.path.starts_with("/chain/scan/full") {
-                return CannedResponse::json(404, json!({"error": "unexpected path"}));
-            }
-            // The first three attempts find a contended chain lock.
-            if server_attempts.fetch_add(1, Ordering::SeqCst) < 3 {
-                CannedResponse::json(503, json!({"error": "overloaded: chain busy; retry"}))
-            } else {
-                CannedResponse::json(
-                    200,
-                    full_scan_json(1, 1, 1, 0x31, vec![block_json(1, 0x31, &h32(0x30))]),
+        fn canonical_chain_identity() -> ChainIdentity {
+            let genesis =
+                dom_chain::build_canonical_genesis(CoreNetwork::Regtest.magic(), &[8; 32])
+                    .expect("regtest genesis");
+            ChainIdentity {
+                network: CoreNetwork::Regtest,
+                network_magic: CoreNetwork::Regtest.magic(),
+                chain_id: *dom_consensus::derive_chain_id(
+                    CoreNetwork::Regtest.magic(),
+                    &genesis.hash,
                 )
+                .as_bytes(),
+                genesis_hash: *genesis.hash.as_bytes(),
+                protocol_version: 1,
+                range_proof_serialization_version: dom_crypto::RANGE_PROOF_SERIALIZATION_VERSION,
+                coinbase_maturity: 1440,
+                current_tip: BlockRef {
+                    height: 0,
+                    hash: [0; 32],
+                },
             }
-        });
-        let source = source_for(&server);
+        }
 
-        for attempt in 0..3 {
-            let error = source
+        fn identity_json(tip_height: u64, tip_hash: [u8; 32]) -> Value {
+            let identity = canonical_chain_identity();
+            json!({
+                "network": "regtest",
+                "network_magic": identity.network_magic,
+                "chain_id": hex::encode(identity.chain_id),
+                "genesis_hash": hex::encode(identity.genesis_hash),
+                "protocol_version": identity.protocol_version,
+                "range_proof_serialization_version": identity.range_proof_serialization_version,
+                "coinbase_maturity": identity.coinbase_maturity,
+                "tip_height": tip_height,
+                "tip_hash": hex::encode(tip_hash),
+            })
+        }
+
+        fn canonical_block(height: u64, previous_hash: [u8; 32], marker: u8) -> ScanBlock {
+            let mut canonical = canonical_genesis_template().clone();
+            let mut offset = [0u8; 32];
+            offset[31] = marker.max(1);
+            let transaction = Transaction {
+                inputs: vec![dom_consensus::TransactionInput {
+                    commitment: canonical.coinbase.output.commitment.clone(),
+                }],
+                outputs: vec![canonical.coinbase.output.clone()],
+                kernels: vec![dom_consensus::TransactionKernel {
+                    features: dom_core::KERNEL_FEAT_PLAIN,
+                    fee: dom_core::Amount::from_noms(height).expect("fee"),
+                    lock_height: 0,
+                    excess: canonical.coinbase.kernel.excess.clone(),
+                    excess_signature: [marker.wrapping_add(60); 65],
+                }],
+                offset,
+            };
+            canonical.header.version =
+                dom_core::required_block_version_for_network(CoreNetwork::Regtest.magic(), height);
+            canonical.header.height = dom_core::BlockHeight(height);
+            canonical.header.prev_hash = dom_core::Hash256::from_bytes(previous_hash);
+            canonical.header.timestamp =
+                dom_core::Timestamp(1_700_000_000 + height + u64::from(marker));
+            canonical.header.total_kernel_offset = offset;
+            canonical.header.pow.nonce = u64::from(marker);
+            canonical.transactions = vec![transaction.clone()];
+            let (output_root, kernel_root, rangeproof_root) =
+                dom_consensus::compute_block_pmmr_roots(
+                    dom_core::BlockHeight(height),
+                    &canonical.coinbase,
+                    &canonical.transactions,
+                )
+                .expect("roots");
+            canonical.header.output_root = output_root;
+            canonical.header.kernel_root = kernel_root;
+            canonical.header.rangeproof_root = rangeproof_root;
+            let canonical_header_bytes = canonical.header.to_bytes().expect("header");
+            let hash = *dom_chain::canonical_header_identifier(
+                CoreNetwork::Regtest.magic(),
+                &canonical_header_bytes,
+            )
+            .expect("header id")
+            .as_bytes();
+            let coinbase_capsule = canonical
+                .coinbase
+                .output
+                .recovery_capsule()
+                .expect("coinbase envelope");
+            let transaction_output_capsule = transaction.outputs[0]
+                .recovery_capsule()
+                .expect("transaction envelope");
+            let coinbase_output = ScanOutput {
+                commitment: *canonical.coinbase.output.commitment.as_bytes(),
+                range_proof: canonical
+                    .coinbase
+                    .output
+                    .range_proof_bytes()
+                    .expect("proof")
+                    .to_vec(),
+                recovery_capsule: coinbase_capsule
+                    .as_ref()
+                    .map(|capsule| capsule.as_bytes().to_vec())
+                    .unwrap_or_default(),
+                recovery_version: coinbase_capsule
+                    .as_ref()
+                    .map_or(0, |capsule| capsule.version()),
+                is_coinbase: true,
+                block_height: height,
+                block_hash: hash,
+                output_position: 0,
+            };
+            let transaction_output = ScanOutput {
+                commitment: *transaction.outputs[0].commitment.as_bytes(),
+                range_proof: transaction.outputs[0]
+                    .range_proof_bytes()
+                    .expect("proof")
+                    .to_vec(),
+                recovery_capsule: transaction_output_capsule
+                    .as_ref()
+                    .map(|capsule| capsule.as_bytes().to_vec())
+                    .unwrap_or_default(),
+                recovery_version: transaction_output_capsule
+                    .as_ref()
+                    .map_or(0, |capsule| capsule.version()),
+                is_coinbase: false,
+                block_height: height,
+                block_hash: hash,
+                output_position: 1,
+            };
+            let coinbase_kernel = ScanKernel {
+                excess: *canonical.coinbase.kernel.excess.as_bytes(),
+                features: canonical.coinbase.kernel.features,
+                fee: 0,
+                lock_height: 0,
+                excess_signature: canonical.coinbase.kernel.excess_signature,
+            };
+            let transaction_kernel = ScanKernel {
+                excess: *transaction.kernels[0].excess.as_bytes(),
+                features: transaction.kernels[0].features,
+                fee: transaction.kernels[0].fee.noms(),
+                lock_height: transaction.kernels[0].lock_height,
+                excess_signature: transaction.kernels[0].excess_signature,
+            };
+            let transaction_bytes = transaction.to_bytes().expect("transaction");
+            ScanBlock {
+                height,
+                block_hash: hash,
+                previous_block_hash: previous_hash,
+                canonical_header_bytes,
+                timestamp: canonical.header.timestamp.0,
+                canonical_marker: hash,
+                outputs: vec![coinbase_output, transaction_output.clone()],
+                inputs: vec![ScanInput {
+                    spent_commitment: *transaction.inputs[0].commitment.as_bytes(),
+                }],
+                kernels: vec![coinbase_kernel, transaction_kernel.clone()],
+                transactions: vec![ScanTransaction {
+                    location: TransactionLocation {
+                        block_height: height,
+                        block_hash: hash,
+                        transaction_index: 0,
+                    },
+                    tx_hash: *dom_crypto::blake2b_256(&transaction_bytes).as_bytes(),
+                    canonical_bytes: transaction_bytes,
+                    inputs: vec![ScanInput {
+                        spent_commitment: *transaction.inputs[0].commitment.as_bytes(),
+                    }],
+                    outputs: vec![transaction_output],
+                    kernels: vec![transaction_kernel],
+                    offset,
+                }],
+                coinbase: CoinbaseScanMetadata {
+                    output_commitment: *canonical.coinbase.output.commitment.as_bytes(),
+                    explicit_value: canonical.coinbase.kernel.explicit_value,
+                    kernel_excess: *canonical.coinbase.kernel.excess.as_bytes(),
+                    kernel_features: canonical.coinbase.kernel.features,
+                    kernel_excess_signature: canonical.coinbase.kernel.excess_signature,
+                    offset: canonical.coinbase.offset,
+                    output_proof_envelope: canonical.coinbase.output.proof.clone(),
+                },
+                total_fees_noms: canonical.total_fees().expect("fees"),
+                protocol_version: canonical.header.version,
+                range_proof_serialization_version: dom_crypto::RANGE_PROOF_SERIALIZATION_VERSION,
+            }
+        }
+
+        fn canonical_genesis_template() -> &'static dom_consensus::Block {
+            static GENESIS: OnceLock<dom_consensus::Block> = OnceLock::new();
+            GENESIS.get_or_init(|| {
+                dom_chain::build_canonical_genesis(CoreNetwork::Regtest.magic(), &[8; 32])
+                    .expect("regtest genesis")
+                    .block
+                    .expect("regtest block")
+            })
+        }
+
+        fn scan_output_json(output: &ScanOutput) -> Value {
+            json!({
+                "commitment": hex::encode(output.commitment),
+                "range_proof": hex::encode(&output.range_proof),
+                "recovery_capsule": hex::encode(&output.recovery_capsule),
+                "recovery_version": output.recovery_version,
+                "is_coinbase": output.is_coinbase,
+                "block_height": output.block_height,
+                "block_hash": hex::encode(output.block_hash),
+                "output_position": output.output_position,
+            })
+        }
+
+        fn scan_kernel_json(kernel: &ScanKernel) -> Value {
+            json!({
+                "excess": hex::encode(kernel.excess),
+                "features": kernel.features,
+                "fee": kernel.fee,
+                "lock_height": kernel.lock_height,
+                "excess_signature": hex::encode(kernel.excess_signature),
+            })
+        }
+
+        fn block_projection_json(block: &ScanBlock) -> Value {
+            json!({
+                "height": block.height,
+                "block_hash": hex::encode(block.block_hash),
+                "previous_block_hash": hex::encode(block.previous_block_hash),
+                "canonical_header_bytes": hex::encode(&block.canonical_header_bytes),
+                "timestamp": block.timestamp,
+                "canonical_marker": hex::encode(block.canonical_marker),
+                "transactions": block.transactions.iter().map(|transaction| json!({
+                    "block_height": transaction.location.block_height,
+                    "block_hash": hex::encode(transaction.location.block_hash),
+                    "transaction_index": transaction.location.transaction_index,
+                    "tx_hash": hex::encode(transaction.tx_hash),
+                    "canonical_bytes": hex::encode(&transaction.canonical_bytes),
+                    "inputs": transaction.inputs.iter().map(|input| json!({
+                        "spent_commitment": hex::encode(input.spent_commitment),
+                    })).collect::<Vec<_>>(),
+                    "outputs": transaction.outputs.iter().map(scan_output_json).collect::<Vec<_>>(),
+                    "kernels": transaction.kernels.iter().map(scan_kernel_json).collect::<Vec<_>>(),
+                    "offset": hex::encode(transaction.offset),
+                })).collect::<Vec<_>>(),
+                "coinbase": {
+                    "output_commitment": hex::encode(block.coinbase.output_commitment),
+                    "explicit_value": block.coinbase.explicit_value,
+                    "kernel_excess": hex::encode(block.coinbase.kernel_excess),
+                    "kernel_features": block.coinbase.kernel_features,
+                    "kernel_excess_signature": hex::encode(block.coinbase.kernel_excess_signature),
+                    "offset": hex::encode(block.coinbase.offset),
+                    "output_proof_envelope": hex::encode(&block.coinbase.output_proof_envelope),
+                },
+                "total_fees_noms": block.total_fees_noms,
+                "protocol_version": block.protocol_version,
+                "range_proof_serialization_version": block.range_proof_serialization_version,
+            })
+        }
+
+        fn block_json(height: u64, marker: u8, previous_hash: &str) -> ScanBlock {
+            canonical_block(
+                height,
+                decode_hash32(previous_hash, "TEST_PREVIOUS_HASH").expect("previous hash"),
+                marker,
+            )
+        }
+
+        fn canonical_blocks(
+            start_height: u64,
+            count: u64,
+            mut previous_hash: [u8; 32],
+            first_marker: u8,
+        ) -> Vec<ScanBlock> {
+            let mut blocks = Vec::with_capacity(count as usize);
+            for offset in 0..count {
+                let block = canonical_block(
+                    start_height + offset,
+                    previous_hash,
+                    first_marker.wrapping_add(offset as u8),
+                );
+                previous_hash = block.block_hash;
+                blocks.push(block);
+            }
+            blocks
+        }
+
+        fn full_scan_json(
+            from: u64,
+            to: u64,
+            tip_height: u64,
+            tip_marker: u8,
+            blocks: impl AsRef<[ScanBlock]>,
+        ) -> Value {
+            let blocks = blocks.as_ref();
+            let tip_hash = blocks
+                .last()
+                .filter(|block| block.height == tip_height)
+                .map_or([tip_marker; 32], |block| block.block_hash);
+            let request_anchor = (from > 0).then(|| BlockRef {
+                height: from - 1,
+                hash: blocks
+                    .first()
+                    .map_or([from.saturating_sub(1) as u8; 32], |block| {
+                        block.previous_block_hash
+                    }),
+            });
+            let served_to = blocks.last().map(|block| block.height);
+            let continuation = blocks.last().and_then(|last| {
+                (last.height < tip_height).then(|| json!({
+                "next_height": last.height + 1,
+                "anchor": { "height": last.height, "block_hash": hex::encode(last.block_hash) },
+                "snapshot_tip_height": tip_height,
+                "snapshot_tip_hash": hex::encode(tip_hash),
+            }))
+            });
+            json!({
+                "schema_version": 1,
+                "status": "ok",
+                "canonical": true,
+                "identity": identity_json(tip_height, tip_hash),
+                "requested_from": from,
+                "requested_to": to,
+                "served_from": from,
+                "served_to": served_to,
+                "request_anchor": request_anchor.map(|anchor| json!({
+                    "height": anchor.height,
+                    "block_hash": hex::encode(anchor.hash),
+                })),
+                "blocks": blocks.iter().map(block_projection_json).collect::<Vec<_>>(),
+                "continuation": continuation,
+            })
+        }
+
+        fn identity_probe_response(tip_height: u64, tip_hash_byte: u8) -> CannedResponse {
+            CannedResponse::json(
+                200,
+                full_scan_json(0, 0, tip_height, tip_hash_byte, Vec::new()),
+            )
+        }
+
+        fn source_for(server: &MockServer) -> RemoteNodeSource {
+            RemoteNodeSource::new(&server.base_url(), Some(TOKEN)).expect("remote source")
+        }
+
+        fn scan_request(start_height: u64, max_blocks: u64) -> ScanRequest {
+            ScanRequest {
+                network: CoreNetwork::Regtest,
+                chain_id: canonical_chain_identity().chain_id,
+                start: ScanStart::Height(start_height),
+                max_blocks,
+                stop_height: None,
+                commitment_filters: Vec::new(),
+            }
+        }
+
+        /// Acceptance (a): a remote scan must hand the scan loop EXACTLY what the
+        /// embedded node hands it for the same chain. The loop, cursor rules and
+        /// recovery all sit above this boundary, so identical projections here are
+        /// what makes a remote restore reach the same balance as a local one.
+        #[test]
+        fn acceptance_a_remote_projection_is_identical_to_the_embedded_one() {
+            let blocks = canonical_blocks(1, 3, [0x30; 32], 0x31);
+            let expected = blocks.clone();
+            let tip_hash = blocks.last().expect("tip").block_hash;
+            let server = MockServer::start(move |request| {
+                if request.path == "/block/0" {
+                    CannedResponse::json(200, json!({"height": 0, "hash": h32(0x30)}))
+                } else if request.path.starts_with("/chain/scan/scriptless/v1") {
+                    CannedResponse::json(200, full_scan_json(1, 3, 3, 0x33, blocks.clone()))
+                } else {
+                    CannedResponse::json(404, json!({"error": "unexpected path"}))
+                }
+            });
+
+            let result = source_for(&server)
+                .scan_range(scan_request(1, 3))
+                .expect("remote scan succeeds");
+
+            assert_eq!(
+                result.blocks, expected,
+                "the remote projection diverged from the embedded one"
+            );
+            assert_eq!(result.tip.height, 3);
+            assert_eq!(result.tip.hash, tip_hash);
+            // Caught up with the tip: nothing left to continue from.
+            assert!(result.continuation.is_none());
+        }
+
+        /// Acceptance (c): when the remote node reorganizes under a live scan, the
+        /// cursor must be reported invalid — that is the signal the shared
+        /// reconciliation path needs to rewind and converge on the canonical chain.
+        /// Silently accepting the stale cursor would strand the wallet on a dead
+        /// fork with a balance that never corrects itself.
+        #[test]
+        fn acceptance_c_remote_reorg_invalidates_the_cursor_instead_of_diverging() {
+            // The anchor the wallet committed at height 2.
+            let anchor = BlockRef {
+                height: 2,
+                hash: [0x32; 32],
+            };
+            let cursor = WalletScanCursor::new(
+                CoreNetwork::Regtest,
+                canonical_chain_identity().chain_id,
+                3,
+                anchor,
+            );
+
+            // Same height, different block: the chain reorganized under us.
+            let reorged = MockServer::start(move |request| {
+                if request.path.starts_with("/block/2") {
+                    CannedResponse::json(200, json!({"height": 2, "hash": h32(0xF2)}))
+                } else if request.path.starts_with("/chain/scan/scriptless/v1") {
+                    identity_probe_response(9, 0xF9)
+                } else {
+                    CannedResponse::json(404, json!({"error": "unexpected path"}))
+                }
+            });
+
+            let validation = source_for(&reorged).validate_cursor(cursor);
+            assert!(
+                matches!(&validation, Ok(check) if !check.valid) || validation.is_err(),
+                "a reorged anchor must never validate: {validation:?}"
+            );
+
+            // The unchanged chain still validates, so the check is not simply
+            // rejecting everything.
+            let intact = MockServer::start(move |request| {
+                if request.path.starts_with("/block/2") {
+                    CannedResponse::json(200, json!({"height": 2, "hash": h32(0x32)}))
+                } else if request.path.starts_with("/chain/scan/scriptless/v1") {
+                    identity_probe_response(9, 0xF9)
+                } else {
+                    CannedResponse::json(404, json!({"error": "unexpected path"}))
+                }
+            });
+            let validation = source_for(&intact)
+                .validate_cursor(cursor)
+                .expect("an intact anchor validates");
+            assert!(validation.valid);
+        }
+
+        /// Acceptance (d): a busy remote node must never freeze the cursor. Every
+        /// busy answer has to come back retriable so the scan loop backs off and
+        /// tries again; classifying it as terminal is precisely the frozen-cursor
+        /// regression.
+        #[test]
+        fn acceptance_d_busy_remote_is_retriable_and_the_scan_then_advances() {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let server_attempts = Arc::clone(&attempts);
+            let block = block_json(1, 0x31, &h32(0x30));
+            let server = MockServer::start(move |request| {
+                if request.path == "/block/0" {
+                    return CannedResponse::json(200, json!({"height": 0, "hash": h32(0x30)}));
+                }
+                if !request.path.starts_with("/chain/scan/scriptless/v1") {
+                    return CannedResponse::json(404, json!({"error": "unexpected path"}));
+                }
+                // The first three attempts find a contended chain lock.
+                if server_attempts.fetch_add(1, Ordering::SeqCst) < 3 {
+                    CannedResponse::json(503, json!({"error": "overloaded: chain busy; retry"}))
+                } else {
+                    CannedResponse::json(200, full_scan_json(1, 1, 1, 0x31, vec![block.clone()]))
+                }
+            });
+            let source = source_for(&server);
+
+            for attempt in 0..3 {
+                let error = source
+                    .scan_range(scan_request(1, 1))
+                    .expect_err("a busy chain must fail this attempt");
+                assert!(
+                    matches!(error, WalletCoreError::NodeNotReady(_)),
+                    "attempt {attempt} must stay retriable, got {error:?}"
+                );
+            }
+
+            // Once the lock frees the very same cursor advances — no reset, no
+            // manual intervention, no terminal state in between.
+            let result = source
                 .scan_range(scan_request(1, 1))
-                .expect_err("a busy chain must fail this attempt");
+                .expect("the scan proceeds once the remote is free");
+            assert_eq!(result.blocks.len(), 1);
+            assert_eq!(result.blocks[0].height, 1);
+            assert_eq!(attempts.load(Ordering::SeqCst), 4);
+        }
+
+        fn scan_error_of(response: CannedResponse) -> WalletCoreError {
+            let server = MockServer::start(move |_| response.clone());
+            let source = source_for(&server);
+            source
+                .scan_range(scan_request(0, 2))
+                .expect_err("scan must fail")
+        }
+
+        // ── Tests ───────────────────────────────────────────────────────────
+
+        #[test]
+        fn full_scan_page_maps_to_scan_result_and_reconstructs_output_context() {
+            let blocks = canonical_blocks(1, 2, [0x50; 32], 0x51);
+            let tip_hash = blocks[1].block_hash;
+            let first_hash = blocks[0].block_hash;
+            let body = full_scan_json(1, 2, 2, 0x52, blocks);
+            let server = MockServer::start(move |request| {
+                if request.path == "/block/0" {
+                    return CannedResponse::json(200, json!({"height": 0, "hash": h32(0x50)}));
+                }
+                assert_eq!(request.path, "/chain/scan/scriptless/v1");
+                assert!(request.query.contains("from=1&to=2"));
+                assert_eq!(
+                    request.authorization.as_deref(),
+                    Some("Bearer test-token"),
+                    "scan endpoint must be called with the bearer token"
+                );
+                CannedResponse::json(200, body.clone())
+            });
+            let source = source_for(&server);
+            let result = source.scan_range(scan_request(1, 2)).expect("scan page");
+
+            assert_eq!(
+                result.tip,
+                BlockRef {
+                    height: 2,
+                    hash: tip_hash
+                }
+            );
+            assert_eq!(result.blocks.len(), 2);
+            let first = &result.blocks[0];
+            assert_eq!(first.height, 1);
+            assert_eq!(first.block_hash, first_hash);
+            assert_eq!(first.previous_block_hash, [0x50; 32]);
+            assert_eq!(first.canonical_marker, first_hash);
+            assert_eq!(first.outputs.len(), 2);
+            let output = &first.outputs[0];
+            assert_eq!(output.block_height, 1);
+            assert_eq!(output.block_hash, first_hash);
+            assert!(output.is_coinbase);
+            assert_eq!(output.range_proof.len(), dom_crypto::RANGE_PROOF_SIZE);
+            assert_eq!(output.output_position, 0);
+            assert_eq!(first.inputs.len(), 1);
+            assert_eq!(first.kernels.len(), 2);
+            assert_eq!(first.transactions.len(), 1);
+            // Page ends at the tip: no continuation.
+            assert!(result.continuation.is_none());
+            assert_eq!(
+                source.last_observed_tip(),
+                Some(BlockRef {
+                    height: 2,
+                    hash: tip_hash
+                })
+            );
+            assert!(source.tip_regression().is_none());
+        }
+
+        #[test]
+        fn server_clamp_is_respected_and_yields_continuation_cursor() {
+            // The wallet asks for up to 1000 blocks; the server clamps the page
+            // to 2 blocks (budget/tip clamp) and echoes the effective `to`.
+            let blocks = canonical_blocks(1, 2, [0x50; 32], 0x51);
+            let anchor_hash = blocks[1].block_hash;
+            let body = full_scan_json(1, 64, 5, 0x55, blocks);
+            let server = MockServer::start(move |request| {
+                if request.path == "/block/0" {
+                    return CannedResponse::json(200, json!({"height": 0, "hash": h32(0x50)}));
+                }
+                assert!(request.query.contains("from=1&to=64"));
+                CannedResponse::json(200, body.clone())
+            });
+            let source = source_for(&server);
+            let result = source.scan_range(scan_request(1, 1000)).expect("scan page");
+            assert_eq!(result.blocks.len(), 2);
+            let continuation = result.continuation.expect("continuation cursor");
+            assert_eq!(continuation.next_height, 3);
+            assert_eq!(continuation.anchor_height, 2);
+            assert_eq!(continuation.anchor_hash, anchor_hash);
+            assert_eq!(continuation.chain_id, canonical_chain_identity().chain_id);
+            assert_eq!(continuation.network_magic, CoreNetwork::Regtest.magic());
+        }
+
+        #[test]
+        fn busy_503_maps_to_retriable_node_not_ready() {
+            let error = scan_error_of(CannedResponse::json(
+                503,
+                json!({"error": "overloaded: chain busy; retry"}),
+            ));
             assert!(
                 matches!(error, WalletCoreError::NodeNotReady(_)),
-                "attempt {attempt} must stay retriable, got {error:?}"
+                "busy must stay retriable, got {error:?}"
             );
         }
 
-        // Once the lock frees the very same cursor advances — no reset, no
-        // manual intervention, no terminal state in between.
-        let result = source
-            .scan_range(scan_request(1, 1))
-            .expect("the scan proceeds once the remote is free");
-        assert_eq!(result.blocks.len(), 1);
-        assert_eq!(result.blocks[0].height, 1);
-        assert_eq!(attempts.load(Ordering::SeqCst), 4);
-    }
-
-    fn scan_error_of(response: CannedResponse) -> WalletCoreError {
-        let server = MockServer::start(move |_| response.clone());
-        let source = source_for(&server);
-        source
-            .scan_range(scan_request(1, 2))
-            .expect_err("scan must fail")
-    }
-
-    // ── Tests ───────────────────────────────────────────────────────────
-
-    #[test]
-    fn full_scan_page_maps_to_scan_result_and_reconstructs_output_context() {
-        let body = full_scan_json(
-            1,
-            2,
-            2,
-            0x52,
-            vec![
-                block_json(1, 0x51, &h32(0x50)),
-                block_json(2, 0x52, &h32(0x51)),
-            ],
-        );
-        let server = MockServer::start(move |request| {
-            assert_eq!(request.path, "/chain/scan/full");
-            assert_eq!(request.query, "from=1&to=2");
-            assert_eq!(
-                request.authorization.as_deref(),
-                Some("Bearer test-token"),
-                "scan endpoint must be called with the bearer token"
-            );
-            CannedResponse::json(200, body.clone())
-        });
-        let source = source_for(&server);
-        let result = source.scan_range(scan_request(1, 2)).expect("scan page");
-
-        assert_eq!(
-            result.tip,
-            BlockRef {
-                height: 2,
-                hash: [0x52; 32]
-            }
-        );
-        assert_eq!(result.blocks.len(), 2);
-        let first = &result.blocks[0];
-        assert_eq!(first.height, 1);
-        assert_eq!(first.block_hash, [0x51; 32]);
-        assert_eq!(first.previous_block_hash, [0x50; 32]);
-        assert_eq!(first.canonical_marker, [0x51; 32]);
-        assert_eq!(first.outputs.len(), 1);
-        let output = &first.outputs[0];
-        // Reconstructed from the enclosing block (omitted from the wire).
-        assert_eq!(output.block_height, 1);
-        assert_eq!(output.block_hash, [0x51; 32]);
-        assert!(output.is_coinbase);
-        assert_eq!(output.range_proof, vec![7u8; 40]);
-        assert_eq!(output.recovery_capsule, vec![9u8; 16]);
-        assert_eq!(output.recovery_version, 1);
-        assert_eq!(output.output_position, 0);
-        assert_eq!(first.inputs.len(), 1);
-        assert_eq!(first.kernels.len(), 1);
-        assert_eq!(first.coinbase.explicit_value, 5_000_000_000);
-        // Page ends at the tip: no continuation.
-        assert!(result.continuation.is_none());
-        assert_eq!(
-            source.last_observed_tip(),
-            Some(BlockRef {
-                height: 2,
-                hash: [0x52; 32]
-            })
-        );
-        assert!(source.tip_regression().is_none());
-    }
-
-    #[test]
-    fn server_clamp_is_respected_and_yields_continuation_cursor() {
-        // The wallet asks for up to 1000 blocks; the server clamps the page
-        // to 2 blocks (budget/tip clamp) and echoes the effective `to`.
-        let body = full_scan_json(
-            1,
-            2,
-            5,
-            0x55,
-            vec![
-                block_json(1, 0x51, &h32(0x50)),
-                block_json(2, 0x52, &h32(0x51)),
-            ],
-        );
-        let server = MockServer::start(move |request| {
-            assert_eq!(request.query, "from=1&to=1000");
-            CannedResponse::json(200, body.clone())
-        });
-        let source = source_for(&server);
-        let result = source.scan_range(scan_request(1, 1000)).expect("scan page");
-        assert_eq!(result.blocks.len(), 2);
-        let continuation = result.continuation.expect("continuation cursor");
-        assert_eq!(continuation.next_height, 3);
-        assert_eq!(continuation.anchor_height, 2);
-        assert_eq!(continuation.anchor_hash, [0x52; 32]);
-        assert_eq!(continuation.chain_id, [0x11; 32]);
-        assert_eq!(continuation.network_magic, CoreNetwork::Regtest.magic());
-    }
-
-    #[test]
-    fn busy_503_maps_to_retriable_node_not_ready() {
-        let error = scan_error_of(CannedResponse::json(
-            503,
-            json!({"error": "overloaded: chain busy; retry"}),
-        ));
-        assert!(
-            matches!(error, WalletCoreError::NodeNotReady(_)),
-            "busy must stay retriable, got {error:?}"
-        );
-    }
-
-    #[test]
-    fn rate_limited_429_text_body_maps_to_retriable_temporary_failure() {
-        // 429 arrives as plain text, not JSON (tower_governor behaviour).
-        let error = scan_error_of(CannedResponse::text(429, "Too Many Requests! Wait for 1s"));
-        assert!(matches!(error, WalletCoreError::TemporaryFailure(_)));
-    }
-
-    #[test]
-    fn unauthorized_401_maps_to_terminal_internal_failure() {
-        let error = scan_error_of(CannedResponse::text(401, ""));
-        match error {
-            WalletCoreError::InternalFailure(message) => {
-                assert!(message.contains("unauthorized"), "message: {message}");
-            }
-            other => panic!("401 must be terminal InternalFailure, got {other:?}"),
+        #[test]
+        fn rate_limited_429_text_body_maps_to_retriable_temporary_failure() {
+            // 429 arrives as plain text, not JSON (tower_governor behaviour).
+            let error = scan_error_of(CannedResponse::text(429, "Too Many Requests! Wait for 1s"));
+            assert!(matches!(error, WalletCoreError::TemporaryFailure(_)));
         }
-    }
 
-    #[test]
-    fn missing_endpoint_404_maps_to_terminal_upgrade_error() {
-        let error = scan_error_of(CannedResponse::text(404, "not found"));
-        match error {
-            WalletCoreError::InternalFailure(message) => {
-                assert!(message.contains("/chain/scan/full"), "message: {message}");
-            }
-            other => panic!("404 must be terminal InternalFailure, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn canonical_gap_code_maps_to_canonical_gap_and_plain_500_stays_retriable() {
-        let gap = scan_error_of(CannedResponse::json(
-            500,
-            json!({"error": "canonical gap: missing canonical block at height 7",
-                   "code": "canonical_gap"}),
-        ));
-        assert!(matches!(gap, WalletCoreError::CanonicalGap(_)));
-
-        let plain = scan_error_of(CannedResponse::json(
-            500,
-            json!({"error": "internal: transient store hiccup"}),
-        ));
-        assert!(
-            matches!(plain, WalletCoreError::TemporaryFailure(_)),
-            "uncoded 500 must stay retriable, got {plain:?}"
-        );
-    }
-
-    #[test]
-    fn connection_failure_maps_to_retriable_temporary_failure() {
-        // Reserved port with no listener: connection refused.
-        let source =
-            RemoteNodeSource::new("http://127.0.0.1:1", Some(TOKEN)).expect("remote source");
-        let error = source
-            .scan_range(scan_request(1, 2))
-            .expect_err("connection must fail");
-        assert!(matches!(error, WalletCoreError::TemporaryFailure(_)));
-    }
-
-    #[test]
-    fn commitment_filters_are_rejected_locally_without_any_network_traffic() {
-        let server = MockServer::start(|_| CannedResponse::text(500, "must never be reached"));
-        let source = source_for(&server);
-        let mut request = scan_request(1, 2);
-        request.commitment_filters = vec![[0xAB; 33]];
-        let error = source
-            .scan_range(request)
-            .expect_err("filters must be rejected");
-        assert!(matches!(error, WalletCoreError::InvalidScanRequest(_)));
-        assert_eq!(server.hits(), 0, "privacy: no request may leave the wallet");
-    }
-
-    #[test]
-    fn schema_divergence_is_terminal_and_never_partially_consumed() {
-        let valid_blocks = || {
-            vec![
-                block_json(1, 0x51, &h32(0x50)),
-                block_json(2, 0x52, &h32(0x51)),
-            ]
-        };
-
-        let mut unknown_version = full_scan_json(1, 2, 2, 0x52, valid_blocks());
-        unknown_version["schema_version"] = json!(2);
-
-        let mut nonconsecutive = full_scan_json(1, 2, 2, 0x52, valid_blocks());
-        nonconsecutive["blocks"][1]["height"] = json!(3);
-
-        let missing_block = full_scan_json(1, 2, 2, 0x52, vec![block_json(1, 0x51, &h32(0x50))]);
-
-        let mut bad_hex = full_scan_json(1, 2, 2, 0x52, valid_blocks());
-        bad_hex["blocks"][0]["block_hash"] = json!("zz");
-
-        let mut broken_chain = full_scan_json(1, 2, 2, 0x52, valid_blocks());
-        broken_chain["blocks"][1]["previous_block_hash"] = json!(h32(0x99));
-
-        let mut capsule_mismatch = full_scan_json(1, 2, 2, 0x52, valid_blocks());
-        capsule_mismatch["blocks"][0]["outputs"][0]["recovery_version"] = json!(0);
-
-        let mut beyond_tip = full_scan_json(1, 2, 1, 0x51, valid_blocks());
-        beyond_tip["tip"]["height"] = json!(1);
-
-        for (case, body) in [
-            ("unknown schema_version", unknown_version),
-            ("nonconsecutive heights", nonconsecutive),
-            ("missing block in range", missing_block),
-            ("invalid hex", bad_hex),
-            ("broken previous-hash chain", broken_chain),
-            ("capsule/version mismatch", capsule_mismatch),
-            ("to beyond tip", beyond_tip),
-            ("json garbage", json!("not an object")),
-        ] {
-            let error = scan_error_of(CannedResponse::raw_json(200, body.to_string()));
+        #[test]
+        fn unauthorized_401_maps_to_terminal_internal_failure() {
+            let error = scan_error_of(CannedResponse::text(401, ""));
             match error {
                 WalletCoreError::InternalFailure(message) => {
-                    assert!(
-                        message.contains("remote schema violation"),
-                        "case {case}: message {message}"
-                    );
+                    assert!(message.contains("unauthorized"), "message: {message}");
                 }
-                other => panic!("case {case}: expected terminal InternalFailure, got {other:?}"),
+                other => panic!("401 must be terminal InternalFailure, got {other:?}"),
             }
         }
-    }
 
-    #[test]
-    fn tip_regression_is_recorded_for_the_consumer_without_aborting_the_scan() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let handler_calls = Arc::clone(&calls);
-        let server = MockServer::start(move |_| {
-            let call = handler_calls.fetch_add(1, Ordering::SeqCst);
-            if call == 0 {
-                CannedResponse::json(
-                    200,
-                    full_scan_json(1, 1, 10, 0x5A, vec![block_json(1, 0x51, &h32(0x50))]),
-                )
-            } else {
-                CannedResponse::json(
-                    200,
-                    full_scan_json(2, 2, 8, 0x58, vec![block_json(2, 0x52, &h32(0x51))]),
-                )
-            }
-        });
-        let source = source_for(&server);
-        source.scan_range(scan_request(1, 1)).expect("first page");
-        assert!(source.tip_regression().is_none());
-        source.scan_range(scan_request(2, 1)).expect("second page");
-        let regression = source.tip_regression().expect("regression recorded");
-        assert_eq!(regression.previous.height, 10);
-        assert_eq!(regression.previous.hash, [0x5A; 32]);
-        assert_eq!(regression.observed.height, 8);
-        assert_eq!(regression.observed.hash, [0x58; 32]);
-        // High-water mark keeps the honest maximum.
-        assert_eq!(source.last_observed_tip().map(|tip| tip.height), Some(10));
-    }
-
-    #[test]
-    fn remote_identity_drift_within_session_is_terminal_chain_mismatch() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let handler_calls = Arc::clone(&calls);
-        let server = MockServer::start(move |_| {
-            let call = handler_calls.fetch_add(1, Ordering::SeqCst);
-            let mut body = full_scan_json(1, 1, 5, 0x55, vec![block_json(1, 0x51, &h32(0x50))]);
-            if call > 0 {
-                // Same network/chain_id (passes the request check) but a
-                // different genesis: a node silently swapping chains.
-                body["identity"]["genesis_hash"] = json!(h32(0x23));
-            }
-            CannedResponse::json(200, body)
-        });
-        let source = source_for(&server);
-        source.scan_range(scan_request(1, 1)).expect("first page");
-        let error = source
-            .scan_range(scan_request(1, 1))
-            .expect_err("identity drift must fail");
-        assert!(matches!(error, WalletCoreError::CursorChainMismatch(_)));
-    }
-
-    #[test]
-    fn chain_identity_probes_with_an_empty_page_and_pins_the_session() {
-        let server = MockServer::start(|request| {
-            assert_eq!(request.path, "/chain/scan/full");
-            assert_eq!(request.query, "from=1&to=0");
-            identity_probe_response(9, 0x59)
-        });
-        let source = source_for(&server);
-        let identity = source.chain_identity().expect("identity probe");
-        assert_eq!(identity.network, CoreNetwork::Regtest);
-        assert_eq!(identity.network_magic, CoreNetwork::Regtest.magic());
-        assert_eq!(identity.chain_id, [0x11; 32]);
-        assert_eq!(identity.genesis_hash, [0x22; 32]);
-        assert_eq!(identity.coinbase_maturity, 1440);
-        assert_eq!(
-            identity.current_tip,
-            BlockRef {
-                height: 9,
-                hash: [0x59; 32]
-            }
-        );
-        assert_eq!(source.last_observed_tip().map(|tip| tip.height), Some(9));
-    }
-
-    #[test]
-    fn canonical_hash_at_height_maps_found_and_missing_headers() {
-        let server = MockServer::start(|request| {
-            assert!(
-                request.authorization.is_none(),
-                "/block is public; the bearer token must not be sent"
-            );
-            match request.path.as_str() {
-                "/block/5" => CannedResponse::json(
-                    200,
-                    json!({
-                        "height": 5,
-                        "hash": h32(0x77),
-                        "prev_hash": h32(0x76),
-                        "timestamp": 1_753_651_200u64,
-                        "target": "00ff",
-                    }),
-                ),
-                "/block/6" => CannedResponse::json(404, json!({"found": false})),
-                other => panic!("unexpected path {other}"),
-            }
-        });
-        let source = source_for(&server);
-        assert_eq!(
-            source.canonical_hash_at_height(5).expect("found header"),
-            Some([0x77; 32])
-        );
-        assert_eq!(
-            source.canonical_hash_at_height(6).expect("missing header"),
-            None
-        );
-    }
-
-    #[test]
-    fn validate_cursor_detects_reorg_through_the_public_header_endpoint() {
-        let cursor = WalletScanCursor::new(
-            CoreNetwork::Regtest,
-            [0x11; 32],
-            8,
-            BlockRef {
-                height: 7,
-                hash: [0x66; 32],
-            },
-        );
-
-        let matching = MockServer::start(|request| match request.path.as_str() {
-            "/chain/scan/full" => identity_probe_response(9, 0x59),
-            "/block/7" => CannedResponse::json(
-                200,
-                json!({"height": 7, "hash": h32(0x66), "prev_hash": h32(0x65),
-                       "timestamp": 1u64, "target": "00ff"}),
-            ),
-            other => panic!("unexpected path {other}"),
-        });
-        let source = source_for(&matching);
-        let validation = source.validate_cursor(cursor).expect("valid cursor");
-        assert!(validation.valid);
-        assert_eq!(validation.safe_rescan_anchor.height, 7);
-        assert_eq!(validation.safe_rescan_anchor.hash, [0x66; 32]);
-        drop(matching);
-
-        let reorged = MockServer::start(|request| match request.path.as_str() {
-            "/chain/scan/full" => identity_probe_response(9, 0x59),
-            "/block/7" => CannedResponse::json(
-                200,
-                json!({"height": 7, "hash": h32(0x67), "prev_hash": h32(0x65),
-                       "timestamp": 1u64, "target": "00ff"}),
-            ),
-            other => panic!("unexpected path {other}"),
-        });
-        let source = source_for(&reorged);
-        let error = source
-            .validate_cursor(cursor)
-            .expect_err("reorged anchor must fail");
-        assert!(matches!(error, WalletCoreError::CursorReorg(_)));
-    }
-
-    #[test]
-    fn scan_next_validates_the_anchor_and_pages_from_the_cursor() {
-        let cursor = WalletScanCursor::new(
-            CoreNetwork::Regtest,
-            [0x11; 32],
-            8,
-            BlockRef {
-                height: 7,
-                hash: [0x66; 32],
-            },
-        );
-        let server = MockServer::start(|request| {
-            match (request.path.as_str(), request.query.as_str()) {
-                // scan_next trait default: identity probe first.
-                ("/chain/scan/full", "from=1&to=0") => identity_probe_response(9, 0x69),
-                ("/block/7", _) => CannedResponse::json(
-                    200,
-                    json!({"height": 7, "hash": h32(0x66), "prev_hash": h32(0x65),
-                           "timestamp": 1u64, "target": "00ff"}),
-                ),
-                ("/chain/scan/full", "from=8&to=9") => CannedResponse::json(
-                    200,
-                    full_scan_json(
-                        8,
-                        9,
-                        9,
-                        0x69,
-                        vec![
-                            block_json(8, 0x68, &h32(0x66)),
-                            block_json(9, 0x69, &h32(0x68)),
-                        ],
-                    ),
-                ),
-                (path, query) => panic!("unexpected request {path}?{query}"),
-            }
-        });
-        let source = source_for(&server);
-        let result = source.scan_next(cursor, 2).expect("cursor page");
-        assert_eq!(
-            result
-                .blocks
-                .iter()
-                .map(|block| block.height)
-                .collect::<Vec<_>>(),
-            vec![8, 9]
-        );
-        assert!(result.continuation.is_none(), "page reached the tip");
-    }
-
-    #[test]
-    fn operations_outside_the_scan_surface_are_terminal_embedded_only_errors() {
-        // No server needed: these must fail without any network traffic.
-        let source =
-            RemoteNodeSource::new("http://127.0.0.1:1", Some(TOKEN)).expect("remote source");
-        let errors = [
-            source.get_utxo(&[0xAB; 33]).map(|_| ()).unwrap_err(),
-            source.get_kernel(&[0xAB; 33]).map(|_| ()).unwrap_err(),
-            source
-                .get_block_summary(BlockSelector::Height(1))
-                .map(|_| ())
-                .unwrap_err(),
-            source
-                .transaction_status(TransactionIdentifier::TxHash([0; 32]))
-                .map(|_| ())
-                .unwrap_err(),
-            source
-                .rebroadcast_transaction(TransactionIdentifier::TxHash([0; 32]))
-                .map(|_| ())
-                .unwrap_err(),
-            source
-                .query_submission(TransactionIdentifier::TxHash([0; 32]))
-                .map(|_| ())
-                .unwrap_err(),
-            source.mempool_policy_snapshot().map(|_| ()).unwrap_err(),
-            source.fee_policy_snapshot().map(|_| ()).unwrap_err(),
-            source.fee_policy().map(|_| ()).unwrap_err(),
-            source
-                .transaction_weight(TransactionShape {
-                    input_count: 1,
-                    output_count: 1,
-                    kernel_count: 1,
-                })
-                .map(|_| ())
-                .unwrap_err(),
-        ];
-        for error in errors {
+        #[test]
+        fn missing_endpoint_404_maps_to_terminal_upgrade_error() {
+            let error = scan_error_of(CannedResponse::text(404, "not found"));
             match error {
                 WalletCoreError::InternalFailure(message) => {
                     assert!(
-                        message.contains("requires the embedded node"),
+                        message.contains("/chain/scan/scriptless/v1"),
                         "message: {message}"
                     );
                 }
-                other => panic!("expected terminal InternalFailure, got {other:?}"),
+                other => panic!("404 must be terminal InternalFailure, got {other:?}"),
             }
         }
-    }
 
-    #[test]
-    fn debug_output_redacts_the_bearer_token() {
-        let source =
-            RemoteNodeSource::new("http://127.0.0.1:1", Some("super-secret")).expect("source");
-        let debug = format!("{source:?}");
-        assert!(!debug.contains("super-secret"), "debug: {debug}");
-        assert!(debug.contains("<redacted>"), "debug: {debug}");
-    }
+        #[test]
+        fn canonical_gap_code_maps_to_canonical_gap_and_plain_500_stays_retriable() {
+            let gap = scan_error_of(CannedResponse::json(
+                500,
+                json!({"error": "canonical gap: missing canonical block at height 7",
+                   "code": "canonical_gap"}),
+            ));
+            assert!(matches!(gap, WalletCoreError::CanonicalGap(_)));
 
-    #[test]
-    fn constructor_rejects_bad_configuration() {
-        assert!(matches!(
-            RemoteNodeSource::new("not a url", None),
-            Err(RemoteSourceConfigError::InvalidBaseUrl(_))
-        ));
-        assert!(matches!(
-            RemoteNodeSource::new("ftp://example.com", None),
-            Err(RemoteSourceConfigError::UnsupportedScheme)
-        ));
-        assert!(matches!(
-            RemoteNodeSource::new("http://127.0.0.1:1", Some("  \n")),
-            Err(RemoteSourceConfigError::EmptyBearerToken)
-        ));
-        // The node writes the token file with a trailing newline; trim it.
-        let source = RemoteNodeSource::new("http://127.0.0.1:1/", Some("token-value\n"))
-            .expect("trimmed token");
-        assert_eq!(
-            source.bearer_token.as_ref().map(|token| token.0.as_str()),
-            Some("token-value")
-        );
-        assert_eq!(source.base_url, "http://127.0.0.1:1");
-    }
+            let plain = scan_error_of(CannedResponse::json(
+                500,
+                json!({"error": "internal: transient store hiccup"}),
+            ));
+            assert!(
+                matches!(plain, WalletCoreError::TemporaryFailure(_)),
+                "uncoded 500 must stay retriable, got {plain:?}"
+            );
+        }
 
-    #[test]
-    fn scan_past_the_tip_returns_an_empty_page_without_continuation() {
-        let server = MockServer::start(|request| {
-            // from beyond the tip: server clamps to an empty page (to < from).
-            assert_eq!(request.query, "from=10&to=11");
-            CannedResponse::json(200, full_scan_json(10, 5, 5, 0x55, Vec::new()))
-        });
-        let source = source_for(&server);
-        let result = source.scan_range(scan_request(10, 2)).expect("empty page");
-        assert!(result.blocks.is_empty());
-        assert!(result.continuation.is_none());
-        assert_eq!(result.tip.height, 5);
+        #[test]
+        fn connection_failure_maps_to_retriable_temporary_failure() {
+            // Reserved port with no listener: connection refused.
+            let source =
+                RemoteNodeSource::new("http://127.0.0.1:1", Some(TOKEN)).expect("remote source");
+            let error = source
+                .scan_range(scan_request(1, 2))
+                .expect_err("connection must fail");
+            assert!(matches!(error, WalletCoreError::TemporaryFailure(_)));
+        }
+
+        #[test]
+        fn commitment_filters_are_rejected_locally_without_any_network_traffic() {
+            let server = MockServer::start(|_| CannedResponse::text(500, "must never be reached"));
+            let source = source_for(&server);
+            let mut request = scan_request(1, 2);
+            request.commitment_filters = vec![[0xAB; 33]];
+            let error = source
+                .scan_range(request)
+                .expect_err("filters must be rejected");
+            assert!(matches!(error, WalletCoreError::InvalidScanRequest(_)));
+            assert_eq!(server.hits(), 0, "privacy: no request may leave the wallet");
+        }
+
+        #[test]
+        fn schema_divergence_is_terminal_and_never_partially_consumed() {
+            let valid_blocks = || canonical_blocks(1, 2, [0x50; 32], 0x51);
+
+            let mut unknown_version = full_scan_json(1, 2, 2, 0x52, valid_blocks());
+            unknown_version["schema_version"] = json!(2);
+
+            let mut nonconsecutive = full_scan_json(1, 2, 2, 0x52, valid_blocks());
+            nonconsecutive["blocks"][1]["height"] = json!(3);
+
+            let mut missing_block =
+                full_scan_json(1, 2, 2, 0x52, vec![block_json(1, 0x51, &h32(0x50))]);
+            missing_block["served_to"] = json!(2);
+
+            let mut bad_hex = full_scan_json(1, 2, 2, 0x52, valid_blocks());
+            bad_hex["blocks"][0]["block_hash"] = json!("zz");
+
+            let mut broken_chain = full_scan_json(1, 2, 2, 0x52, valid_blocks());
+            broken_chain["blocks"][1]["previous_block_hash"] = json!(h32(0x99));
+
+            let mut capsule_mismatch = full_scan_json(1, 2, 2, 0x52, valid_blocks());
+            capsule_mismatch["blocks"][0]["transactions"][0]["outputs"][0]["recovery_version"] =
+                json!(1);
+
+            let mut beyond_tip = full_scan_json(1, 2, 1, 0x51, valid_blocks());
+            beyond_tip["tip"]["height"] = json!(1);
+
+            for (case, body) in [
+                ("unknown schema_version", unknown_version),
+                ("nonconsecutive heights", nonconsecutive),
+                ("missing block in range", missing_block),
+                ("invalid hex", bad_hex),
+                ("broken previous-hash chain", broken_chain),
+                ("capsule/version mismatch", capsule_mismatch),
+                ("to beyond tip", beyond_tip),
+                ("json garbage", json!("not an object")),
+            ] {
+                let error = scan_error_of(CannedResponse::raw_json(200, body.to_string()));
+                match error {
+                    WalletCoreError::InternalFailure(message) => {
+                        assert!(
+                            message.contains("remote schema violation"),
+                            "case {case}: message {message}"
+                        );
+                    }
+                    other => {
+                        panic!("case {case}: expected terminal InternalFailure, got {other:?}")
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn tip_regression_is_recorded_for_the_consumer_without_aborting_the_scan() {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let handler_calls = Arc::clone(&calls);
+            let first = block_json(1, 0x51, &h32(0x50));
+            let second = canonical_block(2, first.block_hash, 0x52);
+            let first_for_server = first.clone();
+            let server = MockServer::start(move |request| {
+                if request.path == "/block/0" {
+                    return CannedResponse::json(200, json!({"height": 0, "hash": h32(0x50)}));
+                }
+                if request.path == "/block/1" {
+                    return CannedResponse::json(
+                        200,
+                        json!({"height": 1, "hash": hex::encode(first_for_server.block_hash)}),
+                    );
+                }
+                let call = handler_calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    CannedResponse::json(
+                        200,
+                        full_scan_json(1, 1, 10, 0x5A, vec![first_for_server.clone()]),
+                    )
+                } else {
+                    CannedResponse::json(200, full_scan_json(2, 2, 8, 0x58, vec![second.clone()]))
+                }
+            });
+            let source = source_for(&server);
+            source.scan_range(scan_request(1, 1)).expect("first page");
+            assert!(source.tip_regression().is_none());
+            source.scan_range(scan_request(2, 1)).expect("second page");
+            let regression = source.tip_regression().expect("regression recorded");
+            assert_eq!(regression.previous.height, 10);
+            assert_eq!(regression.previous.hash, [0x5A; 32]);
+            assert_eq!(regression.observed.height, 8);
+            assert_eq!(regression.observed.hash, [0x58; 32]);
+            // High-water mark keeps the honest maximum.
+            assert_eq!(source.last_observed_tip().map(|tip| tip.height), Some(10));
+        }
+
+        #[test]
+        fn remote_identity_drift_within_session_is_terminal_chain_mismatch() {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let handler_calls = Arc::clone(&calls);
+            let block = block_json(1, 0x51, &h32(0x50));
+            let server = MockServer::start(move |request| {
+                if request.path == "/block/0" {
+                    return CannedResponse::json(200, json!({"height": 0, "hash": h32(0x50)}));
+                }
+                let call = handler_calls.fetch_add(1, Ordering::SeqCst);
+                let mut body = full_scan_json(1, 1, 5, 0x55, vec![block.clone()]);
+                if call > 0 {
+                    // Same network/chain_id (passes the request check) but a
+                    // different genesis: a node silently swapping chains.
+                    body["identity"]["genesis_hash"] = json!(h32(0x23));
+                }
+                CannedResponse::json(200, body)
+            });
+            let source = source_for(&server);
+            source.scan_range(scan_request(1, 1)).expect("first page");
+            let error = source
+                .scan_range(scan_request(1, 1))
+                .expect_err("identity drift must fail");
+            assert!(matches!(error, WalletCoreError::CursorChainMismatch(_)));
+        }
+
+        #[test]
+        fn chain_identity_probes_with_an_empty_page_and_pins_the_session() {
+            let server = MockServer::start(|request| {
+                assert_eq!(request.path, "/chain/scan/scriptless/v1");
+                assert!(request.query.contains("from=0&to=0"));
+                identity_probe_response(9, 0x59)
+            });
+            let source = source_for(&server);
+            let identity = source.chain_identity().expect("identity probe");
+            assert_eq!(identity.network, CoreNetwork::Regtest);
+            assert_eq!(identity.network_magic, CoreNetwork::Regtest.magic());
+            assert_eq!(identity.chain_id, canonical_chain_identity().chain_id);
+            assert_eq!(
+                identity.genesis_hash,
+                canonical_chain_identity().genesis_hash
+            );
+            assert_eq!(identity.coinbase_maturity, 1440);
+            assert_eq!(
+                identity.current_tip,
+                BlockRef {
+                    height: 9,
+                    hash: [0x59; 32]
+                }
+            );
+            assert_eq!(source.last_observed_tip().map(|tip| tip.height), Some(9));
+        }
+
+        #[test]
+        fn canonical_hash_at_height_maps_found_and_missing_headers() {
+            let server = MockServer::start(|request| {
+                assert!(
+                    request.authorization.is_none(),
+                    "/block is public; the bearer token must not be sent"
+                );
+                match request.path.as_str() {
+                    "/block/5" => CannedResponse::json(
+                        200,
+                        json!({
+                            "height": 5,
+                            "hash": h32(0x77),
+                            "prev_hash": h32(0x76),
+                            "timestamp": 1_753_651_200u64,
+                            "target": "00ff",
+                        }),
+                    ),
+                    "/block/6" => CannedResponse::json(404, json!({"found": false})),
+                    other => panic!("unexpected path {other}"),
+                }
+            });
+            let source = source_for(&server);
+            assert_eq!(
+                source.canonical_hash_at_height(5).expect("found header"),
+                Some([0x77; 32])
+            );
+            assert_eq!(
+                source.canonical_hash_at_height(6).expect("missing header"),
+                None
+            );
+        }
+
+        #[test]
+        fn validate_cursor_detects_reorg_through_the_public_header_endpoint() {
+            let cursor = WalletScanCursor::new(
+                CoreNetwork::Regtest,
+                canonical_chain_identity().chain_id,
+                8,
+                BlockRef {
+                    height: 7,
+                    hash: [0x66; 32],
+                },
+            );
+
+            let matching = MockServer::start(|request| match request.path.as_str() {
+                "/chain/scan/scriptless/v1" => identity_probe_response(9, 0x59),
+                "/block/7" => CannedResponse::json(
+                    200,
+                    json!({"height": 7, "hash": h32(0x66), "prev_hash": h32(0x65),
+                       "timestamp": 1u64, "target": "00ff"}),
+                ),
+                other => panic!("unexpected path {other}"),
+            });
+            let source = source_for(&matching);
+            let validation = source.validate_cursor(cursor).expect("valid cursor");
+            assert!(validation.valid);
+            assert_eq!(validation.safe_rescan_anchor.height, 7);
+            assert_eq!(validation.safe_rescan_anchor.hash, [0x66; 32]);
+            drop(matching);
+
+            let reorged = MockServer::start(|request| match request.path.as_str() {
+                "/chain/scan/scriptless/v1" => identity_probe_response(9, 0x59),
+                "/block/7" => CannedResponse::json(
+                    200,
+                    json!({"height": 7, "hash": h32(0x67), "prev_hash": h32(0x65),
+                       "timestamp": 1u64, "target": "00ff"}),
+                ),
+                other => panic!("unexpected path {other}"),
+            });
+            let source = source_for(&reorged);
+            let error = source
+                .validate_cursor(cursor)
+                .expect_err("reorged anchor must fail");
+            assert!(matches!(error, WalletCoreError::CursorReorg(_)));
+        }
+
+        #[test]
+        fn scan_next_validates_the_anchor_and_pages_from_the_cursor() {
+            let cursor = WalletScanCursor::new(
+                CoreNetwork::Regtest,
+                canonical_chain_identity().chain_id,
+                8,
+                BlockRef {
+                    height: 7,
+                    hash: [0x66; 32],
+                },
+            );
+            let blocks = canonical_blocks(8, 2, [0x66; 32], 0x68);
+            let blocks_for_server = blocks.clone();
+            let server = MockServer::start(move |request| {
+                match (request.path.as_str(), request.query.as_str()) {
+                    // scan_next trait default: identity probe first.
+                    ("/chain/scan/scriptless/v1", query) if query.contains("from=0&to=0") => {
+                        identity_probe_response(9, 0x69)
+                    }
+                    ("/block/7", _) => CannedResponse::json(
+                        200,
+                        json!({"height": 7, "hash": h32(0x66), "prev_hash": h32(0x65),
+                           "timestamp": 1u64, "target": "00ff"}),
+                    ),
+                    ("/chain/scan/scriptless/v1", query) if query.contains("from=8&to=9") => {
+                        CannedResponse::json(
+                            200,
+                            full_scan_json(8, 9, 9, 0x69, blocks_for_server.clone()),
+                        )
+                    }
+                    (path, query) => panic!("unexpected request {path}?{query}"),
+                }
+            });
+            let source = source_for(&server);
+            let result = source.scan_next(cursor, 2).expect("cursor page");
+            assert_eq!(
+                result
+                    .blocks
+                    .iter()
+                    .map(|block| block.height)
+                    .collect::<Vec<_>>(),
+                vec![8, 9]
+            );
+            assert!(result.continuation.is_none(), "page reached the tip");
+        }
+
+        #[test]
+        fn operations_outside_the_scan_surface_are_terminal_embedded_only_errors() {
+            // No server needed: these must fail without any network traffic.
+            let source =
+                RemoteNodeSource::new("http://127.0.0.1:1", Some(TOKEN)).expect("remote source");
+            let errors = [
+                source.get_utxo(&[0xAB; 33]).map(|_| ()).unwrap_err(),
+                source.get_kernel(&[0xAB; 33]).map(|_| ()).unwrap_err(),
+                source
+                    .get_block_summary(BlockSelector::Height(1))
+                    .map(|_| ())
+                    .unwrap_err(),
+                source
+                    .transaction_status(TransactionIdentifier::TxHash([0; 32]))
+                    .map(|_| ())
+                    .unwrap_err(),
+                source
+                    .rebroadcast_transaction(TransactionIdentifier::TxHash([0; 32]))
+                    .map(|_| ())
+                    .unwrap_err(),
+                source
+                    .query_submission(TransactionIdentifier::TxHash([0; 32]))
+                    .map(|_| ())
+                    .unwrap_err(),
+                source.mempool_policy_snapshot().map(|_| ()).unwrap_err(),
+                source.fee_policy_snapshot().map(|_| ()).unwrap_err(),
+                source.fee_policy().map(|_| ()).unwrap_err(),
+                source
+                    .transaction_weight(TransactionShape {
+                        input_count: 1,
+                        output_count: 1,
+                        kernel_count: 1,
+                    })
+                    .map(|_| ())
+                    .unwrap_err(),
+            ];
+            for error in errors {
+                match error {
+                    WalletCoreError::InternalFailure(message) => {
+                        assert!(
+                            message.contains("requires the embedded node"),
+                            "message: {message}"
+                        );
+                    }
+                    other => panic!("expected terminal InternalFailure, got {other:?}"),
+                }
+            }
+        }
+
+        #[test]
+        fn debug_output_redacts_the_bearer_token() {
+            let source =
+                RemoteNodeSource::new("http://127.0.0.1:1", Some("super-secret")).expect("source");
+            let debug = format!("{source:?}");
+            assert!(!debug.contains("super-secret"), "debug: {debug}");
+            assert!(debug.contains("<redacted>"), "debug: {debug}");
+        }
+
+        #[test]
+        fn constructor_rejects_bad_configuration() {
+            assert!(matches!(
+                RemoteNodeSource::new("not a url", None),
+                Err(RemoteSourceConfigError::InvalidBaseUrl(_))
+            ));
+            assert!(matches!(
+                RemoteNodeSource::new("ftp://example.com", None),
+                Err(RemoteSourceConfigError::UnsupportedScheme)
+            ));
+            assert!(matches!(
+                RemoteNodeSource::new("http://127.0.0.1:1", Some("  \n")),
+                Err(RemoteSourceConfigError::EmptyBearerToken)
+            ));
+            // The node writes the token file with a trailing newline; trim it.
+            let source = RemoteNodeSource::new("http://127.0.0.1:1/", Some("token-value\n"))
+                .expect("trimmed token");
+            assert_eq!(
+                source.bearer_token.as_ref().map(|token| token.0.as_str()),
+                Some("token-value")
+            );
+            assert_eq!(source.base_url, "http://127.0.0.1:1");
+        }
+
+        #[test]
+        fn scan_past_the_tip_returns_an_empty_page_without_continuation() {
+            let server = MockServer::start(|request| {
+                if request.path == "/block/9" {
+                    return CannedResponse::json(
+                        200,
+                        json!({"height": 9, "hash": hex::encode([9; 32])}),
+                    );
+                }
+                assert!(request.query.contains("from=10&to=11"));
+                CannedResponse::json(200, full_scan_json(10, 11, 5, 0x55, Vec::new()))
+            });
+            let source = source_for(&server);
+            let result = source.scan_range(scan_request(10, 2)).expect("empty page");
+            assert!(result.blocks.is_empty());
+            assert!(result.continuation.is_none());
+            assert_eq!(result.tip.height, 5);
+        }
     }
 }
