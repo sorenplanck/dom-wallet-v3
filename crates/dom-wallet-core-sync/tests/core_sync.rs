@@ -1,10 +1,14 @@
+use dom_consensus::{Block, Transaction, TransactionInput, TransactionKernel};
+use dom_core::{Amount, BlockHeight, Hash256, Timestamp, KERNEL_FEAT_PLAIN};
+use dom_serialization::DomSerialize;
 use dom_wallet_core_api::{
     BlockRef, BlockSelector, BlockSummary, ChainIdentity, CoinbaseScanMetadata, CoreNetwork,
     CursorValidation, FeeBreakdown, FeeEstimate, FeeEstimateRequest, FeePolicySnapshot,
     FeeValidation, KernelQueryResult, MempoolPolicySnapshot, ScanBlock, ScanInput, ScanKernel,
-    ScanOutput, ScanRequest, ScanResult, ScanStart, SubmissionResult, SubmitTransactionRequest,
-    SyncStatus, TransactionIdentifier, TransactionShape, TransactionStatus, TransactionWeight,
-    UtxoQueryResult, WalletCoreApi, WalletCoreError, WalletScanCursor, WALLET_SCAN_CURSOR_LEN,
+    ScanOutput, ScanRequest, ScanResult, ScanStart, ScanTransaction, SubmissionResult,
+    SubmitTransactionRequest, SyncStatus, TransactionIdentifier, TransactionLocation,
+    TransactionShape, TransactionStatus, TransactionWeight, UtxoQueryResult, WalletCoreApi,
+    WalletCoreError, WalletScanCursor, WALLET_SCAN_CURSOR_LEN,
 };
 use dom_wallet_core_sync::{
     CoreBlockReference, CoreChainAdapter, CoreChainIdentity, CoreCursorBytes, CoreReconcileResult,
@@ -16,7 +20,7 @@ use dom_wallet_embedded_core::{
 use std::{
     collections::BTreeMap,
     net::{SocketAddr, TcpListener},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 use tempfile::TempDir;
 
@@ -46,15 +50,27 @@ enum Mutation {
     ContinuationRegression,
     MissingContinuation,
     TipDisagreement,
+    HeaderBytes,
+    TransactionHash,
+    TransactionBytes,
+    TransactionProjection,
+    FlatProjection,
 }
 
 impl FakeCore {
     fn new(block_count: u64) -> Self {
-        let blocks: Vec<_> = (0..block_count).map(scan_block).collect();
+        assert!(block_count > 0, "fake canonical chain requires genesis");
+        let mut blocks = Vec::with_capacity(block_count as usize);
+        let mut previous_hash = [0u8; 32];
+        for height in 0..block_count {
+            let block = scan_block(height, previous_hash, height as u8 + 1);
+            previous_hash = block.block_hash;
+            blocks.push(block);
+        }
         let tip = blocks.last().map_or(
             BlockRef {
                 height: 0,
-                hash: [1; 32],
+                hash: blocks[0].block_hash,
             },
             |block| BlockRef {
                 height: block.height,
@@ -67,7 +83,7 @@ impl FakeCore {
                     network: CoreNetwork::Regtest,
                     network_magic: CoreNetwork::Regtest.magic(),
                     chain_id: [8; 32],
-                    genesis_hash: [1; 32],
+                    genesis_hash: blocks[0].block_hash,
                     protocol_version: dom_core::PROTOCOL_VERSION,
                     range_proof_serialization_version:
                         dom_crypto::RANGE_PROOF_SERIALIZATION_VERSION,
@@ -93,10 +109,8 @@ impl FakeCore {
         self.state.lock().expect("fake state").fail_scan_at_genesis = true;
     }
 
-    fn clear_outputs(&self) {
-        for block in &mut self.state.lock().expect("fake state").blocks {
-            block.outputs.clear();
-        }
+    fn block(&self, height: u64) -> ScanBlock {
+        self.state.lock().expect("fake state").blocks[height as usize].clone()
     }
 
     fn mutate_identity(&self, change: impl FnOnce(&mut ChainIdentity)) {
@@ -120,16 +134,16 @@ impl FakeCore {
         let block_len = state.blocks.len();
         let mut previous_hash = previous;
         for index in height as usize..block_len {
-            let block = &mut state.blocks[index];
-            block.block_hash = [marker.wrapping_add(index as u8); 32];
-            block.canonical_marker = block.block_hash;
-            block.previous_block_hash = previous_hash;
-            block.coinbase.output_commitment = commitment(marker.wrapping_add(index as u8));
-            for output in &mut block.outputs {
-                output.block_hash = block.block_hash;
-                output.commitment = block.coinbase.output_commitment;
-            }
-            previous_hash = block.block_hash;
+            let replacement = scan_block(
+                index as u64,
+                previous_hash,
+                marker.wrapping_add(index as u8),
+            );
+            previous_hash = replacement.block_hash;
+            state.blocks[index] = replacement;
+        }
+        if height == 0 {
+            state.identity.genesis_hash = state.blocks[0].block_hash;
         }
         state.identity.current_tip = BlockRef {
             height: state.blocks.last().expect("block").height,
@@ -339,56 +353,156 @@ fn apply_mutation(blocks: &mut [ScanBlock], mutation: Mutation) {
         Mutation::RangeProofVersion if !blocks.is_empty() => {
             blocks[0].range_proof_serialization_version += 1;
         }
+        Mutation::HeaderBytes if !blocks.is_empty() => blocks[0].canonical_header_bytes[0] ^= 1,
+        Mutation::TransactionHash if !blocks.is_empty() => {
+            blocks[0].transactions[0].tx_hash[0] ^= 1
+        }
+        Mutation::TransactionBytes if !blocks.is_empty() => {
+            blocks[0].transactions[0].canonical_bytes.push(0)
+        }
+        Mutation::TransactionProjection if !blocks.is_empty() => {
+            blocks[0].transactions[0].kernels[0].excess_signature[0] ^= 1
+        }
+        Mutation::FlatProjection if !blocks.is_empty() => {
+            blocks[0].kernels.pop();
+        }
         _ => {}
     }
 }
 
-fn commitment(marker: u8) -> [u8; 33] {
-    let mut value = [marker; 33];
-    value[0] = 2;
-    value
+fn canonical_genesis_template() -> &'static Block {
+    static GENESIS: OnceLock<Block> = OnceLock::new();
+    GENESIS.get_or_init(|| {
+        dom_chain::build_canonical_genesis(CoreNetwork::Regtest.magic(), &[8; 32])
+            .expect("regtest genesis")
+            .block
+            .expect("regtest has a canonical block")
+    })
 }
 
-fn scan_block(height: u64) -> ScanBlock {
-    let marker = height as u8 + 1;
-    let hash = [marker; 32];
-    let previous = if height == 0 {
-        [0; 32]
-    } else {
-        [marker - 1; 32]
+fn scan_output(
+    output: &dom_consensus::TransactionOutput,
+    is_coinbase: bool,
+    block_height: u64,
+    block_hash: [u8; 32],
+    output_position: u32,
+) -> ScanOutput {
+    let capsule = output.recovery_capsule().expect("capsule envelope");
+    ScanOutput {
+        commitment: *output.commitment.as_bytes(),
+        range_proof: output
+            .range_proof_bytes()
+            .expect("range proof envelope")
+            .to_vec(),
+        recovery_capsule: capsule
+            .as_ref()
+            .map(|value| value.as_bytes().to_vec())
+            .unwrap_or_default(),
+        recovery_version: capsule.as_ref().map_or(0, |value| value.version()),
+        is_coinbase,
+        block_height,
+        block_hash,
+        output_position,
+    }
+}
+
+fn scan_block(height: u64, previous_hash: [u8; 32], marker: u8) -> ScanBlock {
+    let mut canonical = canonical_genesis_template().clone();
+    let mut offset = [0u8; 32];
+    offset[31] = marker.max(1);
+    let transaction = Transaction {
+        inputs: vec![TransactionInput {
+            commitment: canonical.coinbase.output.commitment.clone(),
+        }],
+        outputs: vec![canonical.coinbase.output.clone()],
+        kernels: vec![TransactionKernel {
+            features: KERNEL_FEAT_PLAIN,
+            fee: Amount::from_noms(height).expect("fee"),
+            lock_height: height,
+            excess: canonical.coinbase.kernel.excess.clone(),
+            excess_signature: [marker.wrapping_add(60); 65],
+        }],
+        offset,
     };
-    let output_commitment = commitment(marker);
+    canonical.header.version =
+        dom_core::required_block_version_for_network(CoreNetwork::Regtest.magic(), height);
+    canonical.header.height = BlockHeight(height);
+    canonical.header.prev_hash = Hash256::from_bytes(previous_hash);
+    canonical.header.timestamp = Timestamp(1_700_000_000 + height + u64::from(marker));
+    canonical.header.total_kernel_offset = offset;
+    canonical.header.pow.nonce = u64::from(marker);
+    canonical.transactions = vec![transaction.clone()];
+    let (output_root, kernel_root, rangeproof_root) = dom_consensus::compute_block_pmmr_roots(
+        BlockHeight(height),
+        &canonical.coinbase,
+        &canonical.transactions,
+    )
+    .expect("canonical body roots");
+    canonical.header.output_root = output_root;
+    canonical.header.kernel_root = kernel_root;
+    canonical.header.rangeproof_root = rangeproof_root;
+    let canonical_header_bytes = canonical.header.to_bytes().expect("canonical header");
+    let hash = *dom_chain::canonical_header_identifier(
+        CoreNetwork::Regtest.magic(),
+        &canonical_header_bytes,
+    )
+    .expect("canonical header id")
+    .as_bytes();
+    let transaction_bytes = transaction.to_bytes().expect("canonical transaction");
+    let transaction_kernel = &transaction.kernels[0];
+    let coinbase_output = scan_output(&canonical.coinbase.output, true, height, hash, 0);
+    let transaction_output = scan_output(&transaction.outputs[0], false, height, hash, 1);
+    let coinbase_kernel = ScanKernel {
+        excess: *canonical.coinbase.kernel.excess.as_bytes(),
+        features: canonical.coinbase.kernel.features,
+        fee: 0,
+        lock_height: 0,
+        excess_signature: canonical.coinbase.kernel.excess_signature,
+    };
+    let transaction_kernel = ScanKernel {
+        excess: *transaction_kernel.excess.as_bytes(),
+        features: transaction_kernel.features,
+        fee: transaction_kernel.fee.noms(),
+        lock_height: transaction_kernel.lock_height,
+        excess_signature: transaction_kernel.excess_signature,
+    };
     ScanBlock {
         height,
         block_hash: hash,
-        previous_block_hash: previous,
-        timestamp: 1_700_000_000 + height,
+        previous_block_hash: previous_hash,
+        canonical_header_bytes,
+        timestamp: canonical.header.timestamp.0,
         canonical_marker: hash,
-        outputs: vec![ScanOutput {
-            commitment: output_commitment,
-            range_proof: vec![marker; dom_crypto::RANGE_PROOF_SIZE],
-            recovery_capsule: vec![marker; dom_crypto::recovery::RECOVERY_CAPSULE_SIZE],
-            recovery_version: dom_crypto::recovery::RECOVERY_VERSION,
-            is_coinbase: true,
-            block_height: height,
-            block_hash: hash,
-            output_position: 0,
-        }],
+        outputs: vec![coinbase_output, transaction_output.clone()],
         inputs: vec![ScanInput {
-            spent_commitment: commitment(marker.wrapping_add(20)),
+            spent_commitment: *transaction.inputs[0].commitment.as_bytes(),
         }],
-        kernels: vec![ScanKernel {
-            excess: commitment(marker.wrapping_add(40)),
-            features: 1,
-            fee: height,
-            lock_height: height,
+        kernels: vec![coinbase_kernel, transaction_kernel.clone()],
+        transactions: vec![ScanTransaction {
+            location: TransactionLocation {
+                block_height: height,
+                block_hash: hash,
+                transaction_index: 0,
+            },
+            tx_hash: *dom_crypto::blake2b_256(&transaction_bytes).as_bytes(),
+            canonical_bytes: transaction_bytes,
+            inputs: vec![ScanInput {
+                spent_commitment: *transaction.inputs[0].commitment.as_bytes(),
+            }],
+            outputs: vec![transaction_output],
+            kernels: vec![transaction_kernel],
+            offset,
         }],
         coinbase: CoinbaseScanMetadata {
-            output_commitment,
-            explicit_value: 50,
-            kernel_excess: commitment(marker.wrapping_add(40)),
+            output_commitment: *canonical.coinbase.output.commitment.as_bytes(),
+            explicit_value: canonical.coinbase.kernel.explicit_value,
+            kernel_excess: *canonical.coinbase.kernel.excess.as_bytes(),
+            kernel_features: canonical.coinbase.kernel.features,
+            kernel_excess_signature: canonical.coinbase.kernel.excess_signature,
+            offset: canonical.coinbase.offset,
+            output_proof_envelope: canonical.coinbase.output.proof.clone(),
         },
-        total_fees_noms: height,
+        total_fees_noms: canonical.total_fees().expect("total fees"),
         protocol_version: dom_core::required_block_version_for_network(
             CoreNetwork::Regtest.magic(),
             height,
@@ -549,11 +663,13 @@ fn cursor_rejects_zero_anchor_hash() {
 
 #[test]
 fn identity_mapping_is_complete_and_network_bound() {
-    let adapter = FakeCore::new(2).adapter();
+    let core = FakeCore::new(2);
+    let expected_genesis = core.block(0).block_hash;
+    let adapter = core.adapter();
     let identity = adapter.identity();
     assert_eq!(identity.network_magic, CoreNetwork::Regtest.magic());
     assert_eq!(identity.chain_id, [8; 32]);
-    assert_eq!(identity.genesis_hash, [1; 32]);
+    assert_eq!(identity.genesis_hash, expected_genesis);
     assert_eq!(identity.protocol_version, dom_core::PROTOCOL_VERSION);
     assert_eq!(identity.coinbase_maturity, 1);
 }
@@ -642,6 +758,31 @@ fn scan_rejects_unsupported_range_proof_version() {
 }
 
 #[test]
+fn scan_rejects_noncanonical_header_bytes() {
+    reject_mutation(Mutation::HeaderBytes);
+}
+
+#[test]
+fn scan_rejects_transaction_hash_mismatch() {
+    reject_mutation(Mutation::TransactionHash);
+}
+
+#[test]
+fn scan_rejects_noncanonical_transaction_bytes() {
+    reject_mutation(Mutation::TransactionBytes);
+}
+
+#[test]
+fn scan_rejects_transaction_projection_mismatch() {
+    reject_mutation(Mutation::TransactionProjection);
+}
+
+#[test]
+fn scan_rejects_flat_projection_mismatch() {
+    reject_mutation(Mutation::FlatProjection);
+}
+
+#[test]
 fn scan_rejects_continuation_regression() {
     reject_mutation(Mutation::ContinuationRegression);
 }
@@ -669,12 +810,38 @@ fn reject_mutation(mutation: Mutation) {
 
 #[test]
 fn proof_and_capsule_bytes_are_preserved() {
-    let batch = FakeCore::new(2).adapter().scan_from_height(0, 2).unwrap();
+    let core = FakeCore::new(2);
+    let expected = core.block(0).outputs[0].clone();
+    let batch = core.adapter().scan_from_height(0, 2).unwrap();
     let output = &batch.blocks[0].outputs[0];
-    assert_eq!(output.range_proof, vec![1; dom_crypto::RANGE_PROOF_SIZE]);
+    assert_eq!(output.range_proof, expected.range_proof);
+    assert_eq!(output.recovery_capsule, expected.recovery_capsule);
+}
+
+#[test]
+fn full_fidelity_scriptless_evidence_is_preserved() {
+    let core = FakeCore::new(2);
+    let expected = core.block(0);
+    let batch = core.adapter().scan_from_height(0, 2).unwrap();
+    let block = &batch.blocks[0];
     assert_eq!(
-        output.recovery_capsule,
-        vec![1; dom_crypto::recovery::RECOVERY_CAPSULE_SIZE]
+        block.canonical_header_bytes,
+        expected.canonical_header_bytes
+    );
+    assert_eq!(block.kernels[1].excess_signature, [61; 65]);
+    assert_eq!(block.transactions.len(), 1);
+    assert_eq!(
+        block.transactions[0].canonical_bytes,
+        expected.transactions[0].canonical_bytes
+    );
+    assert_eq!(block.transactions[0].kernels[0].excess_signature, [61; 65]);
+    assert_eq!(
+        block.coinbase.kernel_excess_signature,
+        expected.coinbase.kernel_excess_signature
+    );
+    assert_eq!(
+        block.coinbase.output_proof_envelope,
+        expected.coinbase.output_proof_envelope
     );
 }
 
@@ -768,7 +935,7 @@ fn cursor_ahead_of_tip_rewinds_atomically_to_the_common_ancestor() {
     };
     let cursor = cursor.decode().unwrap();
     assert_eq!(cursor.anchor_height, 2);
-    assert_eq!(cursor.anchor_hash, [3; 32]);
+    assert_eq!(cursor.anchor_hash, core.block(2).block_hash);
     assert_eq!(sink.hashes.keys().copied().collect::<Vec<_>>(), vec![1, 2]);
 }
 
@@ -831,7 +998,7 @@ fn missing_cursor_genesis_only_initializes_height_zero() {
     };
     let cursor = cursor.decode().unwrap();
     assert_eq!(cursor.anchor_height, 0);
-    assert_eq!(cursor.anchor_hash, [1; 32]);
+    assert_eq!(cursor.anchor_hash, core.block(0).block_hash);
     assert!(sink.hashes.is_empty());
 }
 
@@ -849,8 +1016,9 @@ fn missing_cursor_scans_existing_height_one() {
     };
     let cursor = cursor.decode().unwrap();
     assert_eq!(cursor.anchor_height, 1);
-    assert_eq!(cursor.anchor_hash, [2; 32]);
-    assert_eq!(sink.hashes, BTreeMap::from([(1, [2; 32])]));
+    let height_one_hash = core.block(1).block_hash;
+    assert_eq!(cursor.anchor_hash, height_one_hash);
+    assert_eq!(sink.hashes, BTreeMap::from([(1, height_one_hash)]));
 }
 
 #[test]
@@ -871,9 +1039,8 @@ fn mainnet_missing_cursor_rejects_genesis_mismatch() {
 }
 
 #[test]
-fn empty_wallet_scan_is_success() {
+fn complete_wallet_scan_is_success() {
     let core = FakeCore::new(2);
-    core.clear_outputs();
     let adapter = core.adapter();
     let mut sink = MemorySink::default();
 

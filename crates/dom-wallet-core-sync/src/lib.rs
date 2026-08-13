@@ -2,10 +2,16 @@
 
 #![forbid(unsafe_code)]
 
+use dom_consensus::{
+    Block, BlockHeader, CoinbaseKernel, CoinbaseTransaction, Transaction, TransactionOutput,
+};
+use dom_crypto::pedersen::Commitment;
+use dom_serialization::{DomDeserialize, DomSerialize};
 use dom_wallet_core_api::{
     BlockRef, ChainIdentity, CoinbaseScanMetadata, CoreNetwork, CursorValidation, ScanBlock,
-    ScanRequest, ScanResult, ScanStart, WalletCoreApi, WalletCoreError, WalletScanCursor,
-    WALLET_SCAN_CURSOR_LEN, WALLET_SCAN_CURSOR_VERSION,
+    ScanInput, ScanKernel, ScanOutput, ScanRequest, ScanResult, ScanStart, ScanTransaction,
+    TransactionLocation, WalletCoreApi, WalletCoreError, WalletScanCursor, WALLET_SCAN_CURSOR_LEN,
+    WALLET_SCAN_CURSOR_VERSION,
 };
 use std::{fmt, sync::Arc};
 use thiserror::Error;
@@ -147,6 +153,8 @@ pub struct CoreScanKernel {
     pub fee: u64,
     /// Absolute lock height.
     pub lock_height: u64,
+    /// Exact final DOM Schnorr signature retained for Scriptless evidence.
+    pub excess_signature: [u8; 65],
 }
 
 /// Wallet-owned coinbase metadata projection.
@@ -158,6 +166,14 @@ pub struct CoreCoinbaseMetadata {
     pub explicit_value: u64,
     /// Coinbase kernel excess.
     pub kernel_excess: [u8; 33],
+    /// Coinbase kernel feature byte.
+    pub kernel_features: u8,
+    /// Exact coinbase kernel signature.
+    pub kernel_excess_signature: [u8; 65],
+    /// Canonical coinbase transaction offset.
+    pub offset: [u8; 32],
+    /// Exact coinbase output proof envelope.
+    pub output_proof_envelope: Vec<u8>,
 }
 
 impl From<CoinbaseScanMetadata> for CoreCoinbaseMetadata {
@@ -166,6 +182,10 @@ impl From<CoinbaseScanMetadata> for CoreCoinbaseMetadata {
             output_commitment: value.output_commitment,
             explicit_value: value.explicit_value,
             kernel_excess: value.kernel_excess,
+            kernel_features: value.kernel_features,
+            kernel_excess_signature: value.kernel_excess_signature,
+            offset: value.offset,
+            output_proof_envelope: value.output_proof_envelope,
         }
     }
 }
@@ -179,6 +199,8 @@ pub struct CoreScanBlock {
     pub block_hash: [u8; 32],
     /// Previous block hash.
     pub previous_block_hash: [u8; 32],
+    /// Exact canonical header bytes authenticated by `block_hash`.
+    pub canonical_header_bytes: Vec<u8>,
     /// Timestamp.
     pub timestamp: u64,
     /// Canonical marker supplied by Core.
@@ -189,6 +211,8 @@ pub struct CoreScanBlock {
     pub inputs: Vec<CoreScanInput>,
     /// Kernels.
     pub kernels: Vec<CoreScanKernel>,
+    /// Full canonical non-coinbase transactions in block order.
+    pub transactions: Vec<ScanTransaction>,
     /// Coinbase metadata.
     pub coinbase: CoreCoinbaseMetadata,
     /// Total fees.
@@ -953,6 +977,7 @@ fn map_block(
             code: "RANGE_PROOF_VERSION",
         });
     }
+    validate_full_fidelity_projection(&block, identity)?;
     let mut outputs = Vec::with_capacity(block.outputs.len());
     for output in block.outputs {
         if output.block_height != block.height || output.block_hash != block.block_hash {
@@ -992,6 +1017,7 @@ fn map_block(
         height: block.height,
         block_hash: block.block_hash,
         previous_block_hash: block.previous_block_hash,
+        canonical_header_bytes: block.canonical_header_bytes,
         timestamp: block.timestamp,
         canonical_marker: block.canonical_marker,
         outputs,
@@ -1010,11 +1036,280 @@ fn map_block(
                 features: kernel.features,
                 fee: kernel.fee,
                 lock_height: kernel.lock_height,
+                excess_signature: kernel.excess_signature,
             })
             .collect(),
+        transactions: block.transactions,
         coinbase: block.coinbase.into(),
         total_fees_noms: block.total_fees_noms,
         protocol_version: block.protocol_version,
         range_proof_serialization_version: block.range_proof_serialization_version,
+    })
+}
+
+/// Reconstruct the canonical DOM block view and require every redundant scanner
+/// projection to agree with the bytes committed by the header. The Core RPC is
+/// authenticated, but Wallet must still fail closed if a buggy or compromised
+/// adapter changes transaction boundaries, signatures, or evidence fields.
+fn validate_full_fidelity_projection(
+    block: &ScanBlock,
+    identity: &CoreChainIdentity,
+) -> Result<(), CoreScanError> {
+    let header = BlockHeader::from_bytes(&block.canonical_header_bytes).map_err(|_| {
+        CoreScanError::InvalidScan {
+            code: "HEADER_DECODE",
+        }
+    })?;
+    if header.to_bytes().map_err(|_| CoreScanError::InvalidScan {
+        code: "HEADER_ENCODE",
+    })? != block.canonical_header_bytes
+    {
+        return Err(CoreScanError::InvalidScan {
+            code: "NONCANONICAL_HEADER_BYTES",
+        });
+    }
+    if header.height.0 != block.height
+        || header.prev_hash.as_bytes() != &block.previous_block_hash
+        || header.timestamp.0 != block.timestamp
+        || header.version != block.protocol_version
+    {
+        return Err(CoreScanError::InvalidScan {
+            code: "HEADER_PROJECTION_MISMATCH",
+        });
+    }
+    dom_consensus::block::validate_header_syntax(&header, identity.network_magic).map_err(
+        |_| CoreScanError::InvalidScan {
+            code: "HEADER_SYNTAX",
+        },
+    )?;
+    let header_identifier = dom_chain::canonical_header_identifier(
+        identity.network_magic,
+        &block.canonical_header_bytes,
+    )
+    .map_err(|_| CoreScanError::InvalidScan {
+        code: "HEADER_IDENTIFIER",
+    })?;
+    if header_identifier.as_bytes() != &block.block_hash {
+        return Err(CoreScanError::InvalidScan {
+            code: "HEADER_HASH_MISMATCH",
+        });
+    }
+
+    let coinbase_commitment = Commitment::from_compressed_bytes(&block.coinbase.output_commitment)
+        .map_err(|_| CoreScanError::InvalidScan {
+            code: "COINBASE_COMMITMENT",
+        })?;
+    let coinbase_excess = Commitment::from_compressed_bytes(&block.coinbase.kernel_excess)
+        .map_err(|_| CoreScanError::InvalidScan {
+            code: "COINBASE_EXCESS",
+        })?;
+    let coinbase = CoinbaseTransaction {
+        output: TransactionOutput {
+            commitment: coinbase_commitment,
+            proof: block.coinbase.output_proof_envelope.clone(),
+        },
+        kernel: CoinbaseKernel {
+            features: block.coinbase.kernel_features,
+            explicit_value: block.coinbase.explicit_value,
+            excess: coinbase_excess,
+            excess_signature: block.coinbase.kernel_excess_signature,
+        },
+        offset: block.coinbase.offset,
+    };
+    let coinbase_bytes = coinbase
+        .to_bytes()
+        .map_err(|_| CoreScanError::InvalidScan {
+            code: "COINBASE_ENCODE",
+        })?;
+    let coinbase = CoinbaseTransaction::from_bytes(&coinbase_bytes).map_err(|_| {
+        CoreScanError::InvalidScan {
+            code: "COINBASE_DECODE",
+        }
+    })?;
+
+    let mut transactions = Vec::with_capacity(block.transactions.len());
+    let mut expected_inputs = Vec::new();
+    let mut expected_outputs = Vec::new();
+    let mut expected_kernels = Vec::new();
+    expected_outputs.push(scan_output_from_transaction_output(
+        &coinbase.output,
+        true,
+        block.height,
+        block.block_hash,
+        0,
+    )?);
+    expected_kernels.push(ScanKernel {
+        excess: *coinbase.kernel.excess.as_bytes(),
+        features: coinbase.kernel.features,
+        fee: 0,
+        lock_height: 0,
+        excess_signature: coinbase.kernel.excess_signature,
+    });
+
+    let mut output_position = 1u32;
+    for (index, projected) in block.transactions.iter().enumerate() {
+        let transaction_index = u32::try_from(index).map_err(|_| CoreScanError::InvalidScan {
+            code: "TRANSACTION_INDEX_OVERFLOW",
+        })?;
+        if projected.location
+            != (TransactionLocation {
+                block_height: block.height,
+                block_hash: block.block_hash,
+                transaction_index,
+            })
+        {
+            return Err(CoreScanError::InvalidScan {
+                code: "TRANSACTION_LOCATION",
+            });
+        }
+        if dom_crypto::blake2b_256(&projected.canonical_bytes).as_bytes() != &projected.tx_hash {
+            return Err(CoreScanError::InvalidScan {
+                code: "TRANSACTION_HASH",
+            });
+        }
+        let transaction = Transaction::from_bytes(&projected.canonical_bytes).map_err(|_| {
+            CoreScanError::InvalidScan {
+                code: "TRANSACTION_DECODE",
+            }
+        })?;
+        if transaction
+            .to_bytes()
+            .map_err(|_| CoreScanError::InvalidScan {
+                code: "TRANSACTION_ENCODE",
+            })?
+            != projected.canonical_bytes
+        {
+            return Err(CoreScanError::InvalidScan {
+                code: "NONCANONICAL_TRANSACTION_BYTES",
+            });
+        }
+        if transaction.offset != projected.offset {
+            return Err(CoreScanError::InvalidScan {
+                code: "TRANSACTION_OFFSET",
+            });
+        }
+
+        let transaction_inputs: Vec<_> = transaction
+            .inputs
+            .iter()
+            .map(|input| ScanInput {
+                spent_commitment: *input.commitment.as_bytes(),
+            })
+            .collect();
+        if transaction_inputs != projected.inputs {
+            return Err(CoreScanError::InvalidScan {
+                code: "TRANSACTION_INPUT_PROJECTION",
+            });
+        }
+        expected_inputs.extend(transaction_inputs);
+
+        let mut transaction_outputs = Vec::with_capacity(transaction.outputs.len());
+        for output in &transaction.outputs {
+            let projected_output = scan_output_from_transaction_output(
+                output,
+                false,
+                block.height,
+                block.block_hash,
+                output_position,
+            )?;
+            output_position = output_position
+                .checked_add(1)
+                .ok_or(CoreScanError::InvalidScan {
+                    code: "OUTPUT_POSITION_OVERFLOW",
+                })?;
+            transaction_outputs.push(projected_output.clone());
+            expected_outputs.push(projected_output);
+        }
+        if transaction_outputs != projected.outputs {
+            return Err(CoreScanError::InvalidScan {
+                code: "TRANSACTION_OUTPUT_PROJECTION",
+            });
+        }
+
+        let transaction_kernels: Vec<_> = transaction
+            .kernels
+            .iter()
+            .map(|kernel| ScanKernel {
+                excess: *kernel.excess.as_bytes(),
+                features: kernel.features,
+                fee: kernel.fee.noms(),
+                lock_height: kernel.lock_height,
+                excess_signature: kernel.excess_signature,
+            })
+            .collect();
+        if transaction_kernels != projected.kernels {
+            return Err(CoreScanError::InvalidScan {
+                code: "TRANSACTION_KERNEL_PROJECTION",
+            });
+        }
+        expected_kernels.extend(transaction_kernels);
+        transactions.push(transaction);
+    }
+
+    if block.inputs != expected_inputs {
+        return Err(CoreScanError::InvalidScan {
+            code: "FLAT_INPUT_PROJECTION",
+        });
+    }
+    if block.outputs != expected_outputs {
+        return Err(CoreScanError::InvalidScan {
+            code: "FLAT_OUTPUT_PROJECTION",
+        });
+    }
+    if block.kernels != expected_kernels {
+        return Err(CoreScanError::InvalidScan {
+            code: "FLAT_KERNEL_PROJECTION",
+        });
+    }
+
+    let reconstructed = Block {
+        header,
+        coinbase,
+        transactions,
+    };
+    if reconstructed
+        .total_fees()
+        .map_err(|_| CoreScanError::InvalidScan {
+            code: "TOTAL_FEE_OVERFLOW",
+        })?
+        != block.total_fees_noms
+    {
+        return Err(CoreScanError::InvalidScan {
+            code: "TOTAL_FEE_PROJECTION",
+        });
+    }
+    dom_consensus::validate_pmmr_roots(&reconstructed).map_err(|_| CoreScanError::InvalidScan {
+        code: "BLOCK_BODY_COMMITMENT",
+    })
+}
+
+fn scan_output_from_transaction_output(
+    output: &TransactionOutput,
+    is_coinbase: bool,
+    block_height: u64,
+    block_hash: [u8; 32],
+    output_position: u32,
+) -> Result<ScanOutput, CoreScanError> {
+    let range_proof = output
+        .range_proof_bytes()
+        .map_err(|_| CoreScanError::InvalidScan {
+            code: "OUTPUT_PROOF_ENVELOPE",
+        })?;
+    let capsule = output
+        .recovery_capsule()
+        .map_err(|_| CoreScanError::InvalidScan {
+            code: "OUTPUT_RECOVERY_CAPSULE",
+        })?;
+    Ok(ScanOutput {
+        commitment: *output.commitment.as_bytes(),
+        range_proof: range_proof.to_vec(),
+        recovery_version: capsule.as_ref().map_or(0, |value| value.version()),
+        recovery_capsule: capsule
+            .map(|value| value.as_bytes().to_vec())
+            .unwrap_or_default(),
+        is_coinbase,
+        block_height,
+        block_hash,
+        output_position,
     })
 }

@@ -3,21 +3,26 @@
 #![forbid(unsafe_code)]
 
 use bip39::{Language, Mnemonic};
-use dom_consensus::TransactionOutput;
+use dom_adaptor::{SessionBlindingShareCapabilityV1, SigningShareV1};
+use dom_consensus::{
+    validate_transaction, Transaction, TransactionInput, TransactionOutput, ValidationContext,
+};
+use dom_core::{BlockHeight, Timestamp};
 use dom_crypto::{
-    pedersen::Commitment,
+    pedersen::{BlindingFactor, Commitment},
     range_proof_verify_with_extra_commit,
     recovery::{
         derive_recovery_root, recover_output_from_capsule, OutputRecoveryDomain, PublicOutputKind,
         RecoveredOutput, RecoveryCapsule, RecoveryChainContext, RecoveryRoot,
         RECOVERY_CAPSULE_SIZE, RECOVERY_VERSION,
     },
-    MAX_PROVABLE_VALUE, RANGE_PROOF_SERIALIZATION_VERSION, RANGE_PROOF_SIZE,
+    schnorr_add_public_keys, MAX_PROVABLE_VALUE, RANGE_PROOF_SERIALIZATION_VERSION,
+    RANGE_PROOF_SIZE,
 };
 use dom_serialization::{DomDeserialize, DomSerialize};
 use dom_slate::{
-    build_send_recoverable, finalize, respond_receive_recoverable, sender_phase_slate,
-    RecoveryBuildContext, SlateInput,
+    build_send_recoverable, finalize, respond_receive_recoverable, sender_excess_blinding,
+    sender_phase_slate, slate_kernel_features, RecoveryBuildContext, SlateInput,
 };
 use dom_tx::{build_recoverable_output, slate::Slate};
 use dom_wallet_core_api::ScanBlock;
@@ -479,6 +484,177 @@ impl RecoverableOutputBuilder {
         fee: u64,
         coordinate: ReservedRecoveryCoordinate,
     ) -> Result<RecoverableSlateMaterial, RecoveryMaterialError> {
+        self.build_sender_offer_with_lock_height(inputs, change_value, amount, fee, 0, coordinate)
+    }
+
+    /// Build the ordinary-wallet contribution consumed by the authoritative
+    /// Scriptless funding transaction composer.
+    ///
+    /// This performs no collaborative proof or signing. It delegates change
+    /// construction to the same recovery-capable DOM output builder used by a
+    /// normal wallet send, creates one public offset contribution, and derives
+    /// exactly `e_i = change_i - inputs_i - offset_i` through the canonical
+    /// Slate arithmetic. The opaque Scriptless layer later combines `e_i`
+    /// only with this participant's shared-output share.
+    pub fn build_scriptless_funding_contribution(
+        &self,
+        inputs: &[WalletSlateInput],
+        change_value: u64,
+        coordinate: Option<ReservedRecoveryCoordinate>,
+    ) -> Result<PreparedScriptlessFundingContributionV1, RecoveryMaterialError> {
+        if inputs.is_empty() && (change_value != 0 || coordinate.is_some()) {
+            return Err(RecoveryMaterialError::ScriptlessFundingConstruction);
+        }
+        let change = match (change_value, coordinate) {
+            (0, None) => None,
+            (0, Some(_)) | (_, None) => {
+                return Err(RecoveryMaterialError::CoordinateDomainMismatch)
+            }
+            (_, Some(coordinate)) if coordinate.class() != RecoveryOutputClass::Change => {
+                return Err(RecoveryMaterialError::CoordinateDomainMismatch)
+            }
+            (_, Some(coordinate)) => {
+                let RecoverableOutputResult {
+                    output,
+                    commitment,
+                    secret,
+                    ..
+                } = self.build(change_value, coordinate)?;
+                Some((
+                    output,
+                    RecoverableOwnedOutput {
+                        commitment,
+                        value: change_value,
+                        blinding: Zeroizing::new(*secret.0.as_bytes()),
+                    },
+                ))
+            }
+        };
+
+        let offset = BlindingFactor::random();
+        let wallet_excess = Zeroizing::new(
+            sender_excess_blinding(
+                inputs.iter().map(|input| &input.blinding),
+                change.as_ref().map(|(_, owned)| &*owned.blinding),
+                offset.as_bytes(),
+            )
+            .map_err(|_| RecoveryMaterialError::ScriptlessFundingConstruction)?,
+        );
+        let opaque = SigningShareV1::from_be_bytes(*wallet_excess)
+            .map_err(|_| RecoveryMaterialError::ScriptlessFundingConstruction)?;
+        let wallet_excess_public_key = opaque.public_key().to_compressed_bytes();
+        drop(opaque);
+
+        let canonical_inputs = inputs
+            .iter()
+            .map(|input| {
+                Ok(TransactionInput {
+                    commitment: Commitment::from_compressed_bytes(&input.commitment)
+                        .map_err(|_| RecoveryMaterialError::ScriptlessFundingConstruction)?,
+                })
+            })
+            .collect::<Result<Vec<_>, RecoveryMaterialError>>()?;
+        let (other_outputs, change) = match change {
+            Some((output, owned)) => (vec![output], Some(owned)),
+            None => (Vec::new(), None),
+        };
+        Ok(PreparedScriptlessFundingContributionV1 {
+            public: ScriptlessFundingPublicComponentsV1 {
+                inputs: canonical_inputs,
+                other_outputs,
+                offset_contribution: *offset.as_bytes(),
+                wallet_excess_public_key,
+            },
+            change,
+            wallet_excess,
+        })
+    }
+
+    /// Build the wallet-owned output contribution for one real Scriptless
+    /// claim or refund template.
+    ///
+    /// The output is constructed by the frozen Recovery Capsule path. The
+    /// opaque local excess is exactly `e_i = payout_blinding_i - offset_i`;
+    /// subtraction of this participant's shared-output share belongs only to
+    /// the pinned `dom-adaptor` composition authority.
+    pub fn build_scriptless_shared_output_spend_contribution(
+        &self,
+        payout_value: u64,
+        coordinate: Option<ReservedRecoveryCoordinate>,
+    ) -> Result<PreparedScriptlessPayoutContributionV1, RecoveryMaterialError> {
+        let payout = match (payout_value, coordinate) {
+            (0, None) => None,
+            (0, Some(_)) | (_, None) => {
+                return Err(RecoveryMaterialError::CoordinateDomainMismatch)
+            }
+            (_, Some(coordinate)) if coordinate.class() != RecoveryOutputClass::SelfTransfer => {
+                return Err(RecoveryMaterialError::CoordinateDomainMismatch)
+            }
+            (_, Some(coordinate)) => {
+                let RecoverableOutputResult {
+                    output,
+                    commitment,
+                    secret,
+                    ..
+                } = self.build(payout_value, coordinate)?;
+                Some((
+                    output,
+                    RecoverableOwnedOutput {
+                        commitment,
+                        value: payout_value,
+                        blinding: Zeroizing::new(*secret.0.as_bytes()),
+                    },
+                ))
+            }
+        };
+        let offset = BlindingFactor::random();
+        let payout_excess = Zeroizing::new(
+            sender_excess_blinding(
+                std::iter::empty::<&[u8; 32]>(),
+                payout.as_ref().map(|(_, owned)| &*owned.blinding),
+                offset.as_bytes(),
+            )
+            .map_err(|_| RecoveryMaterialError::ScriptlessPayoutConstruction)?,
+        );
+        let opaque = SigningShareV1::from_be_bytes(*payout_excess)
+            .map_err(|_| RecoveryMaterialError::ScriptlessPayoutConstruction)?;
+        let payout_excess_public_key = opaque.public_key().to_compressed_bytes();
+        drop(opaque);
+
+        Ok(PreparedScriptlessPayoutContributionV1 {
+            public: ScriptlessPayoutPublicComponentsV1 {
+                outputs: payout
+                    .as_ref()
+                    .map(|(output, _)| vec![output.clone()])
+                    .unwrap_or_default(),
+                offset_contribution: *offset.as_bytes(),
+                payout_excess_public_key,
+            },
+            owned_output: payout.map(|(_, owned)| owned),
+            payout_excess,
+        })
+    }
+
+    /// Create sender change through the frozen recovery-capable Slate builder
+    /// while preserving an explicit canonical kernel lock height.
+    ///
+    /// `lock_height == 0` is byte-compatible with the historical PLAIN path.
+    /// A non-zero value is written before the Slate is serialized or exported
+    /// and before either participant signs. The canonical DOM responder and
+    /// finalizer consequently derive `KERNEL_FEAT_HEIGHT_LOCKED` and bind the
+    /// height into the kernel signature; no transaction bytes are edited.
+    ///
+    /// The satisfied-height policy and consensus preflight belong to the
+    /// caller because this builder deliberately has no chain snapshot.
+    pub fn build_sender_offer_with_lock_height(
+        &self,
+        inputs: &[WalletSlateInput],
+        change_value: u64,
+        amount: u64,
+        fee: u64,
+        lock_height: u64,
+        coordinate: ReservedRecoveryCoordinate,
+    ) -> Result<RecoverableSlateMaterial, RecoveryMaterialError> {
         if coordinate.class() != RecoveryOutputClass::Change {
             return Err(RecoveryMaterialError::CoordinateDomainMismatch);
         }
@@ -489,7 +665,7 @@ impl RecoverableOutputBuilder {
                 blinding: input.blinding,
             })
             .collect();
-        let sender = build_send_recoverable(
+        let mut sender = build_send_recoverable(
             &core_inputs,
             change_value,
             amount,
@@ -503,6 +679,13 @@ impl RecoverableOutputBuilder {
             },
         )
         .map_err(|_| RecoveryMaterialError::SlateConstruction)?;
+        // The pinned DOM API exposes `build_send_with_lock_height` and
+        // `build_send_recoverable`, but not their combined form. The only
+        // semantic difference before signing is this public Slate field.
+        // Setting it here, before `from_slate` freezes canonical bytes, keeps
+        // the recovery-capable output path and delegates all feature/message
+        // derivation to the canonical responder/finalizer.
+        sender.slate.lock_height = lock_height;
         let private = SlatePrivateMaterial::Sender {
             excess_blinding: Zeroizing::new(sender.excess_blinding),
             nonce: Zeroizing::new(sender.nonce),
@@ -548,6 +731,249 @@ impl RecoverableOutputBuilder {
                 output_blinding: Zeroizing::new(response.recipient_output_blinding),
             },
         )
+    }
+}
+
+/// Exact public common-wallet components for one participant's funding input.
+/// These are normal DOM transaction objects and contain no blinding, nonce,
+/// seed, participant identity, or Scriptless marker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScriptlessFundingPublicComponentsV1 {
+    pub inputs: Vec<TransactionInput>,
+    pub other_outputs: Vec<TransactionOutput>,
+    pub offset_contribution: [u8; 32],
+    pub wallet_excess_public_key: [u8; 33],
+}
+
+/// Exact public contribution for one participant's claim or refund payout.
+/// It contains only a normal recoverable DOM output, a canonical transaction
+/// offset contribution and the public point `e_i*G`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScriptlessPayoutPublicComponentsV1 {
+    /// Empty for a non-beneficiary signer and exactly one official Wallet V3
+    /// recoverable output for the beneficiary.
+    pub outputs: Vec<TransactionOutput>,
+    pub offset_contribution: [u8; 32],
+    pub payout_excess_public_key: [u8; 33],
+}
+
+/// Prepared payout material whose secrets may only enter encrypted Wallet V3
+/// state. It deliberately has no serialization, Clone or scalar accessor.
+pub struct PreparedScriptlessPayoutContributionV1 {
+    pub public: ScriptlessPayoutPublicComponentsV1,
+    pub owned_output: Option<RecoverableOwnedOutput>,
+    payout_excess: Zeroizing<[u8; 32]>,
+}
+
+/// Short-lived opaque payout excess used only to authenticate encrypted state
+/// against its persisted public point before template binding. It exposes no
+/// signing or composition operation and is not a signing capability.
+pub struct OpaqueScriptlessPayoutExcessV1 {
+    share: SigningShareV1,
+}
+
+impl OpaqueScriptlessPayoutExcessV1 {
+    /// Rehydrate `e_i = payout_blinding_i - offset_i` from encrypted state.
+    pub fn from_encrypted_context(
+        payout_excess_contribution: [u8; 32],
+    ) -> Result<Self, RecoveryMaterialError> {
+        let share = SigningShareV1::from_be_bytes(payout_excess_contribution)
+            .map_err(|_| RecoveryMaterialError::ScriptlessPayoutConstruction)?;
+        Ok(Self { share })
+    }
+
+    /// Public point used to authenticate encrypted state against persisted and
+    /// possibly exposed payout components.
+    pub fn public_key_bytes(&self) -> [u8; 33] {
+        self.share.public_key().to_compressed_bytes()
+    }
+}
+
+impl fmt::Debug for PreparedScriptlessPayoutContributionV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PreparedScriptlessPayoutContributionV1(REDACTED)")
+    }
+}
+
+impl PreparedScriptlessPayoutContributionV1 {
+    /// Copy `e_i` only into the encrypted payout reservation context.
+    pub fn copy_payout_excess_to(&self, destination: &mut [u8; 32]) {
+        destination.copy_from_slice(self.payout_excess.as_ref());
+    }
+}
+
+/// Prepared public components plus secrets destined only for encrypted Wallet
+/// V3 state. Debug output is intentionally fully redacted.
+pub struct PreparedScriptlessFundingContributionV1 {
+    pub public: ScriptlessFundingPublicComponentsV1,
+    pub change: Option<RecoverableOwnedOutput>,
+    wallet_excess: Zeroizing<[u8; 32]>,
+}
+
+impl fmt::Debug for PreparedScriptlessFundingContributionV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PreparedScriptlessFundingContributionV1(REDACTED)")
+    }
+}
+
+impl PreparedScriptlessFundingContributionV1 {
+    /// Copy the wallet excess only into the encrypted persistence context.
+    pub fn copy_wallet_excess_to(&self, destination: &mut [u8; 32]) {
+        destination.copy_from_slice(self.wallet_excess.as_ref());
+    }
+}
+
+/// Short-lived authentication view of an encrypted funding excess. It can
+/// reproduce only the already-public `e_i*G`; it has no signing/composition
+/// method and is never a substitute for the post-template capability.
+pub struct OpaqueScriptlessFundingExcessV1 {
+    share: SigningShareV1,
+}
+
+impl OpaqueScriptlessFundingExcessV1 {
+    pub fn from_encrypted_context(
+        wallet_excess_contribution: [u8; 32],
+    ) -> Result<Self, RecoveryMaterialError> {
+        let share = SigningShareV1::from_be_bytes(wallet_excess_contribution)
+            .map_err(|_| RecoveryMaterialError::ScriptlessFundingConstruction)?;
+        Ok(Self { share })
+    }
+
+    pub fn public_key_bytes(&self) -> [u8; 33] {
+        self.share.public_key().to_compressed_bytes()
+    }
+}
+
+/// Durable public binding copied into a short-lived signing capability.
+///
+/// It contains no secret, but prevents a rehydrated wallet contribution from
+/// being composed under another chain, session, participant or template.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct BoundScriptlessSigningContextV1 {
+    pub chain_id: [u8; 32],
+    pub session_id: [u8; 32],
+    pub session_share_binding_digest: [u8; 32],
+    pub participant_position: u16,
+    pub template_hash: [u8; 32],
+}
+
+impl BoundScriptlessSigningContextV1 {
+    fn matches(&self, session_share: &SessionBlindingShareCapabilityV1) -> bool {
+        let binding = session_share.binding();
+        self.chain_id == *binding.chain_id()
+            && self.session_id == *binding.session_id()
+            && self.session_share_binding_digest == binding.binding_digest_v1()
+            && self.participant_position == binding.participant_index()
+            && binding.roster().len() == 2
+            && binding.terms_hash() != &[0u8; 32]
+            && binding.capsule_hash() != &[0u8; 32]
+            && binding.roster().get(usize::from(self.participant_position))
+                == Some(binding.participant_id())
+            && session_share.public_key() == binding.share_point()
+            && self.template_hash != [0u8; 32]
+    }
+}
+
+impl fmt::Debug for BoundScriptlessSigningContextV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BoundScriptlessSigningContextV1")
+            .field("participant_position", &self.participant_position)
+            .field("binding", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Short-lived, non-serializable funding handoff into `dom-adaptor`.
+///
+/// The wallet contribution remains opaque and zeroizes on drop. The only
+/// secret-bearing operation accepts the exact authenticated shared-blinding
+/// capability already bound to the real funding template and returns DOM's
+/// opaque combined `r_i + e_i` share. There is no callback or byte accessor.
+pub struct ScriptlessFundingSigningCapabilityV1 {
+    share: SigningShareV1,
+    context: BoundScriptlessSigningContextV1,
+}
+
+impl ScriptlessFundingSigningCapabilityV1 {
+    /// Rehydrate an encrypted common-wallet excess only after template bind.
+    pub fn from_template_bound_encrypted_context(
+        wallet_excess_contribution: [u8; 32],
+        context: BoundScriptlessSigningContextV1,
+    ) -> Result<Self, RecoveryMaterialError> {
+        let share = SigningShareV1::from_be_bytes(wallet_excess_contribution)
+            .map_err(|_| RecoveryMaterialError::ScriptlessFundingConstruction)?;
+        if context.chain_id == [0u8; 32]
+            || context.session_id == [0u8; 32]
+            || context.session_share_binding_digest == [0u8; 32]
+            || context.participant_position >= 2
+            || context.template_hash == [0u8; 32]
+        {
+            return Err(RecoveryMaterialError::ScriptlessSigningBinding);
+        }
+        Ok(Self { share, context })
+    }
+
+    /// Compose exactly `r_i + e_i` through the bound DOM authority.
+    pub fn compose_local_funding_share_v1(
+        &self,
+        session_share: &SessionBlindingShareCapabilityV1,
+    ) -> Result<SigningShareV1, RecoveryMaterialError> {
+        if !self.context.matches(session_share) {
+            return Err(RecoveryMaterialError::ScriptlessSigningBinding);
+        }
+        session_share
+            .compose_funding_signing_share_v1(&self.share)
+            .map_err(|_| RecoveryMaterialError::ScriptlessFundingConstruction)
+    }
+
+    /// Public key used to verify that encrypted restart state still matches
+    /// the already-persisted public funding component.
+    pub fn public_key_bytes(&self) -> [u8; 33] {
+        self.share.public_key().to_compressed_bytes()
+    }
+}
+
+/// Short-lived, non-serializable Claim/Refund handoff into `dom-adaptor`.
+/// Its sole operation returns the opaque `e_i - r_i` share for the exact
+/// template-bound session; no wallet or shared-output scalar is exposed.
+pub struct ScriptlessPayoutSigningCapabilityV1 {
+    share: SigningShareV1,
+    context: BoundScriptlessSigningContextV1,
+}
+
+impl ScriptlessPayoutSigningCapabilityV1 {
+    pub fn from_template_bound_encrypted_context(
+        payout_excess_contribution: [u8; 32],
+        context: BoundScriptlessSigningContextV1,
+    ) -> Result<Self, RecoveryMaterialError> {
+        let share = SigningShareV1::from_be_bytes(payout_excess_contribution)
+            .map_err(|_| RecoveryMaterialError::ScriptlessPayoutConstruction)?;
+        if context.chain_id == [0u8; 32]
+            || context.session_id == [0u8; 32]
+            || context.session_share_binding_digest == [0u8; 32]
+            || context.participant_position >= 2
+            || context.template_hash == [0u8; 32]
+        {
+            return Err(RecoveryMaterialError::ScriptlessSigningBinding);
+        }
+        Ok(Self { share, context })
+    }
+
+    pub fn compose_local_shared_output_spend_share_v1(
+        &self,
+        session_share: &SessionBlindingShareCapabilityV1,
+    ) -> Result<SigningShareV1, RecoveryMaterialError> {
+        if !self.context.matches(session_share) {
+            return Err(RecoveryMaterialError::ScriptlessSigningBinding);
+        }
+        session_share
+            .compose_shared_output_spend_signing_share_v1(&self.share)
+            .map_err(|_| RecoveryMaterialError::ScriptlessPayoutConstruction)
+    }
+
+    pub fn public_key_bytes(&self) -> [u8; 33] {
+        self.share.public_key().to_compressed_bytes()
     }
 }
 
@@ -761,6 +1187,17 @@ pub struct FinalizedRecoverableTransaction {
     pub weight: u32,
 }
 
+/// Public evidence returned after an independent participant verifies that
+/// finalized canonical transaction bytes are exactly bound to its response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedRecoverableTransaction {
+    pub transaction_hash: [u8; 32],
+    pub kernel_excess: [u8; 33],
+    pub fee: u64,
+    pub lock_height: u64,
+    pub weight: u32,
+}
+
 /// Finalize only when the response strips exactly to the persisted recovery offer.
 pub fn finalize_recoverable_transaction(
     response: &RecoverySlateBody,
@@ -805,6 +1242,122 @@ pub fn finalize_recoverable_transaction(
             .map_err(|_| RecoveryMaterialError::SlateConstruction)?,
         weight: transaction.weight(),
     })
+}
+
+/// Independently verify finalized bytes against a recipient's exact Slate
+/// response and the current validated DOM chain snapshot.
+///
+/// This is the receiver-side half of the G0 requirement that both wallets
+/// validate the final transaction before broadcast. It performs canonical
+/// decode/re-encode, exact input/output/order/offset/kernel binding, and the
+/// full public DOM consensus transaction verifier. It never needs sender or
+/// recipient secret material.
+pub fn verify_recoverable_transaction_against_response(
+    canonical_bytes: &[u8],
+    response: &RecoverySlateBody,
+    identity: &CoreChainIdentity,
+) -> Result<VerifiedRecoverableTransaction, RecoveryMaterialError> {
+    validate_identity(identity)?;
+    let transaction = Transaction::from_bytes(canonical_bytes)
+        .map_err(|_| RecoveryMaterialError::TransactionVerification)?;
+    if transaction
+        .to_bytes()
+        .map_err(|_| RecoveryMaterialError::TransactionVerification)?
+        != canonical_bytes
+    {
+        return Err(RecoveryMaterialError::TransactionVerification);
+    }
+
+    let slate = Slate::from_bytes(response.canonical_bytes())
+        .map_err(|_| RecoveryMaterialError::TransactionVerification)?;
+    if slate.chain_id != identity.chain_id
+        || transaction.inputs.len() != slate.sender_inputs.len()
+        || transaction
+            .inputs
+            .iter()
+            .zip(&slate.sender_inputs)
+            .any(|(input, expected)| input.commitment != *expected)
+        || transaction.offset != slate.sender_offset_contribution
+    {
+        return Err(RecoveryMaterialError::SlateBindingMismatch);
+    }
+
+    let expected_outputs = response_transaction_outputs(&slate)?;
+    if transaction.outputs != expected_outputs || transaction.kernels.len() != 1 {
+        return Err(RecoveryMaterialError::SlateBindingMismatch);
+    }
+
+    let recipient_excess = slate
+        .recipient_public_excess
+        .clone()
+        .ok_or(RecoveryMaterialError::TransactionVerification)?;
+    let aggregate_excess =
+        schnorr_add_public_keys(&[slate.sender_public_excess.clone(), recipient_excess])
+            .map_err(|_| RecoveryMaterialError::TransactionVerification)?;
+    let expected_excess =
+        Commitment::from_compressed_bytes(&aggregate_excess.to_compressed_bytes())
+            .map_err(|_| RecoveryMaterialError::TransactionVerification)?;
+    let kernel = &transaction.kernels[0];
+    if kernel.features != slate_kernel_features(slate.lock_height)
+        || kernel.fee.noms() != slate.fee
+        || kernel.lock_height != slate.lock_height
+        || kernel.excess != expected_excess
+    {
+        return Err(RecoveryMaterialError::SlateBindingMismatch);
+    }
+
+    validate_transaction(
+        &transaction,
+        &ValidationContext {
+            current_height: BlockHeight(identity.current_tip.height),
+            chain_id: identity.chain_id,
+            // Transaction validation currently has no wall-clock rule. Keep a
+            // deterministic value instead of smuggling local time into G0.
+            now: Timestamp(0),
+        },
+    )
+    .map_err(|_| RecoveryMaterialError::TransactionVerification)?;
+
+    Ok(VerifiedRecoverableTransaction {
+        transaction_hash: *dom_crypto::blake2b_256(canonical_bytes).as_bytes(),
+        kernel_excess: *kernel.excess.as_bytes(),
+        fee: kernel.fee.noms(),
+        lock_height: kernel.lock_height,
+        weight: transaction.weight(),
+    })
+}
+
+fn response_transaction_outputs(
+    slate: &Slate,
+) -> Result<Vec<TransactionOutput>, RecoveryMaterialError> {
+    let recipient = slate
+        .recipient_output
+        .clone()
+        .ok_or(RecoveryMaterialError::TransactionVerification)?;
+    let mut outputs = Vec::with_capacity(usize::from(slate.sender_change_output.is_some()) + 1);
+    if let Some(change) = &slate.sender_change_output {
+        let capsule = RecoveryCapsule::from_bytes(&slate.sender_change_recovery_capsule)
+            .map_err(|_| RecoveryMaterialError::InvalidCapsule)?;
+        outputs.push(
+            TransactionOutput::with_recovery_capsule(
+                change.commitment.clone(),
+                change.proof.bytes.clone(),
+                &capsule,
+            )
+            .map_err(|_| RecoveryMaterialError::TransactionVerification)?,
+        );
+    }
+    let capsule = RecoveryCapsule::from_bytes(&slate.recipient_recovery_capsule)
+        .map_err(|_| RecoveryMaterialError::InvalidCapsule)?;
+    outputs.push(
+        TransactionOutput::with_recovery_capsule(
+            recipient.commitment,
+            recipient.proof.bytes,
+            &capsule,
+        )
+        .map_err(|_| RecoveryMaterialError::TransactionVerification)?,
+    );
+    Ok(outputs)
 }
 
 fn recipient_public(body: &RecoverySlateBody) -> Result<([u8; 33], u64), RecoveryMaterialError> {
@@ -944,6 +1497,14 @@ pub enum RecoveryMaterialError {
     SlateConstruction,
     #[error("recoverable Slate response does not bind to the persisted offer")]
     SlateBindingMismatch,
+    #[error("finalized transaction does not pass canonical DOM verification")]
+    TransactionVerification,
+    #[error("Scriptless funding wallet contribution construction failed")]
+    ScriptlessFundingConstruction,
+    #[error("Scriptless claim/refund payout contribution construction failed")]
+    ScriptlessPayoutConstruction,
+    #[error("Scriptless signing capability binding is invalid")]
+    ScriptlessSigningBinding,
 }
 
 /// Whether encrypted state is eligible for the canonical BIP-39 boundary.

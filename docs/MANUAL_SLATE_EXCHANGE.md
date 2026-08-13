@@ -30,7 +30,16 @@ hash. Incomplete or mixed frames never reach slate parsing.
    creates then exports a response. Its receive descriptor and non-reuse floor
    are durable before response export.
 4. Wallet A imports the response, finalizes the canonical DOM transaction,
-   then explicitly submits it through the configured node.
+   and verifies the exact canonical bytes against the response.
+5. Wallet A exports those public finalized bytes. Wallet B independently
+   verifies them against its persisted response and durably retains the same
+   bytes. A conflicting re-import fails closed.
+6. Wallet A explicitly submits the already verified bytes through the
+   configured node.
+
+Steps 4 and 5 are the bilateral pre-broadcast verification boundary required
+by the G0 common-wallet gate. Finalized transaction bytes contain public chain
+material only; neither participant's Slate private context is exported.
 
 The frontend renders QR locally and starts a local scanner only after explicit
 user action. It releases the camera on successful scan, cancel, lock, close,
@@ -57,3 +66,9 @@ only. `slate_qr_encode`, `slate_qr_decode_frame`,
 public canonical transport representation; QR decoding never replaces backend
 slate validation. No generic filesystem, shell, process, or HTTP bridge is
 introduced.
+
+The Rust service additionally exposes `transaction_finalized_export` and
+`transaction_finalized_verify_and_import` for the G0 laboratory's exact public
+byte exchange. A product transport must preserve the bytes exactly and apply
+the same input bounds and redaction rules before these methods are registered
+at a UI boundary.

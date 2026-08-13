@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 bip39.workspace = true
+dom-adaptor.workspace = true
 dom-consensus.workspace = true
 dom-core.workspace = true
 dom-crypto.workspace = true
