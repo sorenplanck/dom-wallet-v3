@@ -50,9 +50,11 @@ use dom_wallet_core_api::{
 };
 use serde::Deserialize;
 use std::fmt;
+use std::io::Read;
 use std::sync::Mutex;
 use std::time::Duration;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 /// TCP connect timeout for every remote request.
 pub const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -70,6 +72,16 @@ pub const REMOTE_FULL_SCAN_SCHEMA_VERSION: u32 = 1;
 /// spanning more heights than this is a schema violation.
 pub const REMOTE_MAX_FULL_SCAN_RANGE: u64 = 1_000;
 
+/// Hard cap for every HTTP response before it is buffered in memory. Remote
+/// nodes are untrusted and may otherwise exhaust the wallet process with an
+/// unbounded or deliberately misleading response body.
+pub const REMOTE_MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// IPC/configuration bounds prevent a compromised renderer from using the
+/// native bridge as an unbounded memory or private-config-file sink.
+const REMOTE_MAX_BASE_URL_BYTES: usize = 4 * 1024;
+const REMOTE_MAX_BEARER_TOKEN_BYTES: usize = 4 * 1024;
+
 /// Configuration errors raised while constructing a [`RemoteNodeSource`].
 #[derive(Debug, Error)]
 pub enum RemoteSourceConfigError {
@@ -79,9 +91,15 @@ pub enum RemoteSourceConfigError {
     /// The base URL scheme is not `http`/`https`.
     #[error("remote node base URL must use http or https")]
     UnsupportedScheme,
+    /// The URL exceeds the bounded configuration contract.
+    #[error("remote node base URL is too long")]
+    BaseUrlTooLong,
     /// A bearer token was supplied but is empty after trimming.
     #[error("remote node bearer token must not be empty")]
     EmptyBearerToken,
+    /// A token must be representable as a single HTTP Authorization value.
+    #[error("remote node bearer token is invalid")]
+    InvalidBearerToken,
     /// The HTTP client could not be constructed.
     #[error("failed to build remote HTTP client: {0}")]
     ClientBuild(String),
@@ -103,7 +121,7 @@ pub struct TipRegression {
 }
 
 /// Bearer token wrapper that never leaks the secret through `Debug`.
-struct BearerToken(String);
+struct BearerToken(Zeroizing<String>);
 
 impl fmt::Debug for BearerToken {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -159,10 +177,25 @@ impl RemoteNodeSource {
         base_url: &str,
         bearer_token: Option<&str>,
     ) -> Result<Self, RemoteSourceConfigError> {
-        let parsed = url::Url::parse(base_url.trim())
+        let base_url = base_url.trim();
+        if base_url.len() > REMOTE_MAX_BASE_URL_BYTES {
+            return Err(RemoteSourceConfigError::BaseUrlTooLong);
+        }
+        let parsed = url::Url::parse(base_url)
             .map_err(|error| RemoteSourceConfigError::InvalidBaseUrl(error.to_string()))?;
         if !matches!(parsed.scheme(), "http" | "https") {
             return Err(RemoteSourceConfigError::UnsupportedScheme);
+        }
+        if parsed.host().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || parsed.path() != "/"
+        {
+            return Err(RemoteSourceConfigError::InvalidBaseUrl(
+                "credentials, query, fragment, and path are not allowed".into(),
+            ));
         }
         let bearer_token = match bearer_token {
             None => None,
@@ -171,7 +204,12 @@ impl RemoteNodeSource {
                 if trimmed.is_empty() {
                     return Err(RemoteSourceConfigError::EmptyBearerToken);
                 }
-                Some(BearerToken(trimmed.to_string()))
+                if trimmed.len() > REMOTE_MAX_BEARER_TOKEN_BYTES
+                    || reqwest::header::HeaderValue::from_str(trimmed).is_err()
+                {
+                    return Err(RemoteSourceConfigError::InvalidBearerToken);
+                }
+                Some(BearerToken(Zeroizing::new(trimmed.to_string())))
             }
         };
         let client = reqwest::blocking::Client::builder()
@@ -218,12 +256,35 @@ impl RemoteNodeSource {
         let mut request = self.client.get(url);
         if authenticated {
             if let Some(token) = &self.bearer_token {
-                request = request.bearer_auth(&token.0);
+                request = request.bearer_auth(token.0.as_str());
             }
         }
-        let response = request.send().map_err(map_transport_error)?;
+        let mut response = request.send().map_err(map_transport_error)?;
         let status = response.status().as_u16();
-        let body = response.text().map_err(map_transport_error)?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > REMOTE_MAX_RESPONSE_BYTES)
+        {
+            return Err(WalletCoreError::InternalFailure(
+                "remote response exceeds the wallet size limit".to_string(),
+            ));
+        }
+        let mut bytes = Vec::new();
+        response
+            .by_ref()
+            .take(REMOTE_MAX_RESPONSE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| {
+                WalletCoreError::TemporaryFailure("remote response body could not be read".into())
+            })?;
+        if bytes.len() as u64 > REMOTE_MAX_RESPONSE_BYTES {
+            return Err(WalletCoreError::InternalFailure(
+                "remote response exceeds the wallet size limit".to_string(),
+            ));
+        }
+        let body = String::from_utf8(bytes).map_err(|_| {
+            WalletCoreError::InternalFailure("remote response is not valid UTF-8".into())
+        })?;
         Ok(HttpReply { status, body })
     }
 
@@ -878,6 +939,7 @@ mod tests {
         status: u16,
         content_type: &'static str,
         body: String,
+        declared_content_length: Option<u64>,
     }
 
     impl CannedResponse {
@@ -886,6 +948,7 @@ mod tests {
                 status,
                 content_type: "application/json",
                 body: body.to_string(),
+                declared_content_length: None,
             }
         }
 
@@ -894,6 +957,7 @@ mod tests {
                 status,
                 content_type: "application/json",
                 body,
+                declared_content_length: None,
             }
         }
 
@@ -902,6 +966,7 @@ mod tests {
                 status,
                 content_type: "text/plain",
                 body: body.to_string(),
+                declared_content_length: None,
             }
         }
     }
@@ -1008,7 +1073,9 @@ mod tests {
             "HTTP/1.1 {} MOCK\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
             response.status,
             response.content_type,
-            response.body.len(),
+            response
+                .declared_content_length
+                .unwrap_or(response.body.len() as u64),
             response.body
         );
         let _ = stream.write_all(payload.as_bytes());
@@ -1783,6 +1850,55 @@ mod tests {
         let debug = format!("{source:?}");
         assert!(!debug.contains("super-secret"), "debug: {debug}");
         assert!(debug.contains("<redacted>"), "debug: {debug}");
+    }
+
+    #[test]
+    fn configuration_rejects_unbounded_or_non_header_secrets() {
+        assert!(matches!(
+            RemoteNodeSource::new(
+                &format!("http://localhost/{}", "a".repeat(REMOTE_MAX_BASE_URL_BYTES)),
+                None,
+            ),
+            Err(RemoteSourceConfigError::BaseUrlTooLong)
+        ));
+        assert!(matches!(
+            RemoteNodeSource::new(
+                "http://127.0.0.1:1",
+                Some(&"a".repeat(REMOTE_MAX_BEARER_TOKEN_BYTES + 1)),
+            ),
+            Err(RemoteSourceConfigError::InvalidBearerToken)
+        ));
+        assert!(matches!(
+            RemoteNodeSource::new("http://127.0.0.1:1", Some("token\r\ninjected: value")),
+            Err(RemoteSourceConfigError::InvalidBearerToken)
+        ));
+        for unsafe_url in [
+            "https://user:secret@example.com",
+            "https://example.com/rpc",
+            "https://example.com?token=secret",
+            "https://example.com#fragment",
+        ] {
+            assert!(matches!(
+                RemoteNodeSource::new(unsafe_url, None),
+                Err(RemoteSourceConfigError::InvalidBaseUrl(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn oversized_remote_response_is_rejected_before_buffering() {
+        let server = MockServer::start(|_| CannedResponse {
+            status: 200,
+            content_type: "application/json",
+            body: String::new(),
+            declared_content_length: Some(REMOTE_MAX_RESPONSE_BYTES + 1),
+        });
+        let source = source_for(&server);
+        assert!(matches!(
+            source.chain_identity(),
+            Err(WalletCoreError::InternalFailure(message))
+                if message.contains("size limit")
+        ));
     }
 
     #[test]

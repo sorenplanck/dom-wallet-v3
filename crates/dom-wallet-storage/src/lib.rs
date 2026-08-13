@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 const METADATA_FILE: &str = "metadata.json";
 const ACTIVE_FILE: &str = "active-generation";
@@ -61,6 +62,19 @@ struct BackupPayload {
     payload_version: u16,
     state: WalletState,
     rescan_plan: Option<RescanPlan>,
+}
+
+#[derive(Serialize)]
+struct BackupPayloadRef<'a> {
+    payload_version: u16,
+    state: &'a WalletState,
+    rescan_plan: &'a Option<RescanPlan>,
+}
+
+fn serialize_secret<T: Serialize>(value: &T) -> Result<Zeroizing<Vec<u8>>, StorageError> {
+    serde_json::to_vec(value)
+        .map(Zeroizing::new)
+        .map_err(|_| StorageError::CanonicalEncoding)
 }
 
 impl WalletMetadata {
@@ -381,7 +395,7 @@ impl WalletDirectory {
         password: &str,
         kdf: KdfParameters,
     ) -> Result<(), StorageError> {
-        let plaintext = serde_json::to_vec(plan).map_err(|_| StorageError::CanonicalEncoding)?;
+        let plaintext = serialize_secret(plan)?;
         let context = rescan_context(state.wallet_id, &state.identity);
         let encoded =
             encode(&seal(&plaintext, password, &context, kdf).map_err(StorageError::Crypto)?)
@@ -436,13 +450,12 @@ impl WalletDirectory {
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|_| StorageError::Clock)?
             .as_secs();
-        let payload = BackupPayload {
+        let payload = BackupPayloadRef {
             payload_version: BACKUP_FORMAT_VERSION,
-            state: state.clone(),
-            rescan_plan: plan,
+            state: &state,
+            rescan_plan: &plan,
         };
-        let plaintext =
-            serde_json::to_vec(&payload).map_err(|_| StorageError::CanonicalEncoding)?;
+        let plaintext = serialize_secret(&payload)?;
         if plaintext.is_empty() || plaintext.len() > MAX_STATE_BYTES {
             return Err(StorageError::FileSizeOutOfBounds);
         }
@@ -660,8 +673,7 @@ impl WalletDirectory {
             .join(format!(".{generation}.{}.staging", Uuid::new_v4()));
         fs::create_dir(&temporary_dir).map_err(StorageError::Io)?;
         let result = (|| {
-            let plaintext =
-                serde_json::to_vec(state).map_err(|_| StorageError::CanonicalEncoding)?;
+            let plaintext = serialize_secret(state)?;
             let context = state_context(state.wallet_id, &state.identity, state.generation);
             let envelope =
                 seal(&plaintext, password, &context, kdf).map_err(StorageError::Crypto)?;
