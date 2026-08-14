@@ -60,21 +60,21 @@ tauri-plugin-updater = "=2.10.1"
 # sole authority for slate construction, transaction serialization, proof and
 # signature validation.  These are deliberately revision pinned rather than
 # copied into this wallet workspace.
-dom-core = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "0b4fd8063d745883a438222f5b187ed392bcc9dd" }
-dom-crypto = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "0b4fd8063d745883a438222f5b187ed392bcc9dd" }
-dom-consensus = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "0b4fd8063d745883a438222f5b187ed392bcc9dd" }
-dom-serialization = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "0b4fd8063d745883a438222f5b187ed392bcc9dd" }
-dom-tx = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "0b4fd8063d745883a438222f5b187ed392bcc9dd" }
-dom-slate = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "0b4fd8063d745883a438222f5b187ed392bcc9dd" }
-dom-config = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "0b4fd8063d745883a438222f5b187ed392bcc9dd" }
-dom-chain = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "0b4fd8063d745883a438222f5b187ed392bcc9dd" }
-dom-node = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "0b4fd8063d745883a438222f5b187ed392bcc9dd" }
-dom-pow = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "0b4fd8063d745883a438222f5b187ed392bcc9dd" }
-dom-wallet = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "0b4fd8063d745883a438222f5b187ed392bcc9dd" }
-dom-wallet-core-api = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "0b4fd8063d745883a438222f5b187ed392bcc9dd" }
-dom-wallet-keys = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "0b4fd8063d745883a438222f5b187ed392bcc9dd" }
-dom-wallet-recovery = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "0b4fd8063d745883a438222f5b187ed392bcc9dd" }
-dom-adaptor = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "0b4fd8063d745883a438222f5b187ed392bcc9dd" }
+dom-core = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
+dom-crypto = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
+dom-consensus = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
+dom-serialization = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
+dom-tx = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
+dom-slate = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
+dom-config = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
+dom-chain = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
+dom-node = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
+dom-pow = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
+dom-wallet = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
+dom-wallet-core-api = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
+dom-wallet-keys = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
+dom-wallet-recovery = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
+dom-adaptor = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
 
 # Sidecar release authentication and atomic pointer handling are deliberately
 # consumed from their reviewed protocol commit. This does not move the wallet's
