@@ -96,22 +96,38 @@ impl WalletDirectory {
         kdf: KdfParameters,
     ) -> Result<Self, StorageError> {
         let root = root.as_ref().to_path_buf();
-        if root.exists() {
-            return Err(StorageError::AlreadyExists);
+        match fs::symlink_metadata(&root) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(StorageError::UnsafePath);
+            }
+            Ok(_) => return Err(StorageError::AlreadyExists),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(StorageError::Io(error)),
         }
         let parent = root.parent().ok_or(StorageError::UnsafePath)?.to_path_buf();
-        if !parent.is_dir() {
-            return Err(StorageError::NotFound);
+        let parent_metadata = fs::symlink_metadata(&parent).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                StorageError::NotFound
+            } else {
+                StorageError::Io(error)
+            }
+        })?;
+        if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+            return Err(StorageError::UnsafePath);
         }
         let staging = Self::create_staging_path(&root)?;
-        if staging.exists() {
-            return Err(StorageError::IncompleteGeneration);
+        match fs::symlink_metadata(&staging) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(StorageError::UnsafePath);
+            }
+            Ok(_) => return Err(StorageError::IncompleteGeneration),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(StorageError::Io(error)),
         }
         state.validate().map_err(StorageError::Domain)?;
-        fs::create_dir(&staging).map_err(StorageError::Io)?;
-        restrict_private_directory(&staging)?;
+        create_private_directory(&staging)?;
         let result = (|| {
-            fs::create_dir(staging.join(GENERATIONS_DIR)).map_err(StorageError::Io)?;
+            create_private_directory(&staging.join(GENERATIONS_DIR))?;
             let wallet = Self {
                 _writer_lock: acquire_writer_lock(&staging)?,
                 root: staging.clone(),
@@ -650,15 +666,15 @@ impl WalletDirectory {
         kdf: KdfParameters,
     ) -> Result<(), StorageError> {
         let generation = generation_name(state.generation);
-        let final_dir = self.root.join(GENERATIONS_DIR).join(&generation);
+        let generations_dir = self.root.join(GENERATIONS_DIR);
+        require_directory(&generations_dir)?;
+        let final_dir = generations_dir.join(&generation);
         if final_dir.exists() {
             return Err(StorageError::GenerationAlreadyExists);
         }
-        let temporary_dir = self
-            .root
-            .join(GENERATIONS_DIR)
-            .join(format!(".{generation}.{}.staging", Uuid::new_v4()));
-        fs::create_dir(&temporary_dir).map_err(StorageError::Io)?;
+        let temporary_dir =
+            generations_dir.join(format!(".{generation}.{}.staging", Uuid::new_v4()));
+        create_private_directory(&temporary_dir)?;
         let result = (|| {
             let plaintext =
                 serde_json::to_vec(state).map_err(|_| StorageError::CanonicalEncoding)?;
@@ -669,7 +685,7 @@ impl WalletDirectory {
             atomic_write(&temporary_dir.join(STATE_FILE), &encoded)?;
             sync_directory(&temporary_dir)?;
             fs::rename(&temporary_dir, &final_dir).map_err(StorageError::Io)?;
-            sync_directory(&self.root.join(GENERATIONS_DIR))?;
+            sync_directory(&generations_dir)?;
             Ok(())
         })();
         if result.is_err() {
@@ -870,6 +886,7 @@ fn atomic_write_private(path: &Path, bytes: &[u8], max_bytes: usize) -> Result<(
     if bytes.is_empty() || bytes.len() > max_bytes {
         return Err(StorageError::FileSizeOutOfBounds);
     }
+    validate_atomic_destination(path)?;
     let temporary = unique_temporary_sibling(path)?;
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -880,6 +897,7 @@ fn atomic_write_private(path: &Path, bytes: &[u8], max_bytes: usize) -> Result<(
     }
     let mut file = options.open(&temporary).map_err(StorageError::Io)?;
     let result = (|| {
+        restrict_private_file(&file)?;
         file.write_all(bytes).map_err(StorageError::Io)?;
         file.sync_all().map_err(StorageError::Io)?;
         drop(file);
@@ -896,23 +914,25 @@ fn atomic_write_private(path: &Path, bytes: &[u8], max_bytes: usize) -> Result<(
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
-    if bytes.is_empty() || bytes.len() > MAX_STATE_BYTES {
-        return Err(StorageError::FileSizeOutOfBounds);
+    atomic_write_private(path, bytes, MAX_STATE_BYTES)
+}
+
+fn validate_atomic_destination(path: &Path) -> Result<(), StorageError> {
+    let parent = path.parent().ok_or(StorageError::UnsafePath)?;
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    require_directory(parent)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            Err(StorageError::UnsafePath)
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(StorageError::Io(error)),
     }
-    let temporary = unique_temporary_sibling(path)?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .map_err(StorageError::Io)?;
-    file.write_all(bytes).map_err(StorageError::Io)?;
-    file.sync_all().map_err(StorageError::Io)?;
-    drop(file);
-    fs::rename(&temporary, path).map_err(StorageError::Io)?;
-    if let Some(parent) = path.parent() {
-        sync_directory(parent)?;
-    }
-    Ok(())
 }
 
 fn unique_temporary_sibling(path: &Path) -> Result<PathBuf, StorageError> {
@@ -935,11 +955,44 @@ fn sync_directory(path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 
+fn create_private_directory(path: &Path) -> Result<(), StorageError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(path)
+            .map_err(StorageError::Io)?;
+    }
+    #[cfg(not(unix))]
+    fs::create_dir(path).map_err(StorageError::Io)?;
+    restrict_private_directory(path)
+}
+
+fn require_directory(path: &Path) -> Result<(), StorageError> {
+    let metadata = fs::symlink_metadata(path).map_err(StorageError::Io)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(StorageError::UnsafePath);
+    }
+    Ok(())
+}
+
 fn restrict_private_directory(path: &Path) -> Result<(), StorageError> {
+    require_directory(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(StorageError::Io)?;
+    }
+    Ok(())
+}
+
+fn restrict_private_file(file: &File) -> Result<(), StorageError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(StorageError::Io)?;
     }
     Ok(())
 }
@@ -1027,6 +1080,12 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn unix_mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
     #[test]
     fn create_reopen_and_wrong_password_fail_closed() {
         let temp = tempfile::tempdir().unwrap();
@@ -1044,6 +1103,78 @@ mod tests {
             wallet.load("wrong"),
             Err(StorageError::InvalidPassword)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn created_and_committed_wallet_tree_is_owner_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("wallet");
+        let state = WalletState::new(identity(), [6; 32], default_node_configuration(identity()));
+        let wallet =
+            WalletDirectory::create(&root, &state, "correct", KdfParameters::TEST).unwrap();
+
+        let generations = root.join(GENERATIONS_DIR);
+        let generation_zero = generations.join(generation_name(0));
+        for directory in [&root, &generations, &generation_zero] {
+            assert_eq!(unix_mode(directory), 0o700, "{directory:?}");
+        }
+        for file in [
+            root.join(METADATA_FILE),
+            root.join(ACTIVE_FILE),
+            root.join(AUTHENTICATION_FILE),
+            root.join(WRITER_LOCK_FILE),
+            generation_zero.join(STATE_FILE),
+        ] {
+            assert_eq!(unix_mode(&file), 0o600, "{file:?}");
+        }
+
+        let next = wallet.load("correct").unwrap();
+        wallet
+            .commit(0, next, "correct", KdfParameters::TEST)
+            .unwrap();
+        let generation_one = generations.join(generation_name(1));
+        assert_eq!(unix_mode(&generation_one), 0o700);
+        assert_eq!(unix_mode(&generation_one.join(STATE_FILE)), 0o600);
+        assert_eq!(unix_mode(&root.join(METADATA_FILE)), 0o600);
+        assert_eq!(unix_mode(&root.join(ACTIVE_FILE)), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_creation_and_atomic_writes_reject_symlink_paths() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        let linked_directory = temp.path().join("linked-directory");
+        symlink(outside.path(), &linked_directory).unwrap();
+        assert!(matches!(
+            restrict_private_directory(&linked_directory),
+            Err(StorageError::UnsafePath)
+        ));
+        assert!(matches!(
+            WalletDirectory::create(
+                linked_directory.join("wallet"),
+                &WalletState::new(identity(), [6; 32], default_node_configuration(identity())),
+                "correct",
+                KdfParameters::TEST,
+            ),
+            Err(StorageError::UnsafePath)
+        ));
+        assert!(!outside.path().join("wallet").exists());
+
+        let target = outside.path().join("target");
+        fs::write(&target, b"preserved").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        let linked_file = temp.path().join("linked-file");
+        symlink(&target, &linked_file).unwrap();
+        assert!(matches!(
+            atomic_write(&linked_file, b"replacement"),
+            Err(StorageError::UnsafePath)
+        ));
+        assert_eq!(fs::read(&target).unwrap(), b"preserved");
     }
 
     #[test]
