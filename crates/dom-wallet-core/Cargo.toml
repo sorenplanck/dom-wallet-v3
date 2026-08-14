@@ -40,7 +40,11 @@ uuid.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+dom-config.workspace = true
 dom-crypto.workspace = true
+dom-wallet.workspace = true
+dom-wallet-remote-source = { path = "../dom-wallet-remote-source" }
+reqwest.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

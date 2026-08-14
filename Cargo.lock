@@ -1086,7 +1086,7 @@ dependencies = [
 [[package]]
 name = "dom-adaptor"
 version = "0.2.0"
-source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71#6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71"
+source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=03da17dab81dbb75f3d2a032c65cc10808a355f2#03da17dab81dbb75f3d2a032c65cc10808a355f2"
 dependencies = [
  "dom-consensus",
  "dom-core",
@@ -1101,7 +1101,7 @@ dependencies = [
 [[package]]
 name = "dom-chain"
 version = "0.2.0"
-source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71#6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71"
+source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=03da17dab81dbb75f3d2a032c65cc10808a355f2#03da17dab81dbb75f3d2a032c65cc10808a355f2"
 dependencies = [
  "blake2",
  "dom-consensus",
@@ -1121,7 +1121,7 @@ dependencies = [
 [[package]]
 name = "dom-config"
 version = "0.2.0"
-source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71#6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71"
+source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=03da17dab81dbb75f3d2a032c65cc10808a355f2#03da17dab81dbb75f3d2a032c65cc10808a355f2"
 dependencies = [
  "dom-core",
  "serde",
@@ -1132,7 +1132,7 @@ dependencies = [
 [[package]]
 name = "dom-consensus"
 version = "0.2.0"
-source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71#6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71"
+source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=03da17dab81dbb75f3d2a032c65cc10808a355f2#03da17dab81dbb75f3d2a032c65cc10808a355f2"
 dependencies = [
  "dom-core",
  "dom-crypto",
@@ -1146,7 +1146,7 @@ dependencies = [
 [[package]]
 name = "dom-core"
 version = "0.2.0"
-source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71#6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71"
+source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=03da17dab81dbb75f3d2a032c65cc10808a355f2#03da17dab81dbb75f3d2a032c65cc10808a355f2"
 dependencies = [
  "hex",
  "subtle",
@@ -1157,7 +1157,7 @@ dependencies = [
 [[package]]
 name = "dom-crypto"
 version = "0.2.0"
-source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71#6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71"
+source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=03da17dab81dbb75f3d2a032c65cc10808a355f2#03da17dab81dbb75f3d2a032c65cc10808a355f2"
 dependencies = [
  "blake2",
  "chacha20poly1305",
@@ -1179,7 +1179,7 @@ dependencies = [
 [[package]]
 name = "dom-mempool"
 version = "0.2.0"
-source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71#6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71"
+source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=03da17dab81dbb75f3d2a032c65cc10808a355f2#03da17dab81dbb75f3d2a032c65cc10808a355f2"
 dependencies = [
  "dom-consensus",
  "dom-core",
@@ -1194,7 +1194,7 @@ dependencies = [
 [[package]]
 name = "dom-node"
 version = "0.2.0"
-source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71#6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71"
+source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=03da17dab81dbb75f3d2a032c65cc10808a355f2#03da17dab81dbb75f3d2a032c65cc10808a355f2"
 dependencies = [
  "anyhow",
  "dom-chain",
@@ -1228,7 +1228,7 @@ dependencies = [
 [[package]]
 name = "dom-pmmr"
 version = "0.2.0"
-source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71#6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71"
+source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=03da17dab81dbb75f3d2a032c65cc10808a355f2#03da17dab81dbb75f3d2a032c65cc10808a355f2"
 dependencies = [
  "dom-core",
  "dom-crypto",
@@ -1238,7 +1238,7 @@ dependencies = [
 [[package]]
 name = "dom-pow"
 version = "0.2.0"
-source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71#6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71"
+source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=03da17dab81dbb75f3d2a032c65cc10808a355f2#03da17dab81dbb75f3d2a032c65cc10808a355f2"
 dependencies = [
  "blake2",
  "dom-core",
@@ -1252,7 +1252,7 @@ dependencies = [
 [[package]]
 name = "dom-rpc"
 version = "0.2.0"
-source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71#6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71"
+source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=03da17dab81dbb75f3d2a032c65cc10808a355f2#03da17dab81dbb75f3d2a032c65cc10808a355f2"
 dependencies = [
  "axum",
  "dirs 5.0.1",
@@ -1278,7 +1278,7 @@ dependencies = [
 [[package]]
 name = "dom-serialization"
 version = "0.2.0"
-source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71#6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71"
+source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=03da17dab81dbb75f3d2a032c65cc10808a355f2#03da17dab81dbb75f3d2a032c65cc10808a355f2"
 dependencies = [
  "dom-core",
  "thiserror 1.0.69",
@@ -1300,7 +1300,7 @@ dependencies = [
 [[package]]
 name = "dom-slate"
 version = "0.2.0"
-source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71#6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71"
+source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=03da17dab81dbb75f3d2a032c65cc10808a355f2#03da17dab81dbb75f3d2a032c65cc10808a355f2"
 dependencies = [
  "dom-consensus",
  "dom-core",
@@ -1315,7 +1315,7 @@ dependencies = [
 [[package]]
 name = "dom-store"
 version = "0.2.0"
-source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71#6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71"
+source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=03da17dab81dbb75f3d2a032c65cc10808a355f2#03da17dab81dbb75f3d2a032c65cc10808a355f2"
 dependencies = [
  "blake2",
  "dom-consensus",
@@ -1331,7 +1331,7 @@ dependencies = [
 [[package]]
 name = "dom-tx"
 version = "0.2.0"
-source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71#6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71"
+source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=03da17dab81dbb75f3d2a032c65cc10808a355f2#03da17dab81dbb75f3d2a032c65cc10808a355f2"
 dependencies = [
  "dom-consensus",
  "dom-core",
@@ -1343,7 +1343,7 @@ dependencies = [
 [[package]]
 name = "dom-wallet"
 version = "0.2.0"
-source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71#6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71"
+source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=03da17dab81dbb75f3d2a032c65cc10808a355f2#03da17dab81dbb75f3d2a032c65cc10808a355f2"
 dependencies = [
  "argon2",
  "bip39",
@@ -1391,12 +1391,14 @@ name = "dom-wallet-core"
 version = "0.3.2"
 dependencies = [
  "dom-adaptor",
+ "dom-config",
  "dom-consensus",
  "dom-core",
  "dom-crypto",
  "dom-node",
  "dom-serialization",
  "dom-slate",
+ "dom-wallet",
  "dom-wallet-chain",
  "dom-wallet-core-api",
  "dom-wallet-core-protocol",
@@ -1409,9 +1411,11 @@ dependencies = [
  "dom-wallet-embedded-core",
  "dom-wallet-production-backend",
  "dom-wallet-protocol",
+ "dom-wallet-remote-source",
  "dom-wallet-storage",
  "hex",
  "rand 0.8.6",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2",
@@ -1426,7 +1430,7 @@ dependencies = [
 [[package]]
 name = "dom-wallet-core-api"
 version = "0.2.0"
-source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71#6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71"
+source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=03da17dab81dbb75f3d2a032c65cc10808a355f2#03da17dab81dbb75f3d2a032c65cc10808a355f2"
 dependencies = [
  "dom-consensus",
  "dom-core",
@@ -1537,7 +1541,7 @@ dependencies = [
 [[package]]
 name = "dom-wallet-crypto"
 version = "0.2.0"
-source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71#6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71"
+source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=03da17dab81dbb75f3d2a032c65cc10808a355f2#03da17dab81dbb75f3d2a032c65cc10808a355f2"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -1597,7 +1601,7 @@ dependencies = [
 [[package]]
 name = "dom-wallet-keys"
 version = "0.2.0"
-source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71#6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71"
+source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=03da17dab81dbb75f3d2a032c65cc10808a355f2#03da17dab81dbb75f3d2a032c65cc10808a355f2"
 dependencies = [
  "bip39",
  "hmac",
@@ -1663,7 +1667,7 @@ dependencies = [
 [[package]]
 name = "dom-wallet-recovery"
 version = "0.2.0"
-source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71#6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71"
+source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=03da17dab81dbb75f3d2a032c65cc10808a355f2#03da17dab81dbb75f3d2a032c65cc10808a355f2"
 dependencies = [
  "dom-core",
  "dom-crypto",
@@ -1761,7 +1765,7 @@ dependencies = [
 [[package]]
 name = "dom-wire"
 version = "0.2.0"
-source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71#6a295fddf4e6a3afd6cf0f3fdb1e3a636a2f3d71"
+source = "git+file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative?rev=03da17dab81dbb75f3d2a032c65cc10808a355f2#03da17dab81dbb75f3d2a032c65cc10808a355f2"
 dependencies = [
  "blake2",
  "dom-config",
