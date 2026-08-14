@@ -39,15 +39,16 @@
 #![forbid(unsafe_code)]
 
 use dom_consensus::{BlockHeader, Transaction};
+use dom_core::{fee_policy, DomError, MAX_TX_WEIGHT, MIN_RELAY_FEE_RATE};
 use dom_serialization::{DomDeserialize, DomSerialize};
 use dom_wallet_core_api::{
     BlockRef, BlockSelector, BlockSummary, ChainIdentity, CoinbaseScanMetadata, CoreNetwork,
-    CursorValidation, FeeBreakdown, FeeEstimate, FeeEstimateRequest, FeePolicySnapshot,
-    FeeValidation, KernelQueryResult, MempoolPolicySnapshot, ScanBlock, ScanInput, ScanKernel,
-    ScanOutput, ScanRequest, ScanResult, ScanStart, ScanTransaction, SubmissionResult,
-    SubmitTransactionRequest, SyncStatus, TransactionIdentifier, TransactionLocation,
-    TransactionShape, TransactionStatus, TransactionWeight, UtxoQueryResult, WalletCoreApi,
-    WalletCoreError, WalletScanCursor,
+    CursorValidation, FeeBreakdown, FeeEstimate, FeeEstimateRequest, FeeEstimateTarget,
+    FeePolicySnapshot, FeeRate, FeeValidation, KernelQueryResult, MempoolPolicySnapshot, ScanBlock,
+    ScanInput, ScanKernel, ScanOutput, ScanRequest, ScanResult, ScanStart, ScanTransaction,
+    SubmissionResult, SubmitTransactionRequest, SyncStatus, TransactionIdentifier,
+    TransactionLocation, TransactionShape, TransactionStatus, TransactionWeight, UtxoQueryResult,
+    WalletCoreApi, WalletCoreError, WalletScanCursor,
 };
 use serde::Deserialize;
 use std::fmt;
@@ -125,10 +126,10 @@ struct SessionState {
 
 /// Remote DOM node consumed through the frozen [`WalletCoreApi`] contract.
 ///
-/// Only the scan surface (`chain_identity`, `scan_range`, `scan_next`,
-/// `validate_cursor`, `canonical_hash_at_height`) plus derived readiness is
-/// served remotely. Submission and fee-policy operations return a stable,
-/// non-retriable error: spending stays on the embedded node.
+/// The scan surface (`chain_identity`, `scan_range`, `scan_next`,
+/// `validate_cursor`, `canonical_hash_at_height`) plus the frozen deterministic
+/// fee policy and derived readiness are served remotely. Transaction
+/// submission remains unavailable: broadcasting stays on the retained node.
 pub struct RemoteNodeSource {
     base_url: String,
     bearer_token: Option<BearerToken>,
@@ -320,6 +321,59 @@ impl RemoteNodeSource {
             }
             404 => Ok(None),
             other => Err(map_block_status(other, &reply.body)),
+        }
+    }
+
+    fn core_shape(shape: TransactionShape) -> fee_policy::TransactionShape {
+        fee_policy::TransactionShape {
+            input_count: shape.input_count,
+            output_count: shape.output_count,
+            kernel_count: shape.kernel_count,
+        }
+    }
+
+    fn api_fee_rate(rate: fee_policy::FeeRate) -> FeeRate {
+        FeeRate {
+            noms_per_weight_unit: rate.noms_per_weight_unit,
+        }
+    }
+
+    fn api_weight(weight: fee_policy::TransactionWeight) -> TransactionWeight {
+        TransactionWeight {
+            input_weight: weight.input_weight,
+            output_weight: weight.output_weight,
+            kernel_weight: weight.kernel_weight,
+            total_weight: weight.total_weight,
+        }
+    }
+
+    fn api_breakdown(network: CoreNetwork, breakdown: fee_policy::FeeBreakdown) -> FeeBreakdown {
+        FeeBreakdown {
+            input_count: breakdown.shape.input_count,
+            output_count: breakdown.shape.output_count,
+            kernel_count: breakdown.shape.kernel_count,
+            input_weight: breakdown.weight.input_weight,
+            output_weight: breakdown.weight.output_weight,
+            kernel_weight: breakdown.weight.kernel_weight,
+            total_weight: breakdown.weight.total_weight,
+            minimum_fee_noms: breakdown.minimum_fee_noms,
+            recommended_fee_noms: breakdown.recommended_fee_noms,
+            minimum_fee_rate: Self::api_fee_rate(breakdown.minimum_fee_rate),
+            recommended_fee_rate: Self::api_fee_rate(breakdown.recommended_fee_rate),
+            policy_version: breakdown.policy_version,
+            network,
+            validity_horizon: None,
+            dust_threshold_noms: breakdown.dust_threshold_noms,
+        }
+    }
+
+    fn map_policy_error(error: DomError) -> WalletCoreError {
+        match error {
+            DomError::Invalid(message) | DomError::PolicyRejected(message) => {
+                WalletCoreError::InvalidScanRequest(message)
+            }
+            DomError::Internal(message) => WalletCoreError::InternalFailure(message),
+            other => WalletCoreError::InternalFailure(other.to_string()),
         }
     }
 }
@@ -546,26 +600,79 @@ impl WalletCoreApi for RemoteNodeSource {
     }
 
     fn fee_policy_snapshot(&self) -> Result<FeePolicySnapshot, WalletCoreError> {
-        Err(requires_embedded_node("fee policy"))
+        let network = self.session_identity_or_probe()?.network;
+        Ok(FeePolicySnapshot {
+            policy_version: fee_policy::FEE_POLICY_VERSION,
+            network,
+            min_relay_fee_rate: MIN_RELAY_FEE_RATE,
+            min_mempool_fee_rate: MIN_RELAY_FEE_RATE,
+            recommended_fee_rate: fee_policy::FeeRate::recommended()
+                .map_err(Self::map_policy_error)?
+                .noms_per_weight_unit,
+            dust_threshold_noms: fee_policy::DUST_THRESHOLD_NOMS,
+            max_tx_weight: u64::from(MAX_TX_WEIGHT),
+            validity_horizon: None,
+        })
     }
 
     fn transaction_weight(
         &self,
-        _shape: TransactionShape,
+        shape: TransactionShape,
     ) -> Result<TransactionWeight, WalletCoreError> {
-        Err(requires_embedded_node("transaction weight"))
+        let weight = fee_policy::transaction_weight(Self::core_shape(shape))
+            .map_err(Self::map_policy_error)?;
+        Ok(Self::api_weight(weight))
     }
 
-    fn minimum_fee(&self, _shape: TransactionShape) -> Result<FeeBreakdown, WalletCoreError> {
-        Err(requires_embedded_node("minimum fee"))
+    fn minimum_fee(&self, shape: TransactionShape) -> Result<FeeBreakdown, WalletCoreError> {
+        let network = self.session_identity_or_probe()?.network;
+        let breakdown =
+            fee_policy::fee_breakdown(Self::core_shape(shape)).map_err(Self::map_policy_error)?;
+        Ok(Self::api_breakdown(network, breakdown))
     }
 
-    fn estimate_fee(&self, _request: FeeEstimateRequest) -> Result<FeeEstimate, WalletCoreError> {
-        Err(requires_embedded_node("fee estimation"))
+    fn estimate_fee(&self, request: FeeEstimateRequest) -> Result<FeeEstimate, WalletCoreError> {
+        let breakdown = self.minimum_fee(request.shape)?;
+        let (selected_fee_noms, selected_fee_rate) = match request.target {
+            FeeEstimateTarget::Minimum => (breakdown.minimum_fee_noms, breakdown.minimum_fee_rate),
+            FeeEstimateTarget::Recommended => (
+                breakdown.recommended_fee_noms,
+                breakdown.recommended_fee_rate,
+            ),
+        };
+        Ok(FeeEstimate {
+            breakdown,
+            selected_fee_noms,
+            selected_fee_rate,
+        })
     }
 
-    fn validate_fee(&self, _transaction: &Transaction) -> Result<FeeValidation, WalletCoreError> {
-        Err(requires_embedded_node("fee validation"))
+    fn validate_fee(&self, transaction: &Transaction) -> Result<FeeValidation, WalletCoreError> {
+        let network = self.session_identity_or_probe()?.network;
+        let fee = transaction.total_fee().map_err(Self::map_policy_error)?;
+        let shape = transaction.fee_shape().map_err(Self::map_policy_error)?;
+        let breakdown = fee_policy::fee_breakdown(shape).map_err(Self::map_policy_error)?;
+        let minimum_fee_noms = breakdown.minimum_fee_noms;
+        let total_weight = breakdown.weight.total_weight;
+        let api_breakdown = Self::api_breakdown(network, breakdown);
+        let accepted_by_policy = fee >= minimum_fee_noms;
+        let shortfall_noms = if accepted_by_policy {
+            0
+        } else {
+            minimum_fee_noms
+                .checked_sub(fee)
+                .ok_or_else(|| WalletCoreError::InternalFailure("fee shortfall underflow".into()))?
+        };
+        let actual_fee_rate =
+            fee_policy::actual_fee_rate(fee, total_weight).map_err(Self::map_policy_error)?;
+        Ok(FeeValidation {
+            accepted_by_policy,
+            actual_fee_noms: fee,
+            minimum_fee_noms,
+            shortfall_noms,
+            actual_fee_rate: Self::api_fee_rate(actual_fee_rate),
+            breakdown: api_breakdown,
+        })
     }
 }
 
@@ -2809,7 +2916,7 @@ mod tests {
         }
 
         #[test]
-        fn operations_outside_the_scan_surface_are_terminal_embedded_only_errors() {
+        fn node_owned_operations_are_terminal_embedded_only_errors() {
             // No server needed: these must fail without any network traffic.
             let source =
                 RemoteNodeSource::new("http://127.0.0.1:1", Some(TOKEN)).expect("remote source");
@@ -2833,16 +2940,6 @@ mod tests {
                     .map(|_| ())
                     .unwrap_err(),
                 source.mempool_policy_snapshot().map(|_| ()).unwrap_err(),
-                source.fee_policy_snapshot().map(|_| ()).unwrap_err(),
-                source.fee_policy().map(|_| ()).unwrap_err(),
-                source
-                    .transaction_weight(TransactionShape {
-                        input_count: 1,
-                        output_count: 1,
-                        kernel_count: 1,
-                    })
-                    .map(|_| ())
-                    .unwrap_err(),
             ];
             for error in errors {
                 match error {
@@ -2855,6 +2952,32 @@ mod tests {
                     other => panic!("expected terminal InternalFailure, got {other:?}"),
                 }
             }
+        }
+
+        #[test]
+        fn frozen_fee_policy_is_available_without_submission_authority() {
+            let server = MockServer::start(|request| match request.path.as_str() {
+                "/chain/scan/scriptless/v1" => identity_probe_response(9, 0x59),
+                other => panic!("unexpected path {other}"),
+            });
+            let source = source_for(&server);
+            let snapshot = source.fee_policy_snapshot().expect("frozen fee policy");
+            assert_eq!(snapshot.policy_version, fee_policy::FEE_POLICY_VERSION);
+            assert_eq!(snapshot.network, CoreNetwork::Regtest);
+            assert_eq!(snapshot.min_relay_fee_rate, MIN_RELAY_FEE_RATE);
+            assert_eq!(snapshot.max_tx_weight, u64::from(MAX_TX_WEIGHT));
+
+            let shape = TransactionShape {
+                input_count: 2,
+                output_count: 3,
+                kernel_count: 1,
+            };
+            let expected = fee_policy::fee_breakdown(RemoteNodeSource::core_shape(shape))
+                .expect("canonical breakdown");
+            let actual = source.minimum_fee(shape).expect("remote minimum fee");
+            assert_eq!(actual.total_weight, expected.weight.total_weight);
+            assert_eq!(actual.minimum_fee_noms, expected.minimum_fee_noms);
+            assert_eq!(actual.recommended_fee_noms, expected.recommended_fee_noms);
         }
 
         #[test]
