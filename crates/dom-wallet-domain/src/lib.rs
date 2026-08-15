@@ -963,12 +963,24 @@ impl WalletState {
                 transaction.lifecycle,
                 TransactionLifecycle::Confirmed { .. }
             ) {
-                transaction.lifecycle = if transaction.submitted {
-                    TransactionLifecycle::Submitted
-                } else {
-                    TransactionLifecycle::Finalized
-                };
+                transaction.lifecycle = Self::rescan_rewind_lifecycle(transaction);
             }
+        }
+    }
+
+    /// The state a confirmed transaction rewinds to when its confirmation
+    /// evidence is discarded for a rescan. A recipient transaction was never
+    /// submitted and carries no kernel excess: it can only re-confirm through
+    /// mark_known_outputs_confirmed, which requires a ResponseExported (or
+    /// ResponsePrepared) lifecycle — rewinding it to Submitted would strand
+    /// it forever.
+    fn rescan_rewind_lifecycle(transaction: &LocalTransactionIntent) -> TransactionLifecycle {
+        if transaction.role == Some(TransactionRole::Recipient) {
+            TransactionLifecycle::ResponseExported
+        } else if transaction.submitted {
+            TransactionLifecycle::Submitted
+        } else {
+            TransactionLifecycle::Finalized
         }
     }
 
@@ -983,7 +995,7 @@ impl WalletState {
                 transaction.lifecycle,
                 TransactionLifecycle::Confirmed { .. }
             ) {
-                transaction.lifecycle = TransactionLifecycle::Submitted;
+                transaction.lifecycle = Self::rescan_rewind_lifecycle(transaction);
             }
         }
         self.rescan_plan = Some(RescanPlan {
