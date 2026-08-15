@@ -14,7 +14,7 @@ use dom_pow::{
 use dom_serialization::{DomDeserialize, DomSerialize};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    mpsc, Arc,
+    Arc,
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -110,7 +110,7 @@ pub async fn mine_wallet_block(
     };
 
     let round_stop = Arc::new(AtomicBool::new(false));
-    let (sender, receiver) = mpsc::channel();
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     let mut workers = Vec::with_capacity(threads);
     for worker_id in 0..threads {
         let worker_template = template.clone();
@@ -159,25 +159,31 @@ pub async fn mine_wallet_block(
     }
     drop(sender);
 
+    // Await results without blocking the executor: RandomX rounds run for
+    // minutes at real difficulty, and the caller may share its runtime with
+    // other tasks. The worker threads are joined on the blocking pool.
     let mut winning_header = None;
-    while !stop_requested.load(Ordering::Acquire) {
-        match receiver.recv_timeout(Duration::from_millis(100)) {
-            Ok(Ok(header)) => {
+    loop {
+        if stop_requested.load(Ordering::Acquire) {
+            break;
+        }
+        match tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await {
+            Ok(Some(Ok(header))) => {
                 winning_header = Some(header);
                 break;
             }
-            Ok(Err(())) => {
-                round_stop.store(true, Ordering::Release);
-                break;
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Ok(Some(Err(()))) | Ok(None) => break,
+            Err(_) => {}
         }
     }
     round_stop.store(true, Ordering::Release);
-    for worker in workers {
-        let _ = worker.join();
-    }
+    tokio::task::spawn_blocking(move || {
+        for worker in workers {
+            let _ = worker.join();
+        }
+    })
+    .await
+    .map_err(|_| WalletMiningError::Worker)?;
     let Some(header) = winning_header else {
         return if stop_requested.load(Ordering::Acquire) {
             Ok(WalletMiningOutcome::Stopped)
