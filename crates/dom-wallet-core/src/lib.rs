@@ -667,8 +667,14 @@ impl WalletService {
             .identity()
             .current_tip
             .height;
+        let maturity = self
+            .backend
+            .as_ref()
+            .ok_or(CoreError::EmbeddedCoreRequired)?
+            .identity()
+            .coinbase_maturity;
         let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
-        rewind_recovery_state(&mut state, 0, tip);
+        rewind_recovery_state(&mut state, 0, tip, maturity)?;
         state.core_scan_cursor = None;
         state.recovery_canonical_blocks.clear();
         self.commit(state)?;
@@ -1587,7 +1593,12 @@ impl WalletRecoverySink {
     ) -> Result<(), CoreError> {
         let mut next = self.state.clone();
         if let Some(anchor) = reorg {
-            rewind_recovery_state(&mut next, anchor.height, batch.observed_tip.height);
+            rewind_recovery_state(
+                &mut next,
+                anchor.height,
+                batch.observed_tip.height,
+                self.identity.coinbase_maturity,
+            )?;
         }
         apply_recovery_batch(
             &self.seed,
