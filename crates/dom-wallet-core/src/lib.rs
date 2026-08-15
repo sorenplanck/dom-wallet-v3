@@ -1006,7 +1006,15 @@ impl WalletService {
             &identity,
             identity.current_tip.height,
         )?;
-        transaction.lifecycle = TransactionLifecycle::RequestExported;
+        // Re-exporting is a read for any transaction that already advanced past
+        // the request phase: the lifecycle must never regress to RequestExported,
+        // otherwise a submitted transaction would become cancellable again.
+        if matches!(
+            transaction.lifecycle,
+            TransactionLifecycle::InputsReserved | TransactionLifecycle::RequestExported
+        ) {
+            transaction.lifecycle = TransactionLifecycle::RequestExported;
+        }
         let export = SlateExport {
             transaction_id: transaction.id,
             slate_id,
@@ -1073,6 +1081,9 @@ impl WalletService {
             .clone();
         let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
         let index = find_transaction_index(&state, slate_id, TransactionRole::Recipient)?;
+        if state.transactions[index].lifecycle != TransactionLifecycle::RequestImported {
+            return Err(CoreError::InvalidTransactionTransition);
+        }
         let coordinate = state.reserve_recovery_coordinate(0, RecoveryOutputClass::ReceiveSlate)?;
         self.commit(state)?; // Burn the recipient coordinate before response construction.
         let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
@@ -1134,7 +1145,15 @@ impl WalletService {
             &identity,
             identity.current_tip.height,
         )?;
-        transaction.lifecycle = TransactionLifecycle::ResponseExported;
+        // Same non-regression rule as the request export: a confirmed or
+        // submitted recipient transaction must not fall back to an
+        // exported-and-cancellable state.
+        if matches!(
+            transaction.lifecycle,
+            TransactionLifecycle::ResponsePrepared | TransactionLifecycle::ResponseExported
+        ) {
+            transaction.lifecycle = TransactionLifecycle::ResponseExported;
+        }
         let export = SlateExport {
             transaction_id: transaction.id,
             slate_id,
@@ -1166,6 +1185,14 @@ impl WalletService {
         if request.replay_key() != response.replay_key() {
             return Err(CoreError::SlateReplayConflict);
         }
+        if !matches!(
+            transaction.lifecycle,
+            TransactionLifecycle::InputsReserved
+                | TransactionLifecycle::RequestExported
+                | TransactionLifecycle::ResponseImported
+        ) {
+            return Err(CoreError::InvalidTransactionTransition);
+        }
         transaction.response_bytes = response.canonical_bytes().to_vec();
         transaction.lifecycle = TransactionLifecycle::ResponseImported;
         let id = transaction.id;
@@ -1187,6 +1214,9 @@ impl WalletService {
         let index = find_transaction_index(state, slate_id, TransactionRole::Sender)?;
         if state.transactions[index].lifecycle == TransactionLifecycle::Finalized {
             return Ok(transaction_summary_from(&state.transactions[index]));
+        }
+        if state.transactions[index].lifecycle != TransactionLifecycle::ResponseImported {
+            return Err(CoreError::InvalidTransactionTransition);
         }
         let request = CanonicalSlate::from_recovery_bytes(
             &state.transactions[index].request_bytes,
@@ -1348,6 +1378,11 @@ impl WalletService {
             .iter()
             .position(|transaction| transaction.slate_id == Some(slate_id))
             .ok_or(CoreError::TransactionNotFound)?;
+        // Every state below is only reachable after a submission attempt, so
+        // the transaction may already exist on the network: releasing its
+        // inputs would construct a double spend. RetransmitRequired and
+        // ReconciliationRequired mean the node outcome is unknown, which must
+        // be treated as possibly-broadcast.
         if matches!(
             state.transactions[index].lifecycle,
             TransactionLifecycle::Submitting
@@ -1355,6 +1390,9 @@ impl WalletService {
                 | TransactionLifecycle::AcceptedNotRelayed
                 | TransactionLifecycle::InMempool
                 | TransactionLifecycle::Confirmed { .. }
+                | TransactionLifecycle::RetransmitRequired
+                | TransactionLifecycle::Reorged
+                | TransactionLifecycle::ReconciliationRequired
         ) {
             return Err(CoreError::CannotCancelTransaction);
         }
@@ -1373,6 +1411,41 @@ impl WalletService {
                     output.state = OutputState::Confirmed;
                 }
             }
+        }
+        // The change/recipient outputs of a cancelled negotiation can never
+        // appear on-chain; keeping them as PendingIncoming would inflate the
+        // balance forever. Only still-pending records are removed.
+        let candidates: Vec<Uuid> = [
+            state.transactions[index].change_output_id,
+            state.transactions[index].recipient_output_id,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let removed: Vec<Uuid> = state
+            .outputs
+            .iter()
+            .filter(|output| {
+                candidates.contains(&output.id)
+                    && matches!(output.state, OutputState::PendingIncoming)
+            })
+            .map(|output| output.id)
+            .collect();
+        state.outputs.retain(|output| !removed.contains(&output.id));
+        state
+            .private_output_blindings
+            .retain(|secret| !removed.contains(&secret.output_id));
+        if state.transactions[index]
+            .change_output_id
+            .is_some_and(|id| removed.contains(&id))
+        {
+            state.transactions[index].change_output_id = None;
+        }
+        if state.transactions[index]
+            .recipient_output_id
+            .is_some_and(|id| removed.contains(&id))
+        {
+            state.transactions[index].recipient_output_id = None;
         }
         state.transactions[index].lifecycle = TransactionLifecycle::Cancelled;
         let id = state.transactions[index].id;
@@ -2071,6 +2144,119 @@ mod tests {
             require_mainnet_identity(&wrong_genesis),
             Err(CoreError::IdentityMismatch)
         ));
+    }
+
+    fn intent(slate_id: Uuid, lifecycle: TransactionLifecycle) -> LocalTransactionIntent {
+        LocalTransactionIntent {
+            id: Uuid::new_v4(),
+            kernel_excess: Vec::new(),
+            lifecycle,
+            submitted: false,
+            slate_id: Some(slate_id),
+            role: Some(TransactionRole::Sender),
+            amount: 5,
+            fee: 1,
+            reserved_output_ids: Vec::new(),
+            request_bytes: Vec::new(),
+            response_bytes: Vec::new(),
+            finalized_transaction_bytes: Vec::new(),
+            transaction_hash: None,
+            attempt_count: 0,
+            private_context: None,
+            recipient_output_id: None,
+            change_output_id: None,
+        }
+    }
+
+    #[test]
+    fn cancel_is_rejected_for_every_post_submission_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut service = test_service();
+        service
+            .create_recoverable(temp.path().join("wallet"), "password-1", backup_identity())
+            .unwrap();
+        service.unlock("password-1").unwrap();
+        for lifecycle in [
+            TransactionLifecycle::Submitting,
+            TransactionLifecycle::Submitted,
+            TransactionLifecycle::AcceptedNotRelayed,
+            TransactionLifecycle::InMempool,
+            TransactionLifecycle::Confirmed {
+                height: 9,
+                block_hash: [7; 32],
+            },
+            TransactionLifecycle::RetransmitRequired,
+            TransactionLifecycle::Reorged,
+            TransactionLifecycle::ReconciliationRequired,
+        ] {
+            let slate_id = Uuid::new_v4();
+            let mut state = service.unlocked.as_ref().unwrap().clone();
+            state.transactions.push(intent(slate_id, lifecycle));
+            service.commit(state).unwrap();
+            assert!(matches!(
+                service.transaction_cancel(slate_id, true),
+                Err(CoreError::CannotCancelTransaction)
+            ));
+        }
+    }
+
+    #[test]
+    fn cancel_removes_pending_change_output_and_blinding() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut service = test_service();
+        service
+            .create_recoverable(temp.path().join("wallet"), "password-1", backup_identity())
+            .unwrap();
+        service.unlock("password-1").unwrap();
+        let slate_id = Uuid::new_v4();
+        let change_id = Uuid::new_v4();
+        let input_id = Uuid::new_v4();
+        let mut state = service.unlocked.as_ref().unwrap().clone();
+        let account_id = state.default_account.id;
+        let mut transaction = intent(slate_id, TransactionLifecycle::RequestExported);
+        transaction.reserved_output_ids = vec![input_id];
+        transaction.change_output_id = Some(change_id);
+        let transaction_id = transaction.id;
+        state.outputs.push(OutputRecord {
+            id: input_id,
+            account_id,
+            commitment: Some([3; 33]),
+            value: 10,
+            state: OutputState::PendingOutgoing,
+            discovered_height: 4,
+            reserved_by: Some(transaction_id),
+        });
+        state.outputs.push(OutputRecord {
+            id: change_id,
+            account_id,
+            commitment: Some([4; 33]),
+            value: 4,
+            state: OutputState::PendingIncoming,
+            discovered_height: 0,
+            reserved_by: None,
+        });
+        state.remember_output_blinding(change_id, [9; 32]);
+        state.transactions.push(transaction);
+        service.commit(state).unwrap();
+
+        service.transaction_cancel(slate_id, true).unwrap();
+        let state = service.unlocked.as_ref().unwrap();
+        assert!(state.outputs.iter().all(|output| output.id != change_id));
+        assert!(state.output_blinding(change_id).is_none());
+        let input = state
+            .outputs
+            .iter()
+            .find(|output| output.id == input_id)
+            .unwrap();
+        assert_eq!(input.state, OutputState::Confirmed);
+        assert_eq!(input.reserved_by, None);
+        let cancelled = state
+            .transactions
+            .iter()
+            .find(|transaction| transaction.slate_id == Some(slate_id))
+            .unwrap();
+        assert_eq!(cancelled.lifecycle, TransactionLifecycle::Cancelled);
+        assert_eq!(cancelled.change_output_id, None);
     }
 
     #[test]
