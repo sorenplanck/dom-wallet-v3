@@ -162,6 +162,14 @@ const refreshSummary = async () => {
   byId("settings-heights").textContent = `${synchronization.cursor_height ?? "—"} / ${network.canonical_height}`;
 };
 const refreshNode = async () => redactJson(byId("node-status"), await invoke("embedded_node_status"));
+// Network hashrate spans many orders of magnitude; scale the unit for reading.
+const formatHashrate = (hps) => {
+  if (hps == null || !Number.isFinite(hps)) return "—";
+  const units = ["H/s", "kH/s", "MH/s", "GH/s", "TH/s"];
+  let scaled = hps; let unit = 0;
+  while (scaled >= 1000 && unit < units.length - 1) { scaled /= 1000; unit += 1; }
+  return `${scaled.toFixed(1)} ${units[unit]}`;
+};
 // The 15s background refresh must not clobber a field the user is editing.
 const setUnlessFocused = (element, apply) => { if (document.activeElement !== element) apply(element); };
 const renderMining = (value) => {
@@ -171,6 +179,7 @@ const renderMining = (value) => {
   byId("mining-threads").disabled = !value.enabled || value.running;
   setUnlessFocused(byId("mining-address"), (input) => { input.value = value.mining_address; });
   byId("mining-hashrate").textContent = `${value.hashrate_hps.toFixed(1)} H/s`;
+  byId("mining-network-hashrate").textContent = formatHashrate(value.network_hashrate_hps);
   byId("mining-height").textContent = value.current_height;
   byId("mining-peers").textContent = value.connected_peers;
   byId("mining-accepted").textContent = value.accepted_blocks;

@@ -221,6 +221,61 @@ pub async fn mine_wallet_block(
     }
 }
 
+/// Trailing block window used for the network hashrate estimate.
+pub const NETWORK_HASHRATE_WINDOW_BLOCKS: u64 = 120;
+
+/// Estimate the network's average hashrate in hashes per second over the
+/// trailing `window` blocks ending at the canonical tip.
+///
+/// Every difficulty unit corresponds to one expected hash, so the ratio
+/// Δ(accumulated difficulty) / Δ(header timestamp) is the mean rate the whole
+/// network sustained across the window. Returns None while the chain is too
+/// short — or its timestamps too degenerate — to measure.
+pub async fn network_hashrate_estimate(node: Arc<DomNode>, window: u64) -> Option<f64> {
+    if window == 0 {
+        return None;
+    }
+    let chain = node.chain.lock().await;
+    let tip_height = chain.tip_height.0;
+    if tip_height == 0 {
+        return None;
+    }
+    let start_height = tip_height - window.min(tip_height);
+    let tip_header = chain
+        .store
+        .get_block_header(chain.tip_hash.as_bytes())
+        .ok()
+        .flatten()
+        .and_then(|bytes| BlockHeader::from_bytes(&bytes).ok())?;
+    let start_hash = chain
+        .store
+        .get_hash_at_height(start_height)
+        .ok()
+        .flatten()?;
+    let start_header = chain
+        .store
+        .get_block_header(&start_hash)
+        .ok()
+        .flatten()
+        .and_then(|bytes| BlockHeader::from_bytes(&bytes).ok())?;
+    drop(chain);
+    let elapsed = tip_header
+        .timestamp
+        .0
+        .saturating_sub(start_header.timestamp.0);
+    if elapsed == 0 {
+        return None;
+    }
+    let delta = tip_header
+        .total_difficulty
+        .saturating_sub(start_header.total_difficulty);
+    // U256 little-endian limbs folded most-significant first into an f64.
+    let delta_hashes = delta.0.iter().rev().fold(0.0_f64, |acc, limb| {
+        acc * 18_446_744_073_709_551_616.0 + *limb as f64
+    });
+    Some(delta_hashes / elapsed as f64)
+}
+
 fn now_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

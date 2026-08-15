@@ -25,7 +25,10 @@ use std::{
 use thiserror::Error;
 
 mod miner;
-pub use miner::{mine_wallet_block, WalletMiningError, WalletMiningOutcome};
+pub use miner::{
+    mine_wallet_block, network_hashrate_estimate, WalletMiningError, WalletMiningOutcome,
+    NETWORK_HASHRATE_WINDOW_BLOCKS,
+};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(10);

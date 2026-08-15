@@ -13,8 +13,8 @@ use dom_wallet_core::{
 use dom_wallet_core_api::CoreNetwork;
 use dom_wallet_domain::{BalanceProjection, Network, NetworkIdentity};
 use dom_wallet_embedded_core::{
-    mine_wallet_block, EmbeddedCoreConfiguration, WalletMiningOutcome, MAINNET_BOOTSTRAP_FALLBACK,
-    MAINNET_DNS_SEEDS,
+    mine_wallet_block, network_hashrate_estimate, EmbeddedCoreConfiguration, WalletMiningOutcome,
+    MAINNET_BOOTSTRAP_FALLBACK, MAINNET_DNS_SEEDS, NETWORK_HASHRATE_WINDOW_BLOCKS,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -262,6 +262,9 @@ pub struct MiningStatusDto {
     pub mining_address: String,
     pub hash_attempts: u64,
     pub hashrate_hps: f64,
+    /// Estimated network-wide average hashrate over the trailing difficulty
+    /// window; None while the chain is too short to measure.
+    pub network_hashrate_hps: Option<f64>,
     pub current_height: u64,
     pub connected_peers: u64,
     pub accepted_blocks: u64,
@@ -775,6 +778,23 @@ impl DesktopApplication {
             .map_err(CommandError::from)?;
         let last_candidate = mining.last_candidate_time.load(Ordering::Acquire);
         let last_height = mining.last_accepted_height.load(Ordering::Acquire);
+        let network_hashrate = self
+            .service
+            .lock()
+            .ok()
+            .and_then(|service| service.embedded_node_handle().ok())
+            .and_then(|node| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok()
+                    .and_then(|runtime| {
+                        runtime.block_on(network_hashrate_estimate(
+                            node,
+                            NETWORK_HASHRATE_WINDOW_BLOCKS,
+                        ))
+                    })
+            });
         Ok(MiningStatusDto {
             status: mining_state_name(raw_state, config.enabled).into(),
             enabled: config.enabled,
@@ -787,6 +807,7 @@ impl DesktopApplication {
             } else {
                 0.0
             },
+            network_hashrate_hps: network_hashrate,
             current_height: peer_status.canonical_height,
             connected_peers: peer_status.connected_total,
             accepted_blocks: mining.accepted_blocks.load(Ordering::Relaxed),
