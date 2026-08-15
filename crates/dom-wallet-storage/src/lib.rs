@@ -122,6 +122,24 @@ impl WalletDirectory {
         let metadata = self.metadata()?;
         let active = self.active_generation()?;
         if active != metadata.active_generation {
+            // Publication writes the active pointer and then the metadata
+            // file; a crash between the two renames leaves the pointer ahead
+            // of the metadata. The pointed-to generation authenticates its
+            // own generation number and wallet identity through the AEAD
+            // context, so when it decrypts and validates the publication is
+            // completed (roll-forward). Anything else fails closed.
+            if active == metadata.active_generation.wrapping_add(1) {
+                if let Ok(state) = self.load_generation(active, password, &metadata) {
+                    if state.generation == active
+                        && state.wallet_id == metadata.wallet_id
+                        && state.identity == metadata.identity
+                        && state.validate().is_ok()
+                    {
+                        self.publish_pointer_and_metadata(&state)?;
+                        return Ok(state);
+                    }
+                }
+            }
             return Err(StorageError::GenerationConflict);
         }
         let state = self.load_generation(active, password, &metadata)?;
@@ -442,14 +460,23 @@ impl WalletDirectory {
         let generation = generation_name(state.generation);
         let final_dir = self.root.join(GENERATIONS_DIR).join(&generation);
         if final_dir.exists() {
-            return Err(StorageError::GenerationAlreadyExists);
+            // The caller verified the active pointer names an older
+            // generation, so a directory with this name is an orphan from a
+            // crash between the generation rename and the pointer publish.
+            // It was never active; replace it instead of blocking every
+            // future commit.
+            fs::remove_dir_all(&final_dir).map_err(StorageError::Io)?;
+            sync_directory(&self.root.join(GENERATIONS_DIR))?;
         }
         let temporary_dir = self
             .root
             .join(GENERATIONS_DIR)
             .join(format!(".{generation}.staging"));
         if temporary_dir.exists() {
-            return Err(StorageError::IncompleteGeneration);
+            // Staging directories are only renamed away once complete; a
+            // leftover one is an interrupted write and safe to discard.
+            fs::remove_dir_all(&temporary_dir).map_err(StorageError::Io)?;
+            sync_directory(&self.root.join(GENERATIONS_DIR))?;
         }
         fs::create_dir(&temporary_dir).map_err(StorageError::Io)?;
         let result = (|| {
@@ -587,6 +614,11 @@ fn atomic_write_private(path: &Path, bytes: &[u8], max_bytes: usize) -> Result<(
         return Err(StorageError::FileSizeOutOfBounds);
     }
     let temporary = path.with_extension("tmp");
+    // A leftover temporary is an interrupted write that never reached its
+    // rename; clear it so one crash cannot block this path forever.
+    if temporary.exists() {
+        fs::remove_file(&temporary).map_err(StorageError::Io)?;
+    }
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -616,19 +648,28 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
         return Err(StorageError::FileSizeOutOfBounds);
     }
     let temporary = path.with_extension("tmp");
+    if temporary.exists() {
+        fs::remove_file(&temporary).map_err(StorageError::Io)?;
+    }
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temporary)
         .map_err(StorageError::Io)?;
-    file.write_all(bytes).map_err(StorageError::Io)?;
-    file.sync_all().map_err(StorageError::Io)?;
-    drop(file);
-    fs::rename(&temporary, path).map_err(StorageError::Io)?;
-    if let Some(parent) = path.parent() {
-        sync_directory(parent)?;
+    let result = (|| {
+        file.write_all(bytes).map_err(StorageError::Io)?;
+        file.sync_all().map_err(StorageError::Io)?;
+        drop(file);
+        fs::rename(&temporary, path).map_err(StorageError::Io)?;
+        if let Some(parent) = path.parent() {
+            sync_directory(parent)?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
     }
-    Ok(())
+    result
 }
 
 fn sync_directory(path: &Path) -> Result<(), StorageError> {
@@ -759,6 +800,61 @@ mod tests {
         )
         .unwrap();
         assert!(wallet.load("correct").is_err());
+    }
+
+    #[test]
+    fn pointer_ahead_of_metadata_is_rolled_forward_on_load() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = WalletState::new(identity(), [6; 32], default_node_configuration(identity()));
+        let wallet = WalletDirectory::create(
+            temp.path().join("wallet"),
+            &state,
+            "correct",
+            KdfParameters::TEST,
+        )
+        .unwrap();
+        let staged = wallet
+            .stage_generation(0, wallet.load("correct").unwrap(), "correct", KdfParameters::TEST)
+            .unwrap();
+        assert_eq!(staged.generation, 1);
+        // Simulate the crash window inside publish_pointer_and_metadata: the
+        // active pointer advanced but the metadata rename never happened.
+        fs::write(wallet.root().join(ACTIVE_FILE), generation_name(1).as_bytes()).unwrap();
+        let healed = wallet.load("correct").unwrap();
+        assert_eq!(healed.generation, 1);
+        assert_eq!(wallet.metadata().unwrap().active_generation, 1);
+        assert_eq!(wallet.load("correct").unwrap().generation, 1);
+    }
+
+    #[test]
+    fn crash_artifacts_do_not_block_future_commits() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = WalletState::new(identity(), [6; 32], default_node_configuration(identity()));
+        let wallet = WalletDirectory::create(
+            temp.path().join("wallet"),
+            &state,
+            "correct",
+            KdfParameters::TEST,
+        )
+        .unwrap();
+        // Orphan complete generation: staged but the pointer publish never ran.
+        wallet
+            .stage_generation(0, wallet.load("correct").unwrap(), "correct", KdfParameters::TEST)
+            .unwrap();
+        // Interrupted staging directory and interrupted pointer write.
+        fs::create_dir(
+            wallet
+                .root()
+                .join(GENERATIONS_DIR)
+                .join(format!(".{}.staging", generation_name(1))),
+        )
+        .unwrap();
+        fs::write(wallet.root().join(ACTIVE_FILE).with_extension("tmp"), b"x").unwrap();
+        let committed = wallet
+            .commit(0, wallet.load("correct").unwrap(), "correct", KdfParameters::TEST)
+            .unwrap();
+        assert_eq!(committed.generation, 1);
+        assert_eq!(wallet.load("correct").unwrap().generation, 1);
     }
 
     #[test]
