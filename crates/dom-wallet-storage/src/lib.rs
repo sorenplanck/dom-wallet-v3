@@ -814,12 +814,21 @@ mod tests {
         )
         .unwrap();
         let staged = wallet
-            .stage_generation(0, wallet.load("correct").unwrap(), "correct", KdfParameters::TEST)
+            .stage_generation(
+                0,
+                wallet.load("correct").unwrap(),
+                "correct",
+                KdfParameters::TEST,
+            )
             .unwrap();
         assert_eq!(staged.generation, 1);
         // Simulate the crash window inside publish_pointer_and_metadata: the
         // active pointer advanced but the metadata rename never happened.
-        fs::write(wallet.root().join(ACTIVE_FILE), generation_name(1).as_bytes()).unwrap();
+        fs::write(
+            wallet.root().join(ACTIVE_FILE),
+            generation_name(1).as_bytes(),
+        )
+        .unwrap();
         let healed = wallet.load("correct").unwrap();
         assert_eq!(healed.generation, 1);
         assert_eq!(wallet.metadata().unwrap().active_generation, 1);
@@ -839,7 +848,12 @@ mod tests {
         .unwrap();
         // Orphan complete generation: staged but the pointer publish never ran.
         wallet
-            .stage_generation(0, wallet.load("correct").unwrap(), "correct", KdfParameters::TEST)
+            .stage_generation(
+                0,
+                wallet.load("correct").unwrap(),
+                "correct",
+                KdfParameters::TEST,
+            )
             .unwrap();
         // Interrupted staging directory and interrupted pointer write.
         fs::create_dir(
@@ -851,7 +865,12 @@ mod tests {
         .unwrap();
         fs::write(wallet.root().join(ACTIVE_FILE).with_extension("tmp"), b"x").unwrap();
         let committed = wallet
-            .commit(0, wallet.load("correct").unwrap(), "correct", KdfParameters::TEST)
+            .commit(
+                0,
+                wallet.load("correct").unwrap(),
+                "correct",
+                KdfParameters::TEST,
+            )
             .unwrap();
         assert_eq!(committed.generation, 1);
         assert_eq!(wallet.load("correct").unwrap().generation, 1);
