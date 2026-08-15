@@ -123,7 +123,7 @@ byId("restore-form").addEventListener("submit", async (event) => {
     show("Restore: initializing Mainnet node.");
     const result = await run(() => invoke("wallet_restore_from_mnemonic", { path: data.get("path"), password: data.get("password"), mnemonic: data.get("mnemonic") }));
     form.querySelector('textarea[name="mnemonic"]').value = ""; clearPasswords(form);
-    show(`Restore completed: ${result.owned_output_count} owned outputs, ${result.confirmed_balance} confirmed noms.`);
+    show(`Restore completed: ${result.owned_outputs} owned outputs, ${result.balance.confirmed} confirmed noms.`);
   } catch (error) { form.querySelector('textarea[name="mnemonic"]').value = ""; clearPasswords(form); show(redactedError(error), true); }
 });
 byId("open-form").addEventListener("submit", async (event) => {
@@ -162,12 +162,14 @@ const refreshSummary = async () => {
   byId("settings-heights").textContent = `${synchronization.cursor_height ?? "—"} / ${network.canonical_height}`;
 };
 const refreshNode = async () => redactJson(byId("node-status"), await invoke("embedded_node_status"));
+// The 15s background refresh must not clobber a field the user is editing.
+const setUnlessFocused = (element, apply) => { if (document.activeElement !== element) apply(element); };
 const renderMining = (value) => {
   byId("mining-status").textContent = value.status;
-  byId("mining-enabled").checked = value.enabled;
-  byId("mining-threads").value = value.cpu_threads;
+  setUnlessFocused(byId("mining-enabled"), (input) => { input.checked = value.enabled; });
+  setUnlessFocused(byId("mining-threads"), (input) => { input.value = value.cpu_threads; });
   byId("mining-threads").disabled = !value.enabled || value.running;
-  byId("mining-address").value = value.mining_address;
+  setUnlessFocused(byId("mining-address"), (input) => { input.value = value.mining_address; });
   byId("mining-hashrate").textContent = `${value.hashrate_hps.toFixed(1)} H/s`;
   byId("mining-height").textContent = value.current_height;
   byId("mining-peers").textContent = value.connected_peers;
@@ -258,7 +260,13 @@ tx("transaction-finalize", "transaction_finalize");
 tx("transaction-submit", "transaction_submit");
 tx("transaction-retry", "transaction_retry_submission");
 tx("transaction-reconcile", "transaction_reconcile_submission");
-tx("transaction-cancel", "transaction_cancel", () => ({ slateId: requiredId(), confirmExported: window.confirm("Cancel this payment and retain its consumed recovery coordinate?") }));
+byId("transaction-cancel").addEventListener("click", async () => {
+  // Declining the dialog must abort the cancellation entirely; the answer is
+  // not a parameter of the call.
+  if (!window.confirm("Cancel this payment and retain its consumed recovery coordinate?")) return;
+  try { renderTransaction(await run(() => invoke("transaction_cancel", { slateId: requiredId(), confirmExported: true }))); show("transaction cancel completed."); }
+  catch (error) { show(redactedError(error), true); }
+});
 
 const receiveText = byId("receive-transaction-text");
 const receiveId = byId("receive-transaction-slate-id");
@@ -305,7 +313,12 @@ byId("qr-clear").addEventListener("click", () => { qrFrames = []; canvas.getCont
 byId("qr-cancel").addEventListener("click", () => stopScanner());
 byId("qr-scan").addEventListener("click", async () => {
   await stopScanner();
-  scanner = new QrScanner(video, async (scan) => { const decoded = await invoke("slate_qr_decode_frame", { frame: scan.data }); if (decoded.complete_text) { slateText.value = decoded.complete_text; await stopScanner(); } }, { preferredCamera: "environment", returnDetailedScanResult: true });
+  scanner = new QrScanner(video, async (scan) => {
+    try {
+      const decoded = await invoke("slate_qr_decode_frame", { frame: scan.data });
+      if (decoded.complete_text) { slateText.value = decoded.complete_text; await stopScanner(); }
+    } catch { /* non-DOM frame: keep scanning instead of raising an unhandled rejection per frame */ }
+  }, { preferredCamera: "environment", returnDetailedScanResult: true });
   try { await scanner.start(); } catch (error) { await stopScanner(); show(redactedError(error), true); }
 });
 byId("qr-animate").addEventListener("click", () => show("Single canonical QR frame requires no animation."));
