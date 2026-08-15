@@ -221,6 +221,7 @@ pub fn collect_provisional_pages<S: ChainSource>(
     target: &ScanTarget,
 ) -> Result<Vec<ScanPage>, ChainError> {
     let mut expected_page = 0;
+    let mut expected_start = target.scan_bounds.start_height;
     let mut all = Vec::new();
     loop {
         if expected_page >= target.scan_bounds.max_pages {
@@ -233,7 +234,11 @@ pub fn collect_provisional_pages<S: ChainSource>(
         {
             return Err(ChainError::InconsistentPage);
         }
-        if page.start_height < target.scan_bounds.start_height
+        // Pages must tile the requested range without holes: each page has to
+        // begin exactly where the previous one ended, otherwise a truncating
+        // or malicious node could silently conceal a height range from the
+        // scan while every per-page check still passes.
+        if page.start_height != expected_start
             || page.end_height > target.scan_bounds.end_height
             || page.start_height > page.end_height
         {
@@ -243,6 +248,10 @@ pub fn collect_provisional_pages<S: ChainSource>(
             return Err(ChainError::PageLimitExceeded);
         }
         let is_last = page.is_last;
+        expected_start = page
+            .end_height
+            .checked_add(1)
+            .ok_or(ChainError::ChangedBounds)?;
         all.push(page);
         if is_last {
             return Ok(all);
@@ -746,9 +755,12 @@ impl DomHttpChainSource {
             .end_height
             .min(start.saturating_add(MAX_NODE_PAGE_HEIGHTS - 1));
         let scan: ScanDto = self.request_json(&format!("/chain/scan?from={start}&to={end}"))?;
+        // The node must serve exactly the requested range: page starts are
+        // derived arithmetically from the page number, so a short `to` would
+        // leave the heights between `to` and the next page start unscanned
+        // while the scan still appeared to complete.
         if scan.from != start
-            || scan.to < start
-            || scan.to > end
+            || scan.to != end
             || scan.blocks.len() > MAX_NODE_PAGE_HEIGHTS as usize
         {
             return Err(ChainError::ChangedBounds);
@@ -1202,6 +1214,55 @@ mod tests {
         assert_eq!(reconnect.failures(), 1);
         reconnect.on_success();
         assert_eq!(reconnect.failures(), 0);
+    }
+
+    #[test]
+    fn pages_with_a_height_gap_are_rejected() {
+        let mut source = MockChainSource::new(identity());
+        source.handshake.tip_height = 5;
+        source.handshake.tip_hash = [8; 32];
+        source.hashes.insert(5, [8; 32]);
+        let first = ScanPage {
+            source_identity: "mock-dom-node".into(),
+            target_hash: [8; 32],
+            start_height: 0,
+            end_height: 1,
+            page_number: 0,
+            is_last: false,
+            outputs: Vec::new(),
+            blocks: Vec::new(),
+        };
+        let mut second = first.clone();
+        // Heights 2..=2 are silently skipped by the truncating node.
+        second.start_height = 3;
+        second.end_height = 5;
+        second.page_number = 1;
+        second.is_last = true;
+        source.pages = vec![first, second];
+        let target = acquire_target(
+            &mut source,
+            &identity(),
+            ScanBounds {
+                start_height: 0,
+                end_height: 5,
+                max_pages: 4,
+                max_records_per_page: 10,
+            },
+        )
+        .unwrap()
+        .1;
+        assert_eq!(
+            collect_provisional_pages(&mut source, &target),
+            Err(ChainError::ChangedBounds)
+        );
+        // Contiguous pages covering the same range are accepted.
+        source.pages[1].start_height = 2;
+        assert_eq!(
+            collect_provisional_pages(&mut source, &target)
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]
