@@ -353,10 +353,13 @@ pub struct SlateQrReassemblyDto {
 
 impl DesktopApplication {
     pub fn application_status(&self) -> ApplicationStatusDto {
+        // Status must stay reachable even after another thread panicked while
+        // holding the lock: diagnostics are read-only, so recover the inner
+        // value instead of crashing the whole wallet on a poisoned mutex.
         let diagnostic = self
             .service
             .lock()
-            .expect("application mutex poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .diagnostics();
         ApplicationStatusDto {
             state: diagnostic.application_state,
@@ -938,7 +941,7 @@ impl DesktopApplication {
     pub fn diagnostics_redacted(&self) -> DiagnosticSnapshot {
         self.service
             .lock()
-            .expect("application mutex poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .diagnostics()
     }
     pub fn application_shutdown(&self) -> Result<(), CommandError> {
