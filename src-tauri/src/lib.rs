@@ -1603,7 +1603,7 @@ mod tests {
     fn native_bridge_probe_is_static_redacted_and_versioned() {
         let status = native_bridge_status();
         assert_eq!(status.bridge, "ready");
-        assert_eq!(status.app_version, "0.1.5");
+        assert_eq!(status.app_version, "0.1.6");
         fn assert_serializable<T: serde::Serialize>(_: &T) {}
         assert_serializable(&status);
     }
