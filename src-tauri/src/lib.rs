@@ -24,6 +24,7 @@ use std::sync::{
 };
 use std::{net::SocketAddr, path::Path, thread::JoinHandle};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 pub struct DesktopApplication {
     service: Arc<Mutex<WalletService>>,
@@ -275,11 +276,33 @@ pub struct MiningStatusDto {
     pub error_code: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+/// The recovery phrase is the master secret in its most directly usable form.
+/// It is held in a scrubbing buffer so the wallet's own copy does not survive
+/// in freed memory, serialized by value for the one-time creation ceremony,
+/// and never rendered by Debug.
+#[derive(Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryCreateDto {
     pub wallet: WalletSummary,
-    pub mnemonic: String,
+    #[serde(serialize_with = "serialize_recovery_phrase")]
+    pub mnemonic: Zeroizing<String>,
+}
+
+impl std::fmt::Debug for RecoveryCreateDto {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecoveryCreateDto")
+            .field("wallet", &self.wallet)
+            .field("mnemonic", &"[REDACTED]")
+            .finish()
+    }
+}
+
+fn serialize_recovery_phrase<S>(value: &Zeroizing<String>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(value.as_str())
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -386,7 +409,8 @@ impl DesktopApplication {
             .map_err(CommandError::from)?;
         Ok(RecoveryCreateDto {
             wallet: result.wallet,
-            mnemonic: result.mnemonic.to_string(),
+            // Moved, never copied out of its scrubbing buffer.
+            mnemonic: result.mnemonic,
         })
     }
 

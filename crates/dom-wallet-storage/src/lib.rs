@@ -13,6 +13,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 const METADATA_FILE: &str = "metadata.json";
 const ACTIVE_FILE: &str = "active-generation";
@@ -242,7 +243,7 @@ impl WalletDirectory {
         password: &str,
         kdf: KdfParameters,
     ) -> Result<(), StorageError> {
-        let plaintext = serde_json::to_vec(plan).map_err(|_| StorageError::CanonicalEncoding)?;
+        let plaintext = secret_json(plan)?;
         let context = rescan_context(state.wallet_id, &state.identity);
         let encoded =
             encode(&seal(&plaintext, password, &context, kdf).map_err(StorageError::Crypto)?)
@@ -302,8 +303,7 @@ impl WalletDirectory {
             state: state.clone(),
             rescan_plan: plan,
         };
-        let plaintext =
-            serde_json::to_vec(&payload).map_err(|_| StorageError::CanonicalEncoding)?;
+        let plaintext = secret_json(&payload)?;
         if plaintext.is_empty() || plaintext.len() > MAX_STATE_BYTES {
             return Err(StorageError::FileSizeOutOfBounds);
         }
@@ -315,7 +315,7 @@ impl WalletDirectory {
             format_version: BACKUP_FORMAT_VERSION,
             created_unix_seconds,
             wallet_id: state.wallet_id,
-            identity: state.identity,
+            identity: state.identity.clone(),
             envelope,
         };
         let encoded =
@@ -480,8 +480,7 @@ impl WalletDirectory {
         }
         fs::create_dir(&temporary_dir).map_err(StorageError::Io)?;
         let result = (|| {
-            let plaintext =
-                serde_json::to_vec(state).map_err(|_| StorageError::CanonicalEncoding)?;
+            let plaintext = secret_json(state)?;
             let context = state_context(state.wallet_id, &state.identity, state.generation);
             let envelope =
                 seal(&plaintext, password, &context, kdf).map_err(StorageError::Crypto)?;
@@ -595,6 +594,54 @@ fn backup_context(
     context.extend_from_slice(&identity.chain_id);
     context.extend_from_slice(&identity.genesis_id);
     context
+}
+
+/// Initial capacity for secret-bearing serialization buffers.
+const SECRET_BUFFER_INITIAL_BYTES: usize = 64 * 1024;
+
+/// Growth-controlled JSON sink for plaintext that contains wallet secrets.
+///
+/// `serde_json::to_vec` grows its output by reallocation and releases every
+/// superseded buffer without scrubbing it, leaving copies of the master
+/// entropy and the per-output blindings in freed memory. This writer owns the
+/// growth so each superseded buffer is zeroized as it is replaced, and the
+/// final buffer is zeroized when the caller drops it.
+struct SecretJsonWriter {
+    buffer: Zeroizing<Vec<u8>>,
+}
+
+impl SecretJsonWriter {
+    fn new() -> Self {
+        Self {
+            buffer: Zeroizing::new(Vec::with_capacity(SECRET_BUFFER_INITIAL_BYTES)),
+        }
+    }
+}
+
+impl Write for SecretJsonWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let required = self.buffer.len().saturating_add(data.len());
+        if required > self.buffer.capacity() {
+            let capacity = required.max(self.buffer.capacity().saturating_mul(2));
+            let mut grown = Zeroizing::new(Vec::with_capacity(capacity));
+            grown.extend_from_slice(&self.buffer);
+            // Replacing the buffer drops the superseded one, scrubbing it.
+            self.buffer = grown;
+        }
+        self.buffer.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Serialize secret-bearing state into a buffer that is scrubbed on drop.
+fn secret_json<T: Serialize>(value: &T) -> Result<Zeroizing<Vec<u8>>, StorageError> {
+    let mut writer = SecretJsonWriter::new();
+    serde_json::to_writer(&mut writer, value).map_err(|_| StorageError::CanonicalEncoding)?;
+    Ok(writer.buffer)
 }
 
 fn read_bounded(path: &Path) -> Result<Vec<u8>, StorageError> {
@@ -738,6 +785,35 @@ mod tests {
             chain_id: [4; 32],
             genesis_id: [5; 32],
         }
+    }
+
+    #[test]
+    fn secret_json_matches_serde_across_buffer_growth() {
+        // The scrubbing writer owns its own growth, so it must produce exactly
+        // the same bytes as serde_json both below and far beyond the initial
+        // capacity; a divergence here would corrupt persisted wallet state.
+        let mut state =
+            WalletState::new(identity(), [7; 32], default_node_configuration(identity()));
+        assert_eq!(
+            secret_json(&state).unwrap().as_slice(),
+            serde_json::to_vec(&state).unwrap().as_slice()
+        );
+
+        for index in 0..4_000u32 {
+            state.remember_output_blinding(uuid::Uuid::new_v4(), [index as u8; 32]);
+        }
+        let grown = secret_json(&state).unwrap();
+        assert!(grown.len() > SECRET_BUFFER_INITIAL_BYTES);
+        assert_eq!(
+            grown.as_slice(),
+            serde_json::to_vec(&state).unwrap().as_slice()
+        );
+        let restored: WalletState = serde_json::from_slice(&grown).unwrap();
+        assert_eq!(restored.root_material, state.root_material);
+        assert_eq!(
+            restored.private_output_blindings.len(),
+            state.private_output_blindings.len()
+        );
     }
 
     #[test]
