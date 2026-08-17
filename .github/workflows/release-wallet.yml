@@ -262,4 +262,7 @@ jobs:
 
           Installers are unsigned, so operating-system warnings are expected. No independent security audit is claimed.
           NOTES
-          gh release create "$GITHUB_REF_NAME" --verify-tag --prerelease --title "DOM Wallet V3 ${GITHUB_REF_NAME#wallet-v} Experimental" --notes-file /tmp/release-notes.md release-upload/*
+          # The release is created as a draft so the checksums manifest can be
+          # minisign-signed and the signature attached before anything becomes
+          # public. Publishing the draft is a manual, deliberate step.
+          gh release create "$GITHUB_REF_NAME" --verify-tag --draft --prerelease --title "DOM Wallet V3 ${GITHUB_REF_NAME#wallet-v} Experimental" --notes-file /tmp/release-notes.md release-upload/*
