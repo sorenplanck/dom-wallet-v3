@@ -68,6 +68,11 @@ jobs:
           /tmp/actionlint .github/workflows/release-wallet.yml
       - name: Verify source, event, and version binding
         shell: bash
+        env:
+          # Dispatch inputs reach the script through the environment so their
+          # content is never interpolated into shell source.
+          INPUT_PUBLISH_RELEASE: ${{ inputs.publish_release }}
+          INPUT_RELEASE_VERSION: ${{ inputs.release_version }}
         run: |
           set -euo pipefail
           VERSION="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
@@ -83,9 +88,9 @@ jobs:
             test "${GITHUB_REF_NAME#wallet-v}" = "$VERSION"
             test "$(git rev-parse "${GITHUB_REF}^{commit}")" = "$GITHUB_SHA"
           else
-            test "${{ inputs.publish_release }}" = "false"
-            if [[ -n "${{ inputs.release_version }}" ]]; then
-              test "${{ inputs.release_version }}" = "$VERSION"
+            test "$INPUT_PUBLISH_RELEASE" = "false"
+            if [[ -n "$INPUT_RELEASE_VERSION" ]]; then
+              test "$INPUT_RELEASE_VERSION" = "$VERSION"
             fi
           fi
       - name: Install locked frontend dependencies
@@ -192,7 +197,7 @@ jobs:
           ROOT="$ROOT" TARGET="${{ matrix.target }}" node <<'NODE'
           const { createHash } = require("node:crypto");
           const { readdirSync, readFileSync, statSync, writeFileSync } = require("node:fs");
-          const { join, relative } = require("node:path");
+          const { join, relative, sep } = require("node:path");
           const root = process.env.ROOT;
           const suffixes = [".AppImage", ".deb", ".rpm", ".exe", ".msi", ".dmg", ".app.tar.gz"];
           const files = [];
@@ -204,7 +209,7 @@ jobs:
           visit(root);
           const lines = files.sort().map((path) => {
             const digest = createHash("sha256").update(readFileSync(path)).digest("hex");
-            return `${digest}  ${relative(root, path).replaceAll("\\\\", "/")}`;
+            return `${digest}  ${relative(root, path).split(sep).join("/")}`;
           });
           if (lines.length === 0) throw new Error("no release artifacts found");
           writeFileSync(join(root, `SHA256SUMS-${process.env.TARGET}.txt`), `${lines.join("\n")}\n`);
@@ -257,4 +262,7 @@ jobs:
 
           Installers are unsigned, so operating-system warnings are expected. No independent security audit is claimed.
           NOTES
-          gh release create "$GITHUB_REF_NAME" --verify-tag --prerelease --title "DOM Wallet V3 ${GITHUB_REF_NAME#wallet-v} Experimental" --notes-file /tmp/release-notes.md release-upload/*
+          # The release is created as a draft so the checksums manifest can be
+          # minisign-signed and the signature attached before anything becomes
+          # public. Publishing the draft is a manual, deliberate step.
+          gh release create "$GITHUB_REF_NAME" --verify-tag --draft --prerelease --title "DOM Wallet V3 ${GITHUB_REF_NAME#wallet-v} Experimental" --notes-file /tmp/release-notes.md release-upload/*

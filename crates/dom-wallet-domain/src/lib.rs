@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use thiserror::Error;
 use uuid::Uuid;
+use zeroize::{Zeroize, Zeroizing};
 
 pub const MODEL_VERSION: u16 = 1;
 pub const SECRET_PROFILE_VERSION: u16 = 1;
@@ -213,12 +214,36 @@ impl std::fmt::Debug for PrivateTransactionContext {
     }
 }
 
+/// Slate continuation secrets are spending authority: scrub them on drop so
+/// transient clones of a transaction do not survive in freed memory.
+impl Drop for PrivateTransactionContext {
+    fn drop(&mut self) {
+        for secret in [
+            &mut self.sender_excess_blinding,
+            &mut self.sender_nonce,
+            &mut self.recipient_output_blinding,
+        ] {
+            if let Some(bytes) = secret.as_mut() {
+                bytes.zeroize();
+            }
+        }
+    }
+}
+
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrivateOutputBlinding {
     pub output_id: Uuid,
     #[serde(with = "serde_bytes_32")]
     pub blinding: [u8; 32],
+}
+
+/// The blinding is spending authority: scrub it when the record — including
+/// every transient clone of the wallet state that carries it — is dropped.
+impl Drop for PrivateOutputBlinding {
+    fn drop(&mut self) {
+        self.blinding.zeroize();
+    }
 }
 
 impl std::fmt::Debug for PrivateOutputBlinding {
@@ -567,6 +592,16 @@ pub struct WalletState {
     pub mining_preferences: MiningPreferences,
     #[serde(with = "serde_bytes_32")]
     pub root_material: [u8; 32],
+}
+
+/// The root material is the BIP-39 master entropy. The wallet clones this
+/// state for nearly every operation, so each clone must scrub the entropy when
+/// it is dropped; otherwise the master secret accumulates in freed memory for
+/// the lifetime of the process.
+impl Drop for WalletState {
+    fn drop(&mut self) {
+        self.root_material.zeroize();
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -963,12 +998,24 @@ impl WalletState {
                 transaction.lifecycle,
                 TransactionLifecycle::Confirmed { .. }
             ) {
-                transaction.lifecycle = if transaction.submitted {
-                    TransactionLifecycle::Submitted
-                } else {
-                    TransactionLifecycle::Finalized
-                };
+                transaction.lifecycle = Self::rescan_rewind_lifecycle(transaction);
             }
+        }
+    }
+
+    /// The state a confirmed transaction rewinds to when its confirmation
+    /// evidence is discarded for a rescan. A recipient transaction was never
+    /// submitted and carries no kernel excess: it can only re-confirm through
+    /// mark_known_outputs_confirmed, which requires a ResponseExported (or
+    /// ResponsePrepared) lifecycle — rewinding it to Submitted would strand
+    /// it forever.
+    fn rescan_rewind_lifecycle(transaction: &LocalTransactionIntent) -> TransactionLifecycle {
+        if transaction.role == Some(TransactionRole::Recipient) {
+            TransactionLifecycle::ResponseExported
+        } else if transaction.submitted {
+            TransactionLifecycle::Submitted
+        } else {
+            TransactionLifecycle::Finalized
         }
     }
 
@@ -983,7 +1030,7 @@ impl WalletState {
                 transaction.lifecycle,
                 TransactionLifecycle::Confirmed { .. }
             ) {
-                transaction.lifecycle = TransactionLifecycle::Submitted;
+                transaction.lifecycle = Self::rescan_rewind_lifecycle(transaction);
             }
         }
         self.rescan_plan = Some(RescanPlan {
@@ -1102,10 +1149,16 @@ pub mod serde_bytes_32 {
     where
         D: Deserializer<'de>,
     {
-        let bytes = Vec::<u8>::deserialize(deserializer)?;
-        bytes
-            .try_into()
-            .map_err(|_| serde::de::Error::custom("expected exactly 32 bytes"))
+        // The decoded buffer holds secret material, so it is scrubbed on drop
+        // instead of being consumed by `try_into`, which would release the
+        // allocation with the secret still in it.
+        let bytes = super::Zeroizing::new(Vec::<u8>::deserialize(deserializer)?);
+        if bytes.len() != 32 {
+            return Err(serde::de::Error::custom("expected exactly 32 bytes"));
+        }
+        let mut value = [0u8; 32];
+        value.copy_from_slice(&bytes);
+        Ok(value)
     }
 }
 
@@ -1127,10 +1180,13 @@ pub mod serde_option_bytes_32 {
         D: Deserializer<'de>,
     {
         Option::<Vec<u8>>::deserialize(deserializer)?.map_or(Ok(None), |bytes| {
-            bytes
-                .try_into()
-                .map(Some)
-                .map_err(|_| serde::de::Error::custom("expected exactly 32 bytes"))
+            let bytes = super::Zeroizing::new(bytes);
+            if bytes.len() != 32 {
+                return Err(serde::de::Error::custom("expected exactly 32 bytes"));
+            }
+            let mut value = [0u8; 32];
+            value.copy_from_slice(&bytes);
+            Ok(Some(value))
         })
     }
 }

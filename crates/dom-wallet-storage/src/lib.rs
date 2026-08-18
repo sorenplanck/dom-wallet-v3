@@ -13,6 +13,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 const METADATA_FILE: &str = "metadata.json";
 const ACTIVE_FILE: &str = "active-generation";
@@ -122,6 +123,24 @@ impl WalletDirectory {
         let metadata = self.metadata()?;
         let active = self.active_generation()?;
         if active != metadata.active_generation {
+            // Publication writes the active pointer and then the metadata
+            // file; a crash between the two renames leaves the pointer ahead
+            // of the metadata. The pointed-to generation authenticates its
+            // own generation number and wallet identity through the AEAD
+            // context, so when it decrypts and validates the publication is
+            // completed (roll-forward). Anything else fails closed.
+            if active == metadata.active_generation.wrapping_add(1) {
+                if let Ok(state) = self.load_generation(active, password, &metadata) {
+                    if state.generation == active
+                        && state.wallet_id == metadata.wallet_id
+                        && state.identity == metadata.identity
+                        && state.validate().is_ok()
+                    {
+                        self.publish_pointer_and_metadata(&state)?;
+                        return Ok(state);
+                    }
+                }
+            }
             return Err(StorageError::GenerationConflict);
         }
         let state = self.load_generation(active, password, &metadata)?;
@@ -224,7 +243,7 @@ impl WalletDirectory {
         password: &str,
         kdf: KdfParameters,
     ) -> Result<(), StorageError> {
-        let plaintext = serde_json::to_vec(plan).map_err(|_| StorageError::CanonicalEncoding)?;
+        let plaintext = secret_json(plan)?;
         let context = rescan_context(state.wallet_id, &state.identity);
         let encoded =
             encode(&seal(&plaintext, password, &context, kdf).map_err(StorageError::Crypto)?)
@@ -284,8 +303,7 @@ impl WalletDirectory {
             state: state.clone(),
             rescan_plan: plan,
         };
-        let plaintext =
-            serde_json::to_vec(&payload).map_err(|_| StorageError::CanonicalEncoding)?;
+        let plaintext = secret_json(&payload)?;
         if plaintext.is_empty() || plaintext.len() > MAX_STATE_BYTES {
             return Err(StorageError::FileSizeOutOfBounds);
         }
@@ -297,7 +315,7 @@ impl WalletDirectory {
             format_version: BACKUP_FORMAT_VERSION,
             created_unix_seconds,
             wallet_id: state.wallet_id,
-            identity: state.identity,
+            identity: state.identity.clone(),
             envelope,
         };
         let encoded =
@@ -442,19 +460,27 @@ impl WalletDirectory {
         let generation = generation_name(state.generation);
         let final_dir = self.root.join(GENERATIONS_DIR).join(&generation);
         if final_dir.exists() {
-            return Err(StorageError::GenerationAlreadyExists);
+            // The caller verified the active pointer names an older
+            // generation, so a directory with this name is an orphan from a
+            // crash between the generation rename and the pointer publish.
+            // It was never active; replace it instead of blocking every
+            // future commit.
+            fs::remove_dir_all(&final_dir).map_err(StorageError::Io)?;
+            sync_directory(&self.root.join(GENERATIONS_DIR))?;
         }
         let temporary_dir = self
             .root
             .join(GENERATIONS_DIR)
             .join(format!(".{generation}.staging"));
         if temporary_dir.exists() {
-            return Err(StorageError::IncompleteGeneration);
+            // Staging directories are only renamed away once complete; a
+            // leftover one is an interrupted write and safe to discard.
+            fs::remove_dir_all(&temporary_dir).map_err(StorageError::Io)?;
+            sync_directory(&self.root.join(GENERATIONS_DIR))?;
         }
         fs::create_dir(&temporary_dir).map_err(StorageError::Io)?;
         let result = (|| {
-            let plaintext =
-                serde_json::to_vec(state).map_err(|_| StorageError::CanonicalEncoding)?;
+            let plaintext = secret_json(state)?;
             let context = state_context(state.wallet_id, &state.identity, state.generation);
             let envelope =
                 seal(&plaintext, password, &context, kdf).map_err(StorageError::Crypto)?;
@@ -570,6 +596,54 @@ fn backup_context(
     context
 }
 
+/// Initial capacity for secret-bearing serialization buffers.
+const SECRET_BUFFER_INITIAL_BYTES: usize = 64 * 1024;
+
+/// Growth-controlled JSON sink for plaintext that contains wallet secrets.
+///
+/// `serde_json::to_vec` grows its output by reallocation and releases every
+/// superseded buffer without scrubbing it, leaving copies of the master
+/// entropy and the per-output blindings in freed memory. This writer owns the
+/// growth so each superseded buffer is zeroized as it is replaced, and the
+/// final buffer is zeroized when the caller drops it.
+struct SecretJsonWriter {
+    buffer: Zeroizing<Vec<u8>>,
+}
+
+impl SecretJsonWriter {
+    fn new() -> Self {
+        Self {
+            buffer: Zeroizing::new(Vec::with_capacity(SECRET_BUFFER_INITIAL_BYTES)),
+        }
+    }
+}
+
+impl Write for SecretJsonWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let required = self.buffer.len().saturating_add(data.len());
+        if required > self.buffer.capacity() {
+            let capacity = required.max(self.buffer.capacity().saturating_mul(2));
+            let mut grown = Zeroizing::new(Vec::with_capacity(capacity));
+            grown.extend_from_slice(&self.buffer);
+            // Replacing the buffer drops the superseded one, scrubbing it.
+            self.buffer = grown;
+        }
+        self.buffer.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Serialize secret-bearing state into a buffer that is scrubbed on drop.
+fn secret_json<T: Serialize>(value: &T) -> Result<Zeroizing<Vec<u8>>, StorageError> {
+    let mut writer = SecretJsonWriter::new();
+    serde_json::to_writer(&mut writer, value).map_err(|_| StorageError::CanonicalEncoding)?;
+    Ok(writer.buffer)
+}
+
 fn read_bounded(path: &Path) -> Result<Vec<u8>, StorageError> {
     read_bounded_with_limit(path, MAX_STATE_BYTES)
 }
@@ -587,6 +661,11 @@ fn atomic_write_private(path: &Path, bytes: &[u8], max_bytes: usize) -> Result<(
         return Err(StorageError::FileSizeOutOfBounds);
     }
     let temporary = path.with_extension("tmp");
+    // A leftover temporary is an interrupted write that never reached its
+    // rename; clear it so one crash cannot block this path forever.
+    if temporary.exists() {
+        fs::remove_file(&temporary).map_err(StorageError::Io)?;
+    }
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -616,19 +695,28 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
         return Err(StorageError::FileSizeOutOfBounds);
     }
     let temporary = path.with_extension("tmp");
+    if temporary.exists() {
+        fs::remove_file(&temporary).map_err(StorageError::Io)?;
+    }
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temporary)
         .map_err(StorageError::Io)?;
-    file.write_all(bytes).map_err(StorageError::Io)?;
-    file.sync_all().map_err(StorageError::Io)?;
-    drop(file);
-    fs::rename(&temporary, path).map_err(StorageError::Io)?;
-    if let Some(parent) = path.parent() {
-        sync_directory(parent)?;
+    let result = (|| {
+        file.write_all(bytes).map_err(StorageError::Io)?;
+        file.sync_all().map_err(StorageError::Io)?;
+        drop(file);
+        fs::rename(&temporary, path).map_err(StorageError::Io)?;
+        if let Some(parent) = path.parent() {
+            sync_directory(parent)?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
     }
-    Ok(())
+    result
 }
 
 fn sync_directory(path: &Path) -> Result<(), StorageError> {
@@ -700,6 +788,35 @@ mod tests {
     }
 
     #[test]
+    fn secret_json_matches_serde_across_buffer_growth() {
+        // The scrubbing writer owns its own growth, so it must produce exactly
+        // the same bytes as serde_json both below and far beyond the initial
+        // capacity; a divergence here would corrupt persisted wallet state.
+        let mut state =
+            WalletState::new(identity(), [7; 32], default_node_configuration(identity()));
+        assert_eq!(
+            secret_json(&state).unwrap().as_slice(),
+            serde_json::to_vec(&state).unwrap().as_slice()
+        );
+
+        for index in 0..4_000u32 {
+            state.remember_output_blinding(uuid::Uuid::new_v4(), [index as u8; 32]);
+        }
+        let grown = secret_json(&state).unwrap();
+        assert!(grown.len() > SECRET_BUFFER_INITIAL_BYTES);
+        assert_eq!(
+            grown.as_slice(),
+            serde_json::to_vec(&state).unwrap().as_slice()
+        );
+        let restored: WalletState = serde_json::from_slice(&grown).unwrap();
+        assert_eq!(restored.root_material, state.root_material);
+        assert_eq!(
+            restored.private_output_blindings.len(),
+            state.private_output_blindings.len()
+        );
+    }
+
+    #[test]
     fn create_reopen_and_wrong_password_fail_closed() {
         let temp = tempfile::tempdir().unwrap();
         let state = WalletState::new(identity(), [6; 32], default_node_configuration(identity()));
@@ -759,6 +876,80 @@ mod tests {
         )
         .unwrap();
         assert!(wallet.load("correct").is_err());
+    }
+
+    #[test]
+    fn pointer_ahead_of_metadata_is_rolled_forward_on_load() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = WalletState::new(identity(), [6; 32], default_node_configuration(identity()));
+        let wallet = WalletDirectory::create(
+            temp.path().join("wallet"),
+            &state,
+            "correct",
+            KdfParameters::TEST,
+        )
+        .unwrap();
+        let staged = wallet
+            .stage_generation(
+                0,
+                wallet.load("correct").unwrap(),
+                "correct",
+                KdfParameters::TEST,
+            )
+            .unwrap();
+        assert_eq!(staged.generation, 1);
+        // Simulate the crash window inside publish_pointer_and_metadata: the
+        // active pointer advanced but the metadata rename never happened.
+        fs::write(
+            wallet.root().join(ACTIVE_FILE),
+            generation_name(1).as_bytes(),
+        )
+        .unwrap();
+        let healed = wallet.load("correct").unwrap();
+        assert_eq!(healed.generation, 1);
+        assert_eq!(wallet.metadata().unwrap().active_generation, 1);
+        assert_eq!(wallet.load("correct").unwrap().generation, 1);
+    }
+
+    #[test]
+    fn crash_artifacts_do_not_block_future_commits() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = WalletState::new(identity(), [6; 32], default_node_configuration(identity()));
+        let wallet = WalletDirectory::create(
+            temp.path().join("wallet"),
+            &state,
+            "correct",
+            KdfParameters::TEST,
+        )
+        .unwrap();
+        // Orphan complete generation: staged but the pointer publish never ran.
+        wallet
+            .stage_generation(
+                0,
+                wallet.load("correct").unwrap(),
+                "correct",
+                KdfParameters::TEST,
+            )
+            .unwrap();
+        // Interrupted staging directory and interrupted pointer write.
+        fs::create_dir(
+            wallet
+                .root()
+                .join(GENERATIONS_DIR)
+                .join(format!(".{}.staging", generation_name(1))),
+        )
+        .unwrap();
+        fs::write(wallet.root().join(ACTIVE_FILE).with_extension("tmp"), b"x").unwrap();
+        let committed = wallet
+            .commit(
+                0,
+                wallet.load("correct").unwrap(),
+                "correct",
+                KdfParameters::TEST,
+            )
+            .unwrap();
+        assert_eq!(committed.generation, 1);
+        assert_eq!(wallet.load("correct").unwrap().generation, 1);
     }
 
     #[test]

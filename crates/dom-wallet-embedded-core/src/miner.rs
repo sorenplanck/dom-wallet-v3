@@ -14,7 +14,7 @@ use dom_pow::{
 use dom_serialization::{DomDeserialize, DomSerialize};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    mpsc, Arc,
+    Arc,
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -110,7 +110,7 @@ pub async fn mine_wallet_block(
     };
 
     let round_stop = Arc::new(AtomicBool::new(false));
-    let (sender, receiver) = mpsc::channel();
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     let mut workers = Vec::with_capacity(threads);
     for worker_id in 0..threads {
         let worker_template = template.clone();
@@ -159,25 +159,31 @@ pub async fn mine_wallet_block(
     }
     drop(sender);
 
+    // Await results without blocking the executor: RandomX rounds run for
+    // minutes at real difficulty, and the caller may share its runtime with
+    // other tasks. The worker threads are joined on the blocking pool.
     let mut winning_header = None;
-    while !stop_requested.load(Ordering::Acquire) {
-        match receiver.recv_timeout(Duration::from_millis(100)) {
-            Ok(Ok(header)) => {
+    loop {
+        if stop_requested.load(Ordering::Acquire) {
+            break;
+        }
+        match tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await {
+            Ok(Some(Ok(header))) => {
                 winning_header = Some(header);
                 break;
             }
-            Ok(Err(())) => {
-                round_stop.store(true, Ordering::Release);
-                break;
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Ok(Some(Err(()))) | Ok(None) => break,
+            Err(_) => {}
         }
     }
     round_stop.store(true, Ordering::Release);
-    for worker in workers {
-        let _ = worker.join();
-    }
+    tokio::task::spawn_blocking(move || {
+        for worker in workers {
+            let _ = worker.join();
+        }
+    })
+    .await
+    .map_err(|_| WalletMiningError::Worker)?;
     let Some(header) = winning_header else {
         return if stop_requested.load(Ordering::Acquire) {
             Ok(WalletMiningOutcome::Stopped)
@@ -213,6 +219,61 @@ pub async fn mine_wallet_block(
     } else {
         Ok(WalletMiningOutcome::Rejected { height })
     }
+}
+
+/// Trailing block window used for the network hashrate estimate.
+pub const NETWORK_HASHRATE_WINDOW_BLOCKS: u64 = 120;
+
+/// Estimate the network's average hashrate in hashes per second over the
+/// trailing `window` blocks ending at the canonical tip.
+///
+/// Every difficulty unit corresponds to one expected hash, so the ratio
+/// Δ(accumulated difficulty) / Δ(header timestamp) is the mean rate the whole
+/// network sustained across the window. Returns None while the chain is too
+/// short — or its timestamps too degenerate — to measure.
+pub async fn network_hashrate_estimate(node: Arc<DomNode>, window: u64) -> Option<f64> {
+    if window == 0 {
+        return None;
+    }
+    let chain = node.chain.lock().await;
+    let tip_height = chain.tip_height.0;
+    if tip_height == 0 {
+        return None;
+    }
+    let start_height = tip_height - window.min(tip_height);
+    let tip_header = chain
+        .store
+        .get_block_header(chain.tip_hash.as_bytes())
+        .ok()
+        .flatten()
+        .and_then(|bytes| BlockHeader::from_bytes(&bytes).ok())?;
+    let start_hash = chain
+        .store
+        .get_hash_at_height(start_height)
+        .ok()
+        .flatten()?;
+    let start_header = chain
+        .store
+        .get_block_header(&start_hash)
+        .ok()
+        .flatten()
+        .and_then(|bytes| BlockHeader::from_bytes(&bytes).ok())?;
+    drop(chain);
+    let elapsed = tip_header
+        .timestamp
+        .0
+        .saturating_sub(start_header.timestamp.0);
+    if elapsed == 0 {
+        return None;
+    }
+    let delta = tip_header
+        .total_difficulty
+        .saturating_sub(start_header.total_difficulty);
+    // U256 little-endian limbs folded most-significant first into an f64.
+    let delta_hashes = delta.0.iter().rev().fold(0.0_f64, |acc, limb| {
+        acc * 18_446_744_073_709_551_616.0 + *limb as f64
+    });
+    Some(delta_hashes / elapsed as f64)
 }
 
 fn now_seconds() -> u64 {

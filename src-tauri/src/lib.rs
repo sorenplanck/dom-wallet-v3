@@ -13,8 +13,8 @@ use dom_wallet_core::{
 use dom_wallet_core_api::CoreNetwork;
 use dom_wallet_domain::{BalanceProjection, Network, NetworkIdentity};
 use dom_wallet_embedded_core::{
-    mine_wallet_block, EmbeddedCoreConfiguration, WalletMiningOutcome, MAINNET_BOOTSTRAP_FALLBACK,
-    MAINNET_DNS_SEEDS,
+    mine_wallet_block, network_hashrate_estimate, EmbeddedCoreConfiguration, WalletMiningOutcome,
+    MAINNET_BOOTSTRAP_FALLBACK, MAINNET_DNS_SEEDS, NETWORK_HASHRATE_WINDOW_BLOCKS,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -24,6 +24,7 @@ use std::sync::{
 };
 use std::{net::SocketAddr, path::Path, thread::JoinHandle};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 pub struct DesktopApplication {
     service: Arc<Mutex<WalletService>>,
@@ -262,6 +263,9 @@ pub struct MiningStatusDto {
     pub mining_address: String,
     pub hash_attempts: u64,
     pub hashrate_hps: f64,
+    /// Estimated network-wide average hashrate over the trailing difficulty
+    /// window; None while the chain is too short to measure.
+    pub network_hashrate_hps: Option<f64>,
     pub current_height: u64,
     pub connected_peers: u64,
     pub accepted_blocks: u64,
@@ -272,11 +276,33 @@ pub struct MiningStatusDto {
     pub error_code: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+/// The recovery phrase is the master secret in its most directly usable form.
+/// It is held in a scrubbing buffer so the wallet's own copy does not survive
+/// in freed memory, serialized by value for the one-time creation ceremony,
+/// and never rendered by Debug.
+#[derive(Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryCreateDto {
     pub wallet: WalletSummary,
-    pub mnemonic: String,
+    #[serde(serialize_with = "serialize_recovery_phrase")]
+    pub mnemonic: Zeroizing<String>,
+}
+
+impl std::fmt::Debug for RecoveryCreateDto {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecoveryCreateDto")
+            .field("wallet", &self.wallet)
+            .field("mnemonic", &"[REDACTED]")
+            .finish()
+    }
+}
+
+fn serialize_recovery_phrase<S>(value: &Zeroizing<String>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(value.as_str())
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -353,10 +379,13 @@ pub struct SlateQrReassemblyDto {
 
 impl DesktopApplication {
     pub fn application_status(&self) -> ApplicationStatusDto {
+        // Status must stay reachable even after another thread panicked while
+        // holding the lock: diagnostics are read-only, so recover the inner
+        // value instead of crashing the whole wallet on a poisoned mutex.
         let diagnostic = self
             .service
             .lock()
-            .expect("application mutex poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .diagnostics();
         ApplicationStatusDto {
             state: diagnostic.application_state,
@@ -380,7 +409,8 @@ impl DesktopApplication {
             .map_err(CommandError::from)?;
         Ok(RecoveryCreateDto {
             wallet: result.wallet,
-            mnemonic: result.mnemonic.to_string(),
+            // Moved, never copied out of its scrubbing buffer.
+            mnemonic: result.mnemonic,
         })
     }
 
@@ -772,6 +802,23 @@ impl DesktopApplication {
             .map_err(CommandError::from)?;
         let last_candidate = mining.last_candidate_time.load(Ordering::Acquire);
         let last_height = mining.last_accepted_height.load(Ordering::Acquire);
+        let network_hashrate = self
+            .service
+            .lock()
+            .ok()
+            .and_then(|service| service.embedded_node_handle().ok())
+            .and_then(|node| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok()
+                    .and_then(|runtime| {
+                        runtime.block_on(network_hashrate_estimate(
+                            node,
+                            NETWORK_HASHRATE_WINDOW_BLOCKS,
+                        ))
+                    })
+            });
         Ok(MiningStatusDto {
             status: mining_state_name(raw_state, config.enabled).into(),
             enabled: config.enabled,
@@ -784,6 +831,7 @@ impl DesktopApplication {
             } else {
                 0.0
             },
+            network_hashrate_hps: network_hashrate,
             current_height: peer_status.canonical_height,
             connected_peers: peer_status.connected_total,
             accepted_blocks: mining.accepted_blocks.load(Ordering::Relaxed),
@@ -938,7 +986,7 @@ impl DesktopApplication {
     pub fn diagnostics_redacted(&self) -> DiagnosticSnapshot {
         self.service
             .lock()
-            .expect("application mutex poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .diagnostics()
     }
     pub fn application_shutdown(&self) -> Result<(), CommandError> {
@@ -1579,7 +1627,7 @@ mod tests {
     fn native_bridge_probe_is_static_redacted_and_versioned() {
         let status = native_bridge_status();
         assert_eq!(status.bridge, "ready");
-        assert_eq!(status.app_version, "0.1.5");
+        assert_eq!(status.app_version, "0.1.6");
         fn assert_serializable<T: serde::Serialize>(_: &T) {}
         assert_serializable(&status);
     }
