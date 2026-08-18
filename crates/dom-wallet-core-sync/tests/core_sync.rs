@@ -110,16 +110,6 @@ impl FakeCore {
         });
     }
 
-    fn truncate_chain(&self, height: u64) {
-        let mut state = self.state.lock().expect("fake state");
-        state.blocks.truncate(height as usize + 1);
-        let tip = state.blocks.last().expect("block");
-        state.identity.current_tip = BlockRef {
-            height: tip.height,
-            hash: tip.block_hash,
-        };
-    }
-
     fn replace_from(&self, height: u64, marker: u8) {
         let mut state = self.state.lock().expect("fake state");
         let previous = if height == 0 {
@@ -820,58 +810,6 @@ fn mainnet_missing_cursor_rejects_genesis_mismatch() {
         })
     );
     assert_eq!(sink.cursor, PersistedCoreCursorState::Absent);
-}
-
-#[test]
-fn reconcile_to_tip_is_idempotent_when_already_synchronized() {
-    let core = FakeCore::new(3);
-    let adapter = core.adapter();
-    let mut sink = MemorySink::default();
-    adapter.reconcile_to_tip(&mut sink).unwrap();
-    assert_eq!(
-        adapter.reconcile_to_tip(&mut sink),
-        Ok(CoreReconcileResult::NoChanges)
-    );
-}
-
-#[test]
-fn reorg_with_genesis_fork_point_reconciles_from_genesis_anchor() {
-    let core = FakeCore::new(4);
-    core.reject_genesis_scan();
-    let adapter = core.adapter();
-    let mut sink = MemorySink::default();
-    adapter.reconcile_to_tip(&mut sink).unwrap();
-    core.replace_from(1, 70);
-    let result = adapter.reconcile_once(&mut sink).unwrap();
-    assert!(matches!(
-        result,
-        CoreReconcileResult::ReorgCommitted {
-            safe_anchor: CoreBlockReference { height: 0, .. },
-            ..
-        }
-    ));
-    assert_eq!(sink.reorg_commits, 1);
-}
-
-#[test]
-fn reorg_to_fork_point_tip_rewinds_to_anchor() {
-    let core = FakeCore::new(4);
-    let adapter = core.adapter();
-    let mut sink = MemorySink::default();
-    adapter.reconcile_to_tip(&mut sink).unwrap();
-    core.truncate_chain(1);
-    let result = adapter.reconcile_once(&mut sink).unwrap();
-    let CoreReconcileResult::ReorgCommitted {
-        safe_anchor,
-        cursor,
-    } = result
-    else {
-        panic!("expected reorg commit, got {result:?}");
-    };
-    assert_eq!(safe_anchor.height, 1);
-    assert_eq!(cursor.decode().unwrap().anchor_height, 1);
-    assert!(sink.hashes.keys().all(|height| *height <= 1));
-    assert_eq!(sink.reorg_commits, 1);
 }
 
 #[test]

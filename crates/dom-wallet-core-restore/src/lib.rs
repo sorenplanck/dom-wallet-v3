@@ -186,22 +186,20 @@ impl SeedRestoreService {
             chain_id: self.expected_identity.chain_id,
         };
         let password = Zeroizing::new(password.to_owned());
-        let (directory, state, resumed_complete) = if staging.exists() {
+        let (directory, state) = if staging.exists() {
             let directory =
                 WalletDirectory::open(&staging).map_err(|_| SeedRestoreError::Storage)?;
             let state = directory
                 .load(password.as_str())
                 .map_err(|_| SeedRestoreError::IncompatibleCheckpoint)?;
             validate_checkpoint(&state, &seed, &self.expected_identity)?;
-            let complete = state.seed_restore_status == Some(SeedRestoreStatus::Complete)
-                && state.core_scan_cursor.is_some();
-            (directory, state, complete)
+            (directory, state)
         } else {
             let state = initial_restore_state(&seed, &self.expected_identity)?;
             let directory = WalletDirectory::create(&staging, &state, password.as_str(), self.kdf)
                 .map_err(|_| SeedRestoreError::Storage)?;
             restrict_directory(&staging)?;
-            (directory, state, false)
+            (directory, state)
         };
         Ok(SeedRestoreSession {
             adapter,
@@ -214,7 +212,7 @@ impl SeedRestoreService {
             kdf: self.kdf,
             destination,
             staging,
-            ready_to_publish: resumed_complete,
+            ready_to_publish: false,
         })
     }
 
@@ -308,13 +306,6 @@ impl SeedRestoreSession {
         if state.core_scan_cursor.is_none() {
             return Err(SeedRestoreError::Incomplete);
         }
-        // Check the destination before committing the Complete marker: a
-        // Complete staging wallet whose rename then fails would otherwise be
-        // unreachable. Should the rename still fail, begin() accepts Complete
-        // checkpoints so the publish can be retried.
-        if self.destination.exists() {
-            return Err(SeedRestoreError::InvalidDestination);
-        }
         state.seed_restore_status = Some(SeedRestoreStatus::Complete);
         state.sync_status = SyncStatus::Synced;
         let expected_generation = state.generation;
@@ -323,6 +314,9 @@ impl SeedRestoreSession {
             .commit(expected_generation, state, self.password.as_str(), self.kdf)
             .map_err(|_| SeedRestoreError::Storage)?;
         let result = result_from_state(&state, &self.identity)?;
+        if self.destination.exists() {
+            return Err(SeedRestoreError::InvalidDestination);
+        }
         fs::rename(&self.staging, &self.destination).map_err(|_| SeedRestoreError::Storage)?;
         sync_parent(&self.destination)?;
         Ok(result)
@@ -393,12 +387,7 @@ impl RestoreSink<'_> {
         let expected_generation = state.generation;
         let result = (|| {
             if let Some(anchor) = reorg_anchor {
-                rewind_recovery_state(
-                    &mut state,
-                    anchor.height,
-                    batch.observed_tip.height,
-                    self.identity.coinbase_maturity,
-                )?;
+                rewind_recovery_state(&mut state, anchor.height, batch.observed_tip.height);
             }
             apply_recovery_batch(self.seed, self.chain, self.identity, &mut state, batch)?;
             state.core_scan_cursor = Some(cursor.as_bytes().to_vec());
@@ -543,57 +532,30 @@ fn merge_restored_output(
         restored.derivation_index,
     );
     state.non_reuse_floor = state.non_reuse_floor.max(restored.derivation_index);
-    if let Some(index) = state
+    if let Some(existing) = state
         .outputs
         .iter()
-        .position(|output| output.commitment == Some(restored.commitment))
+        .find(|output| output.commitment == Some(restored.commitment))
     {
-        let existing_id = state.outputs[index].id;
-        let blinding = state
-            .output_blinding(existing_id)
-            .ok_or(SeedRestoreError::ConflictingOutput)?;
-        if state.outputs[index].value != restored.value || blinding != restored.blinding {
-            return Err(SeedRestoreError::ConflictingOutput);
-        }
-        if let Some(metadata) = state
+        let metadata = state
             .recovered_output_metadata
             .iter()
-            .find(|metadata| metadata.output_id == existing_id)
+            .find(|metadata| metadata.output_id == existing.id)
+            .ok_or(SeedRestoreError::ConflictingOutput)?;
+        let blinding = state
+            .output_blinding(existing.id)
+            .ok_or(SeedRestoreError::ConflictingOutput)?;
+        if existing.value != restored.value
+            || existing.discovered_height != restored.block_height
+            || metadata.recovery_account != restored.account
+            || metadata.derivation_index != restored.derivation_index
+            || metadata.domain != domain
+            || metadata.block_hash != restored.block_hash
+            || metadata.output_position != output_position
+            || blinding != restored.blinding
         {
-            if state.outputs[index].discovered_height != restored.block_height
-                || metadata.recovery_account != restored.account
-                || metadata.derivation_index != restored.derivation_index
-                || metadata.domain != domain
-                || metadata.block_hash != restored.block_hash
-                || metadata.output_position != output_position
-            {
-                return Err(SeedRestoreError::ConflictingOutput);
-            }
-            return Ok(());
+            return Err(SeedRestoreError::ConflictingOutput);
         }
-        // A record without recovery metadata is an output this wallet created
-        // locally (change or recipient) that is now observed on-chain for the
-        // first time. Adopt it as recovered evidence — value and blinding
-        // already matched above — instead of failing the batch, which would
-        // wedge synchronization at this block forever.
-        state.outputs[index].discovered_height = restored.block_height;
-        if let Some(spent_height) = restored.spent_at_height {
-            state.outputs[index].state = OutputState::Spent { spent_height };
-        } else if matches!(state.outputs[index].state, OutputState::PendingIncoming) {
-            state.outputs[index].state =
-                recovered_output_state(restored, tip_height, coinbase_maturity)?;
-        }
-        state
-            .recovered_output_metadata
-            .push(RecoveredOutputMetadata {
-                output_id: existing_id,
-                recovery_account: restored.account,
-                derivation_index: restored.derivation_index,
-                domain,
-                is_coinbase: restored.is_coinbase,
-                block_hash: restored.block_hash,
-                output_position,
-            });
         return Ok(());
     }
     let account_id = account_id_for(state, restored.account)?;
@@ -649,15 +611,7 @@ fn refresh_maturity(
     coinbase_maturity: u64,
 ) -> Result<(), SeedRestoreError> {
     for output in &mut state.outputs {
-        // Maturity refresh must only move outputs between the settled
-        // Immature/Confirmed states. In-flight lifecycle states such as
-        // PendingOutgoing (inputs committed to an unconfirmed send) or Locked
-        // are wallet evidence, not chain observations, and clobbering them
-        // would report reserved funds as spendable.
-        if !matches!(
-            output.state,
-            OutputState::Immature { .. } | OutputState::Confirmed
-        ) {
+        if matches!(output.state, OutputState::Spent { .. }) {
             continue;
         }
         let Some(metadata) = state
@@ -685,12 +639,7 @@ fn refresh_maturity(
 }
 
 /// Rewind canonical recovery evidence while preserving allocation non-reuse floors.
-pub fn rewind_recovery_state(
-    state: &mut WalletState,
-    safe_height: u64,
-    tip_height: u64,
-    coinbase_maturity: u64,
-) -> Result<(), SeedRestoreError> {
+pub fn rewind_recovery_state(state: &mut WalletState, safe_height: u64, tip_height: u64) {
     let removed_ids = state
         .outputs
         .iter()
@@ -715,7 +664,7 @@ pub fn rewind_recovery_state(
             output.state = OutputState::Confirmed;
         }
     }
-    refresh_maturity(state, tip_height, coinbase_maturity)
+    let _ = refresh_maturity(state, tip_height, 0);
 }
 
 fn account_id_for(
@@ -845,13 +794,7 @@ fn validate_checkpoint(
     seed.copy_entropy_to(&mut entropy);
     if state.root_material != *entropy
         || state.identity != domain_identity(identity)
-        || !matches!(
-            state.seed_restore_status,
-            // Complete is accepted so a restore whose final publish rename
-            // failed can be resumed and re-published instead of stranding
-            // the finished wallet in the hidden staging directory.
-            Some(SeedRestoreStatus::InProgress) | Some(SeedRestoreStatus::Complete)
-        )
+        || state.seed_restore_status != Some(SeedRestoreStatus::InProgress)
         || state
             .recovery
             .as_ref()

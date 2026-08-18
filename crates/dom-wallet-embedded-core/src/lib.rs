@@ -13,7 +13,7 @@ use dom_wallet_core_api::{
 };
 use std::{
     fmt,
-    net::SocketAddr,
+    net::{SocketAddr, TcpListener},
     path::PathBuf,
     sync::{
         atomic::{AtomicU8, Ordering},
@@ -25,10 +25,7 @@ use std::{
 use thiserror::Error;
 
 mod miner;
-pub use miner::{
-    mine_wallet_block, network_hashrate_estimate, WalletMiningError, WalletMiningOutcome,
-    NETWORK_HASHRATE_WINDOW_BLOCKS,
-};
+pub use miner::{mine_wallet_block, WalletMiningError, WalletMiningOutcome};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -746,16 +743,12 @@ async fn run_wallet_dns_discovery(
 }
 
 fn listener_is_bound(address: SocketAddr) -> bool {
-    // Probe with a connect instead of a bind: a probe bind would briefly own
-    // the exact port the node is trying to claim, and could make the node's
-    // own bind fail with AddrInUse — inducing the startup failure this
-    // readiness check exists to detect.
-    match std::net::TcpStream::connect_timeout(&address, Duration::from_millis(250)) {
-        Ok(stream) => {
-            drop(stream);
-            true
+    match TcpListener::bind(address) {
+        Ok(listener) => {
+            drop(listener);
+            false
         }
-        Err(_) => false,
+        Err(error) => error.kind() == std::io::ErrorKind::AddrInUse,
     }
 }
 
@@ -763,7 +756,6 @@ fn listener_is_bound(address: SocketAddr) -> bool {
 mod tests {
     use super::*;
     use std::fs;
-    use std::net::TcpListener;
     use std::path::Path;
     use tempfile::TempDir;
 

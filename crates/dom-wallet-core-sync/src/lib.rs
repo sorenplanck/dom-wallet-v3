@@ -501,10 +501,7 @@ impl CoreChainAdapter {
             .ok_or(CoreScanError::InvalidScan {
                 code: "MISSING_CANONICAL_GENESIS",
             })?;
-        // Every network that declares a real (nonzero) genesis hash is gated,
-        // not only Mainnet. Regtest keeps the documented zero-genesis
-        // exemption from map_identity.
-        if identity.genesis_hash != [0u8; 32] && genesis_hash != identity.genesis_hash {
+        if identity.network == CoreNetwork::Mainnet && genesis_hash != identity.genesis_hash {
             return Err(CoreScanError::InvalidScan {
                 code: "GENESIS_HASH_DISAGREEMENT",
             });
@@ -549,17 +546,6 @@ impl CoreChainAdapter {
                 CoreReconcileResult::Committed(cursor)
                 | CoreReconcileResult::ReorgCommitted { cursor, .. } => cursor,
                 CoreReconcileResult::NoChanges => {
-                    // An already-synchronized wallet legitimately has nothing
-                    // to commit: only report a stall when the persisted
-                    // cursor really is behind the target.
-                    if let PersistedCoreCursorState::Valid(cursor) = sink
-                        .core_cursor_state()
-                        .map_err(|_| CoreScanError::Persistence)?
-                    {
-                        if cursor.decode()?.anchor_height >= target_height {
-                            return Ok(CoreReconcileResult::NoChanges);
-                        }
-                    }
                     return Err(CoreScanError::InvalidScan {
                         code: "SCAN_STALLED_BEFORE_TARGET",
                     });
@@ -600,30 +586,6 @@ impl CoreChainAdapter {
                 })?;
         let batch = self.scan_from_height(start_height, self.maximum_batch_blocks)?;
         let Some(replacement) = batch.commit_cursor else {
-            if batch.observed_tip.height == safe_anchor.height {
-                // The new canonical tip is the fork point itself, so there is
-                // nothing to scan above the anchor — but the stale blocks
-                // must still be rewound. Commit the reorg with a cursor
-                // rebuilt at the anchor instead of failing forever.
-                let identity = self.current_identity()?;
-                let cursor = WalletScanCursor::new(
-                    identity.network,
-                    identity.chain_id,
-                    start_height,
-                    BlockRef {
-                        height: safe_anchor.height,
-                        hash: safe_anchor.hash,
-                    },
-                );
-                let cursor = CoreCursorBytes::from_cursor(cursor, &identity)?;
-                self.validate_cursor(cursor)?;
-                sink.commit_core_reorg(safe_anchor, &batch, cursor)
-                    .map_err(|_| CoreScanError::Persistence)?;
-                return Ok(CoreReconcileResult::ReorgCommitted {
-                    safe_anchor,
-                    cursor,
-                });
-            }
             return Err(CoreScanError::InvalidScan {
                 code: "REORG_REPLACEMENT_EMPTY",
             });
@@ -653,21 +615,6 @@ impl CoreChainAdapter {
                         height,
                         hash: core_hash,
                     });
-                }
-            }
-            // Genesis is an anchor, never a scanned wallet block, so the sink
-            // holds no local hash for height 0 — yet it is by definition the
-            // common ancestor of every branch of this chain (the identity
-            // checks already pin chain-id and network). Without this a reorg
-            // whose fork point is genesis could never be reconciled.
-            if height == 0 {
-                if let Some(core_hash) = core {
-                    if core_hash != [0u8; 32] {
-                        return Ok(CoreBlockReference {
-                            height: 0,
-                            hash: core_hash,
-                        });
-                    }
                 }
             }
         }

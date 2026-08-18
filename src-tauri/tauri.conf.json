@@ -1,17 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "DOM Wallet V3",
-  "version": "0.1.6",
+  "version": "0.1.5",
   "identifier": "org.domprotocol.wallet.v3",
   "build": {
     "beforeBuildCommand": "npm --prefix frontend run build",
     "frontendDist": "../frontend/dist"
   },
-  "app": {
-    "windows": [{ "label": "main", "title": "DOM Wallet V3", "width": 1100, "height": 760 }],
-    "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: asset: http://asset.localhost; media-src 'self' blob:; worker-src 'self' blob:; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'; base-uri 'self'; form-action 'self'"
-    }
-  },
+  "app": { "windows": [{ "label": "main", "title": "DOM Wallet V3", "width": 1100, "height": 760 }] },
   "bundle": { "icon": ["../frontend/assets/dom-coin.png", "icons/icon.ico"] }
 }
