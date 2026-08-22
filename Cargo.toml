@@ -60,21 +60,21 @@ tauri-plugin-updater = "=2.10.1"
 # sole authority for slate construction, transaction serialization, proof and
 # signature validation.  These are deliberately revision pinned rather than
 # copied into this wallet workspace.
-dom-core = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
-dom-crypto = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
-dom-consensus = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
-dom-serialization = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
-dom-tx = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
-dom-slate = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
-dom-config = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
-dom-chain = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
-dom-node = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
-dom-pow = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
-dom-wallet = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
-dom-wallet-core-api = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
-dom-wallet-keys = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
-dom-wallet-recovery = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
-dom-adaptor = { git = "file:///home/leonardov/F7_LAB/20260813T155739Z/worktrees/dom-protocol-f7-authoritative", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
+dom-core = { git = "https://github.com/sorenplanck/dom-protocol", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
+dom-crypto = { git = "https://github.com/sorenplanck/dom-protocol", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
+dom-consensus = { git = "https://github.com/sorenplanck/dom-protocol", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
+dom-serialization = { git = "https://github.com/sorenplanck/dom-protocol", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
+dom-tx = { git = "https://github.com/sorenplanck/dom-protocol", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
+dom-slate = { git = "https://github.com/sorenplanck/dom-protocol", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
+dom-config = { git = "https://github.com/sorenplanck/dom-protocol", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
+dom-chain = { git = "https://github.com/sorenplanck/dom-protocol", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
+dom-node = { git = "https://github.com/sorenplanck/dom-protocol", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
+dom-pow = { git = "https://github.com/sorenplanck/dom-protocol", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
+dom-wallet = { git = "https://github.com/sorenplanck/dom-protocol", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
+dom-wallet-core-api = { git = "https://github.com/sorenplanck/dom-protocol", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
+dom-wallet-keys = { git = "https://github.com/sorenplanck/dom-protocol", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
+dom-wallet-recovery = { git = "https://github.com/sorenplanck/dom-protocol", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
+dom-adaptor = { git = "https://github.com/sorenplanck/dom-protocol", rev = "6f8a947dee0e54c3421caa295755b1746c178137" }
 
 # Sidecar release authentication and atomic pointer handling are deliberately
 # consumed from their reviewed protocol commit. This does not move the wallet's
