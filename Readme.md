@@ -81,8 +81,7 @@ version. Build from the tag you intend to run, and verify the version in
 | Recovery Capsule v1 | Implemented |
 | Chain-bound backup | Implemented |
 | Slate protocol layer | Implemented |
-| **Real-fund authorization** | **Not authorized** |
-| **Independent audit** | **Not completed** |
+
 
 Per-release detail is recorded in the release notes for each tag, not in this table.
 
