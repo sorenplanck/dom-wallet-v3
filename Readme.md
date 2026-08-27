@@ -4,8 +4,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/status-Experimental%20Desktop%20Wallet-b87333?style=flat-square" alt="Status: Experimental Desktop Wallet">
-  <img src="https://img.shields.io/badge/latest%20published-v0.1.1-7a4a22?style=flat-square" alt="Latest published version: v0.1.1">
-  <img src="https://img.shields.io/badge/next%20patch-v0.1.2%20in%20development-8a6a3f?style=flat-square" alt="Next patch: v0.1.2 in development">
+  <img src="https://img.shields.io/badge/latest%20release-wallet--v0.3.2-7a4a22?style=flat-square" alt="Latest release: wallet-v0.3.2">
   <img src="https://img.shields.io/badge/network-DOM%20Mainnet-3d2f22?style=flat-square" alt="Network: DOM Mainnet">
   <img src="https://img.shields.io/badge/language-Rust-7a4a22?style=flat-square" alt="Language: Rust">
   <img src="https://img.shields.io/badge/license-MIT-8a6a3f?style=flat-square" alt="License: MIT">
@@ -46,45 +45,46 @@ Before using it, understand the following:
 
 ### Latest published release
 
-`wallet-v0.1.1`
+`wallet-v0.3.2` — 2026-08-04
 
-The v0.1.1 patch corrected the packaged Tauri native-command bridge failure present in v0.1.0.
+Releases are cut from `wallet-v*` tags and built by
+`.github/workflows/release-wallet.yml`. Packaged artifacts and their checksums are published
+on the GitHub release page:
 
-### Current development target
+<https://github.com/sorenplanck/dom-wallet-v3/releases/tag/wallet-v0.3.2>
 
-`wallet-v0.1.2`
+### Version lines in this repository
 
-The v0.1.2 patch is being developed to complete the following work:
+Two version lines exist here, and neither is an ancestor of the other:
 
-- Mainnet-only user experience.
-- Preconfigured embedded-node networking.
-- Automatic connection to the official DOM Mainnet seeds.
-- Correct wallet cursor activation on a genesis-only chain.
-- Reliable peer and synchronization diagnostics.
-- Restoration of the local CPU mining interface.
-- Mining disabled by default.
-- Protocol-correct Slate v4 send and receive flows.
-- Removal of misleading unilateral address-transfer UX.
-- Packaged-runtime validation against the live Mainnet bootnode.
+| Line | Where | Version |
+|---|---|---|
+| Release line | tags `wallet-v0.2.0` … `wallet-v0.3.2` | `0.3.2` |
+| `main` | default branch | `0.1.5` |
+
+**The release line is the product.** A build from `main` reports `0.1.5`, not the released
+version. Build from the tag you intend to run, and verify the version in
+`Cargo.toml` and `src-tauri/tauri.conf.json` before packaging.
 
 ### Current release maturity
 
 | Area | State |
 |---|---|
 | Native desktop shell | Implemented |
-| Tauri command bridge | Implemented in v0.1.1 |
+| Tauri command bridge | Implemented |
 | Embedded DOM node | Implemented |
+| Independently managed node lifecycle | Implemented |
+| Remote full-fidelity chain source | Implemented |
+| Signed update policy | Implemented |
 | DOM Mainnet identity | Implemented |
 | BIP-39 wallet creation and restore | Implemented |
 | Recovery Capsule v1 | Implemented |
 | Chain-bound backup | Implemented |
-| Slate v4 protocol layer | Implemented |
-| Mainnet peer discovery | Under active correction for v0.1.2 |
-| Genesis-only cursor synchronization | Under active correction for v0.1.2 |
-| Full mining UI | Under active restoration for v0.1.2 |
-| Packaged Mainnet acceptance | In progress |
-| Real-fund authorization | Not authorized |
-| Independent audit | Not completed |
+| Slate protocol layer | Implemented |
+| **Real-fund authorization** | **Not authorized** |
+| **Independent audit** | **Not completed** |
+
+Per-release detail is recorded in the release notes for each tag, not in this table.
 
 ---
 
@@ -151,6 +151,29 @@ Premine: 0 noms
 Height-one reward: 3,300,000,000 noms
 Maximum theoretical issuance: 3,299,996,676,900,000 noms
 ```
+
+---
+
+## Protocol Revision
+
+DOM Wallet V3 does not vendor the DOM protocol. It consumes the protocol crates as pinned
+git dependencies, so every release is built against one exact revision, recorded in
+`Cargo.toml`.
+
+`wallet-v0.3.2` is built against:
+
+```text
+repository  https://github.com/sorenplanck/dom-protocol
+revision    19c191f06240cb73c5aa03128d36c6774d257b6a
+```
+
+The pinned crates are `dom-core`, `dom-crypto`, `dom-consensus`, `dom-serialization`,
+`dom-tx`, `dom-slate`, `dom-config`, `dom-chain`, `dom-node`, `dom-pow`, `dom-wallet`,
+`dom-wallet-core-api`, `dom-wallet-keys`, `dom-wallet-recovery` and `dom-adaptor`.
+
+Anyone reproducing or verifying a build should confirm that the revision pinned in that
+tag's `Cargo.toml` is the one recorded above. A wallet built against a different protocol
+revision is a different artifact, whatever version number it carries.
 
 ---
 
@@ -689,7 +712,17 @@ Independent-audit claim: none
 | `crates/dom-wallet-chain` | Chain source, synchronization, cursor, and reorganization handling. |
 | `crates/dom-wallet-protocol` | Revision-pinned DOM transaction, Slate, fee, proof, and serialization adapter. |
 | `crates/dom-wallet-core` | Wallet lifecycle, orchestration, diagnostics, recovery, and capability APIs. |
-| `crates/dom-wallet-tauri-shell` | Native Tauri command boundary and packaged desktop runtime. |
+| `crates/dom-wallet-core-protocol` | Wallet-owned boundary for frozen Address, Slate, and fee-policy contracts. |
+| `crates/dom-wallet-core-recovery` | Wallet-owned BIP-39 and frozen Recovery Capsule v1 construction boundary. |
+| `crates/dom-wallet-core-restore` | Wallet-owned orchestration for BIP-39 seed plus canonical-chain restoration. |
+| `crates/dom-wallet-core-submit` | Wallet-owned structured submission boundary for the embedded DOM Core API. |
+| `crates/dom-wallet-core-sync` | Wallet-owned validation and persistence boundary for canonical Core scans. |
+| `crates/dom-wallet-embedded-core` | Wallet-owned lifecycle boundary for the embedded DOM node. |
+| `crates/dom-wallet-node-manager` | Wallet-owned lifecycle manager for the independently signed DOM node. |
+| `crates/dom-wallet-production-backend` | Sole default production backend for DOM Wallet V3. |
+| `crates/dom-wallet-remote-source` | Remote full-fidelity chain source for Wallet V3. |
+| `crates/dom-wallet-updater` | Signed update policy and managed node runtime primitives. |
+| `src-tauri` | Native Tauri command boundary and packaged desktop runtime. |
 | `frontend` | Desktop user interface. |
 | `.github/workflows` | Validation and multiplatform release automation. |
 | `docs` | Architecture, implementation, release, and operational documentation. |
@@ -832,46 +865,22 @@ Compare the result with the checksum published in the corresponding GitHub Relea
 
 ## Release History
 
-### v0.1.0
+Detailed notes for each release are published on its GitHub release page. This table records
+what was tagged and when.
 
-First experimental public desktop release.
+| Tag | Date | Note |
+|---|---|---|
+| `wallet-v0.1.0` | — | First experimental public desktop release. Superseded: the packaged Tauri command bridge could be unavailable, so buttons rendered but did not function. |
+| `wallet-v0.1.1` | — | Native bridge correction. Packaged bridge, native command invocation, Linux/Windows/macOS packaging and release checksums validated. |
+| `wallet-v0.1.2` … `wallet-v0.1.5` | 2026-07 | Mainnet-only product flow, preconfigured seeds, genesis-only cursor activation, peer and synchronization diagnostics, restored mining controls, Slate flows. |
+| `wallet-v0.2.0` | 2026-07-23 | Start of the 0.2 stabilization line. |
+| `wallet-v0.2.1` … `wallet-v0.2.9` | 2026-07-23 → 2026-07-28 | Stabilization series. |
+| `wallet-v0.3.0` | 2026-07-29 | Node starts on wallet open; recovery kept offline. |
+| `wallet-v0.3.1` | 2026-07-31 | Release preparation. |
+| **`wallet-v0.3.2`** | **2026-08-04** | **Current release.** |
 
-Known packaged-runtime defect:
-
-- Native Tauri command bridge could be unavailable.
-- Buttons could render but remain nonfunctional.
-
-v0.1.0 should be treated as superseded.
-
-### v0.1.1
-
-Native bridge correction.
-
-Validated:
-
-- Packaged Tauri bridge.
-- Native command invocation.
-- Linux, Windows, and macOS packaging.
-- Release checksums.
-- Experimental release workflow.
-
-Known active issue:
-
-- Mainnet embedded-node peer discovery and cursor activation require correction.
-
-### v0.1.2
-
-In development.
-
-Planned focus:
-
-- Mainnet-only product flow.
-- Preconfigured server and node settings.
-- Real P2P connection to the official bootnode.
-- Cursor activation at height `0`.
-- Improved peer and sync diagnostics.
-- Restored mining module.
-- Protocol-correct Slate v4 interface.
+Releases up to and including `wallet-v0.3.2` are marked experimental. None of them carries a
+real-fund authorization.
 
 ---
 
@@ -984,7 +993,8 @@ No block should be mined during connectivity validation.
 
 ### Native desktop command bridge unavailable
 
-Upgrade from v0.1.0 to v0.1.1 or later.
+Upgrade to the latest published release (`wallet-v0.3.2`). The defect was corrected in
+`wallet-v0.1.1`; every later release carries the fix.
 
 Confirm:
 
@@ -1052,8 +1062,10 @@ Confirm the installed version afterward.
 - Unsigned installers.
 - Real-fund use is not authorized.
 - Public Mainnet validation is ongoing.
-- Mining UI restoration is still in development until v0.1.2 is completed.
-- Mainnet peer and cursor behavior is under active correction until v0.1.2 is completed.
+- Mining controls and Mainnet peer/cursor behaviour were corrected across successive
+  releases in the 0.1.x-0.3.x series; consult the release notes for the state at the
+  version you are running.
+- `main` is behind the release line and does not build the released version.
 - Hardware-wallet support is not implemented.
 - Mobile versions are not implemented.
 - Automatic Slate transport is not guaranteed.
@@ -1064,25 +1076,15 @@ Confirm the installed version afterward.
 
 ## Roadmap
 
-### v0.1.2
-
-- Mainnet-only user flow.
-- Internal server configuration.
-- Official seed bootstrap.
-- Embedded-node Mainnet connectivity.
-- Cursor activation at genesis.
-- Peer diagnostics.
-- Mining controls.
-- Slate v4 UX correction.
-- Packaged live-node acceptance.
+This section records direction, not commitments. No date is given for any item, and nothing
+here is authorized for real funds until it says so in the release notes.
 
 ### Near-term
 
-- Extended multi-node testing.
-- Long-running synchronization tests.
+- Reconcile the `main` branch with the release line so a single line carries the product.
+- Extended multi-node testing and long-running synchronization runs.
 - Reorganization validation under live conditions.
-- Improved transaction history.
-- Better recovery UX.
+- Improved transaction history and recovery UX.
 - Better node and mining telemetry.
 - Installer signing strategy.
 - Additional seed operators.
