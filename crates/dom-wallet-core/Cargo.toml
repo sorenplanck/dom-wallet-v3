@@ -10,6 +10,7 @@ default = []
 legacy-http-tests = ["dep:dom-wallet-chain", "dep:dom-wallet-protocol"]
 
 [dependencies]
+dom-wallet-keys.workspace = true
 dom-consensus.workspace = true
 dom-core.workspace = true
 dom-crypto.workspace = true

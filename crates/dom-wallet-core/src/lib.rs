@@ -488,6 +488,27 @@ impl WalletService {
             .map_err(CoreError::from)
     }
 
+    /// The 64-byte BIP-39 seed for level-1 multichain derivation (swap legs).
+    ///
+    /// Derived on demand from the unlocked wallet's own recovery material
+    /// with an empty passphrase, exactly as the swap tab design premise 1
+    /// requires: one seed, every chain. Returned in a zeroizing buffer and
+    /// never stored — derive, do not persist.
+    pub fn multichain_bip39_seed(&self) -> Result<Zeroizing<[u8; 64]>, CoreError> {
+        let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
+        let seed = CanonicalWalletSeed::from_entropy(&state.root_material)
+            .map_err(|_| CoreError::RecoveryPhraseInvalid)?;
+        let phrase = seed.mnemonic_text();
+        let bip39 = dom_wallet_keys::Bip39Seed::from_phrase(
+            &phrase,
+            dom_wallet_keys::SeedAcceptance::NewWallet,
+        )
+        .map_err(|_| CoreError::RecoveryPhraseInvalid)?;
+        let mut bytes = Zeroizing::new([0u8; 64]);
+        bytes.copy_from_slice(bip39.seed_bytes());
+        Ok(bytes)
+    }
+
     pub fn embedded_peer_status(&self) -> Result<EmbeddedPeerStatus, CoreError> {
         self.backend
             .as_ref()

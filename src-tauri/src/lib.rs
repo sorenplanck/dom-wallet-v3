@@ -176,6 +176,13 @@ macro_rules! wallet_command_registry {
             wallet_sync_retry,
             wallet_rescan,
             mining_status,
+            swap_leg_addresses,
+            swap_fee_quote,
+            swap_intent_create,
+            swap_quotes_list,
+            swap_accept_quote,
+            swap_session_status,
+            swap_history,
             mining_config_get,
             mining_config_set,
             mining_start,
@@ -1055,6 +1062,37 @@ fn ensure_scan_backend(
     }
 }
 
+/// Swap-tab surface: fee minute and the level-1 leg accounts.
+///
+/// The flow commands themselves fail closed until the authenticated channel
+/// to the interop daemon lands; nothing here fabricates a quote, a session
+/// or an address it cannot actually derive.
+pub mod swap {
+    /// Protocol fee in basis points over the DOM leg amount.
+    ///
+    /// WORKING FIGURE, PENDING THE OPERATOR'S RATIFICATION (see
+    /// docs/SWAP_TAB_DESIGN.md, adjudicated decision 5): 10 bps is the
+    /// figure used throughout the DEPC analysis examples. The operator
+    /// fixes the final number before release; changing it is a one-line,
+    /// test-pinned edit.
+    pub const SWAP_FEE_BPS: u64 = 10;
+
+    /// Denominator for basis points.
+    pub const BPS_DENOMINATOR: u64 = 10_000;
+
+    /// Fee in noms for a DOM-leg amount, rounded up so the protocol never
+    /// undercharges by truncation. Fails closed on nonsense inputs.
+    pub fn swap_fee_noms(amount_noms: u64, fee_bps: u64) -> Option<u64> {
+        if amount_noms == 0 || fee_bps > BPS_DENOMINATOR {
+            return None;
+        }
+        let numerator = u128::from(amount_noms) * u128::from(fee_bps);
+        let denominator = u128::from(BPS_DENOMINATOR);
+        let fee = numerator.div_ceil(denominator);
+        u64::try_from(fee).ok()
+    }
+}
+
 /// DEPC-3 estimated production-cost reference.
 ///
 /// Presentation-layer economics only: these values feed the mining screen and
@@ -1129,6 +1167,33 @@ pub mod depc {
         let value = (network_hashrate_hps / 1_000.0) * cost_usd_per_khs_day / daily_emission_dom;
         (value.is_finite() && value > 0.0).then_some(value)
     }
+}
+
+/// Level-1 swap-leg receive addresses, derived from the wallet's own seed.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwapLegAddressesDto {
+    pub evm_address: String,
+    pub evm_derivation_path: String,
+    pub bitcoin_address: String,
+    pub bitcoin_derivation_path: String,
+}
+
+/// The fee minute for one intended swap amount, before any quote exists.
+///
+/// The fee is denominated in DOM; the USD figure is the DEPC-3 estimate and
+/// is `None` whenever the node cannot supply its inputs. Conversion into a
+/// non-DOM payment asset happens at quote time from the accepted quote's own
+/// implied rate, never from an external feed.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwapFeeQuoteDto {
+    pub amount_noms: u64,
+    pub fee_bps: u64,
+    pub fee_noms: u64,
+    pub payment_asset: String,
+    pub fee_usd_estimated: Option<f64>,
+    pub depc_basket_version: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3128,6 +3193,102 @@ impl DesktopApplication {
 
     pub fn slate_qr_reassembly_clear(&self) -> Result<(), CommandError> {
         self.clear_qr_buffers()
+    }
+
+    /// Level-1 swap-leg addresses (design premise 1): taproot at m/86'/0'
+    /// and EVM at m/44'/60', derived on demand from the wallet's own seed.
+    pub fn swap_leg_addresses(&self) -> Result<SwapLegAddressesDto, CommandError> {
+        self.ensure_running()?;
+        let seed = self
+            .service
+            .lock()
+            .map_err(|_| CommandError::Unavailable)?
+            .multichain_bip39_seed()
+            .map_err(CommandError::from)?;
+        let root = dom_wallet_multichain::MultichainRoot::from_bip39_seed(&seed)
+            .map_err(|_| CommandError::Unavailable)?;
+        let evm = root.evm_account(0).map_err(|_| CommandError::Unavailable)?;
+        let bitcoin = root
+            .taproot_account(dom_wallet_multichain::BitcoinNetwork::Mainnet, 0)
+            .map_err(|_| CommandError::Unavailable)?;
+        Ok(SwapLegAddressesDto {
+            evm_address: evm.address(),
+            evm_derivation_path: "m/44'/60'/0'/0/0".into(),
+            bitcoin_address: bitcoin.address().to_owned(),
+            bitcoin_derivation_path: "m/86'/0'/0'/0/0".into(),
+        })
+    }
+
+    /// The fee minute for an intended amount: DOM-denominated fee plus the
+    /// DEPC-3 USD estimate when the node can supply it. Fail-closed: an
+    /// invalid amount or payment asset is an error, never a guess.
+    pub fn swap_fee_quote(
+        &self,
+        amount_noms: u64,
+        payment_asset: &str,
+    ) -> Result<SwapFeeQuoteDto, CommandError> {
+        if !matches!(payment_asset, "DOM" | "BTC" | "USDT") {
+            return Err(CommandError::InvalidInput(
+                "payment asset must be DOM, BTC or USDT".into(),
+            ));
+        }
+        let fee_noms = swap::swap_fee_noms(amount_noms, swap::SWAP_FEE_BPS)
+            .ok_or_else(|| CommandError::InvalidInput("amount must be positive".into()))?;
+        let fee_usd_estimated = self
+            .service
+            .lock()
+            .ok()
+            .and_then(|service| service.embedded_mining_economics().ok())
+            .and_then(|economics| {
+                depc::network_hashrate_hps(
+                    economics.network_difficulty,
+                    economics.target_spacing_seconds,
+                )
+                .and_then(|network_hashrate| {
+                    depc::estimated_production_cost_usd_per_dom(
+                        network_hashrate,
+                        economics.next_block_reward_noms,
+                        economics.noms_per_dom,
+                        economics.target_spacing_seconds,
+                        depc::DEPC_COST_CENTRAL_USD_PER_KHS_DAY,
+                    )
+                })
+                .map(|usd_per_dom| (fee_noms as f64 / economics.noms_per_dom as f64) * usd_per_dom)
+            });
+        Ok(SwapFeeQuoteDto {
+            amount_noms,
+            fee_bps: swap::SWAP_FEE_BPS,
+            fee_noms,
+            payment_asset: payment_asset.to_owned(),
+            fee_usd_estimated,
+            depc_basket_version: depc::DEPC_BASKET_VERSION.to_owned(),
+        })
+    }
+
+    /// Publish a swap intent. FAIL-CLOSED until the authenticated channel to
+    /// the interop daemon lands: no daemon, no intent, no fabricated state.
+    pub fn swap_intent_create(&self) -> Result<(), CommandError> {
+        Err(CommandError::Unavailable)
+    }
+
+    /// List quotes for the open intent. Fail-closed like `swap_intent_create`.
+    pub fn swap_quotes_list(&self) -> Result<(), CommandError> {
+        Err(CommandError::Unavailable)
+    }
+
+    /// Accept a quote. Fail-closed like `swap_intent_create`.
+    pub fn swap_accept_quote(&self) -> Result<(), CommandError> {
+        Err(CommandError::Unavailable)
+    }
+
+    /// Live session status. Fail-closed like `swap_intent_create`.
+    pub fn swap_session_status(&self) -> Result<(), CommandError> {
+        Err(CommandError::Unavailable)
+    }
+
+    /// Durable swap history. Fail-closed like `swap_intent_create`.
+    pub fn swap_history(&self) -> Result<(), CommandError> {
+        Err(CommandError::Unavailable)
     }
 
     pub fn slate_request_import(&self, text: &str) -> Result<TransactionSummary, CommandError> {
@@ -6189,5 +6350,40 @@ mod depc_tests {
             depc::network_hashrate_hps(6_000_000, TARGET_SPACING),
             Some(50_000.0)
         );
+    }
+}
+
+#[cfg(test)]
+mod swap_tests {
+    use super::swap;
+
+    #[test]
+    fn ten_bps_of_a_round_amount_is_exact() {
+        assert_eq!(swap::swap_fee_noms(1_000_000, 10), Some(1_000));
+    }
+
+    #[test]
+    fn truncation_rounds_up_so_the_protocol_never_undercharges() {
+        // 999 * 10 / 10_000 = 0.999 → 1 nom, never 0.
+        assert_eq!(swap::swap_fee_noms(999, 10), Some(1));
+        assert_eq!(swap::swap_fee_noms(1, 10), Some(1));
+    }
+
+    #[test]
+    fn nonsense_inputs_fail_closed() {
+        assert_eq!(swap::swap_fee_noms(0, 10), None);
+        assert_eq!(swap::swap_fee_noms(1_000, swap::BPS_DENOMINATOR + 1), None);
+    }
+
+    #[test]
+    fn the_maximum_amount_does_not_overflow() {
+        let fee = swap::swap_fee_noms(u64::MAX, swap::SWAP_FEE_BPS).expect("fits");
+        assert!(fee < u64::MAX / 100);
+    }
+
+    #[test]
+    fn the_working_figure_is_pinned_until_the_operator_ratifies_it() {
+        // Changing SWAP_FEE_BPS is a deliberate act: this test names it.
+        assert_eq!(swap::SWAP_FEE_BPS, 10);
     }
 }
