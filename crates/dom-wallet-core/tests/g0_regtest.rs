@@ -214,6 +214,7 @@ fn public_recovery_capsule_fixture(marker: [u8; 32]) -> RecoveryCapsule {
         .expect("construct canonical public recovery capsule fixture")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_session_share(
     wallet: &WalletService,
     session_id: [u8; 32],

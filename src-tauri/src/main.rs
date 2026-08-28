@@ -1097,51 +1097,6 @@ fn swap_leg_addresses(
 fn swap_fee_quote(
     app: tauri::State<'_, DesktopApplication>,
     amount: u64,
-    paymentAsset: String,
-) -> Result<dom_wallet_tauri_shell::SwapFeeQuoteDto, dom_wallet_tauri_shell::CommandErrorDto> {
-    app.swap_fee_quote(amount, &paymentAsset)
-        .map_err(Into::into)
-}
-#[tauri::command]
-fn swap_intent_create(
-    app: tauri::State<'_, DesktopApplication>,
-) -> Result<(), dom_wallet_tauri_shell::CommandErrorDto> {
-    app.swap_intent_create().map_err(Into::into)
-}
-#[tauri::command]
-fn swap_quotes_list(
-    app: tauri::State<'_, DesktopApplication>,
-) -> Result<(), dom_wallet_tauri_shell::CommandErrorDto> {
-    app.swap_quotes_list().map_err(Into::into)
-}
-#[tauri::command]
-fn swap_accept_quote(
-    app: tauri::State<'_, DesktopApplication>,
-) -> Result<(), dom_wallet_tauri_shell::CommandErrorDto> {
-    app.swap_accept_quote().map_err(Into::into)
-}
-#[tauri::command]
-fn swap_session_status(
-    app: tauri::State<'_, DesktopApplication>,
-) -> Result<(), dom_wallet_tauri_shell::CommandErrorDto> {
-    app.swap_session_status().map_err(Into::into)
-}
-#[tauri::command]
-fn swap_history(
-    app: tauri::State<'_, DesktopApplication>,
-) -> Result<(), dom_wallet_tauri_shell::CommandErrorDto> {
-    app.swap_history().map_err(Into::into)
-}
-#[tauri::command]
-fn swap_leg_addresses(
-    app: tauri::State<'_, DesktopApplication>,
-) -> Result<dom_wallet_tauri_shell::SwapLegAddressesDto, dom_wallet_tauri_shell::CommandErrorDto> {
-    app.swap_leg_addresses().map_err(Into::into)
-}
-#[tauri::command]
-fn swap_fee_quote(
-    app: tauri::State<'_, DesktopApplication>,
-    amount: u64,
     payment_asset: String,
 ) -> Result<dom_wallet_tauri_shell::SwapFeeQuoteDto, dom_wallet_tauri_shell::CommandErrorDto> {
     app.swap_fee_quote(amount, &payment_asset)
