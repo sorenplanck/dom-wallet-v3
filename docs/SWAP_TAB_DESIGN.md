@@ -285,7 +285,21 @@ financial value, and accepted the deviation for the launch phase as a
 final decision. This paragraph exists so that no future audit mistakes the
 trade-off for an oversight.
 
-**Working figure pending ratification:** the fee percentage itself.
-The implementation carries it as one named constant (`SWAP_FEE_BPS`) with
-the 10 bps working figure used throughout the DEPC analysis examples; the
-operator fixes the final number before release.
+**Ratified — operator, 2026-08-28:** the fee is tiered by the number of
+external legs the route settles, in units of per-thousand. At most one
+external leg (DOM->DOM, DOM<->BTC or DOM<->EVM): 0.5% — a 1,000 DOM
+operation pays 5 DOM. Two external legs (BTC<->EVM crossing the DOM):
+1% — a 1,000 DOM operation pays 10 DOM. Every route through the DOM
+is valid, including same-asset round trips (BTC->DOM->BTC,
+EVM->DOM->EVM), which settle two external legs and pay the 1% tier.
+
+**Asset identity is the (ticker, network) pair — operator, 2026-08-28:**
+USDT on Ethereum and USDT on Base are distinct external assets, so
+USDT(Ethereum)->DOM->USDT(Base) is a two-external-leg route at the 1%
+tier like any other external-to-external route. The tier rule needs
+only the DOM-or-external distinction and is already network-correct;
+the per-network asset identities live in the curated asset registry
+that arrives with the interop daemon integration (decision D-018). The implementation carries the
+tiers as two named constants (`SWAP_FEE_BPS_SINGLE_LEG` = 50,
+`SWAP_FEE_BPS_DUAL_LEG` = 100), pinned by test; changing either is a
+deliberate, operator-authorized act.

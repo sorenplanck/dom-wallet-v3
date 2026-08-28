@@ -1097,9 +1097,11 @@ fn swap_leg_addresses(
 fn swap_fee_quote(
     app: tauri::State<'_, DesktopApplication>,
     amount: u64,
+    from_asset: String,
+    to_asset: String,
     payment_asset: String,
 ) -> Result<dom_wallet_tauri_shell::SwapFeeQuoteDto, dom_wallet_tauri_shell::CommandErrorDto> {
-    app.swap_fee_quote(amount, &payment_asset)
+    app.swap_fee_quote(amount, &from_asset, &to_asset, &payment_asset)
         .map_err(Into::into)
 }
 #[tauri::command]

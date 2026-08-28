@@ -496,12 +496,12 @@ const renderSwapFee = (quote) => {
   const usd = quote.fee_usd_estimated != null
     ? ` (~US$ ${Number(quote.fee_usd_estimated).toPrecision(3)}, ${quote.depc_basket_version} estimate)`
     : "";
-  swapFeeSummary().textContent = `Protocol fee ${quote.fee_bps} bps: ${quote.fee_noms} noms (${dom} DOM), paid in ${quote.payment_asset}${usd}.`;
+  swapFeeSummary().textContent = `Protocol fee ${quote.fee_percent}% (${quote.external_legs === 0 ? "DOM only" : quote.external_legs === 1 ? "one external leg" : "two external legs"}): ${quote.fee_noms} noms (${dom} DOM), paid in ${quote.payment_asset}${usd}.`;
 };
 const previewSwapFee = async () => {
   const data = new FormData(byId("swap-intent-form"));
   const amount = integerNoms(data.get("amount"));
-  const quote = await run(() => invoke("swap_fee_quote", { amount, paymentAsset: byId("swap-fee-asset").value }));
+  const quote = await run(() => invoke("swap_fee_quote", { amount, fromAsset: byId("swap-from").value, toAsset: byId("swap-to").value, paymentAsset: byId("swap-fee-asset").value }));
   if (quote) renderSwapFee(quote);
 };
 const refreshSwap = async () => {

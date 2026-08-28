@@ -1068,17 +1068,56 @@ fn ensure_scan_backend(
 /// to the interop daemon lands; nothing here fabricates a quote, a session
 /// or an address it cannot actually derive.
 pub mod swap {
-    /// Protocol fee in basis points over the DOM leg amount.
+    /// Protocol fee in basis points over the DOM leg amount, tiered by the
+    /// number of external legs the route settles. Ratified by the operator
+    /// on 2026-08-28 (see docs/SWAP_TAB_DESIGN.md, adjudicated decision 5),
+    /// in units of five and ten per thousand: a 1,000 DOM operation pays
+    /// 5 DOM on the single-leg tier.
     ///
-    /// WORKING FIGURE, PENDING THE OPERATOR'S RATIFICATION (see
-    /// docs/SWAP_TAB_DESIGN.md, adjudicated decision 5): 10 bps is the
-    /// figure used throughout the DEPC analysis examples. The operator
-    /// fixes the final number before release; changing it is a one-line,
-    /// test-pinned edit.
-    pub const SWAP_FEE_BPS: u64 = 10;
+    /// At most one external leg — DOM->DOM, DOM<->BTC or DOM<->EVM:
+    /// 0.5% (50 bps).
+    pub const SWAP_FEE_BPS_SINGLE_LEG: u64 = 50;
+    /// Two external legs — BTC<->EVM crossing the DOM: 1% (100 bps).
+    pub const SWAP_FEE_BPS_DUAL_LEG: u64 = 100;
 
     /// Denominator for basis points.
     pub const BPS_DENOMINATOR: u64 = 10_000;
+
+    /// External legs a route settles, fail-closed on unknown assets. Every
+    /// route through the DOM is valid: DOM->DOM settles no external leg, a
+    /// DOM<->external route settles one, and any route between external
+    /// assets crosses the DOM and settles two — including the same asset
+    /// round-tripping through the DOM (BTC->DOM->BTC, EVM->DOM->EVM).
+    ///
+    /// Asset identity is the (ticker, network) pair: USDT on Ethereum and
+    /// USDT on Base are distinct external assets and their pairing is a
+    /// two-leg route. The tier rule needs only the DOM-or-external
+    /// distinction, so it stays correct when the curated registry brings
+    /// per-network identities (docs/SWAP_TAB_DESIGN.md).
+    pub fn external_legs(from_asset: &str, to_asset: &str) -> Option<u64> {
+        let valid = |asset: &str| matches!(asset, "DOM" | "BTC" | "USDT");
+        if !valid(from_asset) || !valid(to_asset) {
+            return None;
+        }
+        match (from_asset == "DOM", to_asset == "DOM") {
+            (true, true) => Some(0),
+            (true, false) | (false, true) => Some(1),
+            (false, false) => Some(2),
+        }
+    }
+
+    /// The ratified fee tier for a route. At most one external leg
+    /// (DOM->DOM included) pays the single-leg tier; two external legs pay
+    /// the dual-leg tier.
+    pub fn fee_bps_for_route(from_asset: &str, to_asset: &str) -> Option<u64> {
+        external_legs(from_asset, to_asset).map(|legs| {
+            if legs <= 1 {
+                SWAP_FEE_BPS_SINGLE_LEG
+            } else {
+                SWAP_FEE_BPS_DUAL_LEG
+            }
+        })
+    }
 
     /// Fee in noms for a DOM-leg amount, rounded up so the protocol never
     /// undercharges by truncation. Fails closed on nonsense inputs.
@@ -1189,7 +1228,11 @@ pub struct SwapLegAddressesDto {
 #[serde(deny_unknown_fields)]
 pub struct SwapFeeQuoteDto {
     pub amount_noms: u64,
+    pub from_asset: String,
+    pub to_asset: String,
+    pub external_legs: u64,
     pub fee_bps: u64,
+    pub fee_percent: f64,
     pub fee_noms: u64,
     pub payment_asset: String,
     pub fee_usd_estimated: Option<f64>,
@@ -3225,6 +3268,8 @@ impl DesktopApplication {
     pub fn swap_fee_quote(
         &self,
         amount_noms: u64,
+        from_asset: &str,
+        to_asset: &str,
         payment_asset: &str,
     ) -> Result<SwapFeeQuoteDto, CommandError> {
         if !matches!(payment_asset, "DOM" | "BTC" | "USDT") {
@@ -3232,7 +3277,12 @@ impl DesktopApplication {
                 "payment asset must be DOM, BTC or USDT".into(),
             ));
         }
-        let fee_noms = swap::swap_fee_noms(amount_noms, swap::SWAP_FEE_BPS)
+        let external_legs = swap::external_legs(from_asset, to_asset).ok_or_else(|| {
+            CommandError::InvalidInput("route assets must be among DOM, BTC and USDT".into())
+        })?;
+        let fee_bps = swap::fee_bps_for_route(from_asset, to_asset)
+            .ok_or_else(|| CommandError::InvalidInput("route has no ratified fee tier".into()))?;
+        let fee_noms = swap::swap_fee_noms(amount_noms, fee_bps)
             .ok_or_else(|| CommandError::InvalidInput("amount must be positive".into()))?;
         let fee_usd_estimated = self
             .service
@@ -3257,7 +3307,11 @@ impl DesktopApplication {
             });
         Ok(SwapFeeQuoteDto {
             amount_noms,
-            fee_bps: swap::SWAP_FEE_BPS,
+            from_asset: from_asset.to_owned(),
+            to_asset: to_asset.to_owned(),
+            external_legs,
+            fee_bps,
+            fee_percent: fee_bps as f64 / 100.0,
             fee_noms,
             payment_asset: payment_asset.to_owned(),
             fee_usd_estimated,
@@ -6358,8 +6412,18 @@ mod swap_tests {
     use super::swap;
 
     #[test]
-    fn ten_bps_of_a_round_amount_is_exact() {
-        assert_eq!(swap::swap_fee_noms(1_000_000, 10), Some(1_000));
+    fn the_operator_example_holds_exactly() {
+        // 1,000 DOM on the single-leg tier pays 5 DOM; on the dual-leg
+        // tier it pays 10 DOM. 1 DOM = 100_000_000 noms.
+        let thousand_dom = 1_000 * 100_000_000_u64;
+        assert_eq!(
+            swap::swap_fee_noms(thousand_dom, swap::SWAP_FEE_BPS_SINGLE_LEG),
+            Some(5 * 100_000_000)
+        );
+        assert_eq!(
+            swap::swap_fee_noms(thousand_dom, swap::SWAP_FEE_BPS_DUAL_LEG),
+            Some(10 * 100_000_000)
+        );
     }
 
     #[test]
@@ -6377,13 +6441,70 @@ mod swap_tests {
 
     #[test]
     fn the_maximum_amount_does_not_overflow() {
-        let fee = swap::swap_fee_noms(u64::MAX, swap::SWAP_FEE_BPS).expect("fits");
-        assert!(fee < u64::MAX / 100);
+        let fee = swap::swap_fee_noms(u64::MAX, swap::SWAP_FEE_BPS_DUAL_LEG).expect("fits");
+        let expected = (u128::from(u64::MAX) * u128::from(swap::SWAP_FEE_BPS_DUAL_LEG))
+            .div_ceil(u128::from(swap::BPS_DENOMINATOR));
+        assert_eq!(u128::from(fee), expected);
     }
 
     #[test]
-    fn the_working_figure_is_pinned_until_the_operator_ratifies_it() {
-        // Changing SWAP_FEE_BPS is a deliberate act: this test names it.
-        assert_eq!(swap::SWAP_FEE_BPS, 10);
+    fn the_ratified_tiers_are_pinned() {
+        // Ratified by the operator on 2026-08-28. Changing either tier is a
+        // deliberate act: this test names it.
+        assert_eq!(swap::SWAP_FEE_BPS_SINGLE_LEG, 50);
+        assert_eq!(swap::SWAP_FEE_BPS_DUAL_LEG, 100);
+    }
+
+    #[test]
+    fn dom_to_dom_settles_no_external_leg_and_pays_the_single_leg_tier() {
+        assert_eq!(swap::external_legs("DOM", "DOM"), Some(0));
+        assert_eq!(
+            swap::fee_bps_for_route("DOM", "DOM"),
+            Some(swap::SWAP_FEE_BPS_SINGLE_LEG)
+        );
+    }
+
+    #[test]
+    fn routes_through_the_dom_pay_the_single_leg_tier() {
+        for (from, to) in [
+            ("DOM", "BTC"),
+            ("BTC", "DOM"),
+            ("DOM", "USDT"),
+            ("USDT", "DOM"),
+        ] {
+            assert_eq!(swap::external_legs(from, to), Some(1), "{from}->{to}");
+            assert_eq!(
+                swap::fee_bps_for_route(from, to),
+                Some(swap::SWAP_FEE_BPS_SINGLE_LEG),
+                "{from}->{to}"
+            );
+        }
+    }
+
+    #[test]
+    fn routes_crossing_the_dom_pay_the_dual_leg_tier() {
+        // Same-asset round trips through the DOM are valid two-leg routes:
+        // BTC->DOM->BTC and EVM->DOM->EVM (operator, 2026-08-28).
+        for (from, to) in [
+            ("BTC", "USDT"),
+            ("USDT", "BTC"),
+            ("BTC", "BTC"),
+            ("USDT", "USDT"),
+        ] {
+            assert_eq!(swap::external_legs(from, to), Some(2), "{from}->{to}");
+            assert_eq!(
+                swap::fee_bps_for_route(from, to),
+                Some(swap::SWAP_FEE_BPS_DUAL_LEG),
+                "{from}->{to}"
+            );
+        }
+    }
+
+    #[test]
+    fn degenerate_routes_have_no_fee_tier() {
+        for (from, to) in [("ETH", "DOM"), ("DOM", "eth"), ("", "BTC")] {
+            assert_eq!(swap::external_legs(from, to), None, "{from}->{to}");
+            assert_eq!(swap::fee_bps_for_route(from, to), None, "{from}->{to}");
+        }
     }
 }

@@ -465,7 +465,7 @@ Its governing design, including the adjudicated product decisions, is [`docs/SWA
 Principles:
 
 - The counterparty legs use addresses derived from the same wallet seed: Taproot at `m/86'/0'` and EVM at `m/44'/60'`. Keys are derived on demand and never persisted.
-- The protocol fee is denominated in DOM over the DOM leg. At launch the DEPC-3 production-cost estimate is the conversion reference, and the user may pay the fee in DOM, BTC, or USDT.
+- The protocol fee is denominated in DOM over the DOM leg and tiered by route: 0.5% when at most one leg is external (DOM -> DOM, DOM <-> BTC or DOM <-> EVM), 1% when the route crosses the DOM between external assets (BTC <-> EVM, and same-asset round trips such as BTC -> DOM -> BTC). At launch the DEPC-3 production-cost estimate is the conversion reference, and the user may pay the fee in DOM, BTC, or USDT.
 - Every action is fail-closed: without a connected interop daemon, no intent is published, no quote is accepted, and no execution starts. The interface says so explicitly instead of pretending.
 - The frontend renders figures the backend computed; it performs no fee arithmetic of its own.
 
@@ -1075,7 +1075,6 @@ Confirm the installed version afterward.
 - Real-fund use is not authorized.
 - Public Mainnet validation is ongoing.
 - Swap execution is blocked until the interop daemon and the protocol-side compositor are frozen.
-- The swap protocol-fee rate is a working figure pending operator ratification.
 - Hardware-wallet support is not implemented.
 - Mobile versions are not implemented.
 - Automatic Slate transport is not guaranteed.
