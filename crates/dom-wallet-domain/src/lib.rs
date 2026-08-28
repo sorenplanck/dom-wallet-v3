@@ -1449,7 +1449,7 @@ impl WalletState {
             }
 
             let has_prepared_fields = reservation.change_commitment.is_some() == has_change
-                && (!reservation.change_output_bytes.is_empty()) == has_change
+                && reservation.change_output_bytes.is_empty() != has_change
                 && reservation.offset_contribution.is_some()
                 && reservation.wallet_excess_public_key.len() == 33
                 && reservation
@@ -1707,7 +1707,7 @@ impl WalletState {
             }
 
             let complete_material = reservation.output_commitment.is_some() == has_output
-                && (!reservation.output_bytes.is_empty()) == has_output
+                && reservation.output_bytes.is_empty() != has_output
                 && reservation.offset_contribution.is_some()
                 && reservation.payout_excess_public_key.len() == 33
                 && reservation
