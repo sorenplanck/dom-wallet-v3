@@ -4,8 +4,8 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/status-Experimental%20Desktop%20Wallet-b87333?style=flat-square" alt="Status: Experimental Desktop Wallet">
-  <img src="https://img.shields.io/badge/latest%20published-v0.1.1-7a4a22?style=flat-square" alt="Latest published version: v0.1.1">
-  <img src="https://img.shields.io/badge/next%20patch-v0.1.2%20in%20development-8a6a3f?style=flat-square" alt="Next patch: v0.1.2 in development">
+  <img src="https://img.shields.io/badge/latest%20tag-wallet--v0.3.2-7a4a22?style=flat-square" alt="Latest tag: wallet-v0.3.2">
+  <img src="https://img.shields.io/badge/development%20line-main--v0.4-8a6a3f?style=flat-square" alt="Development line: main-v0.4">
   <img src="https://img.shields.io/badge/network-DOM%20Mainnet-3d2f22?style=flat-square" alt="Network: DOM Mainnet">
   <img src="https://img.shields.io/badge/language-Rust-7a4a22?style=flat-square" alt="Language: Rust">
   <img src="https://img.shields.io/badge/license-MIT-8a6a3f?style=flat-square" alt="License: MIT">
@@ -44,44 +44,41 @@ Before using it, understand the following:
 
 ## Project Status
 
-### Latest published release
+### Latest tagged release
 
-`wallet-v0.1.1`
+`wallet-v0.3.2`
 
-The v0.1.1 patch corrected the packaged Tauri native-command bridge failure present in v0.1.0.
+The complete release history, with per-version artifacts and checksums, is published on the repository's GitHub Releases page.
 
-### Current development target
+### Current development line
 
-`wallet-v0.1.2`
+`main-v0.4`
 
-The v0.1.2 patch is being developed to complete the following work:
+The `main-v0.4` branch is the principal line. It integrates, on top of `wallet-v0.3.2`:
 
-- Mainnet-only user experience.
-- Preconfigured embedded-node networking.
-- Automatic connection to the official DOM Mainnet seeds.
-- Correct wallet cursor activation on a genesis-only chain.
-- Reliable peer and synchronization diagnostics.
-- Restoration of the local CPU mining interface.
-- Mining disabled by default.
-- Protocol-correct Slate v4 send and receive flows.
-- Removal of misleading unilateral address-transfer UX.
-- Packaged-runtime validation against the live Mainnet bootnode.
+- Estimated production cost per DOM (DEPC-3) derived exclusively from network difficulty and the live block subsidy, shown on the Mining screen.
+- Network fee display in the send flow, fail-closed: a payment is not created when the fee cannot be computed.
+- The Swap tab: intent, quotes, execution, and history screens, fail-closed until the interop daemon is connected. The governing design is [`docs/SWAP_TAB_DESIGN.md`](docs/SWAP_TAB_DESIGN.md).
+- Multichain derivation from the single wallet seed: BIP-86 Taproot (`m/86'/0'`) and EVM (`m/44'/60'`, EIP-55) accounts, derived on demand and never persisted, verified against the published BIP-86, BIP-350, and EIP-55 test vectors.
+- Wallet transport and embedded-node improvements: scriptless remote scan, outbound peer targeting, and miner integration.
+- Security hardening: bounded remote responses, strict base-URL and bearer-token validation, a restrictive content security policy, and zeroized handling of passwords and serialized secrets.
 
 ### Current release maturity
 
 | Area | State |
 |---|---|
 | Native desktop shell | Implemented |
-| Tauri command bridge | Implemented in v0.1.1 |
+| Tauri command bridge | Implemented |
 | Embedded DOM node | Implemented |
 | DOM Mainnet identity | Implemented |
 | BIP-39 wallet creation and restore | Implemented |
 | Recovery Capsule v1 | Implemented |
 | Chain-bound backup | Implemented |
 | Slate v4 protocol layer | Implemented |
-| Mainnet peer discovery | Under active correction for v0.1.2 |
-| Genesis-only cursor synchronization | Under active correction for v0.1.2 |
-| Full mining UI | Under active restoration for v0.1.2 |
+| Mining UI with production-cost estimate | Implemented on main-v0.4 |
+| Multichain derivation (Taproot + EVM) | Implemented on main-v0.4 |
+| Swap tab user interface | Implemented on main-v0.4, fail-closed |
+| Swap execution | Blocked on the interop daemon |
 | Packaged Mainnet acceptance | In progress |
 | Real-fund authorization | Not authorized |
 | Independent audit | Not completed |
@@ -156,7 +153,7 @@ Maximum theoretical issuance: 3,299,996,676,900,000 noms
 
 ## Mainnet-Only Product Direction
 
-Starting with the v0.1.2 product direction, the desktop Wallet is intended to operate as a Mainnet-only user application.
+The desktop Wallet operates as a Mainnet-only user application.
 
 The ordinary user interface must not require manual entry of:
 
@@ -461,6 +458,34 @@ Production code must not permit:
 
 ---
 
+## Swap
+
+The Swap tab is the user surface for cross-chain atomic swaps between DOM, BTC (Taproot), and EVM assets.
+
+Its governing design, including the adjudicated product decisions, is [`docs/SWAP_TAB_DESIGN.md`](docs/SWAP_TAB_DESIGN.md).
+
+Principles:
+
+- The counterparty legs use addresses derived from the same wallet seed: Taproot at `m/86'/0'` and EVM at `m/44'/60'`. Keys are derived on demand and never persisted.
+- The protocol fee is denominated in DOM over the DOM leg. At launch the DEPC-3 production-cost estimate is the conversion reference, and the user may pay the fee in DOM, BTC, or USDT.
+- Every action is fail-closed: without a connected interop daemon, no intent is published, no quote is accepted, and no execution starts. The interface says so explicitly instead of pretending.
+- The frontend renders figures the backend computed; it performs no fee arithmetic of its own.
+
+Swap execution remains blocked until the interop daemon and the wallet-pair compositor are frozen on the protocol side.
+
+---
+
+## Multichain Derivation
+
+The `dom-wallet-multichain` crate derives the swap-leg accounts from the wallet's BIP-39 seed:
+
+- Taproot: BIP-86 path `m/86'/0'`, BIP-341 key tweaking, bech32m (BIP-350) addresses.
+- EVM: path `m/44'/60'`, Keccak-256 of the uncompressed public key, EIP-55 checksummed addresses.
+
+The implementation is verified against the published BIP-86 end-to-end vectors, the BIP-350 examples, and the EIP-55 reference addresses. Derivation is deterministic and stateless: nothing derived is written to disk.
+
+---
+
 ## Mining
 
 DOM Wallet V3 is intended to restore the integrated local CPU mining experience available in earlier DOM wallet generations.
@@ -554,6 +579,18 @@ Metrics must come from the real miner runtime:
 
 The UI must not fabricate shares when the DOM miner does not implement pool-share semantics.
 
+### Estimated production cost
+
+The Mining screen shows the estimated production cost per DOM in USD.
+
+The estimate derives exclusively from:
+
+- the network difficulty of the next expected block;
+- the live block subsidy at the next height, so halvings are followed automatically;
+- the frozen DEPC-3 cost basket (`DEPC-3-2026H2`).
+
+It uses no price feed and no external oracle. It is a production-cost reference, not a market price. When any input is unavailable the value is simply absent; nothing is fabricated.
+
 ---
 
 ## Application Screens
@@ -566,6 +603,7 @@ The target desktop application includes:
 - Send.
 - Receive.
 - Transactions.
+- Swap.
 - Recovery.
 - Backup.
 - Node.
@@ -689,7 +727,18 @@ Independent-audit claim: none
 | `crates/dom-wallet-chain` | Chain source, synchronization, cursor, and reorganization handling. |
 | `crates/dom-wallet-protocol` | Revision-pinned DOM transaction, Slate, fee, proof, and serialization adapter. |
 | `crates/dom-wallet-core` | Wallet lifecycle, orchestration, diagnostics, recovery, and capability APIs. |
-| `crates/dom-wallet-tauri-shell` | Native Tauri command boundary and packaged desktop runtime. |
+| `crates/dom-wallet-core-protocol` | Core protocol contracts shared by the lifecycle crates. |
+| `crates/dom-wallet-core-recovery` | Recovery Capsule creation and resumption. |
+| `crates/dom-wallet-core-restore` | Seed restore staging and destination handling. |
+| `crates/dom-wallet-core-submit` | Transaction submission. |
+| `crates/dom-wallet-core-sync` | Cursor synchronization. |
+| `crates/dom-wallet-embedded-core` | Embedded DOM node integration, mining runtime, and network economics. |
+| `crates/dom-wallet-production-backend` | Production wallet backend: canonical state, persistence, reconciliation. |
+| `crates/dom-wallet-remote-source` | Bounded, schema-validated remote scan source. |
+| `crates/dom-wallet-multichain` | Taproot and EVM account derivation from the wallet seed. |
+| `crates/dom-wallet-node-manager` | Managed node lifecycle. |
+| `crates/dom-wallet-updater` | Signed wallet update feed. |
+| `src-tauri` | Native Tauri command boundary and packaged desktop runtime. |
 | `frontend` | Desktop user interface. |
 | `.github/workflows` | Validation and multiplatform release automation. |
 | `docs` | Architecture, implementation, release, and operational documentation. |
@@ -832,46 +881,21 @@ Compare the result with the checksum published in the corresponding GitHub Relea
 
 ## Release History
 
-### v0.1.0
+The authoritative per-version record — artifacts, checksums, and release notes from `wallet-v0.1.0` through `wallet-v0.3.2` — is the repository's GitHub Releases page.
 
-First experimental public desktop release.
+### wallet-v0.3.2
 
-Known packaged-runtime defect:
+Latest tagged release and the base of the current line. It carries the restored remote-scan redesign and the full regression suite that the `main-v0.4` line builds on.
 
-- Native Tauri command bridge could be unavailable.
-- Buttons could render but remain nonfunctional.
+### main-v0.4
 
-v0.1.0 should be treated as superseded.
+The principal development line. It merges into one branch, on top of `wallet-v0.3.2`:
 
-### v0.1.1
-
-Native bridge correction.
-
-Validated:
-
-- Packaged Tauri bridge.
-- Native command invocation.
-- Linux, Windows, and macOS packaging.
-- Release checksums.
-- Experimental release workflow.
-
-Known active issue:
-
-- Mainnet embedded-node peer discovery and cursor activation require correction.
-
-### v0.1.2
-
-In development.
-
-Planned focus:
-
-- Mainnet-only product flow.
-- Preconfigured server and node settings.
-- Real P2P connection to the official bootnode.
-- Cursor activation at height `0`.
-- Improved peer and sync diagnostics.
-- Restored mining module.
-- Protocol-correct Slate v4 interface.
+- the mining production-cost estimate (DEPC-3) and the fail-closed send-flow fee display;
+- the Swap tab and its adjudicated design;
+- multichain derivation (Taproot and EVM) from the single wallet seed;
+- wallet transport and embedded-node improvements;
+- security hardening across the remote source, the storage layer, and the desktop shell.
 
 ---
 
@@ -1052,8 +1076,8 @@ Confirm the installed version afterward.
 - Unsigned installers.
 - Real-fund use is not authorized.
 - Public Mainnet validation is ongoing.
-- Mining UI restoration is still in development until v0.1.2 is completed.
-- Mainnet peer and cursor behavior is under active correction until v0.1.2 is completed.
+- Swap execution is blocked until the interop daemon and the protocol-side compositor are frozen.
+- The swap protocol-fee rate is a working figure pending operator ratification.
 - Hardware-wallet support is not implemented.
 - Mobile versions are not implemented.
 - Automatic Slate transport is not guaranteed.
@@ -1064,17 +1088,11 @@ Confirm the installed version afterward.
 
 ## Roadmap
 
-### v0.1.2
+### v0.4 line
 
-- Mainnet-only user flow.
-- Internal server configuration.
-- Official seed bootstrap.
-- Embedded-node Mainnet connectivity.
-- Cursor activation at genesis.
-- Peer diagnostics.
-- Mining controls.
-- Slate v4 UX correction.
-- Packaged live-node acceptance.
+- Ratify the final swap protocol-fee rate.
+- Connect the Swap tab to the interop daemon once the protocol-side session store and wallet-pair compositor are frozen.
+- Packaged live-node acceptance of the integrated line.
 
 ### Near-term
 
@@ -1140,6 +1158,7 @@ Core documentation is maintained in:
 - [`docs/BUILD_AND_RUN.md`](docs/BUILD_AND_RUN.md)
 - [`docs/TRANSACTION_ENGINE.md`](docs/TRANSACTION_ENGINE.md)
 - [`docs/MANUAL_SLATE_EXCHANGE.md`](docs/MANUAL_SLATE_EXCHANGE.md)
+- [`docs/SWAP_TAB_DESIGN.md`](docs/SWAP_TAB_DESIGN.md)
 - [`reports/`](reports/)
 
 Some historical documents describe earlier project phases and may not reflect the latest release state. The tagged source, current README, release report, and release manifest take precedence for a specific version.
