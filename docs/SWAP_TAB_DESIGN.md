@@ -276,6 +276,14 @@ requirements, no allowlist) is a stated commitment, not an afterthought.
   is treated as the USD leg directly, and the BTC rate is taken from the
   accepted quote's own implied exchange ratio. The exact figures and the
   DEPC basket version are recorded in the swap history entry.
+- **The rule is uniform across payment assets — operator, 2026-08-28:**
+  the fee is the tier percentage of the operation's dollar value,
+  whatever the asset. A US$1,000 operation pays the same fee whether it
+  moves USDT or BTC. USDT realizes that dollar value directly; BTC
+  realizes it through the operation's own rate chain — the accepted
+  quote's implied BTC/DOM ratio times the DEPC reference — so the BTC
+  figure is fixed at quote acceptance rather than estimated beforehand.
+  Reaffirmed with the no-external-feed rule on 2026-08-28.
 
 **Accepted deviation — recorded, not overlooked.** Charging the fee in BTC
 or USDT at launch relaxes the strict fee-in-DOM posture and its

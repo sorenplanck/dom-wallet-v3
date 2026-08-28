@@ -496,7 +496,18 @@ const renderSwapFee = (quote) => {
   const usd = quote.fee_usd_estimated != null
     ? ` (~US$ ${Number(quote.fee_usd_estimated).toPrecision(3)}, ${quote.depc_basket_version} estimate)`
     : "";
-  swapFeeSummary().textContent = `Protocol fee ${quote.fee_percent}% (${quote.external_legs === 0 ? "DOM only" : quote.external_legs === 1 ? "one external leg" : "two external legs"}): ${quote.fee_noms} noms (${dom} DOM), paid in ${quote.payment_asset}${usd}.`;
+  const legs = quote.external_legs === 0 ? "DOM only" : quote.external_legs === 1 ? "one external leg" : "two external legs";
+  let paid;
+  if (quote.payment_asset === "DOM") {
+    paid = `paid in DOM`;
+  } else if (quote.payment_asset === "USDT") {
+    paid = quote.fee_payment_estimated != null
+      ? `payable as ~${Number(quote.fee_payment_estimated).toPrecision(3)} USDT at the ${quote.depc_basket_version} production-cost reference`
+      : `payable in USDT once the node can supply the production-cost reference`;
+  } else {
+    paid = `payable as the same US$ value in BTC, fixed at the rate implied by the quote you accept`;
+  }
+  swapFeeSummary().textContent = `Protocol fee ${quote.fee_percent}% (${legs}): ${quote.fee_noms} noms (${dom} DOM), ${paid}${usd}.`;
 };
 const previewSwapFee = async () => {
   const data = new FormData(byId("swap-intent-form"));

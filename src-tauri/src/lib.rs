@@ -1236,6 +1236,11 @@ pub struct SwapFeeQuoteDto {
     pub fee_noms: u64,
     pub payment_asset: String,
     pub fee_usd_estimated: Option<f64>,
+    /// Fee expressed in the chosen payment asset. Exact for DOM; for USDT
+    /// it is the DEPC-referenced launch estimate (USDT treated as the USD
+    /// leg, per the adjudicated fee decision); absent for BTC, whose rate
+    /// exists only in an accepted quote's implied ratio.
+    pub fee_payment_estimated: Option<f64>,
     pub depc_basket_version: String,
 }
 
@@ -3315,6 +3320,11 @@ impl DesktopApplication {
             fee_noms,
             payment_asset: payment_asset.to_owned(),
             fee_usd_estimated,
+            fee_payment_estimated: match payment_asset {
+                "DOM" => Some(fee_noms as f64 / 100_000_000.0),
+                "USDT" => fee_usd_estimated,
+                _ => None,
+            },
             depc_basket_version: depc::DEPC_BASKET_VERSION.to_owned(),
         })
     }
