@@ -90,6 +90,7 @@ export function selectScreen(name) {
 document.querySelectorAll("[data-screen]").forEach((button) => button.addEventListener("click", () => {
   selectScreen(button.dataset.screen);
   if (button.dataset.screen === "mining") refreshMining().catch((error) => show(redactedError(error), true));
+  if (button.dataset.screen === "swap") refreshSwap().catch((error) => show(redactedError(error), true));
   if (button.dataset.screen === "node") refreshNode().catch((error) => show(redactedError(error), true));
   if (button.dataset.screen === "history") run(renderHistory).catch((error) => show(redactedError(error), true));
   if (button.dataset.screen === "dashboard" || button.dataset.screen === "diagnostics") refreshSummary().catch((error) => show(redactedError(error), true));
@@ -483,6 +484,66 @@ const renderMiningUnavailable = (node) => {
   byId("mining-start").disabled = true;
   byId("mining-stop").disabled = true;
 };
+// ── Swap tab ────────────────────────────────────────────────────────────────
+// The flow commands fail closed until the interop daemon channel lands; this
+// UI surfaces that honestly instead of fabricating quotes or sessions.
+const SWAP_DAEMON_MESSAGE = "The interop daemon is not connected";
+const swapDaemonBanner = () => byId("swap-daemon-banner");
+const markSwapDaemon = (offline) => { swapDaemonBanner().hidden = !offline; };
+const swapFeeSummary = () => byId("swap-fee-summary");
+const renderSwapFee = (quote) => {
+  const dom = (quote.fee_noms / 100000000).toLocaleString("en-US", { maximumFractionDigits: 8 });
+  const usd = quote.fee_usd_estimated != null
+    ? ` (~US$ ${Number(quote.fee_usd_estimated).toPrecision(3)}, ${quote.depc_basket_version} estimate)`
+    : "";
+  swapFeeSummary().textContent = `Protocol fee ${quote.fee_bps} bps: ${quote.fee_noms} noms (${dom} DOM), paid in ${quote.payment_asset}${usd}.`;
+};
+const previewSwapFee = async () => {
+  const data = new FormData(byId("swap-intent-form"));
+  const amount = integerNoms(data.get("amount"));
+  const quote = await run(() => invoke("swap_fee_quote", { amount, paymentAsset: byId("swap-fee-asset").value }));
+  if (quote) renderSwapFee(quote);
+};
+const refreshSwap = async () => {
+  try {
+    await invoke("swap_session_status");
+    markSwapDaemon(false);
+  } catch {
+    markSwapDaemon(true);
+  }
+};
+byId("swap-fee-preview").addEventListener("click", () => previewSwapFee().catch((error) => {
+  swapFeeSummary().textContent = "The fee could not be computed.";
+  show(redactedError(error), true);
+}));
+byId("swap-addresses-refresh").addEventListener("click", async () => {
+  try {
+    const value = await run(() => invoke("swap_leg_addresses"));
+    if (!value) return;
+    byId("swap-btc-address").textContent = value.bitcoin_address;
+    byId("swap-evm-address").textContent = value.evm_address;
+  } catch (error) { show(redactedError(error), true); }
+});
+byId("swap-intent-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  try {
+    await previewSwapFee();
+    await run(() => invoke("swap_intent_create"));
+    show("Swap intent published.");
+  } catch (error) {
+    markSwapDaemon(true);
+    show(`${SWAP_DAEMON_MESSAGE}; the intent was not published.`, true);
+  }
+});
+byId("swap-quotes-refresh").addEventListener("click", async () => {
+  try { await run(() => invoke("swap_quotes_list")); }
+  catch { markSwapDaemon(true); byId("swap-quotes-list").textContent = `${SWAP_DAEMON_MESSAGE}; no quotes were fetched.`; }
+});
+byId("swap-history-refresh").addEventListener("click", async () => {
+  try { await run(() => invoke("swap_history")); }
+  catch { markSwapDaemon(true); byId("swap-history-list").textContent = `${SWAP_DAEMON_MESSAGE}; history is unavailable.`; }
+});
+
 const refreshMining = async () => {
   const [nodeResult, miningResult] = await Promise.allSettled([
     invoke("embedded_node_status"),
