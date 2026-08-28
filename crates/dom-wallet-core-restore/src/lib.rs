@@ -26,6 +26,8 @@ use std::{
     fmt, fs,
     path::{Path, PathBuf},
     sync::Arc,
+    thread,
+    time::Duration,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -35,6 +37,12 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 pub const DEFAULT_RESTORE_BATCH_BLOCKS: u64 = 256;
 /// Default bounded canonical reorganization search.
 pub const DEFAULT_RESTORE_REORG_DEPTH: u64 = 1_024;
+/// Maximum transient Core lock collisions retried for one restore page.
+pub const DEFAULT_RESTORE_BUSY_RETRY_ATTEMPTS: u32 = 12;
+/// Initial bounded delay after a transient Core lock collision.
+pub const DEFAULT_RESTORE_BUSY_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(10);
+/// Maximum delay between transient Core lock retries.
+pub const DEFAULT_RESTORE_BUSY_RETRY_MAX_DELAY: Duration = Duration::from_millis(250);
 
 /// Safe completion classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +111,8 @@ pub enum SeedRestoreError {
     ChainIdentityMismatch,
     #[error("canonical scan contract failed")]
     CanonicalScan,
+    #[error("Core is temporarily busy while synchronizing")]
+    CoreBusy,
     #[error("canonical recovery data is malformed")]
     MalformedRecovery,
     #[error("restored output metadata conflicts")]
@@ -123,6 +133,9 @@ pub struct SeedRestoreService {
     expected_identity: CoreChainIdentity,
     batch_blocks: u64,
     reorg_depth: u64,
+    busy_retry_attempts: u32,
+    busy_retry_initial_delay: Duration,
+    busy_retry_max_delay: Duration,
     kdf: KdfParameters,
 }
 
@@ -134,6 +147,7 @@ impl fmt::Debug for SeedRestoreService {
             .field("chain_id", &"[PUBLIC CHAIN ID]")
             .field("batch_blocks", &self.batch_blocks)
             .field("reorg_depth", &self.reorg_depth)
+            .field("busy_retry_attempts", &self.busy_retry_attempts)
             .finish_non_exhaustive()
     }
 }
@@ -149,6 +163,9 @@ impl SeedRestoreService {
             expected_identity,
             batch_blocks: DEFAULT_RESTORE_BATCH_BLOCKS,
             reorg_depth: DEFAULT_RESTORE_REORG_DEPTH,
+            busy_retry_attempts: DEFAULT_RESTORE_BUSY_RETRY_ATTEMPTS,
+            busy_retry_initial_delay: DEFAULT_RESTORE_BUSY_RETRY_INITIAL_DELAY,
+            busy_retry_max_delay: DEFAULT_RESTORE_BUSY_RETRY_MAX_DELAY,
             kdf,
         }
     }
@@ -156,6 +173,22 @@ impl SeedRestoreService {
     pub fn with_limits(mut self, batch_blocks: u64, reorg_depth: u64) -> Self {
         self.batch_blocks = batch_blocks;
         self.reorg_depth = reorg_depth;
+        self
+    }
+
+    /// Override the bounded transient-Core retry policy.
+    ///
+    /// Production uses short exponential backoff. Tests may use zero delays
+    /// while retaining the same attempt accounting.
+    pub fn with_busy_retry_policy(
+        mut self,
+        attempts: u32,
+        initial_delay: Duration,
+        max_delay: Duration,
+    ) -> Self {
+        self.busy_retry_attempts = attempts;
+        self.busy_retry_initial_delay = initial_delay;
+        self.busy_retry_max_delay = max_delay.max(initial_delay);
         self
     }
 
@@ -224,9 +257,26 @@ impl SeedRestoreService {
         destination: impl AsRef<Path>,
     ) -> Result<SeedRestoreResult, SeedRestoreError> {
         let mut session = self.begin(mnemonic, password, destination)?;
+        let mut busy_attempts = 0;
+        let mut busy_delay = self.busy_retry_initial_delay;
         loop {
-            if session.advance_once()? == SeedRestoreProgress::ReadyToPublish {
-                return session.publish();
+            match session.advance_once() {
+                Ok(SeedRestoreProgress::ReadyToPublish) => return session.publish(),
+                Ok(_) => {
+                    busy_attempts = 0;
+                    busy_delay = self.busy_retry_initial_delay;
+                }
+                Err(SeedRestoreError::CoreBusy) if busy_attempts < self.busy_retry_attempts => {
+                    busy_attempts += 1;
+                    if !busy_delay.is_zero() {
+                        thread::sleep(busy_delay);
+                    }
+                    busy_delay = busy_delay
+                        .checked_mul(2)
+                        .unwrap_or(self.busy_retry_max_delay)
+                        .min(self.busy_retry_max_delay);
+                }
+                Err(error) => return Err(error),
             }
         }
     }
@@ -275,11 +325,11 @@ impl SeedRestoreSession {
             kdf: self.kdf,
             last_error: None,
         };
-        let reconciliation = self.adapter.reconcile_once(&mut sink);
-        if let Err(error) = reconciliation {
-            return Err(sink.last_error.unwrap_or_else(|| map_scan_error(error)));
-        }
-        match reconciliation.expect("checked above") {
+        let reconciliation = self
+            .adapter
+            .reconcile_once(&mut sink)
+            .map_err(|error| sink.last_error.unwrap_or_else(|| map_scan_error(error)))?;
+        match reconciliation {
             CoreReconcileResult::NoChanges => {
                 self.ready_to_publish = true;
                 Ok(SeedRestoreProgress::ReadyToPublish)
@@ -911,6 +961,7 @@ fn map_scan_error(error: CoreScanError) -> SeedRestoreError {
         | CoreScanError::IdentityMismatch { .. }
         | CoreScanError::CursorIdentityMismatch => SeedRestoreError::ChainIdentityMismatch,
         CoreScanError::Persistence => SeedRestoreError::Storage,
+        CoreScanError::CoreNotReady => SeedRestoreError::CoreBusy,
         _ => SeedRestoreError::CanonicalScan,
     }
 }

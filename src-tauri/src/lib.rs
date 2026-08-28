@@ -11,10 +11,19 @@ use dom_wallet_core::{
     RecoveryRestoreResult, SlateExport, TransactionSummary, WalletService, WalletSummary,
 };
 use dom_wallet_core_api::CoreNetwork;
+use dom_wallet_core_restore::SeedRestoreError;
 use dom_wallet_domain::{BalanceProjection, Network, NetworkIdentity};
 use dom_wallet_embedded_core::{
     mine_wallet_block, EmbeddedCoreConfiguration, WalletMiningOutcome, MAINNET_BOOTSTRAP_FALLBACK,
-    MAINNET_DNS_SEEDS,
+    MAINNET_BOOTSTRAP_PEERS, MAINNET_DNS_SEEDS,
+};
+use dom_wallet_node_manager::{
+    ManagedNodeConfig, NodeManager, NodeReleaseMetadata, SidecarStatus,
+    EXPERIMENTAL_ENABLE_CONFIRMATION,
+};
+use dom_wallet_updater::{
+    NodeUpdaterState, WalletUpdaterState, EMBEDDED_NODE_REVISION, UPDATE_CHANNEL,
+    UPDATE_INTERVAL_SECONDS,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -22,7 +31,11 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
-use std::{net::SocketAddr, path::Path, thread::JoinHandle};
+use std::{
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    thread::JoinHandle,
+};
 use thiserror::Error;
 
 pub struct DesktopApplication {
@@ -32,11 +45,16 @@ pub struct DesktopApplication {
     last_peer_connected_unix_seconds: AtomicU64,
     synchronization_paused: AtomicBool,
     mining: Mutex<MiningRuntime>,
+    sidecar: Mutex<NodeManager>,
     shutdown: AtomicBool,
 }
 
-pub const COMMAND_NAMES: [&str; 56] = [
+pub const COMMAND_NAMES: [&str; 67] = [
     "native_bridge_status",
+    "get_build_info",
+    "update_status",
+    "check_updates_now",
+    "check_node_now",
     "application_status",
     "wallet_create_recoverable",
     "wallet_restore_from_mnemonic",
@@ -51,7 +69,14 @@ pub const COMMAND_NAMES: [&str; 56] = [
     "account_list",
     "account_summary",
     "embedded_node_start",
+    "embedded_node_stop",
     "embedded_node_status",
+    "experimental_sidecar_status",
+    "experimental_sidecar_enable",
+    "experimental_sidecar_disable",
+    "experimental_sidecar_start",
+    "experimental_sidecar_stop",
+    "experimental_sidecar_evaluate_release",
     "node_network_status",
     "node_peer_status",
     "wallet_sync_status",
@@ -96,6 +121,255 @@ pub const COMMAND_NAMES: [&str; 56] = [
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct BuildInfoDto {
+    pub wallet_version: &'static str,
+    pub wallet_revision: &'static str,
+    pub embedded_node_version: &'static str,
+    pub embedded_node_revision: &'static str,
+    pub update_channel: &'static str,
+}
+
+pub fn get_build_info() -> BuildInfoDto {
+    BuildInfoDto {
+        wallet_version: env!("CARGO_PKG_VERSION"),
+        wallet_revision: option_env!("DOM_WALLET_REVISION").unwrap_or("UNAVAILABLE"),
+        embedded_node_version: option_env!("DOM_NODE_VERSION").unwrap_or("0.1.0"),
+        embedded_node_revision: EMBEDDED_NODE_REVISION,
+        update_channel: UPDATE_CHANNEL,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateStatusDto {
+    pub automatic_updates: bool,
+    pub signature_key_configured: bool,
+    pub channel: &'static str,
+    pub wallet: WalletUpdaterStatusDto,
+    pub node: NodeUpdaterStatusDto,
+    pub peers: PeerUpdaterStatusDto,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WalletUpdaterStatusDto {
+    pub installed_version: &'static str,
+    pub installed_revision: &'static str,
+    pub available_version: Option<String>,
+    pub state: WalletUpdaterState,
+    pub last_check_unix_seconds: Option<u64>,
+    pub next_check_unix_seconds: Option<u64>,
+    pub progress_percent: Option<u8>,
+    pub sanitized_error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeUpdaterStatusDto {
+    pub active_version: &'static str,
+    pub active_revision: &'static str,
+    pub previous_version: Option<String>,
+    pub previous_revision: Option<String>,
+    pub available_version: Option<String>,
+    pub available_revision: Option<String>,
+    pub compatibility: String,
+    pub state: NodeUpdaterState,
+    pub last_check_unix_seconds: Option<u64>,
+    pub progress_percent: Option<u8>,
+    pub sanitized_error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerUpdaterStatusDto {
+    pub state: String,
+    pub sequence: u64,
+    pub last_check_unix_seconds: Option<u64>,
+    pub active_peers: Vec<String>,
+    pub sanitized_error: Option<String>,
+}
+
+pub struct UpdateControl {
+    status: Mutex<UpdateStatusDto>,
+    check_in_progress: AtomicBool,
+}
+
+impl UpdateControl {
+    pub fn new(signature_key_configured: bool) -> Self {
+        let build = get_build_info();
+        Self {
+            status: Mutex::new(UpdateStatusDto {
+                automatic_updates: true,
+                signature_key_configured,
+                channel: UPDATE_CHANNEL,
+                wallet: WalletUpdaterStatusDto {
+                    installed_version: build.wallet_version,
+                    installed_revision: build.wallet_revision,
+                    available_version: None,
+                    state: WalletUpdaterState::Idle,
+                    last_check_unix_seconds: None,
+                    next_check_unix_seconds: None,
+                    progress_percent: None,
+                    sanitized_error: None,
+                },
+                node: NodeUpdaterStatusDto {
+                    active_version: build.embedded_node_version,
+                    active_revision: build.embedded_node_revision,
+                    previous_version: None,
+                    previous_revision: None,
+                    available_version: None,
+                    available_revision: None,
+                    compatibility: "RPC_BUILD_INFO_PENDING".into(),
+                    state: NodeUpdaterState::Idle,
+                    last_check_unix_seconds: None,
+                    progress_percent: None,
+                    sanitized_error: None,
+                },
+                peers: PeerUpdaterStatusDto {
+                    state: "IDLE".into(),
+                    sequence: 0,
+                    last_check_unix_seconds: None,
+                    active_peers: MAINNET_BOOTSTRAP_PEERS
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                    sanitized_error: None,
+                },
+            }),
+            check_in_progress: AtomicBool::new(false),
+        }
+    }
+
+    pub fn snapshot(&self) -> UpdateStatusDto {
+        self.status
+            .lock()
+            .map(|status| status.clone())
+            .unwrap_or_else(|_| UpdateStatusDto {
+                automatic_updates: true,
+                signature_key_configured: false,
+                channel: UPDATE_CHANNEL,
+                wallet: WalletUpdaterStatusDto {
+                    installed_version: env!("CARGO_PKG_VERSION"),
+                    installed_revision: "UNAVAILABLE",
+                    available_version: None,
+                    state: WalletUpdaterState::Failed,
+                    last_check_unix_seconds: None,
+                    next_check_unix_seconds: None,
+                    progress_percent: None,
+                    sanitized_error: Some("UPDATE_STATE_UNAVAILABLE".into()),
+                },
+                node: NodeUpdaterStatusDto {
+                    active_version: "UNAVAILABLE",
+                    active_revision: "UNAVAILABLE",
+                    previous_version: None,
+                    previous_revision: None,
+                    available_version: None,
+                    available_revision: None,
+                    compatibility: "UNKNOWN".into(),
+                    state: NodeUpdaterState::Failed,
+                    last_check_unix_seconds: None,
+                    progress_percent: None,
+                    sanitized_error: Some("UPDATE_STATE_UNAVAILABLE".into()),
+                },
+                peers: PeerUpdaterStatusDto {
+                    state: "FAILED".into(),
+                    sequence: 0,
+                    last_check_unix_seconds: None,
+                    active_peers: Vec::new(),
+                    sanitized_error: Some("UPDATE_STATE_UNAVAILABLE".into()),
+                },
+            })
+    }
+
+    pub fn begin_check(&self, now: u64) -> bool {
+        if self
+            .check_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        if let Ok(mut status) = self.status.lock() {
+            status.wallet.state = WalletUpdaterState::Checking;
+            status.node.state = NodeUpdaterState::Checking;
+            status.peers.state = "CHECKING".into();
+            status.wallet.last_check_unix_seconds = Some(now);
+            status.wallet.next_check_unix_seconds = Some(now + UPDATE_INTERVAL_SECONDS);
+            status.node.last_check_unix_seconds = Some(now);
+            status.peers.last_check_unix_seconds = Some(now);
+            status.wallet.sanitized_error = None;
+            status.node.sanitized_error = None;
+            status.peers.sanitized_error = None;
+        }
+        true
+    }
+
+    pub fn finish_check_without_key(&self) {
+        if let Ok(mut status) = self.status.lock() {
+            status.wallet.state = WalletUpdaterState::Failed;
+            status.wallet.sanitized_error = Some("UPDATE_SIGNATURE_KEY_UNAVAILABLE".into());
+            status.node.state = NodeUpdaterState::Failed;
+            status.node.sanitized_error = Some("UPDATE_SIGNATURE_KEY_UNAVAILABLE".into());
+            status.peers.state = "FAILED".into();
+            status.peers.sanitized_error = Some("PEER_SIGNATURE_KEY_UNAVAILABLE".into());
+        }
+        self.check_in_progress.store(false, Ordering::Release);
+    }
+
+    pub fn finish_network_check(
+        &self,
+        wallet_available: Option<String>,
+        wallet_error: Option<&'static str>,
+    ) {
+        if let Ok(mut status) = self.status.lock() {
+            status.wallet.available_version = wallet_available;
+            status.wallet.state = if status.wallet.available_version.is_some() {
+                WalletUpdaterState::WalletUpdateAvailable
+            } else if wallet_error.is_some() {
+                WalletUpdaterState::Failed
+            } else {
+                WalletUpdaterState::UpToDate
+            };
+            status.wallet.sanitized_error = wallet_error.map(str::to_owned);
+            status.node.state = NodeUpdaterState::Failed;
+            status.node.sanitized_error = Some("NODE_RPC_BUILD_INFO_PENDING".into());
+            status.peers.state = "FALLBACK_ACTIVE".into();
+            status.peers.sanitized_error = Some("PEER_MANIFEST_NOT_ACTIVATED".into());
+        }
+        self.check_in_progress.store(false, Ordering::Release);
+    }
+
+    pub fn set_wallet_download_state(&self, state: WalletUpdaterState, progress: Option<u8>) {
+        if let Ok(mut status) = self.status.lock() {
+            status.wallet.state = state;
+            status.wallet.progress_percent = progress;
+        }
+    }
+
+    pub fn fail_wallet_check(&self, error: &'static str) {
+        if let Ok(mut status) = self.status.lock() {
+            status.wallet.state = WalletUpdaterState::Failed;
+            status.wallet.sanitized_error = Some(error.into());
+            status.node.state = NodeUpdaterState::Failed;
+            status.node.sanitized_error = Some("NODE_RPC_BUILD_INFO_PENDING".into());
+            status.peers.state = "FALLBACK_ACTIVE".into();
+            status.peers.sanitized_error = Some("PEER_MANIFEST_NOT_ACTIVATED".into());
+        }
+        self.check_in_progress.store(false, Ordering::Release);
+    }
+
+    pub fn defer_wallet_install(&self, version: String) {
+        if let Ok(mut status) = self.status.lock() {
+            status.wallet.available_version = Some(version);
+            status.wallet.state = WalletUpdaterState::WaitingForSafePoint;
+            status.wallet.sanitized_error = Some("UPDATE_BUSY_CRITICAL_OPERATION".into());
+        }
+        self.check_in_progress.store(false, Ordering::Release);
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct NativeBridgeStatusDto {
     pub bridge: &'static str,
     pub app_version: &'static str,
@@ -117,6 +391,7 @@ impl Default for DesktopApplication {
             last_peer_connected_unix_seconds: AtomicU64::new(0),
             synchronization_paused: AtomicBool::new(false),
             mining: Mutex::new(MiningRuntime::default()),
+            sidecar: Mutex::new(NodeManager::default()),
             shutdown: AtomicBool::new(false),
         }
     }
@@ -156,6 +431,9 @@ pub struct EmbeddedNodeStatusDto {
     pub error_code: Option<String>,
     pub connected_peers: u64,
     pub bootstrap_phase: String,
+    pub highest_known_peer_height: Option<u64>,
+    pub synchronization_progress_percent: Option<u64>,
+    pub status_message: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -198,7 +476,9 @@ pub struct NodeNetworkStatusDto {
 pub struct WalletSyncStatusDto {
     pub state: String,
     pub cursor_height: Option<u64>,
+    pub cursor_hash: Option<String>,
     pub canonical_height: Option<u64>,
+    pub canonical_hash: Option<String>,
     pub synchronized: bool,
     pub paused: bool,
     pub last_result: String,
@@ -218,6 +498,7 @@ struct MiningRuntime {
     hash_attempts: Arc<AtomicU64>,
     accepted_blocks: Arc<AtomicU64>,
     rejected_work: Arc<AtomicU64>,
+    template_refreshes: Arc<AtomicU64>,
     last_candidate_time: Arc<AtomicU64>,
     last_accepted_height: Arc<AtomicU64>,
     started_at: Arc<AtomicU64>,
@@ -233,6 +514,7 @@ impl Default for MiningRuntime {
             hash_attempts: Arc::new(AtomicU64::new(0)),
             accepted_blocks: Arc::new(AtomicU64::new(0)),
             rejected_work: Arc::new(AtomicU64::new(0)),
+            template_refreshes: Arc::new(AtomicU64::new(0)),
             last_candidate_time: Arc::new(AtomicU64::new(0)),
             last_accepted_height: Arc::new(AtomicU64::new(u64::MAX)),
             started_at: Arc::new(AtomicU64::new(0)),
@@ -266,6 +548,7 @@ pub struct MiningStatusDto {
     pub connected_peers: u64,
     pub accepted_blocks: u64,
     pub rejected_work: u64,
+    pub template_refreshes: u64,
     pub last_block_candidate_time: Option<u64>,
     pub last_accepted_block_height: Option<u64>,
     pub uptime_seconds: u64,
@@ -352,16 +635,130 @@ pub struct SlateQrReassemblyDto {
 }
 
 impl DesktopApplication {
-    pub fn application_status(&self) -> ApplicationStatusDto {
-        let diagnostic = self
+    pub fn configure_sidecar_runtime(
+        &self,
+        runtime_root: impl Into<std::path::PathBuf>,
+    ) -> Result<(), CommandError> {
+        self.sidecar
+            .lock()
+            .map_err(|_| CommandError::Unavailable)?
+            .configure_runtime(runtime_root)
+            .map_err(|_| CommandError::Unavailable)?;
+        Ok(())
+    }
+
+    pub fn experimental_sidecar_status(&self) -> Result<SidecarStatus, CommandError> {
+        self.sidecar
+            .lock()
+            .map_err(|_| CommandError::Unavailable)
+            .map(|mut manager| manager.status())
+    }
+
+    pub fn experimental_sidecar_enable(
+        &self,
+        confirmation: &str,
+    ) -> Result<SidecarStatus, CommandError> {
+        self.ensure_running()?;
+        let unlocked = self
             .service
             .lock()
-            .expect("application mutex poisoned")
-            .diagnostics();
-        ApplicationStatusDto {
-            state: diagnostic.application_state,
-            experimental: true,
-            unaudited: true,
+            .map_err(|_| CommandError::Unavailable)?
+            .summary()
+            .is_ok();
+        let mut manager = self.sidecar.lock().map_err(|_| CommandError::Unavailable)?;
+        manager
+            .enable_for_session(confirmation, unlocked)
+            .map_err(|_| {
+                CommandError::InvalidInput(format!(
+                    "sidecar activation requires an unlocked wallet and exact confirmation: {EXPERIMENTAL_ENABLE_CONFIRMATION}"
+                ))
+            })?;
+        Ok(manager.status())
+    }
+
+    pub fn experimental_sidecar_disable(&self) -> Result<SidecarStatus, CommandError> {
+        let mut manager = self.sidecar.lock().map_err(|_| CommandError::Unavailable)?;
+        manager
+            .disable_for_session()
+            .map_err(|_| CommandError::Unavailable)?;
+        Ok(manager.status())
+    }
+
+    pub fn experimental_sidecar_start(
+        &self,
+        configuration: ManagedNodeConfig,
+    ) -> Result<SidecarStatus, CommandError> {
+        self.ensure_running()?;
+        let mut manager = self.sidecar.lock().map_err(|_| CommandError::Unavailable)?;
+        manager
+            .start_active(configuration)
+            .map_err(|_| CommandError::NodeNotReady)?;
+        Ok(manager.status())
+    }
+
+    pub fn experimental_sidecar_stop(&self) -> Result<SidecarStatus, CommandError> {
+        let mut manager = self.sidecar.lock().map_err(|_| CommandError::Unavailable)?;
+        manager.shutdown().map_err(|_| CommandError::Unavailable)?;
+        Ok(manager.status())
+    }
+
+    pub fn experimental_sidecar_evaluate_release(
+        &self,
+        node_feed_json: Option<&str>,
+        sidecar_manifest_json: Option<&str>,
+        sidecar_manifest_signature: Option<&str>,
+        platform: &str,
+    ) -> Result<NodeReleaseMetadata, CommandError> {
+        self.ensure_running()?;
+        self.sidecar
+            .lock()
+            .map_err(|_| CommandError::Unavailable)?
+            .evaluate_running_signed_release_metadata(
+                node_feed_json.map(str::as_bytes),
+                sidecar_manifest_json.map(str::as_bytes),
+                sidecar_manifest_signature,
+                platform,
+            )
+            .map_err(|error| CommandError::InvalidInput(error.to_string()))
+    }
+
+    pub fn update_safe_point_available(&self) -> Result<bool, CommandError> {
+        let service = self.service.lock().map_err(|_| CommandError::Unavailable)?;
+        let transactions = match service.transaction_list() {
+            Ok(transactions) => transactions,
+            Err(CoreError::WalletNotOpen) | Err(CoreError::Locked) => return Ok(true),
+            Err(error) => return Err(CommandError::from(error)),
+        };
+        const CRITICAL_STATES: [&str; 8] = [
+            "INPUTS_RESERVED",
+            "REQUEST_EXPORTED",
+            "REQUEST_IMPORTED",
+            "RESPONSE_PREPARED",
+            "RESPONSE_EXPORTED",
+            "RESPONSE_IMPORTED",
+            "FINALIZED",
+            "SUBMITTING",
+        ];
+        Ok(!transactions
+            .iter()
+            .any(|transaction| CRITICAL_STATES.contains(&transaction.state.as_str())))
+    }
+
+    pub fn application_status(&self) -> ApplicationStatusDto {
+        match self.service.lock() {
+            Ok(service) => {
+                let diagnostic = service.diagnostics();
+                ApplicationStatusDto {
+                    state: diagnostic.application_state,
+                    experimental: true,
+                    unaudited: true,
+                }
+            }
+            Err(_) => ApplicationStatusDto {
+                state: "ERROR".into(),
+                experimental: true,
+                unaudited: true,
+            },
         }
     }
 
@@ -397,6 +794,12 @@ impl DesktopApplication {
                 "recovery phrase is invalid".into(),
             ));
         }
+        let path = path.as_ref();
+        if path.exists() {
+            return Err(CommandError::RestoreDestinationExists);
+        }
+        let node_status = self.embedded_node_status()?;
+        ensure_seed_restore_node_ready(&node_status)?;
         let result: RecoveryRestoreResult = self
             .service
             .lock()
@@ -510,7 +913,7 @@ impl DesktopApplication {
 
     pub fn wallet_lock(&self) -> Result<(), CommandError> {
         self.ensure_running()?;
-        let _ = self.mining_stop();
+        self.stop_mining_worker()?;
         self.clear_qr_buffers()?;
         self.service
             .lock()
@@ -520,7 +923,7 @@ impl DesktopApplication {
     }
     pub fn wallet_close(&self) -> Result<(), CommandError> {
         self.ensure_running()?;
-        let _ = self.mining_stop();
+        self.stop_mining_worker()?;
         self.clear_qr_buffers()?;
         self.service
             .lock()
@@ -583,15 +986,15 @@ impl DesktopApplication {
         let ready = service.embedded_core_ready().unwrap_or(false);
         let diagnostic = service.diagnostics();
         let peers = service.embedded_peer_status().map_err(CommandError::from)?;
-        let lifecycle = if ready {
-            WalletReadinessDto::Ready
-        } else if diagnostic.application_state == "SYNCHRONIZING" {
-            WalletReadinessDto::Synchronizing
-        } else {
-            WalletReadinessDto::Starting
-        };
+        let synchronization = node_synchronization_status(
+            identity.current_tip.height,
+            peers.highest_known_peer_height,
+            peers.connected_total,
+            ready,
+        );
+        let expected_initial_sync = synchronization.lifecycle == WalletReadinessDto::Synchronizing;
         Ok(EmbeddedNodeStatusDto {
-            lifecycle,
+            lifecycle: synchronization.lifecycle,
             network: Some(core_network_name(identity.network).into()),
             chain_id: Some(hex::encode(identity.chain_id)),
             genesis_hash: Some(hex::encode(identity.genesis_hash)),
@@ -600,10 +1003,29 @@ impl DesktopApplication {
             protocol_version: Some(identity.protocol_version),
             range_proof_version: Some(identity.range_proof_serialization_version),
             ready,
-            error_code: diagnostic.last_error.map(|_| "CORE_NOT_READY".into()),
+            error_code: (!ready && !expected_initial_sync)
+                .then(|| diagnostic.last_error.map(|_| "CORE_NOT_READY".into()))
+                .flatten(),
             connected_peers: peers.connected_total,
             bootstrap_phase: peers.bootstrap_phase.into(),
+            highest_known_peer_height: synchronization.highest_known_peer_height,
+            synchronization_progress_percent: synchronization.progress_percent,
+            status_message: synchronization.message,
         })
+    }
+
+    pub fn embedded_node_stop(&self) -> Result<EmbeddedNodeStatusDto, CommandError> {
+        self.ensure_running()?;
+        self.stop_mining_worker()?;
+        self.service
+            .lock()
+            .map_err(|_| CommandError::Unavailable)?
+            .stop_embedded_core()
+            .map_err(CommandError::from)?;
+        self.node_started.store(false, Ordering::Release);
+        self.last_peer_connected_unix_seconds
+            .store(0, Ordering::Release);
+        Ok(stopped_node_status())
     }
 
     pub fn node_network_status(&self) -> Result<NodeNetworkStatusDto, CommandError> {
@@ -660,7 +1082,7 @@ impl DesktopApplication {
                 .collect(),
             canonical_height: status.canonical_height,
             highest_known_peer_height: (status.connected_total > 0)
-                .then_some(status.canonical_height),
+                .then_some(status.highest_known_peer_height),
             peer_addresses: status.peer_addresses,
         })
     }
@@ -672,13 +1094,21 @@ impl DesktopApplication {
             .embedded_core_identity()
             .ok()
             .map(|identity| identity.current_tip.height);
+        let canonical_hash = service
+            .embedded_core_identity()
+            .ok()
+            .map(|identity| hex::encode(identity.current_tip.hash));
         let synchronized = diagnostic.cursor_height.is_some()
             && diagnostic.cursor_height == canonical_height
+            && diagnostic.cursor_hash.is_some()
+            && diagnostic.cursor_hash == canonical_hash
             && diagnostic.last_error.is_none();
         Ok(WalletSyncStatusDto {
             state: diagnostic.application_state,
             cursor_height: diagnostic.cursor_height,
+            cursor_hash: diagnostic.cursor_hash,
             canonical_height,
+            canonical_hash,
             synchronized,
             paused: self.synchronization_paused.load(Ordering::Acquire),
             last_result: if synchronized {
@@ -788,6 +1218,7 @@ impl DesktopApplication {
             connected_peers: peer_status.connected_total,
             accepted_blocks: mining.accepted_blocks.load(Ordering::Relaxed),
             rejected_work: mining.rejected_work.load(Ordering::Relaxed),
+            template_refreshes: mining.template_refreshes.load(Ordering::Relaxed),
             last_block_candidate_time: (last_candidate > 0).then_some(last_candidate),
             last_accepted_block_height: (last_height != u64::MAX).then_some(last_height),
             uptime_seconds: uptime,
@@ -811,7 +1242,9 @@ impl DesktopApplication {
         let peers = self.node_peer_status()?;
         require_mining_cursor_gate(
             sync.cursor_height,
+            sync.cursor_hash.as_deref(),
             sync.canonical_height,
+            sync.canonical_hash.as_deref(),
             sync.last_error.as_deref(),
             peers.total_connected_peers,
         )?;
@@ -821,6 +1254,11 @@ impl DesktopApplication {
             .map_err(|_| CommandError::Unavailable)?
             .embedded_node_handle()
             .map_err(CommandError::from)?;
+        if node.metrics.peer_count.load(Ordering::Acquire) == 0
+            || node.metrics.ibd_progress_percent.load(Ordering::Acquire) < 100
+        {
+            return Err(CommandError::NodeNotReady);
+        }
         let mut mining = self.mining.lock().map_err(|_| CommandError::Unavailable)?;
         if mining.worker.is_some()
             || matches!(
@@ -834,6 +1272,7 @@ impl DesktopApplication {
         mining.hash_attempts.store(0, Ordering::Release);
         mining.accepted_blocks.store(0, Ordering::Release);
         mining.rejected_work.store(0, Ordering::Release);
+        mining.template_refreshes.store(0, Ordering::Release);
         mining.last_candidate_time.store(0, Ordering::Release);
         mining
             .last_accepted_height
@@ -847,6 +1286,7 @@ impl DesktopApplication {
         let attempts = Arc::clone(&mining.hash_attempts);
         let accepted = Arc::clone(&mining.accepted_blocks);
         let rejected = Arc::clone(&mining.rejected_work);
+        let refreshes = Arc::clone(&mining.template_refreshes);
         let candidate_time = Arc::clone(&mining.last_candidate_time);
         let accepted_height = Arc::clone(&mining.last_accepted_height);
         let state = Arc::clone(&mining.state);
@@ -868,6 +1308,7 @@ impl DesktopApplication {
                     };
                     node.metrics.mining_active.store(1, Ordering::Release);
                     state.store(MINING_RUNNING, Ordering::Release);
+                    let mut coinbase_candidate = None;
                     while !stop.load(Ordering::Acquire) {
                         let height = node
                             .metrics
@@ -875,10 +1316,23 @@ impl DesktopApplication {
                             .load(Ordering::Acquire)
                             .saturating_add(1);
                         candidate_time.store(unix_seconds(), Ordering::Release);
-                        let coinbase = service.lock().map_err(|_| ()).and_then(|mut wallet| {
-                            wallet.mining_coinbase_candidate(height).map_err(|_| ())
-                        });
-                        let Ok(coinbase) = coinbase else {
+                        if coinbase_candidate
+                            .as_ref()
+                            .is_none_or(|(candidate_height, _)| *candidate_height != height)
+                        {
+                            let coinbase = service.lock().map_err(|_| ()).and_then(|mut wallet| {
+                                wallet.mining_coinbase_candidate(height).map_err(|_| ())
+                            });
+                            let Ok(coinbase) = coinbase else {
+                                state.store(MINING_ERROR, Ordering::Release);
+                                if let Ok(mut error) = error_code.lock() {
+                                    *error = Some("MINING_COINBASE_PREPARATION_FAILED".into());
+                                }
+                                break;
+                            };
+                            coinbase_candidate = Some((height, coinbase));
+                        }
+                        let Some((_, coinbase)) = coinbase_candidate.as_ref() else {
                             state.store(MINING_ERROR, Ordering::Release);
                             if let Ok(mut error) = error_code.lock() {
                                 *error = Some("MINING_COINBASE_PREPARATION_FAILED".into());
@@ -895,9 +1349,18 @@ impl DesktopApplication {
                             Ok(WalletMiningOutcome::Accepted { height }) => {
                                 accepted.fetch_add(1, Ordering::Relaxed);
                                 accepted_height.store(height, Ordering::Release);
+                                coinbase_candidate = None;
                             }
                             Ok(WalletMiningOutcome::Rejected { .. }) => {
                                 rejected.fetch_add(1, Ordering::Relaxed);
+                                coinbase_candidate = None;
+                            }
+                            Ok(WalletMiningOutcome::Stale { .. }) => {
+                                rejected.fetch_add(1, Ordering::Relaxed);
+                                coinbase_candidate = None;
+                            }
+                            Ok(WalletMiningOutcome::TemplateExpired { .. }) => {
+                                refreshes.fetch_add(1, Ordering::Relaxed);
                             }
                             Ok(WalletMiningOutcome::Stopped) => break,
                             Err(_) => {
@@ -922,6 +1385,11 @@ impl DesktopApplication {
     }
 
     pub fn mining_stop(&self) -> Result<MiningStatusDto, CommandError> {
+        self.stop_mining_worker()?;
+        self.mining_status()
+    }
+
+    fn stop_mining_worker(&self) -> Result<(), CommandError> {
         let worker = {
             let mut mining = self.mining.lock().map_err(|_| CommandError::Unavailable)?;
             if mining.worker.is_some() {
@@ -933,24 +1401,42 @@ impl DesktopApplication {
         if let Some(worker) = worker {
             worker.join().map_err(|_| CommandError::Unavailable)?;
         }
-        self.mining_status()
+        Ok(())
     }
     pub fn diagnostics_redacted(&self) -> DiagnosticSnapshot {
-        self.service
-            .lock()
-            .expect("application mutex poisoned")
-            .diagnostics()
+        match self.service.lock() {
+            Ok(service) => service.diagnostics(),
+            Err(_) => DiagnosticSnapshot {
+                application_state: "ERROR".into(),
+                connection_state: "UNAVAILABLE".into(),
+                generation: None,
+                cursor_height: None,
+                cursor_hash: None,
+                last_error: Some("APPLICATION_STATE_UNAVAILABLE".into()),
+            },
+        }
     }
     pub fn application_shutdown(&self) -> Result<(), CommandError> {
         if self.shutdown.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        let _ = self.mining_stop();
-        self.clear_qr_buffers()?;
-        let mut service = self.service.lock().map_err(|_| CommandError::Unavailable)?;
-        let _ = service.close();
-        self.node_started.store(false, Ordering::Release);
-        Ok(())
+        let result = (|| {
+            self.stop_mining_worker()?;
+            self.sidecar
+                .lock()
+                .map_err(|_| CommandError::Unavailable)?
+                .shutdown()
+                .map_err(|_| CommandError::Unavailable)?;
+            self.clear_qr_buffers()?;
+            let mut service = self.service.lock().map_err(|_| CommandError::Unavailable)?;
+            service.close().map_err(CommandError::from)?;
+            self.node_started.store(false, Ordering::Release);
+            Ok(())
+        })();
+        if result.is_err() {
+            self.shutdown.store(false, Ordering::Release);
+        }
+        result
     }
     pub fn synchronization_pause(&self) -> Result<(), CommandError> {
         self.synchronization_paused.store(true, Ordering::Release);
@@ -1251,6 +1737,70 @@ fn stopped_node_status() -> EmbeddedNodeStatusDto {
         error_code: None,
         connected_peers: 0,
         bootstrap_phase: "STOPPED".into(),
+        highest_known_peer_height: None,
+        synchronization_progress_percent: None,
+        status_message: "Node stopped".into(),
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct NodeSynchronizationStatus {
+    lifecycle: WalletReadinessDto,
+    highest_known_peer_height: Option<u64>,
+    progress_percent: Option<u64>,
+    message: String,
+}
+
+fn node_synchronization_status(
+    local_height: u64,
+    peer_height: u64,
+    connected_peers: u64,
+    ready: bool,
+) -> NodeSynchronizationStatus {
+    let observed_peer_height = (connected_peers > 0).then_some(peer_height);
+    if connected_peers > 0 && peer_height > local_height {
+        let progress_percent = ((u128::from(local_height) * 100) / u128::from(peer_height)) as u64;
+        return NodeSynchronizationStatus {
+            lifecycle: WalletReadinessDto::Synchronizing,
+            highest_known_peer_height: observed_peer_height,
+            progress_percent: Some(progress_percent),
+            message: format!("Synchronizing {local_height} / {peer_height} ({progress_percent}%)"),
+        };
+    }
+    if ready {
+        return NodeSynchronizationStatus {
+            lifecycle: WalletReadinessDto::Ready,
+            highest_known_peer_height: observed_peer_height,
+            progress_percent: observed_peer_height.map(|_| 100),
+            message: format!("Ready at height {local_height}"),
+        };
+    }
+    let message = if connected_peers > 0 {
+        format!("Connected; waiting for synchronization status at height {local_height}")
+    } else {
+        "Discovering peers".into()
+    };
+    NodeSynchronizationStatus {
+        lifecycle: WalletReadinessDto::Starting,
+        highest_known_peer_height: observed_peer_height,
+        progress_percent: None,
+        message,
+    }
+}
+
+fn ensure_seed_restore_node_ready(status: &EmbeddedNodeStatusDto) -> Result<(), CommandError> {
+    let local_height = status.canonical_tip_height.unwrap_or(0);
+    let peer_height = status.highest_known_peer_height.unwrap_or(0);
+    let mainnet = status.network.as_deref() == Some("MAINNET");
+    let synchronized = status.lifecycle == WalletReadinessDto::Ready
+        && status.ready
+        && status.connected_peers > 0
+        && peer_height > 0
+        && local_height >= peer_height;
+    if mainnet && synchronized {
+        Ok(())
+    } else {
+        Err(CommandError::RestoreNodeSynchronizing)
     }
 }
 
@@ -1289,11 +1839,18 @@ fn mining_state_name(state: u64, enabled: bool) -> &'static str {
 
 fn require_mining_cursor_gate(
     cursor_height: Option<u64>,
+    cursor_hash: Option<&str>,
     canonical_height: Option<u64>,
+    canonical_hash: Option<&str>,
     last_error: Option<&str>,
     connected_peers: u64,
 ) -> Result<(), CommandError> {
-    if cursor_height.is_none() || cursor_height != canonical_height || last_error.is_some() {
+    if cursor_height.is_none()
+        || cursor_height != canonical_height
+        || cursor_hash.is_none()
+        || cursor_hash != canonical_hash
+        || last_error.is_some()
+    {
         return Err(CommandError::CursorInitializationFailed);
     }
     if connected_peers == 0 {
@@ -1373,6 +1930,14 @@ pub enum CommandError {
     IdentityMismatch,
     #[error("embedded node is not ready")]
     NodeNotReady,
+    #[error("seed restore requires a synchronized Mainnet node")]
+    RestoreNodeSynchronizing,
+    #[error("restore destination already exists")]
+    RestoreDestinationExists,
+    #[error("restore staging state is incompatible")]
+    RestoreStagingIncompatible,
+    #[error("wallet name is invalid")]
+    InvalidWalletName,
     #[error("wallet synchronization is paused")]
     SynchronizationPaused,
     #[error("wallet cursor initialization failed")]
@@ -1428,6 +1993,39 @@ impl From<CommandError> for CommandErrorDto {
                 category: "NODE".into(),
                 message: "The embedded Mainnet node is still starting.".into(),
                 retryable: true,
+            },
+            CommandError::RestoreNodeSynchronizing => Self {
+                code: "RESTORE_NODE_SYNCHRONIZING".into(),
+                category: "SYNCHRONIZATION".into(),
+                message:
+                    "Wait for the embedded Mainnet node to finish synchronizing, then retry restore."
+                        .into(),
+                retryable: true,
+            },
+            CommandError::RestoreDestinationExists => Self {
+                code: "RESTORE_DESTINATION_EXISTS".into(),
+                category: "STORAGE".into(),
+                message: "A wallet with this name already exists. Choose another name or remove \
+                          the existing wallet folder."
+                    .into(),
+                retryable: false,
+            },
+            CommandError::RestoreStagingIncompatible => Self {
+                code: "RESTORE_STAGING_INCOMPATIBLE".into(),
+                category: "STORAGE".into(),
+                message: "An interrupted restore left staging data for this destination. Retry \
+                          with the same password used before, or remove the hidden restore \
+                          staging folder next to the destination."
+                    .into(),
+                retryable: false,
+            },
+            CommandError::InvalidWalletName => Self {
+                code: "WALLET_NAME_INVALID".into(),
+                category: "VALIDATION".into(),
+                message: "Use a simple wallet name without separators, special characters, or \
+                          reserved Windows names."
+                    .into(),
+                retryable: false,
             },
             CommandError::SynchronizationPaused => Self {
                 code: "WALLET_SYNC_PAUSED".into(),
@@ -1486,6 +2084,7 @@ impl From<CoreError> for CommandError {
             CoreError::IdentityMismatch => Self::IdentityMismatch,
             CoreError::NodeNotReady | CoreError::EmbeddedCoreRequired => Self::NodeNotReady,
             CoreError::InvalidCoreCursor => Self::CursorInitializationFailed,
+            CoreError::Restore(error) => command_error_from_restore(error),
             CoreError::WalletNotOpen => Self::Wallet {
                 code: "WALLET_NOT_OPEN",
                 message: "Open a Mainnet wallet before using this operation.",
@@ -1521,13 +2120,129 @@ impl From<CoreError> for CommandError {
                 message: "The embedded Mainnet node could not complete the requested operation.",
                 retryable: true,
             },
-            other => Self::Wallet {
-                code: other.redacted_code(),
-                message:
-                    "The wallet rejected the requested operation. Review its typed error code.",
-                retryable: false,
-            },
+            other => {
+                let code = other.redacted_code();
+                let (message, retryable) = if code == "WALLET_WRITER_ACTIVE" {
+                    (
+                        "Close the other running wallet process before opening this wallet.",
+                        true,
+                    )
+                } else {
+                    (
+                        "The wallet rejected the requested operation. Review its typed error code.",
+                        false,
+                    )
+                };
+                Self::Wallet {
+                    code,
+                    message,
+                    retryable,
+                }
+            }
         }
+    }
+}
+
+/// Windows device names that can never be wallet names on any platform, so a
+/// managed wallet directory always round-trips across operating systems.
+const RESERVED_WALLET_NAMES: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Validate a user-facing wallet name for the managed wallets directory.
+///
+/// Fail closed: a name is a single path component with no traversal, no
+/// leading dot (hidden and restore-staging namespace), no trailing dot or
+/// space (silently stripped by Windows), no control or Windows-forbidden
+/// characters, and no reserved Windows device name as its stem.
+pub fn validate_wallet_name(name: &str) -> Result<(), CommandError> {
+    if name.is_empty()
+        || name.len() > 64
+        || name.starts_with('.')
+        || name.ends_with('.')
+        || name.starts_with(' ')
+        || name.ends_with(' ')
+    {
+        return Err(CommandError::InvalidWalletName);
+    }
+    if name.chars().any(|character| {
+        character.is_control()
+            || matches!(
+                character,
+                '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+            )
+    }) {
+        return Err(CommandError::InvalidWalletName);
+    }
+    let stem = name.split('.').next().unwrap_or_default();
+    if RESERVED_WALLET_NAMES
+        .iter()
+        .any(|reserved| stem.eq_ignore_ascii_case(reserved))
+    {
+        return Err(CommandError::InvalidWalletName);
+    }
+    Ok(())
+}
+
+/// Resolve a validated wallet name inside the managed wallets root.
+pub fn resolve_wallet_directory(wallets_root: &Path, name: &str) -> Result<PathBuf, CommandError> {
+    validate_wallet_name(name)?;
+    Ok(wallets_root.join(name))
+}
+
+/// List valid wallet names inside the managed wallets root, sorted.
+///
+/// A missing root simply yields no wallets; files, hidden restore-staging
+/// directories and foreign entries are never listed.
+pub fn list_wallet_names(wallets_root: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(wallets_root) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| validate_wallet_name(name).is_ok())
+        .collect();
+    names.sort();
+    names
+}
+
+fn command_error_from_restore(error: SeedRestoreError) -> CommandError {
+    match error {
+        SeedRestoreError::InvalidDestination => CommandError::RestoreDestinationExists,
+        SeedRestoreError::CoreBusy => CommandError::RestoreNodeSynchronizing,
+        SeedRestoreError::InvalidMnemonic => CommandError::Wallet {
+            code: "RECOVERY_PHRASE_INVALID",
+            message: "The recovery phrase is invalid.",
+            retryable: false,
+        },
+        SeedRestoreError::InvalidPassword => CommandError::Wallet {
+            code: "INVALID_PASSWORD",
+            message: "The local wallet password is invalid.",
+            retryable: false,
+        },
+        SeedRestoreError::ChainIdentityMismatch => CommandError::IdentityMismatch,
+        SeedRestoreError::IncompatibleCheckpoint => CommandError::RestoreStagingIncompatible,
+        SeedRestoreError::Storage => CommandError::Wallet {
+            code: "RESTORE_STORAGE_FAILED",
+            message: "The encrypted restore state could not be resumed safely.",
+            retryable: true,
+        },
+        SeedRestoreError::CanonicalScan => CommandError::Wallet {
+            code: "RESTORE_CANONICAL_SCAN_FAILED",
+            message: "The canonical chain scan failed. Check node synchronization and retry.",
+            retryable: true,
+        },
+        SeedRestoreError::MalformedRecovery
+        | SeedRestoreError::ConflictingOutput
+        | SeedRestoreError::CoordinateOverflow
+        | SeedRestoreError::Incomplete => CommandError::Wallet {
+            code: "RESTORE_VALIDATION_FAILED",
+            message: "The restored wallet state failed canonical validation.",
+            retryable: false,
+        },
     }
 }
 
@@ -1558,6 +2273,7 @@ mod tests {
             "wallet_backup_import",
             "wallet_recovery_phrase_confirm",
             "embedded_node_start",
+            "embedded_node_stop",
             "embedded_node_status",
             "wallet_address_validate",
             "application_shutdown",
@@ -1579,16 +2295,175 @@ mod tests {
     fn native_bridge_probe_is_static_redacted_and_versioned() {
         let status = native_bridge_status();
         assert_eq!(status.bridge, "ready");
-        assert_eq!(status.app_version, "0.1.5");
+        assert_eq!(status.app_version, "0.2.6");
         fn assert_serializable<T: serde::Serialize>(_: &T) {}
         assert_serializable(&status);
     }
 
     #[test]
-    fn mining_gate_accepts_synchronized_height_one_cursor() {
-        assert!(require_mining_cursor_gate(Some(1), Some(1), None, 1).is_ok());
+    fn build_and_update_status_are_separate_redacted_channels() {
+        let build = get_build_info();
+        assert_eq!(build.wallet_version, "0.2.6");
+        assert_eq!(build.embedded_node_revision, EMBEDDED_NODE_REVISION);
+        assert_eq!(build.update_channel, "stable");
+
+        let updates = UpdateControl::new(false);
+        assert!(updates.begin_check(100));
+        assert!(!updates.begin_check(100));
+        updates.finish_check_without_key();
+        let status = updates.snapshot();
+        assert_eq!(status.wallet.state, WalletUpdaterState::Failed);
+        assert_eq!(status.node.state, NodeUpdaterState::Failed);
+        assert_eq!(status.peers.state, "FAILED");
+        assert_eq!(
+            status.wallet.sanitized_error.as_deref(),
+            Some("UPDATE_SIGNATURE_KEY_UNAVAILABLE")
+        );
+        let encoded = serde_json::to_string(&status).expect("serialize update status");
+        for forbidden in ["seed", "mnemonic", "password", "private_key", "rpc_token"] {
+            assert!(!encoded.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn closed_wallet_is_a_safe_update_point() {
+        assert!(DesktopApplication::default()
+            .update_safe_point_available()
+            .expect("closed Wallet is safe"));
+    }
+
+    #[test]
+    fn sidecar_cannot_be_enabled_without_an_unlocked_wallet_session() {
+        let runtime = tempfile::tempdir().expect("temporary runtime");
+        let app = DesktopApplication::default();
+        app.configure_sidecar_runtime(runtime.path())
+            .expect("configure isolated runtime");
         assert!(matches!(
-            require_mining_cursor_gate(None, Some(1), None, 1),
+            app.experimental_sidecar_enable(EXPERIMENTAL_ENABLE_CONFIRMATION),
+            Err(CommandError::InvalidInput(_))
+        ));
+        assert!(
+            !app.experimental_sidecar_status()
+                .expect("sidecar status")
+                .enabled_for_session
+        );
+    }
+
+    #[test]
+    fn app_runtime_rejects_equal_and_lower_node_sequences_and_missing_manifest() {
+        use dom_wallet_node_manager::NodeIdentity;
+        use dom_wallet_updater::{ArtifactDescriptor, NodeManifest, UpdateError};
+
+        let runtime = tempfile::tempdir().expect("temporary runtime");
+        let app = DesktopApplication::default();
+        app.configure_sidecar_runtime(runtime.path().join("managed"))
+            .expect("configure isolated runtime");
+        let artifact = b"app-level node fixture";
+        let identity = |version: &str, revision: &str| NodeIdentity {
+            node_version: version.into(),
+            node_revision: revision.into(),
+            network: "mainnet".into(),
+            chain_id: "chain".into(),
+            genesis_hash: "genesis".into(),
+            rpc_protocol_version: 1,
+            p2p_protocol_version: 1,
+            storage_schema_version_supported: 1,
+            storage_schema_version_on_disk: 1,
+            height: 1,
+        };
+        let feed = |sequence: u64, version: &str, revision: &str| {
+            NodeManifest {
+            schema_version: 1,
+            channel: "stable".into(),
+            node_version: version.into(),
+            node_revision: revision.into(),
+            sequence,
+            published_at: "2026-07-23T12:00:00Z".into(),
+            expires_at: "2099-08-23T12:00:00Z".into(),
+            network: "mainnet".into(),
+            chain_id: "chain".into(),
+            genesis_hash: "genesis".into(),
+            rpc_protocol_version: 1,
+            p2p_protocol_version: 1,
+            storage_schema_version: 1,
+            compatible_wallet_versions: ">=0.2.0, <0.3.0".into(),
+            requires_wallet_update: false,
+            node_only_compatible: true,
+            critical_update: false,
+            artifact: ArtifactDescriptor {
+                target: std::env::consts::OS.into(),
+                architecture: std::env::consts::ARCH.into(),
+                url: "https://github.com/sorenplanck/dom-protocol/releases/download/node-test/dom-node"
+                    .parse()
+                    .unwrap(),
+                sha256: format!("{:x}", Sha256::digest(artifact)),
+                size: artifact.len() as u64,
+                signature: "test-only-detached-signature".into(),
+            },
+            manifest_signature: "test-only-feed-signature".into(),
+        }
+        };
+        let installed_at = time::OffsetDateTime::parse(
+            "2026-07-23T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        let now = time::OffsetDateTime::parse(
+            "2026-07-23T13:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        let old = identity("0.1.0", &"b".repeat(40));
+        let active = identity("0.1.1", &"c".repeat(40));
+        let manager = app.sidecar.lock().unwrap();
+        manager
+            .app_test_persist_state(&feed(8, "0.1.1", &"c".repeat(40)), &old, installed_at)
+            .unwrap();
+        for sequence in [8, 7] {
+            assert!(matches!(
+                manager.app_test_evaluate_verified_feed(
+                    feed(sequence, "0.1.2", &"d".repeat(40)),
+                    &active,
+                    now
+                ),
+                Err(dom_wallet_node_manager::NodeManagerError::Update(
+                    UpdateError::DowngradeRejected
+                ))
+            ));
+        }
+        assert_eq!(
+            manager
+                .app_test_evaluate_verified_feed(feed(9, "0.1.2", &"d".repeat(40)), &active, now)
+                .unwrap()
+                .sequence,
+            9
+        );
+        drop(manager);
+        assert!(matches!(
+            app.experimental_sidecar_evaluate_release(None, None, None, std::env::consts::OS),
+            Err(CommandError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn mining_gate_accepts_synchronized_height_one_cursor() {
+        let hash = "11".repeat(32);
+        assert!(
+            require_mining_cursor_gate(Some(1), Some(&hash), Some(1), Some(&hash), None, 1).is_ok()
+        );
+        assert!(matches!(
+            require_mining_cursor_gate(None, None, Some(1), Some(&hash), None, 1),
+            Err(CommandError::CursorInitializationFailed)
+        ));
+        assert!(matches!(
+            require_mining_cursor_gate(
+                Some(1),
+                Some(&hash),
+                Some(1),
+                Some(&"22".repeat(32)),
+                None,
+                1
+            ),
             Err(CommandError::CursorInitializationFailed)
         ));
     }
@@ -1606,12 +2481,231 @@ mod tests {
     }
 
     #[test]
+    fn poisoned_application_state_is_reported_without_panicking() {
+        let app = DesktopApplication::default();
+        let service = Arc::clone(&app.service);
+        let _ = std::thread::spawn(move || {
+            let _guard = service.lock().expect("test acquires service");
+            panic!("poison test mutex");
+        })
+        .join();
+
+        assert_eq!(app.application_status().state, "ERROR");
+        let diagnostic = app.diagnostics_redacted();
+        assert_eq!(diagnostic.application_state, "ERROR");
+        assert_eq!(
+            diagnostic.last_error.as_deref(),
+            Some("APPLICATION_STATE_UNAVAILABLE")
+        );
+    }
+
+    #[test]
     fn redacted_configuration_and_errors_never_serialize_credentials() {
         let app = DesktopApplication::default();
         let error = app.wallet_unlock("password-contains-secret").unwrap_err();
         let rendered = error.to_string();
         assert!(!rendered.contains("password-contains-secret"));
         assert!(!rendered.contains("secret"));
+    }
+
+    #[test]
+    fn node_status_reports_live_initial_block_download_progress() {
+        let status = node_synchronization_status(1_008, 6_622, 1, false);
+
+        assert_eq!(status.lifecycle, WalletReadinessDto::Synchronizing);
+        assert_eq!(status.highest_known_peer_height, Some(6_622));
+        assert_eq!(status.progress_percent, Some(15));
+        assert_eq!(status.message, "Synchronizing 1008 / 6622 (15%)");
+    }
+
+    #[test]
+    fn node_status_never_claims_ready_while_peer_tip_is_ahead() {
+        let status = node_synchronization_status(50, 100, 1, true);
+
+        assert_eq!(status.lifecycle, WalletReadinessDto::Synchronizing);
+        assert_eq!(status.progress_percent, Some(50));
+    }
+
+    #[test]
+    fn node_status_is_readable_while_discovering_peers() {
+        let status = node_synchronization_status(0, 0, 0, false);
+
+        assert_eq!(status.lifecycle, WalletReadinessDto::Starting);
+        assert_eq!(status.highest_known_peer_height, None);
+        assert_eq!(status.progress_percent, None);
+        assert_eq!(status.message, "Discovering peers");
+    }
+
+    fn restore_node_status(
+        lifecycle: WalletReadinessDto,
+        local_height: u64,
+        peer_height: Option<u64>,
+        connected_peers: u64,
+        ready: bool,
+    ) -> EmbeddedNodeStatusDto {
+        EmbeddedNodeStatusDto {
+            lifecycle,
+            network: Some("MAINNET".into()),
+            chain_id: Some("11".repeat(32)),
+            genesis_hash: Some("22".repeat(32)),
+            canonical_tip_height: Some(local_height),
+            canonical_tip_hash: Some("33".repeat(32)),
+            protocol_version: Some(1),
+            range_proof_version: Some(1),
+            ready,
+            error_code: None,
+            connected_peers,
+            bootstrap_phase: "CONNECTED".into(),
+            highest_known_peer_height: peer_height,
+            synchronization_progress_percent: None,
+            status_message: "test-only".into(),
+        }
+    }
+
+    #[test]
+    fn seed_restore_app_gate_requires_a_confirmed_synchronized_peer_tip() {
+        let discovering = restore_node_status(WalletReadinessDto::Ready, 5_241, None, 0, true);
+        assert!(matches!(
+            ensure_seed_restore_node_ready(&discovering),
+            Err(CommandError::RestoreNodeSynchronizing)
+        ));
+
+        let behind = restore_node_status(
+            WalletReadinessDto::Synchronizing,
+            5_241,
+            Some(8_009),
+            2,
+            false,
+        );
+        assert!(matches!(
+            ensure_seed_restore_node_ready(&behind),
+            Err(CommandError::RestoreNodeSynchronizing)
+        ));
+
+        let synchronized =
+            restore_node_status(WalletReadinessDto::Ready, 8_009, Some(8_009), 2, true);
+        assert!(ensure_seed_restore_node_ready(&synchronized).is_ok());
+    }
+
+    #[test]
+    fn wallet_name_validation_fails_closed() {
+        for valid in [
+            "main",
+            "savings-2026",
+            "Leo_wallet",
+            "a",
+            "COM10",
+            "COM",
+            "LPT",
+            "LPT10",
+            "console",
+            "aux-backup",
+        ] {
+            assert!(
+                validate_wallet_name(valid).is_ok(),
+                "expected valid: {valid:?}"
+            );
+        }
+        let oversized = "x".repeat(65);
+        for invalid in [
+            "",
+            ".",
+            "..",
+            ".hidden",
+            ".main.seed-restore",
+            "a/b",
+            "a\\b",
+            "../up",
+            "..\\up",
+            "name.",
+            "name ",
+            " name",
+            "CON",
+            "con",
+            "Con.wallet",
+            "com7",
+            "LPT9",
+            "lpt1.old",
+            "nul",
+            "a:b",
+            "a*b",
+            "a?b",
+            "a|b",
+            "a<b",
+            "a>b",
+            "a\"b",
+            "tab\tname",
+            oversized.as_str(),
+        ] {
+            assert!(
+                matches!(
+                    validate_wallet_name(invalid),
+                    Err(CommandError::InvalidWalletName)
+                ),
+                "expected invalid: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wallet_directory_resolution_and_listing_use_validated_names() {
+        let root = tempfile::tempdir().unwrap();
+        let resolved = resolve_wallet_directory(root.path(), "primary").unwrap();
+        assert_eq!(resolved, root.path().join("primary"));
+        assert!(matches!(
+            resolve_wallet_directory(root.path(), "../escape"),
+            Err(CommandError::InvalidWalletName)
+        ));
+
+        std::fs::create_dir_all(root.path().join("beta")).unwrap();
+        std::fs::create_dir_all(root.path().join("alpha")).unwrap();
+        std::fs::create_dir_all(root.path().join(".alpha.seed-restore")).unwrap();
+        std::fs::write(root.path().join("stray-file"), b"x").unwrap();
+        assert_eq!(
+            list_wallet_names(root.path()),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+        assert!(list_wallet_names(&root.path().join("missing")).is_empty());
+    }
+
+    #[test]
+    fn incompatible_restore_staging_maps_to_guided_error() {
+        let staging: CommandErrorDto =
+            CommandError::from(CoreError::Restore(SeedRestoreError::IncompatibleCheckpoint)).into();
+        assert_eq!(staging.code, "RESTORE_STAGING_INCOMPATIBLE");
+        assert_eq!(staging.category, "STORAGE");
+        assert!(!staging.retryable);
+        assert!(staging.message.contains("same password"));
+    }
+
+    #[test]
+    fn seed_restore_app_reports_destination_and_sync_errors_without_node_mislabeling() {
+        let app = DesktopApplication::default();
+        let parent = tempfile::tempdir().unwrap();
+        let existing = parent.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        assert!(matches!(
+            app.wallet_restore_from_mnemonic(&existing, "correct-horse", "test-only"),
+            Err(CommandError::RestoreDestinationExists)
+        ));
+
+        let not_yet_created = parent.path().join("new-wallet");
+        assert!(matches!(
+            app.wallet_restore_from_mnemonic(&not_yet_created, "correct-horse", "test-only"),
+            Err(CommandError::RestoreNodeSynchronizing)
+        ));
+
+        let destination: CommandErrorDto =
+            CommandError::from(CoreError::Restore(SeedRestoreError::InvalidDestination)).into();
+        assert_eq!(destination.code, "RESTORE_DESTINATION_EXISTS");
+        assert_eq!(destination.category, "STORAGE");
+        assert!(destination.message.contains("already exists"));
+        assert!(destination.message.contains("another name"));
+
+        let busy: CommandErrorDto =
+            CommandError::from(CoreError::Restore(SeedRestoreError::CoreBusy)).into();
+        assert_eq!(busy.code, "RESTORE_NODE_SYNCHRONIZING");
+        assert!(busy.retryable);
     }
 
     #[test]

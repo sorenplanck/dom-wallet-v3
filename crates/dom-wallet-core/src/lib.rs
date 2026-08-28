@@ -79,6 +79,7 @@ pub struct DiagnosticSnapshot {
     pub connection_state: String,
     pub generation: Option<u64>,
     pub cursor_height: Option<u64>,
+    pub cursor_hash: Option<String>,
     pub last_error: Option<String>,
 }
 
@@ -325,8 +326,9 @@ impl WalletService {
     pub fn embedded_core_identity(&self) -> Result<CoreChainIdentity, CoreError> {
         self.backend
             .as_ref()
-            .map(|backend| backend.identity().clone())
-            .ok_or(CoreError::EmbeddedCoreRequired)
+            .ok_or(CoreError::EmbeddedCoreRequired)?
+            .current_identity()
+            .map_err(CoreError::from)
     }
 
     pub fn embedded_core_ready(&self) -> Result<bool, CoreError> {
@@ -353,6 +355,14 @@ impl WalletService {
             .ok_or(CoreError::EmbeddedCoreRequired)?
             .node_handle()
             .map_err(CoreError::from)
+    }
+
+    /// Stop the embedded node without changing the open or unlocked wallet state.
+    pub fn stop_embedded_core(&mut self) -> Result<(), CoreError> {
+        if let Some(mut backend) = self.backend.take() {
+            backend.shutdown()?;
+        }
+        Ok(())
     }
 
     /// Reserve a Coinbase recovery coordinate before creating public mining
@@ -439,7 +449,12 @@ impl WalletService {
             .backend
             .as_ref()
             .ok_or(CoreError::EmbeddedCoreRequired)?;
-        let recovery = backend.restore(phrase, password, &path, self.kdf)?;
+        let recovery = backend
+            .restore(phrase, password, &path, self.kdf)
+            .map_err(|error| match error {
+                ProductionBackendError::Restore(error) => CoreError::Restore(error),
+                other => CoreError::Backend(other),
+            })?;
         let directory = WalletDirectory::open(path)?;
         self.metadata = Some(directory.metadata()?);
         self.location = Some(directory);
@@ -1405,6 +1420,11 @@ impl WalletService {
     }
 
     pub fn diagnostics(&self) -> DiagnosticSnapshot {
+        let cursor = self
+            .unlocked
+            .as_ref()
+            .and_then(|state| state.core_scan_cursor.as_deref())
+            .and_then(|bytes| WalletScanCursor::from_bytes(bytes).ok());
         DiagnosticSnapshot {
             application_state: application_state_name(&self.state).into(),
             connection_state: if self.backend.is_some() {
@@ -1413,12 +1433,8 @@ impl WalletService {
                 "EMBEDDED_CORE_STOPPED".into()
             },
             generation: self.unlocked.as_ref().map(|state| state.generation),
-            cursor_height: self
-                .unlocked
-                .as_ref()
-                .and_then(|state| state.core_scan_cursor.as_deref())
-                .and_then(|bytes| WalletScanCursor::from_bytes(bytes).ok())
-                .map(|cursor| cursor.anchor_height),
+            cursor_height: cursor.as_ref().map(|cursor| cursor.anchor_height),
+            cursor_hash: cursor.map(|cursor| hex::encode(cursor.anchor_hash)),
             last_error: self.last_error.clone(),
         }
     }
@@ -1928,6 +1944,7 @@ impl CoreError {
             Self::ConfirmationRequired => "CONFIRMATION_REQUIRED",
             Self::TransactionNotFound => "TRANSACTION_NOT_FOUND",
             Self::InvalidCoreCursor => "CURSOR_INVALID",
+            Self::Storage(StorageError::WriterActive) => "WALLET_WRITER_ACTIVE",
             Self::Storage(_) => "WALLET_STORAGE_FAILED",
             Self::Domain(_) => "WALLET_STATE_VALIDATION_FAILED",
             Self::Backend(_) => "EMBEDDED_NODE_OPERATION_FAILED",
@@ -1948,6 +1965,7 @@ impl CoreError {
             Self::InvalidCoreCursor => "wallet cursor is invalid",
             Self::InvalidSlateTransport => "Slate v4 transport is invalid",
             Self::MissingPrivateContext => "private Slate context is unavailable",
+            Self::Storage(StorageError::WriterActive) => "wallet is already open by another writer",
             _ => "the requested wallet operation was rejected",
         };
         format!("{}:{description}", self.redacted_code())
@@ -2098,6 +2116,16 @@ mod tests {
     }
 
     #[test]
+    fn active_writer_has_a_distinct_redacted_error_code() {
+        let error = CoreError::Storage(StorageError::WriterActive);
+        assert_eq!(error.redacted_code(), "WALLET_WRITER_ACTIVE");
+        assert_eq!(
+            error.redacted_message(),
+            "WALLET_WRITER_ACTIVE:wallet is already open by another writer"
+        );
+    }
+
+    #[test]
     fn no_legacy_production_reachability() {
         let values = PRODUCTION_REACHABILITY
             .iter()
@@ -2114,5 +2142,40 @@ mod tests {
         assert!(dom_wallet_core_recovery::PRODUCTION_OUTPUT_PATHS
             .iter()
             .all(|path| path.recovery_required));
+    }
+
+    #[test]
+    fn embedded_core_can_stop_and_restart_without_closing_the_service() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let first_address = first_listener.local_addr().unwrap();
+        drop(first_listener);
+        let second_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let second_address = second_listener.local_addr().unwrap();
+        drop(second_listener);
+        let mut service = test_service();
+
+        service
+            .start_embedded_core(EmbeddedCoreConfiguration::new(
+                dom_wallet_embedded_core::EmbeddedCoreNetwork::Regtest,
+                directory.path(),
+                first_address,
+            ))
+            .unwrap();
+        assert!(service.embedded_core_identity().is_ok());
+        service.stop_embedded_core().unwrap();
+        assert!(matches!(
+            service.embedded_core_identity(),
+            Err(CoreError::EmbeddedCoreRequired)
+        ));
+        service
+            .start_embedded_core(EmbeddedCoreConfiguration::new(
+                dom_wallet_embedded_core::EmbeddedCoreNetwork::Regtest,
+                directory.path(),
+                second_address,
+            ))
+            .unwrap();
+        assert!(service.embedded_core_identity().is_ok());
+        service.stop_embedded_core().unwrap();
     }
 }

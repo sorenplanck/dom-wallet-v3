@@ -7,10 +7,12 @@ use dom_wallet_domain::{
     NetworkIdentity, NodeConfiguration, RescanPlan, WalletState, MODEL_VERSION,
     SECRET_PROFILE_VERSION,
 };
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -19,6 +21,7 @@ const ACTIVE_FILE: &str = "active-generation";
 const GENERATIONS_DIR: &str = "generations";
 const STATE_FILE: &str = "state.envelope";
 const RESCAN_PLAN_FILE: &str = "rescan-plan.envelope";
+const WRITER_LOCK_FILE: &str = ".wallet.lock";
 const MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
 pub const BACKUP_MAGIC: [u8; 8] = *b"DOMWBK01";
 pub const BACKUP_FORMAT_VERSION: u16 = 1;
@@ -74,6 +77,7 @@ impl WalletMetadata {
 #[derive(Clone, Debug)]
 pub struct WalletDirectory {
     root: PathBuf,
+    _writer_lock: Arc<File>,
 }
 
 impl WalletDirectory {
@@ -83,26 +87,29 @@ impl WalletDirectory {
         password: &str,
         kdf: KdfParameters,
     ) -> Result<Self, StorageError> {
-        let wallet = Self {
-            root: root.as_ref().to_path_buf(),
-        };
-        if wallet.root.exists() {
+        let root = root.as_ref().to_path_buf();
+        if root.exists() {
             return Err(StorageError::AlreadyExists);
         }
         state.validate().map_err(StorageError::Domain)?;
-        fs::create_dir_all(wallet.root.join(GENERATIONS_DIR)).map_err(StorageError::Io)?;
+        fs::create_dir_all(root.join(GENERATIONS_DIR)).map_err(StorageError::Io)?;
+        let wallet = Self {
+            _writer_lock: acquire_writer_lock(&root)?,
+            root,
+        };
         wallet.publish_initial(state, password, kdf)?;
         Ok(wallet)
     }
 
     pub fn open(root: impl AsRef<Path>) -> Result<Self, StorageError> {
-        let wallet = Self {
-            root: root.as_ref().to_path_buf(),
-        };
-        if !wallet.root.is_dir() {
+        let root = root.as_ref().to_path_buf();
+        if !root.is_dir() {
             return Err(StorageError::NotFound);
         }
-        Ok(wallet)
+        Ok(Self {
+            _writer_lock: acquire_writer_lock(&root)?,
+            root,
+        })
     }
 
     pub fn metadata(&self) -> Result<WalletMetadata, StorageError> {
@@ -121,7 +128,11 @@ impl WalletDirectory {
     pub fn load(&self, password: &str) -> Result<WalletState, StorageError> {
         let metadata = self.metadata()?;
         let active = self.active_generation()?;
-        if active != metadata.active_generation {
+        let interrupted_publication = metadata
+            .active_generation
+            .checked_add(1)
+            .is_some_and(|next| next == active);
+        if active != metadata.active_generation && !interrupted_publication {
             return Err(StorageError::GenerationConflict);
         }
         let state = self.load_generation(active, password, &metadata)?;
@@ -132,6 +143,12 @@ impl WalletDirectory {
             return Err(StorageError::GenerationConflict);
         }
         state.validate().map_err(StorageError::Domain)?;
+        if interrupted_publication {
+            let repaired = serde_json::to_vec(&WalletMetadata::from_state(&state))
+                .map_err(|_| StorageError::CanonicalEncoding)?;
+            atomic_write(&self.root.join(METADATA_FILE), &repaired)?;
+            sync_directory(&self.root)?;
+        }
         Ok(state)
     }
 
@@ -376,6 +393,7 @@ impl WalletDirectory {
             let _ = fs::remove_dir_all(&staging);
         }
         result?;
+        drop(staged);
         WalletDirectory::open(destination)
     }
 
@@ -574,6 +592,26 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>, StorageError> {
     read_bounded_with_limit(path, MAX_STATE_BYTES)
 }
 
+fn acquire_writer_lock(root: &Path) -> Result<Arc<File>, StorageError> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock = options
+        .open(root.join(WRITER_LOCK_FILE))
+        .map_err(StorageError::Io)?;
+    match FileExt::try_lock_exclusive(&lock) {
+        Ok(()) => Ok(Arc::new(lock)),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(StorageError::WriterActive)
+        }
+        Err(error) => Err(StorageError::Io(error)),
+    }
+}
+
 fn read_bounded_with_limit(path: &Path, max_bytes: usize) -> Result<Vec<u8>, StorageError> {
     let metadata = fs::metadata(path).map_err(StorageError::Io)?;
     if metadata.len() == 0 || metadata.len() as usize > max_bytes {
@@ -648,6 +686,8 @@ pub enum StorageError {
     AlreadyExists,
     #[error("wallet directory was not found")]
     NotFound,
+    #[error("wallet is already open by another writer")]
+    WriterActive,
     #[error("invalid wallet metadata")]
     InvalidMetadata,
     #[error("unsupported wallet version")]
@@ -690,6 +730,17 @@ pub enum StorageError {
 mod tests {
     use super::*;
     use dom_wallet_domain::{Network, NetworkIdentity, WalletState};
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct HistoricalSchemaFixture {
+        fixture_version: u16,
+        releases: Vec<String>,
+        metadata_version: u16,
+        schema_version: u16,
+        secret_profile_version: u16,
+        migration_required: bool,
+    }
 
     fn identity() -> NetworkIdentity {
         NetworkIdentity {
@@ -743,6 +794,103 @@ mod tests {
     }
 
     #[test]
+    fn process_lock_rejects_an_active_writer_and_reuses_a_stale_lock_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("wallet");
+        let state = WalletState::new(identity(), [6; 32], default_node_configuration(identity()));
+        let wallet =
+            WalletDirectory::create(&root, &state, "correct", KdfParameters::TEST).unwrap();
+        let shared_owner = wallet.clone();
+
+        assert!(matches!(
+            WalletDirectory::open(&root),
+            Err(StorageError::WriterActive)
+        ));
+        drop(wallet);
+        assert!(matches!(
+            WalletDirectory::open(&root),
+            Err(StorageError::WriterActive)
+        ));
+        drop(shared_owner);
+
+        let reopened = WalletDirectory::open(&root).unwrap();
+        assert_eq!(reopened.load("correct").unwrap().wallet_id, state.wallet_id);
+        assert!(root.join(WRITER_LOCK_FILE).is_file());
+    }
+
+    #[test]
+    fn v01_schema_fixture_opens_without_mutating_wallet_data() {
+        let fixture: HistoricalSchemaFixture =
+            serde_json::from_str(include_str!("../fixtures/v0.1.x-schema-v1.json")).unwrap();
+        assert_eq!(fixture.fixture_version, 1);
+        assert_eq!(
+            fixture
+                .releases
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["0.1.0", "0.1.1", "0.1.2", "0.1.3", "0.1.4", "0.1.5"]
+        );
+        assert_eq!(fixture.metadata_version, 1);
+        assert_eq!(fixture.schema_version, MODEL_VERSION);
+        assert_eq!(fixture.secret_profile_version, SECRET_PROFILE_VERSION);
+        assert!(!fixture.migration_required);
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("v0.1.x-wallet");
+        let state = WalletState::new(identity(), [6; 32], default_node_configuration(identity()));
+        let wallet =
+            WalletDirectory::create(&root, &state, "correct", KdfParameters::TEST).unwrap();
+        let metadata_before = fs::read(root.join(METADATA_FILE)).unwrap();
+        let generation_path = root
+            .join(GENERATIONS_DIR)
+            .join(generation_name(0))
+            .join(STATE_FILE);
+        let generation_before = fs::read(&generation_path).unwrap();
+        drop(wallet);
+
+        let reopened = WalletDirectory::open(&root).unwrap();
+        let loaded = reopened.load("correct").unwrap();
+        assert_eq!(loaded, state);
+        drop(reopened);
+        assert_eq!(fs::read(root.join(METADATA_FILE)).unwrap(), metadata_before);
+        assert_eq!(fs::read(generation_path).unwrap(), generation_before);
+    }
+
+    #[test]
+    fn unknown_schema_fails_without_overwriting_original_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("unknown-schema-wallet");
+        let state = WalletState::new(identity(), [6; 32], default_node_configuration(identity()));
+        let wallet =
+            WalletDirectory::create(&root, &state, "correct", KdfParameters::TEST).unwrap();
+        let mut metadata: WalletMetadata =
+            serde_json::from_slice(&fs::read(root.join(METADATA_FILE)).unwrap()).unwrap();
+        metadata.schema_version = u16::MAX;
+        let unsupported = serde_json::to_vec(&metadata).unwrap();
+        atomic_write(&root.join(METADATA_FILE), &unsupported).unwrap();
+        let generation_path = root
+            .join(GENERATIONS_DIR)
+            .join(generation_name(0))
+            .join(STATE_FILE);
+        let generation_before = fs::read(&generation_path).unwrap();
+        drop(wallet);
+
+        let reopened = WalletDirectory::open(&root).unwrap();
+        assert!(matches!(
+            reopened.metadata(),
+            Err(StorageError::UnsupportedVersion)
+        ));
+        assert!(matches!(
+            reopened.load("correct"),
+            Err(StorageError::UnsupportedVersion)
+        ));
+        drop(reopened);
+        assert_eq!(fs::read(root.join(METADATA_FILE)).unwrap(), unsupported);
+        assert_eq!(fs::read(generation_path).unwrap(), generation_before);
+    }
+
+    #[test]
     fn mixed_generation_pointer_is_rejected() {
         let temp = tempfile::tempdir().unwrap();
         let state = WalletState::new(identity(), [6; 32], default_node_configuration(identity()));
@@ -759,6 +907,39 @@ mod tests {
         )
         .unwrap();
         assert!(wallet.load("correct").is_err());
+    }
+
+    #[test]
+    fn authenticated_adjacent_generation_repairs_interrupted_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let wallet = WalletDirectory::create(
+            temp.path().join("wallet"),
+            &WalletState::new(identity(), [6; 32], default_node_configuration(identity())),
+            "correct",
+            KdfParameters::TEST,
+        )
+        .unwrap();
+        let mut changed = wallet.load("correct").unwrap();
+        changed.allocate().unwrap();
+        let staged = wallet
+            .stage_generation(0, changed, "correct", KdfParameters::TEST)
+            .unwrap();
+        atomic_write(
+            &wallet.root().join(ACTIVE_FILE),
+            generation_name(staged.generation).as_bytes(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            wallet.load("wrong"),
+            Err(StorageError::Crypto(CryptoError::AuthenticationFailed))
+        ));
+        assert_eq!(wallet.metadata().unwrap().active_generation, 0);
+
+        let reopened = wallet.load("correct").unwrap();
+        assert_eq!(reopened.generation, 1);
+        assert_eq!(wallet.metadata().unwrap().active_generation, 1);
+        assert_eq!(wallet.load("correct").unwrap(), reopened);
     }
 
     #[test]

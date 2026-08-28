@@ -635,7 +635,7 @@ fn wallet_owned_miner_counts_real_work_and_accepts_a_regtest_block() {
     let outcome = runtime
         .block_on(mine_wallet_block(
             lifecycle.node_handle().unwrap(),
-            coinbase,
+            &coinbase,
             1,
             stop,
             Arc::clone(&attempts),
@@ -694,7 +694,7 @@ fn wallet_owned_miner_honors_stop_before_any_hash_attempt() {
         .unwrap();
     let result = runtime.block_on(mine_wallet_block(
         lifecycle.node_handle().unwrap(),
-        coinbase,
+        &coinbase,
         1,
         Arc::new(AtomicBool::new(true)),
         Arc::clone(&attempts),

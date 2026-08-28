@@ -96,6 +96,12 @@ impl ProductionWalletBackend {
         &self.identity
     }
 
+    /// Refresh the canonical tip while requiring every immutable chain identity
+    /// field to remain equal to the identity validated at startup.
+    pub fn current_identity(&self) -> Result<CoreChainIdentity, ProductionBackendError> {
+        Ok(self.chain.current_identity()?)
+    }
+
     pub fn is_ready(&self) -> Result<bool, ProductionBackendError> {
         Ok(self.lifecycle.is_ready_for_wallet_operations()?)
     }
@@ -212,5 +218,46 @@ mod tests {
         assert!(backend.is_ready().is_ok());
         backend.shutdown().expect("idempotent shutdown");
         backend.shutdown().expect("repeated shutdown");
+    }
+
+    #[test]
+    fn seed_restore_round_trip_uses_the_real_embedded_core() {
+        let node_directory = tempfile::tempdir().expect("temporary node directory");
+        let wallet_parent = tempfile::tempdir().expect("temporary wallet parent");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral loopback port");
+        let address = listener.local_addr().expect("loopback address");
+        drop(listener);
+        let configuration = EmbeddedCoreConfiguration::new(
+            EmbeddedCoreNetwork::Regtest,
+            node_directory.path(),
+            address,
+        )
+        .with_maximum_inbound_peers(2);
+        let mut backend = ProductionWalletBackend::start(configuration, None)
+            .expect("embedded production backend starts");
+        let seed =
+            CanonicalWalletSeed::from_entropy(&[0x73; 32]).expect("test-only recovery material");
+        let phrase = seed.mnemonic_text();
+        let destination = wallet_parent.path().join("restored-wallet");
+
+        let restored = backend
+            .restore(
+                phrase.as_str(),
+                "test-only-restore-password",
+                &destination,
+                KdfParameters::TEST,
+            )
+            .expect("seed restore through real embedded Core");
+
+        assert_eq!(
+            restored.completion,
+            dom_wallet_core_restore::SeedRestoreCompletion::NoOwnedOutputs
+        );
+        assert!(destination.join("active-generation").is_file());
+        assert!(!wallet_parent
+            .path()
+            .join(".restored-wallet.seed-restore")
+            .exists());
+        backend.shutdown().expect("ordered shutdown");
     }
 }
