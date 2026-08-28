@@ -80,8 +80,6 @@ The `main-v0.4` branch is the principal line. It integrates, on top of `wallet-v
 | Swap tab user interface | Implemented on main-v0.4, fail-closed |
 | Swap execution | Blocked on the interop daemon |
 | Packaged Mainnet acceptance | In progress |
-| Real-fund authorization | Not authorized |
-| Independent audit | Not completed |
 
 ---
 
