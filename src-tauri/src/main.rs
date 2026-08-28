@@ -474,9 +474,10 @@ fn wallet_create_recoverable(
     name: String,
     password: String,
 ) -> Result<dom_wallet_tauri_shell::RecoveryCreateDto, dom_wallet_tauri_shell::CommandErrorDto> {
+    let password = Zeroizing::new(password);
     let path = managed_wallet_path(&handle, &name)?;
     ensure_mainnet_node(&handle, &app)?;
-    app.wallet_create_recoverable(path, &password)
+    app.wallet_create_recoverable(path, password.as_str())
         .map_err(Into::into)
 }
 
@@ -487,9 +488,10 @@ fn wallet_create_resume(
     name: String,
     password: String,
 ) -> Result<dom_wallet_tauri_shell::RecoveryCreateDto, dom_wallet_tauri_shell::CommandErrorDto> {
+    let password = Zeroizing::new(password);
     let path = managed_wallet_path(&handle, &name)?;
     ensure_mainnet_node(&handle, &app)?;
-    app.wallet_create_resume(path, &password)
+    app.wallet_create_resume(path, password.as_str())
         .map_err(Into::into)
 }
 
@@ -500,8 +502,10 @@ fn wallet_create_abort(
     name: String,
     password: String,
 ) -> Result<(), dom_wallet_tauri_shell::CommandErrorDto> {
+    let password = Zeroizing::new(password);
     let path = managed_wallet_path(&handle, &name)?;
-    app.wallet_create_abort(path, &password).map_err(Into::into)
+    app.wallet_create_abort(path, password.as_str())
+        .map_err(Into::into)
 }
 
 #[tauri::command]
@@ -543,8 +547,9 @@ fn wallet_restore_abort(
     name: String,
     password: String,
 ) -> Result<(), dom_wallet_tauri_shell::CommandErrorDto> {
+    let password = Zeroizing::new(password);
     let destination = managed_wallet_path(&handle, &name)?;
-    dom_wallet_core_restore::abort_restore_stage(&destination, &password)
+    dom_wallet_core_restore::abort_restore_stage(&destination, password.as_str())
         .map_err(dom_wallet_tauri_shell::CommandError::from)
         .map_err(Into::into)
 }
@@ -554,7 +559,8 @@ fn wallet_backup_export(
     destination: String,
     backup_password: String,
 ) -> Result<dom_wallet_core::BackupStatus, dom_wallet_tauri_shell::CommandErrorDto> {
-    app.wallet_backup_export(destination, &backup_password)
+    let backup_password = Zeroizing::new(backup_password);
+    app.wallet_backup_export(destination, backup_password.as_str())
         .map_err(Into::into)
 }
 #[tauri::command]
@@ -566,17 +572,25 @@ fn wallet_backup_import(
     backup_password: String,
     password: String,
 ) -> Result<dom_wallet_core::WalletSummary, dom_wallet_tauri_shell::CommandErrorDto> {
+    let backup_password = Zeroizing::new(backup_password);
+    let password = Zeroizing::new(password);
     let destination = managed_wallet_path(&handle, &name)?;
     ensure_mainnet_node(&handle, &app)?;
-    app.wallet_backup_import(destination, backup_path, &backup_password, &password)
-        .map_err(Into::into)
+    app.wallet_backup_import(
+        destination,
+        backup_path,
+        backup_password.as_str(),
+        password.as_str(),
+    )
+    .map_err(Into::into)
 }
 #[tauri::command]
 fn wallet_recovery_phrase_confirm(
     app: tauri::State<'_, DesktopApplication>,
     password: String,
 ) -> Result<(), dom_wallet_tauri_shell::CommandErrorDto> {
-    app.wallet_recovery_phrase_confirm(&password)
+    let password = Zeroizing::new(password);
+    app.wallet_recovery_phrase_confirm(password.as_str())
         .map_err(Into::into)
 }
 
@@ -621,7 +635,8 @@ fn wallet_unlock(
     app: tauri::State<'_, DesktopApplication>,
     password: String,
 ) -> Result<dom_wallet_core::WalletSummary, dom_wallet_tauri_shell::CommandErrorDto> {
-    app.wallet_unlock(&password).map_err(Into::into)
+    let password = Zeroizing::new(password);
+    app.wallet_unlock(password.as_str()).map_err(Into::into)
 }
 #[tauri::command]
 fn wallet_lock(

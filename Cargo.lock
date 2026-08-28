@@ -1706,6 +1706,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "url",
+ "zeroize",
 ]
 
 [[package]]
@@ -1720,6 +1721,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
