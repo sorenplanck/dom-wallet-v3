@@ -697,6 +697,10 @@ struct MiningRuntime {
     hashrate_window: Arc<Mutex<HashrateWindow>>,
     cached_current_height: AtomicU64,
     cached_connected_peers: AtomicU64,
+    /// Last computed DEPC-3 estimate, stored as `f64::to_bits`; zero means
+    /// "no estimate yet". Lets `mining_status` stay responsive when the
+    /// service lock is held by background work (regression A4).
+    cached_production_cost_usd_bits: AtomicU64,
     error_code: Arc<Mutex<Option<String>>>,
     cached_config: Mutex<Option<MiningConfigDto>>,
     worker: Option<JoinHandle<()>>,
@@ -718,6 +722,7 @@ impl Default for MiningRuntime {
             hashrate_window: Arc::new(Mutex::new(HashrateWindow::new())),
             cached_current_height: AtomicU64::new(0),
             cached_connected_peers: AtomicU64::new(0),
+            cached_production_cost_usd_bits: AtomicU64::new(0),
             error_code: Arc::new(Mutex::new(None)),
             cached_config: Mutex::new(Some(MiningConfigDto {
                 enabled: false,
@@ -1050,6 +1055,82 @@ fn ensure_scan_backend(
     }
 }
 
+/// DEPC-3 estimated production-cost reference.
+///
+/// Presentation-layer economics only: these values feed the mining screen and
+/// nothing else. They never enter fee computation, transaction construction,
+/// consensus or any protocol path. Percentage fees are charged on observable
+/// DOM quantities inside a route; this reference merely tells the user what
+/// producing one DOM is estimated to cost.
+pub mod depc {
+    /// Frozen reference basket version. Changing any constant below is a new
+    /// DEPC version, never a silent update of the coefficient.
+    ///
+    /// Basket: five RandomX CPUs (Ryzen 3900X, 5950X, 7950X, 9950X and one
+    /// EPYC 9654) with machine overhead 1.35 (desktop) / 1.20 (EPYC), energy
+    /// at US$ 0.164/kWh central, straight-line depreciation to 20% residual
+    /// and 3% CAPEX/year maintenance. Cost split: energy 53.5%, depreciation
+    /// 39.9%, maintenance 6.5%.
+    pub const DEPC_BASKET_VERSION: &str = "DEPC-3-2026H2";
+    /// Central full-system cost of one kH/s for one day, in USD.
+    pub const DEPC_COST_CENTRAL_USD_PER_KHS_DAY: f64 = 0.074_040_71;
+    /// Low scenario: kWh 0.06, overhead 1.25/1.15, service life 5/6 years.
+    pub const DEPC_COST_LOW_USD_PER_KHS_DAY: f64 = 0.042_319_30;
+    /// High scenario: kWh 0.20, overhead 1.45/1.30, service life 3/4 years.
+    pub const DEPC_COST_HIGH_USD_PER_KHS_DAY: f64 = 0.095_357_97;
+
+    /// Network hashrate implied by the expected per-block difficulty.
+    ///
+    /// The DOM difficulty is the expected number of hashes per block, so the
+    /// network produces `difficulty / spacing` hashes per second on average.
+    pub fn network_hashrate_hps(
+        network_difficulty: u128,
+        target_spacing_seconds: u64,
+    ) -> Option<f64> {
+        if network_difficulty == 0 || target_spacing_seconds == 0 {
+            return None;
+        }
+        let value = network_difficulty as f64 / target_spacing_seconds as f64;
+        (value.is_finite() && value > 0.0).then_some(value)
+    }
+
+    /// Estimated production cost of one DOM in USD.
+    ///
+    /// `cost / daily_emission` where the network spends
+    /// `hashrate x 86400 / 1000` kH-days per day and the chain emits
+    /// `(86400 / spacing) x reward` DOM per day. The emission term uses the
+    /// live consensus subsidy, so the estimate follows every halving without
+    /// a constant to update.
+    ///
+    /// Fails closed: any missing, zero or non-finite input yields `None`,
+    /// never a fabricated number.
+    pub fn estimated_production_cost_usd_per_dom(
+        network_hashrate_hps: f64,
+        next_block_reward_noms: u64,
+        noms_per_dom: u64,
+        target_spacing_seconds: u64,
+        cost_usd_per_khs_day: f64,
+    ) -> Option<f64> {
+        if next_block_reward_noms == 0 || noms_per_dom == 0 || target_spacing_seconds == 0 {
+            return None;
+        }
+        if !(network_hashrate_hps.is_finite() && network_hashrate_hps > 0.0) {
+            return None;
+        }
+        if !(cost_usd_per_khs_day.is_finite() && cost_usd_per_khs_day > 0.0) {
+            return None;
+        }
+        let blocks_per_day = 86_400.0 / target_spacing_seconds as f64;
+        let reward_dom = next_block_reward_noms as f64 / noms_per_dom as f64;
+        let daily_emission_dom = blocks_per_day * reward_dom;
+        if !(daily_emission_dom.is_finite() && daily_emission_dom > 0.0) {
+            return None;
+        }
+        let value = (network_hashrate_hps / 1_000.0) * cost_usd_per_khs_day / daily_emission_dom;
+        (value.is_finite() && value > 0.0).then_some(value)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MiningConfigDto {
@@ -1079,6 +1160,10 @@ pub struct MiningStatusDto {
     pub last_accepted_block_height: Option<u64>,
     pub uptime_seconds: u64,
     pub error_code: Option<String>,
+    /// DEPC-3 estimated production cost of one DOM, in USD. `None` whenever
+    /// the node cannot supply difficulty or subsidy — the UI shows a dash.
+    #[serde(default)]
+    pub estimated_production_cost_usd_per_dom: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -2240,26 +2325,62 @@ impl DesktopApplication {
         } else {
             0.0
         };
-        let (current_height, connected_peers) = match self.service.try_lock() {
-            Ok(service) => {
-                let peer_status = service.embedded_peer_status().map_err(CommandError::from)?;
-                mining
-                    .cached_current_height
-                    .store(peer_status.canonical_height, Ordering::Release);
-                mining
-                    .cached_connected_peers
-                    .store(peer_status.connected_total, Ordering::Release);
-                (peer_status.canonical_height, peer_status.connected_total)
-            }
-            Err(std::sync::TryLockError::WouldBlock) => (
-                mining.cached_current_height.load(Ordering::Acquire),
-                mining.cached_connected_peers.load(Ordering::Acquire),
-            ),
-            Err(std::sync::TryLockError::Poisoned(_)) => {
-                self.recovery_required.store(true, Ordering::Release);
-                return Err(CommandError::RecoveryRequired);
-            }
-        };
+        let (current_height, connected_peers, estimated_production_cost_usd_per_dom) =
+            match self.service.try_lock() {
+                Ok(service) => {
+                    let peer_status = service.embedded_peer_status().map_err(CommandError::from)?;
+                    mining
+                        .cached_current_height
+                        .store(peer_status.canonical_height, Ordering::Release);
+                    mining
+                        .cached_connected_peers
+                        .store(peer_status.connected_total, Ordering::Release);
+                    // Fail-closed presentation: any error along the economics
+                    // chain leaves the estimate empty instead of failing the
+                    // whole status query. The same held lock is reused; this arm
+                    // never blocks on the service a second time.
+                    let estimate = service
+                        .embedded_mining_economics()
+                        .ok()
+                        .and_then(|economics| {
+                            depc::network_hashrate_hps(
+                                economics.network_difficulty,
+                                economics.target_spacing_seconds,
+                            )
+                            .and_then(|network_hashrate| {
+                                depc::estimated_production_cost_usd_per_dom(
+                                    network_hashrate,
+                                    economics.next_block_reward_noms,
+                                    economics.noms_per_dom,
+                                    economics.target_spacing_seconds,
+                                    depc::DEPC_COST_CENTRAL_USD_PER_KHS_DAY,
+                                )
+                            })
+                        });
+                    mining
+                        .cached_production_cost_usd_bits
+                        .store(estimate.map_or(0, f64::to_bits), Ordering::Release);
+                    (
+                        peer_status.canonical_height,
+                        peer_status.connected_total,
+                        estimate,
+                    )
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let cached_bits = mining
+                        .cached_production_cost_usd_bits
+                        .load(Ordering::Acquire);
+                    (
+                        mining.cached_current_height.load(Ordering::Acquire),
+                        mining.cached_connected_peers.load(Ordering::Acquire),
+                        (cached_bits != 0).then(|| f64::from_bits(cached_bits)),
+                    )
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    self.recovery_required.store(true, Ordering::Release);
+                    return Err(CommandError::RecoveryRequired);
+                }
+            };
         let last_candidate = mining.last_candidate_time.load(Ordering::Acquire);
         let last_height = mining.last_accepted_height.load(Ordering::Acquire);
         Ok(MiningStatusDto {
@@ -2283,6 +2404,7 @@ impl DesktopApplication {
                 .lock()
                 .ok()
                 .and_then(|error| error.clone()),
+            estimated_production_cost_usd_per_dom,
         })
     }
 
@@ -5960,5 +6082,112 @@ mod tests {
                 | CommandError::NodeNotReady)
         ));
         app.application_shutdown().expect("shutdown");
+    }
+}
+
+#[cfg(test)]
+mod depc_tests {
+    use super::depc;
+
+    const REWARD_EPOCH_0_NOMS: u64 = 3_300_000_000;
+    const REWARD_EPOCH_1_NOMS: u64 = 2_211_000_000;
+    const NOMS_PER_DOM: u64 = 100_000_000;
+    const TARGET_SPACING: u64 = 120;
+
+    fn relative_error(actual: f64, expected: f64) -> f64 {
+        ((actual - expected) / expected).abs()
+    }
+
+    #[test]
+    fn central_vector_matches_the_frozen_basket() {
+        // 50 kH/s over 23,760 DOM/day: (50 x 0.07404071) / 23,760.
+        let value = depc::estimated_production_cost_usd_per_dom(
+            50_000.0,
+            REWARD_EPOCH_0_NOMS,
+            NOMS_PER_DOM,
+            TARGET_SPACING,
+            depc::DEPC_COST_CENTRAL_USD_PER_KHS_DAY,
+        )
+        .expect("central vector must produce a value");
+        assert!(relative_error(value, 1.558_095_7e-4) < 1.0e-6);
+    }
+
+    #[test]
+    fn low_and_high_scenarios_bound_the_central_value() {
+        let low = depc::estimated_production_cost_usd_per_dom(
+            50_000.0,
+            REWARD_EPOCH_0_NOMS,
+            NOMS_PER_DOM,
+            TARGET_SPACING,
+            depc::DEPC_COST_LOW_USD_PER_KHS_DAY,
+        )
+        .expect("low vector must produce a value");
+        let high = depc::estimated_production_cost_usd_per_dom(
+            50_000.0,
+            REWARD_EPOCH_0_NOMS,
+            NOMS_PER_DOM,
+            TARGET_SPACING,
+            depc::DEPC_COST_HIGH_USD_PER_KHS_DAY,
+        )
+        .expect("high vector must produce a value");
+        assert!(relative_error(low, 8.905_576e-5) < 1.0e-6);
+        assert!(relative_error(high, 2.006_691e-4) < 1.0e-6);
+        assert!(low < high);
+    }
+
+    #[test]
+    fn the_estimate_follows_the_halving_through_the_live_subsidy() {
+        let epoch_0 = depc::estimated_production_cost_usd_per_dom(
+            50_000.0,
+            REWARD_EPOCH_0_NOMS,
+            NOMS_PER_DOM,
+            TARGET_SPACING,
+            depc::DEPC_COST_CENTRAL_USD_PER_KHS_DAY,
+        )
+        .expect("epoch 0 must produce a value");
+        let epoch_1 = depc::estimated_production_cost_usd_per_dom(
+            50_000.0,
+            REWARD_EPOCH_1_NOMS,
+            NOMS_PER_DOM,
+            TARGET_SPACING,
+            depc::DEPC_COST_CENTRAL_USD_PER_KHS_DAY,
+        )
+        .expect("epoch 1 must produce a value");
+        let expected_ratio = REWARD_EPOCH_0_NOMS as f64 / REWARD_EPOCH_1_NOMS as f64;
+        assert!(relative_error(epoch_1 / epoch_0, expected_ratio) < 1.0e-9);
+    }
+
+    #[test]
+    fn missing_or_zero_inputs_fail_closed() {
+        assert_eq!(depc::network_hashrate_hps(0, TARGET_SPACING), None);
+        assert_eq!(depc::network_hashrate_hps(6_000_000, 0), None);
+        assert_eq!(
+            depc::estimated_production_cost_usd_per_dom(
+                50_000.0,
+                0,
+                NOMS_PER_DOM,
+                TARGET_SPACING,
+                depc::DEPC_COST_CENTRAL_USD_PER_KHS_DAY,
+            ),
+            None
+        );
+        assert_eq!(
+            depc::estimated_production_cost_usd_per_dom(
+                f64::NAN,
+                REWARD_EPOCH_0_NOMS,
+                NOMS_PER_DOM,
+                TARGET_SPACING,
+                depc::DEPC_COST_CENTRAL_USD_PER_KHS_DAY,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn network_hashrate_derives_exactly_from_the_expected_difficulty() {
+        assert_eq!(
+            depc::network_hashrate_hps(6_000_000, TARGET_SPACING),
+            Some(50_000.0)
+        );
     }
 }

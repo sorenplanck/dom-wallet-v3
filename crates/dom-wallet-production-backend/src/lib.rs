@@ -20,6 +20,7 @@ use dom_wallet_core_sync::{
 use dom_wallet_crypto::KdfParameters;
 use dom_wallet_embedded_core::{
     EmbeddedCoreAdapterError, EmbeddedCoreConfiguration, EmbeddedCoreLifecycle, EmbeddedPeerStatus,
+    MiningEconomics,
 };
 use std::{fmt, path::Path, sync::Arc};
 use thiserror::Error;
@@ -186,6 +187,13 @@ impl ProductionWalletBackend {
     pub fn peer_status(&self) -> Result<EmbeddedPeerStatus, ProductionBackendError> {
         match &self.lifecycle {
             Some(lifecycle) => Ok(lifecycle.peer_status()?),
+            None => Err(ProductionBackendError::EmbeddedNodeRequired),
+        }
+    }
+
+    pub fn mining_economics(&self) -> Result<MiningEconomics, ProductionBackendError> {
+        match &self.lifecycle {
+            Some(lifecycle) => Ok(lifecycle.mining_economics()?),
             None => Err(ProductionBackendError::EmbeddedNodeRequired),
         }
     }

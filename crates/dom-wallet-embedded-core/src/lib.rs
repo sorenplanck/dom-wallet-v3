@@ -263,6 +263,27 @@ impl EmbeddedCoreConfiguration {
     }
 }
 
+/// Read-only mining economics snapshot for wallet presentation.
+///
+/// Every value is consumed from the embedded canonical node and the frozen
+/// consensus crates. Nothing here recomputes consensus: the difficulty comes
+/// from the same `dom-pow` pair the wallet miner already uses, the subsidy
+/// comes from `dom_core::block_reward`, and the constants are imported.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MiningEconomics {
+    /// Height of the next block candidate.
+    pub next_height: u64,
+    /// Expected proof-of-work difficulty for the next block candidate,
+    /// i.e. the expected number of hashes per block.
+    pub network_difficulty: u128,
+    /// Consensus block subsidy at the next height, in noms.
+    pub next_block_reward_noms: u64,
+    /// Consensus target block spacing, in seconds.
+    pub target_spacing_seconds: u64,
+    /// Consensus base unit: noms per DOM.
+    pub noms_per_dom: u64,
+}
+
 /// Privacy-safe live peer counters from the embedded node.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EmbeddedPeerStatus {
@@ -622,6 +643,47 @@ impl EmbeddedCoreLifecycle {
                     _ => "PENDING",
                 })
                 .collect(),
+        })
+    }
+
+    /// Return the read-only economics snapshot behind the mining screen.
+    ///
+    /// Fails closed: a stopped node, a missing node handle or a clock error
+    /// is an error, never a zeroed snapshot.
+    pub fn mining_economics(&self) -> Result<MiningEconomics, EmbeddedCoreAdapterError> {
+        if self.state() != EmbeddedCoreLifecycleState::Running {
+            return Err(EmbeddedCoreAdapterError::NotRunning);
+        }
+        let node = self
+            .node
+            .as_ref()
+            .ok_or(EmbeddedCoreAdapterError::Internal {
+                code: "MISSING_NODE",
+            })?;
+        let next_height = node
+            .metrics
+            .chain_height
+            .load(Ordering::Relaxed)
+            .saturating_add(1);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| EmbeddedCoreAdapterError::Internal { code: "CLOCK" })?
+            .as_secs();
+        let target = dom_pow::compute_expected_target(
+            node.config.network.magic(),
+            dom_core::Timestamp(now),
+            dom_core::BlockHeight(next_height),
+        )
+        .map_err(|_| EmbeddedCoreAdapterError::Internal {
+            code: "EXPECTED_TARGET",
+        })?;
+        Ok(MiningEconomics {
+            next_height,
+            network_difficulty: dom_pow::target_to_difficulty(&target),
+            next_block_reward_noms: dom_core::block_reward(dom_core::BlockHeight(next_height))
+                .noms(),
+            target_spacing_seconds: dom_core::constants::TARGET_SPACING,
+            noms_per_dom: dom_core::constants::COIN_UNIT,
         })
     }
 

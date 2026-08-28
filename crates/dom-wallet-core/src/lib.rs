@@ -34,7 +34,7 @@ use dom_wallet_domain::{
     TransactionLifecycle, TransactionRole, TransactionTransitionEvidence, WalletState,
     RECOVERY_SCHEME_BIP39_256_V1,
 };
-use dom_wallet_embedded_core::{EmbeddedCoreConfiguration, EmbeddedPeerStatus};
+use dom_wallet_embedded_core::{EmbeddedCoreConfiguration, EmbeddedPeerStatus, MiningEconomics};
 use dom_wallet_production_backend::{ProductionBackendError, PRODUCTION_BACKEND_KIND};
 pub use dom_wallet_production_backend::{ProductionWalletBackend, REMOTE_BACKEND_KIND};
 use dom_wallet_storage::{
@@ -493,6 +493,15 @@ impl WalletService {
             .as_ref()
             .ok_or(CoreError::EmbeddedCoreRequired)?
             .peer_status()
+            .map_err(CoreError::from)
+    }
+
+    /// Read-only mining economics for presentation. Never touches keys.
+    pub fn embedded_mining_economics(&self) -> Result<MiningEconomics, CoreError> {
+        self.backend
+            .as_ref()
+            .ok_or(CoreError::EmbeddedCoreRequired)?
+            .mining_economics()
             .map_err(CoreError::from)
     }
 
