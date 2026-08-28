@@ -65,9 +65,10 @@ impl ProductionBackendError {
 /// Two constructions exist:
 /// - [`ProductionWalletBackend::start`]: the embedded node (default). Owns the
 ///   node lifecycle plus submission and fee-policy adapters.
-/// - [`ProductionWalletBackend::start_remote`]: a remote scan-only source.
-///   `lifecycle`, `submission` and `fees` are absent and every operation that
-///   would need them returns [`ProductionBackendError::EmbeddedNodeRequired`].
+/// - [`ProductionWalletBackend::start_remote`]: a remote scan source with the
+///   frozen deterministic fee policy. `lifecycle` and `submission` are absent;
+///   operations that require node ownership still return
+///   [`ProductionBackendError::EmbeddedNodeRequired`].
 pub struct ProductionWalletBackend {
     lifecycle: Option<EmbeddedCoreLifecycle>,
     chain: CoreChainAdapter,
@@ -118,7 +119,8 @@ impl ProductionWalletBackend {
     /// Start a remote scan-only backend over an already constructed frozen
     /// `WalletCoreApi` (e.g. `dom-wallet-remote-source`). The chain adapter is
     /// identical to the embedded one — cursor rules, reorg depth and paging are
-    /// byte-for-byte the same — but no submission or fee surface exists.
+    /// byte-for-byte the same. The remote API may serve only the frozen,
+    /// deterministic fee policy; transaction submission remains unavailable.
     pub fn start_remote(
         api: Arc<dyn WalletCoreApi + Send + Sync>,
         expected_identity: Option<&CoreChainIdentity>,
@@ -130,11 +132,12 @@ impl ProductionWalletBackend {
             DEFAULT_REORG_DEPTH,
         )?;
         let identity = chain.identity().clone();
+        let fees = CoreFeePolicyService::connect(Arc::clone(&api), identity.clone())?;
         Ok(Self {
             lifecycle: None,
             chain,
             submission: None,
-            fees: None,
+            fees: Some(fees),
             identity,
             api,
         })

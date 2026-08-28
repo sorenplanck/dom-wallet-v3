@@ -2,20 +2,33 @@
 
 //! Production Wallet orchestration over the frozen embedded DOM Core boundary.
 
-use dom_consensus::Transaction;
+use dom_adaptor::{
+    aggregate_transaction_offset_contributions_v1, ContractTxRoleV1,
+    ScriptlessTransactionTemplateV1, SessionBlindingShareCapabilityV1,
+};
+use dom_consensus::{Transaction, TransactionInput, TransactionOutput};
+use dom_core::{KERNEL_FEAT_HEIGHT_LOCKED, KERNEL_FEAT_PLAIN};
+use dom_crypto::{scriptless_add_public_points, PublicKey};
 use dom_serialization::{DomDeserialize, DomSerialize};
+use dom_slate::{
+    sender_excess_blinding, CoverLockOutcomeV1, CoverLockPolicyV1, ValidatedChainSnapshotV1,
+};
 use dom_wallet_core_api::WalletScanCursor;
 use dom_wallet_core_protocol::{
     AddressIdentityPurpose, CanonicalSlate, ProtocolAdapterError, SlatePhase, WalletAddress,
     WalletTransactionShape,
 };
 use dom_wallet_core_recovery::{
-    finalize_recoverable_transaction, CanonicalWalletSeed, RecoverableOutputBuilder,
-    RecoverableSenderParts, WalletSlateInput, CANONICAL_TRANSACTION_OUTPUT_SIZE,
+    finalize_recoverable_transaction, verify_recoverable_transaction_against_response,
+    BoundScriptlessSigningContextV1, CanonicalWalletSeed, OpaqueScriptlessFundingExcessV1,
+    OpaqueScriptlessPayoutExcessV1, RecoverableOutputBuilder, RecoverableSenderParts,
+    ScriptlessFundingSigningCapabilityV1, ScriptlessPayoutSigningCapabilityV1,
+    VerifiedRecoverableTransaction, WalletSlateInput, CANONICAL_TRANSACTION_OUTPUT_SIZE,
 };
 pub use dom_wallet_core_recovery::{PhraseProblem, CANONICAL_PHRASE_WORDS};
 use dom_wallet_core_restore::{
-    apply_recovery_batch, offline_restore_state, rewind_recovery_state, SeedRestoreResult,
+    apply_recovery_batch, offline_restore_state, rewind_recovery_state, SeedRestoreError,
+    SeedRestoreResult,
 };
 use dom_wallet_core_submit::{
     CanonicalTransactionSubmission, WalletSubmissionOutcome, WalletSubmissionQuery,
@@ -29,10 +42,15 @@ use dom_wallet_crypto::{KdfParameters, SecretBytes};
 use dom_wallet_domain::{
     cancellation_decision, BalanceProjection, BroadcastExposure, CancellationDecision,
     LocalTransactionIntent, MiningPreferences, Network, NetworkIdentity, NodeConfiguration,
-    OutputRecord, OutputState, PrivateTransactionContext, RecoveryMetadata, RecoveryOutputClass,
-    RedactedNodeConfiguration, SeedRestoreStatus, SyncStatus, TransactionCancellationReason,
-    TransactionLifecycle, TransactionRole, TransactionTransitionEvidence, WalletState,
-    RECOVERY_SCHEME_BIP39_256_V1,
+    OutputRecord, OutputState, PrivateScriptlessFundingContext, PrivateScriptlessPayoutContext,
+    PrivateTransactionContext, RecoveryMetadata, RecoveryOutputClass, RedactedNodeConfiguration,
+    ScriptlessFundingReservation, ScriptlessFundingReservationState, ScriptlessPayoutReservation,
+    ScriptlessPayoutReservationState, ScriptlessPayoutRoleV1,
+    ScriptlessTemplateParticipantBindingV1, SeedRestoreStatus, SyncStatus,
+    TransactionCancellationReason, TransactionLifecycle, TransactionRole,
+    TransactionTransitionEvidence, WalletState, RECOVERY_SCHEME_BIP39_256_V1,
+    SCRIPTLESS_FUNDING_RESERVATION_VERSION, SCRIPTLESS_PARTICIPANT_COUNT_V1,
+    SCRIPTLESS_PAYOUT_RESERVATION_VERSION,
 };
 use dom_wallet_embedded_core::{EmbeddedCoreConfiguration, EmbeddedPeerStatus, MiningEconomics};
 use dom_wallet_production_backend::{ProductionBackendError, PRODUCTION_BACKEND_KIND};
@@ -165,6 +183,211 @@ pub struct SlateExport {
     pub transaction_id: Uuid,
     pub slate_id: Uuid,
     pub text: String,
+}
+
+/// Exact finalized bytes exchanged only after the normal Slate response.
+/// All fields are public chain data; no participant secret is included.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FinalizedTransactionExport {
+    pub transaction_id: Uuid,
+    pub slate_id: Uuid,
+    pub canonical_bytes: Vec<u8>,
+    pub transaction_hash: [u8; 32],
+}
+
+/// Observable result of the ordinary-send cover decision made before a Slate
+/// exists. A fallback is explicit so G-COVER can count it; it is never hidden
+/// as a successful cover send.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoverSendDecision {
+    HeightLocked { lock_height: u64 },
+    NotSelectedPlain,
+    NoSatisfiedHeightPlainFallback,
+}
+
+/// Public result of constructing an eligible ordinary send under G-COVER.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoverSendResult {
+    pub transaction: TransactionSummary,
+    pub decision: CoverSendDecision,
+}
+
+/// Frozen request from the independent Scriptless session/store to the common
+/// wallet. `local_debit_noms` is this participant's assigned reduction in
+/// wallet value; across all participants it must equal shared-output value plus
+/// the single funding fee. The authoritative Scriptless transaction builder
+/// proves that final balance equation before signing.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct ScriptlessFundingReservationRequestV1 {
+    pub session_id: [u8; 32],
+    /// Exact collaborative output the aggregate funding template must create.
+    pub shared_output_commitment: [u8; 33],
+    /// Zero explicitly represents the non-paying participant's required
+    /// `e_i = -offset_i` contribution and selects no wallet input.
+    pub local_debit_noms: u64,
+    pub funding_fee_noms: u64,
+    /// Frozen aggregate funding shape used for the real node fee-policy check.
+    pub expected_input_count: u32,
+    /// Frozen aggregate count including the one global shared output exactly
+    /// once, plus every participant's ordinary change outputs.
+    pub expected_output_count: u32,
+}
+
+impl fmt::Debug for ScriptlessFundingReservationRequestV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ScriptlessFundingReservationRequestV1")
+            .field("session_id", &"[REDACTED]")
+            .field("shared_output_commitment", &"[PUBLIC COMMITMENT]")
+            .field("amounts", &"[REDACTED]")
+            .field("expected_input_count", &self.expected_input_count)
+            .field("expected_output_count", &self.expected_output_count)
+            .finish()
+    }
+}
+
+/// Redacted durable state returned by reservation lifecycle operations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScriptlessFundingReservationSummaryV1 {
+    pub reservation_id: Uuid,
+    pub state: ScriptlessFundingReservationState,
+    pub selected_input_count: u32,
+    pub has_change: bool,
+    pub template_bound: bool,
+}
+
+/// Exact normal-DOM components handed to
+/// `dom_adaptor::ScriptlessTransactionTemplateV1::funding` by the independent
+/// Scriptless orchestrator. No scalar, seed, nonce, value opening or recovery
+/// key is present.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ScriptlessFundingCompositionV1 {
+    pub reservation_id: Uuid,
+    pub session_id: [u8; 32],
+    pub chain_id: [u8; 32],
+    pub shared_output_commitment: [u8; 33],
+    pub inputs: Vec<TransactionInput>,
+    pub other_outputs: Vec<TransactionOutput>,
+    pub offset_contribution: [u8; 32],
+    pub wallet_excess_public_key: [u8; 33],
+    pub funding_fee_noms: u64,
+    pub expected_input_count: u32,
+    pub expected_output_count: u32,
+}
+
+/// Complete canonical two-party public decomposition used when binding a real
+/// DOM Scriptless template. The aggregate values already appear in the
+/// transaction, but both ordered local contributions are required so each
+/// wallet can prove that the coordinator did not omit or replace its slot.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct ScriptlessTemplateParticipantSetV1 {
+    pub ordered_offset_contributions: [[u8; 32]; 2],
+    pub ordered_kernel_excess_points: [[u8; 33]; 2],
+}
+
+impl fmt::Debug for ScriptlessTemplateParticipantSetV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ScriptlessTemplateParticipantSetV1")
+            .field("participant_count", &2)
+            .field("ordered_offset_contributions", &"[PUBLIC OFFSETS]")
+            .field("ordered_kernel_excess_points", &"[PUBLIC KEYS]")
+            .finish()
+    }
+}
+
+/// Frozen request for one Wallet V3-owned output in a real Scriptless claim
+/// or refund. Claim and refund are distinct reservations even for one session.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct ScriptlessPayoutReservationRequestV1 {
+    pub session_id: [u8; 32],
+    pub role: ScriptlessPayoutRoleV1,
+    pub shared_output_commitment: [u8; 33],
+    /// Zero explicitly represents a non-beneficiary signer and exports no
+    /// output; Wallet V3 never constructs a zero-value confidential output.
+    pub payout_value_noms: u64,
+    pub kernel_fee_noms: u64,
+    pub expected_output_count: u32,
+    /// Must be zero for Claim and nonzero for Refund.
+    pub refund_lock_height: u64,
+}
+
+impl fmt::Debug for ScriptlessPayoutReservationRequestV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ScriptlessPayoutReservationRequestV1")
+            .field("session_id", &"[REDACTED]")
+            .field("role", &self.role)
+            .field("shared_output_commitment", &"[PUBLIC COMMITMENT]")
+            .field("amounts", &"[REDACTED]")
+            .field("expected_output_count", &self.expected_output_count)
+            .field("refund_lock_height", &self.refund_lock_height)
+            .finish()
+    }
+}
+
+/// Redacted lifecycle result for one durable payout reservation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScriptlessPayoutReservationSummaryV1 {
+    pub reservation_id: Uuid,
+    pub role: ScriptlessPayoutRoleV1,
+    pub state: ScriptlessPayoutReservationState,
+    pub template_bound: bool,
+}
+
+/// Exact normal-DOM public components exported before the independent
+/// orchestrator builds the authoritative claim/refund template.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ScriptlessPayoutCompositionV1 {
+    pub reservation_id: Uuid,
+    pub session_id: [u8; 32],
+    pub chain_id: [u8; 32],
+    pub role: ScriptlessPayoutRoleV1,
+    pub shared_output_commitment: [u8; 33],
+    /// Empty for a non-beneficiary signer and exactly one recoverable output
+    /// for the participant assigned a payout.
+    pub outputs: Vec<TransactionOutput>,
+    pub offset_contribution: [u8; 32],
+    pub payout_excess_public_key: [u8; 33],
+    pub kernel_fee_noms: u64,
+    pub expected_output_count: u32,
+    pub refund_lock_height: u64,
+}
+
+impl fmt::Debug for ScriptlessPayoutCompositionV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ScriptlessPayoutCompositionV1")
+            .field("reservation_id", &self.reservation_id)
+            .field("session_id", &"[REDACTED]")
+            .field("chain_id", &"[PUBLIC CHAIN ID]")
+            .field("role", &self.role)
+            .field("shared_output_commitment", &"[PUBLIC COMMITMENT]")
+            .field("output_count", &self.outputs.len())
+            .field("offset_contribution", &"[PUBLIC OFFSET]")
+            .field("payout_excess_public_key", &"[PUBLIC KEY]")
+            .field("kernel_fee_noms", &"[REDACTED]")
+            .field("expected_output_count", &self.expected_output_count)
+            .field("refund_lock_height", &self.refund_lock_height)
+            .finish()
+    }
+}
+
+impl fmt::Debug for ScriptlessFundingCompositionV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ScriptlessFundingCompositionV1")
+            .field("reservation_id", &self.reservation_id)
+            .field("session_id", &"[REDACTED]")
+            .field("chain_id", &"[PUBLIC CHAIN ID]")
+            .field("shared_output_commitment", &"[PUBLIC COMMITMENT]")
+            .field("input_count", &self.inputs.len())
+            .field("other_output_count", &self.other_outputs.len())
+            .field("offset_contribution", &"[PUBLIC OFFSET]")
+            .field("wallet_excess_public_key", &"[PUBLIC KEY]")
+            .field("funding_fee_noms", &"[REDACTED]")
+            .finish()
+    }
 }
 
 pub struct RecoveryCreateResult {
@@ -345,7 +568,7 @@ impl WalletService {
         let directory = WalletDirectory::open(path)?;
         let metadata = directory.metadata()?;
         if let Some(backend) = &self.backend {
-            require_mainnet_identity(&metadata.identity)?;
+            require_canonical_mainnet_when_applicable(&metadata.identity)?;
             require_domain_identity(&metadata.identity, backend.identity())?;
         }
         self.metadata = Some(metadata);
@@ -368,7 +591,7 @@ impl WalletService {
                 .ok_or(CoreError::WalletNotOpen)?
                 .load(password)?;
             if let Some(backend) = &self.backend {
-                require_mainnet_identity(&state.identity)?;
+                require_canonical_mainnet_when_applicable(&state.identity)?;
                 require_domain_identity(&state.identity, backend.identity())?;
             }
             self.password = Some(password_secret);
@@ -429,7 +652,7 @@ impl WalletService {
         if let Some(state) = self.unlocked.as_ref() {
             require_domain_identity(&state.identity, backend.identity())?;
         }
-        let identity = backend.identity().clone();
+        let identity = backend.current_identity()?;
         let result = ProbeResult {
             source_identity: if backend.is_embedded() {
                 PRODUCTION_BACKEND_KIND.into()
@@ -554,7 +777,9 @@ impl WalletService {
         self.backend
             .as_ref()
             .ok_or(CoreError::EmbeddedCoreRequired)?;
-        require_mainnet_identity(&self.unlocked.as_ref().ok_or(CoreError::Locked)?.identity)?;
+        require_canonical_mainnet_when_applicable(
+            &self.unlocked.as_ref().ok_or(CoreError::Locked)?.identity,
+        )?;
         let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
         let coordinate = state.reserve_recovery_coordinate(0, RecoveryOutputClass::Coinbase)?;
         self.commit(state)?;
@@ -908,7 +1133,7 @@ impl WalletService {
         let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
         let seed = CanonicalWalletSeed::from_entropy(&state.root_material)
             .map_err(|_| CoreError::RecoveryPhraseInvalid)?;
-        let identity = backend.identity().clone();
+        let identity = backend.current_identity()?;
         require_domain_identity(&state.identity, &identity)?;
         let location = self
             .location
@@ -922,6 +1147,7 @@ impl WalletService {
         let mut sink = WalletRecoverySink::new(location, state, password, self.kdf, seed, identity);
         self.state = ApplicationState::Synchronizing;
         let result = backend.reconcile_once(&mut sink);
+        let recovery_error = sink.last_recovery_error.take();
         self.backend = Some(backend);
         self.observed_tip_height = sink
             .observed_tip_height
@@ -942,7 +1168,7 @@ impl WalletService {
             }
             Err(error) => {
                 self.finish_sync_failure(&error);
-                Err(error.into())
+                recovery_error.map_or_else(|| Err(error.into()), |error| Err(error.into()))
             }
         }
     }
@@ -976,7 +1202,7 @@ impl WalletService {
         let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
         let seed = CanonicalWalletSeed::from_entropy(&state.root_material)
             .map_err(|_| CoreError::RecoveryPhraseInvalid)?;
-        let identity = backend.identity().clone();
+        let identity = backend.current_identity()?;
         require_domain_identity(&state.identity, &identity)?;
         let location = self
             .location
@@ -990,6 +1216,7 @@ impl WalletService {
         let mut sink = WalletRecoverySink::new(location, state, password, self.kdf, seed, identity);
         self.state = ApplicationState::Synchronizing;
         let result = backend.reconcile_page(&mut sink);
+        let recovery_error = sink.last_recovery_error.take();
         self.backend = Some(backend);
         self.observed_tip_height = sink
             .observed_tip_height
@@ -1010,7 +1237,7 @@ impl WalletService {
             }
             Err(error) => {
                 self.finish_sync_failure(&error);
-                Err(error.into())
+                recovery_error.map_or_else(|| Err(error.into()), |error| Err(error.into()))
             }
         }
     }
@@ -1020,7 +1247,7 @@ impl WalletService {
             .backend
             .as_ref()
             .ok_or(CoreError::EmbeddedCoreRequired)?
-            .identity()
+            .current_identity()?
             .current_tip
             .height;
         let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
@@ -1115,8 +1342,1171 @@ impl WalletService {
             requested_fee,
             None,
             None,
+            0,
             expires_at_height,
         )
+    }
+
+    /// Atomically reserve ordinary wallet UTXOs for one Scriptless funding
+    /// session and prepare exact DOM inputs, recoverable change and a public
+    /// offset contribution. Retrying the identical request after a process
+    /// crash resumes the same reservation; a changed request for the same
+    /// session fails closed.
+    pub fn scriptless_funding_prepare(
+        &mut self,
+        request: ScriptlessFundingReservationRequestV1,
+    ) -> Result<ScriptlessFundingReservationSummaryV1, CoreError> {
+        if request.session_id == [0u8; 32]
+            || request.shared_output_commitment == [0u8; 33]
+            || request.funding_fee_noms == 0
+            || request.expected_output_count == 0
+            || (request.local_debit_noms != 0 && request.expected_input_count == 0)
+        {
+            return Err(CoreError::InvalidScriptlessFundingRequest);
+        }
+        self.ensure_phrase_confirmed()?;
+        dom_crypto::pedersen::Commitment::from_compressed_bytes(&request.shared_output_commitment)
+            .map_err(|_| CoreError::InvalidScriptlessFundingRequest)?;
+        let identity = self
+            .backend
+            .as_ref()
+            .ok_or(CoreError::EmbeddedCoreRequired)?
+            .current_identity()?;
+        let minimum = self
+            .backend
+            .as_ref()
+            .ok_or(CoreError::EmbeddedCoreRequired)?
+            .minimum_fee(WalletTransactionShape {
+                input_count: request.expected_input_count,
+                output_count: request.expected_output_count,
+                kernel_count: 1,
+            })?;
+        if request.funding_fee_noms < minimum.minimum_fee_noms {
+            return Err(CoreError::FeeTooLow);
+        }
+
+        if let Some(existing) = self
+            .unlocked
+            .as_ref()
+            .ok_or(CoreError::Locked)?
+            .scriptless_funding_reservations
+            .iter()
+            .find(|reservation| reservation.session_id == request.session_id)
+        {
+            if existing.shared_output_commitment != request.shared_output_commitment
+                || existing.local_debit_noms != request.local_debit_noms
+                || existing.funding_fee_noms != request.funding_fee_noms
+                || existing.expected_input_count != request.expected_input_count
+                || existing.expected_output_count != request.expected_output_count
+            {
+                return Err(CoreError::ScriptlessFundingSessionConflict);
+            }
+            let reservation_id = existing.id;
+            if !matches!(
+                existing.state,
+                ScriptlessFundingReservationState::Cancelled
+                    | ScriptlessFundingReservationState::AbandonedRetained
+            ) {
+                self.scriptless_funding_resume_preparation(reservation_id)?;
+            }
+            return self.scriptless_funding_summary(reservation_id);
+        }
+
+        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        let mut selected = Vec::new();
+        let mut total = 0u64;
+        if request.local_debit_noms != 0 {
+            for output in spendable_outputs(&state) {
+                selected.push(output.clone());
+                total = total
+                    .checked_add(output.value)
+                    .ok_or(CoreError::ArithmeticOverflow)?;
+                if total >= request.local_debit_noms {
+                    break;
+                }
+            }
+        }
+        if total < request.local_debit_noms {
+            return Err(CoreError::InsufficientFunds);
+        }
+        let change_value_noms = total - request.local_debit_noms;
+        validate_scriptless_funding_local_shape(
+            selected.len(),
+            usize::from(change_value_noms != 0),
+            request.expected_input_count,
+            request.expected_output_count,
+        )?;
+
+        let reservation_id = Uuid::new_v4();
+        let (change_derivation_index, change_output_id) = if change_value_noms == 0 {
+            (None, None)
+        } else {
+            let coordinate = state.reserve_recovery_coordinate(0, RecoveryOutputClass::Change)?;
+            (Some(coordinate.derivation_index()), Some(Uuid::new_v4()))
+        };
+        let reserved_output_ids = selected.iter().map(|output| output.id).collect::<Vec<_>>();
+        let input_commitments = selected
+            .iter()
+            .map(|output| {
+                output
+                    .commitment
+                    .map(|commitment| commitment.to_vec())
+                    .ok_or(CoreError::UnsupportedSpendingEvidence)
+            })
+            .collect::<Result<Vec<_>, CoreError>>()?;
+        for output in &mut state.outputs {
+            if reserved_output_ids.contains(&output.id) {
+                if output.reserved_by.is_some() || output.state != OutputState::Confirmed {
+                    return Err(CoreError::ReservationConflict);
+                }
+                output.reserved_by = Some(reservation_id);
+                output.state = OutputState::PendingOutgoing;
+            }
+        }
+        state
+            .scriptless_funding_reservations
+            .push(ScriptlessFundingReservation {
+                version: SCRIPTLESS_FUNDING_RESERVATION_VERSION,
+                id: reservation_id,
+                session_id: request.session_id,
+                shared_output_commitment: request.shared_output_commitment,
+                created_at_height: identity.current_tip.height,
+                local_debit_noms: request.local_debit_noms,
+                funding_fee_noms: request.funding_fee_noms,
+                expected_input_count: request.expected_input_count,
+                expected_output_count: request.expected_output_count,
+                reserved_output_ids,
+                input_commitments,
+                change_value_noms,
+                change_derivation_index,
+                change_output_id,
+                change_commitment: None,
+                change_output_bytes: Vec::new(),
+                offset_contribution: None,
+                wallet_excess_public_key: Vec::new(),
+                template_hash: None,
+                session_share_binding_digest: None,
+                participant_position: None,
+                template_participants: None,
+                private_context: None,
+                state: ScriptlessFundingReservationState::Reserved,
+            });
+        self.commit(state)?; // Inputs and coordinate are durable before construction.
+        self.scriptless_funding_resume_preparation(reservation_id)?;
+        self.scriptless_funding_summary(reservation_id)
+    }
+
+    /// Bind the exact durable DOM shared-blinding capability before any
+    /// funding component leaves Wallet V3, then return only this
+    /// participant's public composed kernel-excess point `R_i + E_i`.
+    ///
+    /// The point is deterministic for the persisted wallet excess and the
+    /// authenticated session capability. No `SigningShareV1` is constructed,
+    /// exported or consumed on this pre-template path.
+    pub fn scriptless_funding_prepare_kernel_excess_point(
+        &mut self,
+        reservation_id: Uuid,
+        session_share: &SessionBlindingShareCapabilityV1,
+    ) -> Result<[u8; 33], CoreError> {
+        self.scriptless_funding_resume_preparation(reservation_id)?;
+        let identity = self
+            .backend
+            .as_ref()
+            .ok_or(CoreError::EmbeddedCoreRequired)?
+            .current_identity()?;
+        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        let index = find_scriptless_funding_index(&state, reservation_id)?;
+        let (binding_digest, participant_position) = validate_session_share_binding(
+            identity.chain_id,
+            state.scriptless_funding_reservations[index].session_id,
+            session_share,
+        )?;
+        match state.scriptless_funding_reservations[index].state {
+            ScriptlessFundingReservationState::Prepared => {
+                let record = &mut state.scriptless_funding_reservations[index];
+                record.session_share_binding_digest = Some(binding_digest);
+                record.participant_position = Some(u32::from(participant_position));
+                record.state = ScriptlessFundingReservationState::SessionBound;
+                self.commit(state)?; // Binding is durable before returning the public point.
+            }
+            ScriptlessFundingReservationState::SessionBound
+            | ScriptlessFundingReservationState::Exported
+            | ScriptlessFundingReservationState::TemplateBound => {
+                require_persisted_session_binding(
+                    &state.scriptless_funding_reservations[index],
+                    binding_digest,
+                    participant_position,
+                )?;
+            }
+            ScriptlessFundingReservationState::Reserved => {
+                return Err(CoreError::ScriptlessFundingNotPrepared)
+            }
+            ScriptlessFundingReservationState::AbandonedRetained
+            | ScriptlessFundingReservationState::Cancelled => {
+                return Err(CoreError::ScriptlessFundingSigningNotAuthorized)
+            }
+        }
+        let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
+        let record = &state.scriptless_funding_reservations
+            [find_scriptless_funding_index(state, reservation_id)?];
+        require_persisted_session_binding(record, binding_digest, participant_position)?;
+        let wallet_excess_point = parse_funding_public_key(&record.wallet_excess_public_key)?;
+        session_share
+            .funding_kernel_excess_point_v1(&wallet_excess_point)
+            .map(|point| point.to_compressed_bytes())
+            .map_err(|_| CoreError::ScriptlessSessionBindingMismatch)
+    }
+
+    /// Persist the exposure transition before returning exact public funding
+    /// components. A crash after that commit may only retransmit these same
+    /// components; it can never release the reserved inputs automatically.
+    pub fn scriptless_funding_export(
+        &mut self,
+        reservation_id: Uuid,
+    ) -> Result<ScriptlessFundingCompositionV1, CoreError> {
+        self.scriptless_funding_resume_preparation(reservation_id)?;
+        let identity = self
+            .backend
+            .as_ref()
+            .ok_or(CoreError::EmbeddedCoreRequired)?
+            .current_identity()?;
+        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        let index = find_scriptless_funding_index(&state, reservation_id)?;
+        match state.scriptless_funding_reservations[index].state {
+            ScriptlessFundingReservationState::SessionBound => {
+                state.scriptless_funding_reservations[index].state =
+                    ScriptlessFundingReservationState::Exported;
+                self.commit(state)?;
+            }
+            ScriptlessFundingReservationState::Exported => {}
+            ScriptlessFundingReservationState::TemplateBound => {}
+            ScriptlessFundingReservationState::Reserved
+            | ScriptlessFundingReservationState::Prepared => {
+                return Err(CoreError::ScriptlessSessionBindingRequired)
+            }
+            ScriptlessFundingReservationState::AbandonedRetained
+            | ScriptlessFundingReservationState::Cancelled => {
+                return Err(CoreError::ScriptlessFundingCannotExport)
+            }
+        }
+        let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
+        let record = &state.scriptless_funding_reservations
+            [find_scriptless_funding_index(state, reservation_id)?];
+        scriptless_funding_composition(record, identity.chain_id)
+    }
+
+    /// Validate and durably bind the authoritative real DOM funding template.
+    /// Every public participant contribution is supplied in canonical roster
+    /// order and re-aggregated only by pinned DOM authorities. An idempotent
+    /// retry must present byte-identical session and participant bindings.
+    pub fn scriptless_funding_bind_template(
+        &mut self,
+        reservation_id: Uuid,
+        template: &ScriptlessTransactionTemplateV1,
+        session_share: &SessionBlindingShareCapabilityV1,
+        participants: ScriptlessTemplateParticipantSetV1,
+    ) -> Result<ScriptlessFundingReservationSummaryV1, CoreError> {
+        let identity = self
+            .backend
+            .as_ref()
+            .ok_or(CoreError::EmbeddedCoreRequired)?
+            .current_identity()?;
+        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        let index = find_scriptless_funding_index(&state, reservation_id)?;
+        let record = state.scriptless_funding_reservations[index].clone();
+        if !matches!(
+            record.state,
+            ScriptlessFundingReservationState::Exported
+                | ScriptlessFundingReservationState::TemplateBound
+        ) {
+            return Err(CoreError::ScriptlessFundingSigningNotAuthorized);
+        }
+        let (binding_digest, participant_position) =
+            validate_session_share_binding(identity.chain_id, record.session_id, session_share)?;
+        require_persisted_session_binding(&record, binding_digest, participant_position)?;
+        if template.role() != ContractTxRoleV1::Funding
+            || template.shared_output_commitment() != &record.shared_output_commitment
+            || template.template_hash() == &[0u8; 32]
+        {
+            return Err(CoreError::ScriptlessTemplateBindingMismatch);
+        }
+        let transaction = template.transaction_template();
+        if transaction.inputs.is_empty()
+            || transaction.inputs.len() != record.expected_input_count as usize
+            || transaction.outputs.len() != record.expected_output_count as usize
+            || transaction.kernels.len() != 1
+        {
+            return Err(CoreError::ScriptlessFundingShapeMismatch);
+        }
+        let kernel = &transaction.kernels[0];
+        if kernel.features != KERNEL_FEAT_PLAIN
+            || kernel.lock_height != 0
+            || kernel.fee.noms() != record.funding_fee_noms
+            || kernel.excess_signature != [0u8; 65]
+        {
+            return Err(CoreError::ScriptlessTemplateBindingMismatch);
+        }
+        let composition = scriptless_funding_composition(&record, identity.chain_id)?;
+        if composition.inputs.iter().any(|local| {
+            transaction
+                .inputs
+                .iter()
+                .filter(|candidate| *candidate == local)
+                .count()
+                != 1
+        }) || composition.other_outputs.iter().any(|local| {
+            transaction
+                .outputs
+                .iter()
+                .filter(|candidate| *candidate == local)
+                .count()
+                != 1
+        }) || transaction
+            .outputs
+            .iter()
+            .filter(|output| output.commitment.as_bytes() == &record.shared_output_commitment)
+            .count()
+            != 1
+        {
+            return Err(CoreError::ScriptlessTemplateBindingMismatch);
+        }
+        let wallet_excess_point = parse_funding_public_key(&record.wallet_excess_public_key)?;
+        let local_kernel_point = session_share
+            .funding_kernel_excess_point_v1(&wallet_excess_point)
+            .map_err(|_| CoreError::ScriptlessSessionBindingMismatch)?
+            .to_compressed_bytes();
+        let participant_binding = validate_template_participant_set(
+            transaction,
+            record
+                .offset_contribution
+                .ok_or(CoreError::ScriptlessFundingNotPrepared)?,
+            local_kernel_point,
+            participant_position,
+            participants,
+        )?;
+
+        if record.state == ScriptlessFundingReservationState::TemplateBound {
+            if record.template_hash.as_ref() != Some(template.template_hash())
+                || record.template_participants.as_ref() != Some(&participant_binding)
+            {
+                return Err(CoreError::ScriptlessTemplateBindingMismatch);
+            }
+            return self.scriptless_funding_summary(reservation_id);
+        }
+        let record = &mut state.scriptless_funding_reservations[index];
+        record.template_hash = Some(*template.template_hash());
+        record.template_participants = Some(participant_binding);
+        record.state = ScriptlessFundingReservationState::TemplateBound;
+        self.commit(state)?;
+        self.scriptless_funding_summary(reservation_id)
+    }
+
+    /// Rehydrate the wallet excess as a purpose-specific, non-serializable
+    /// capability only after the exact real DOM funding template is bound.
+    pub fn scriptless_funding_signing_capability(
+        &self,
+        reservation_id: Uuid,
+    ) -> Result<ScriptlessFundingSigningCapabilityV1, CoreError> {
+        let identity = self
+            .backend
+            .as_ref()
+            .ok_or(CoreError::EmbeddedCoreRequired)?
+            .current_identity()?;
+        let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
+        let record = &state.scriptless_funding_reservations
+            [find_scriptless_funding_index(state, reservation_id)?];
+        if record.state != ScriptlessFundingReservationState::TemplateBound {
+            return Err(CoreError::ScriptlessFundingSigningNotAuthorized);
+        }
+        let context = record
+            .private_context
+            .as_ref()
+            .ok_or(CoreError::ScriptlessFundingNotPrepared)?;
+        let mut contribution = Zeroizing::new([0u8; 32]);
+        context.copy_wallet_excess_contribution_to(&mut contribution);
+        let capability =
+            ScriptlessFundingSigningCapabilityV1::from_template_bound_encrypted_context(
+                *contribution,
+                bound_signing_context(record, identity.chain_id)?,
+            )?;
+        if capability.public_key_bytes().as_slice() != record.wallet_excess_public_key.as_slice() {
+            return Err(CoreError::ScriptlessFundingContextMismatch);
+        }
+        Ok(capability)
+    }
+
+    /// Release a reservation only while no public component has ever left the
+    /// wallet boundary. The tombstone and burned recovery coordinate remain.
+    pub fn scriptless_funding_cancel_unexposed(
+        &mut self,
+        reservation_id: Uuid,
+    ) -> Result<ScriptlessFundingReservationSummaryV1, CoreError> {
+        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        let index = find_scriptless_funding_index(&state, reservation_id)?;
+        let record = state.scriptless_funding_reservations[index].clone();
+        if !record.state.may_cancel_and_release() {
+            return Err(CoreError::ScriptlessFundingCannotRelease);
+        }
+        for output_id in &record.reserved_output_ids {
+            let output = state
+                .outputs
+                .iter_mut()
+                .find(|output| output.id == *output_id)
+                .ok_or(CoreError::ScriptlessFundingContextMismatch)?;
+            if output.reserved_by != Some(reservation_id)
+                || output.state != OutputState::PendingOutgoing
+            {
+                return Err(CoreError::ScriptlessFundingCannotRelease);
+            }
+            output.reserved_by = None;
+            output.state = OutputState::Confirmed;
+        }
+        if let Some(change_output_id) = record.change_output_id {
+            state.outputs.retain(|output| output.id != change_output_id);
+            state
+                .private_output_blindings
+                .retain(|secret| secret.output_id != change_output_id);
+        }
+        let record = &mut state.scriptless_funding_reservations[index];
+        record.change_commitment = None;
+        record.change_output_bytes.clear();
+        record.offset_contribution = None;
+        record.wallet_excess_public_key.clear();
+        record.template_hash = None;
+        record.session_share_binding_digest = None;
+        record.participant_position = None;
+        record.template_participants = None;
+        record.private_context = None;
+        record.state = ScriptlessFundingReservationState::Cancelled;
+        self.commit(state)?;
+        self.scriptless_funding_summary(reservation_id)
+    }
+
+    /// Record operator abandonment after exposure without making any input
+    /// selectable. Resolution now belongs to authoritative chain/session
+    /// reconciliation.
+    pub fn scriptless_funding_abandon_exposed(
+        &mut self,
+        reservation_id: Uuid,
+    ) -> Result<ScriptlessFundingReservationSummaryV1, CoreError> {
+        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        let index = find_scriptless_funding_index(&state, reservation_id)?;
+        match state.scriptless_funding_reservations[index].state {
+            ScriptlessFundingReservationState::SessionBound
+            | ScriptlessFundingReservationState::Exported
+            | ScriptlessFundingReservationState::TemplateBound => {
+                state.scriptless_funding_reservations[index].state =
+                    ScriptlessFundingReservationState::AbandonedRetained;
+                self.commit(state)?;
+            }
+            ScriptlessFundingReservationState::AbandonedRetained => {}
+            _ => return Err(CoreError::ScriptlessFundingCannotRelease),
+        }
+        self.scriptless_funding_summary(reservation_id)
+    }
+
+    /// Read the redacted durable reservation state without changing exposure.
+    pub fn scriptless_funding_status(
+        &self,
+        reservation_id: Uuid,
+    ) -> Result<ScriptlessFundingReservationSummaryV1, CoreError> {
+        self.scriptless_funding_summary(reservation_id)
+    }
+
+    fn scriptless_funding_resume_preparation(
+        &mut self,
+        reservation_id: Uuid,
+    ) -> Result<(), CoreError> {
+        let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
+        let record = state.scriptless_funding_reservations
+            [find_scriptless_funding_index(state, reservation_id)?]
+        .clone();
+        match record.state {
+            ScriptlessFundingReservationState::Prepared
+            | ScriptlessFundingReservationState::SessionBound
+            | ScriptlessFundingReservationState::Exported
+            | ScriptlessFundingReservationState::TemplateBound => return Ok(()),
+            ScriptlessFundingReservationState::Reserved => {}
+            ScriptlessFundingReservationState::AbandonedRetained
+            | ScriptlessFundingReservationState::Cancelled => {
+                return Err(CoreError::ScriptlessFundingCannotExport)
+            }
+        }
+
+        let seed = CanonicalWalletSeed::from_entropy(&state.root_material)
+            .map_err(|_| CoreError::RecoveryPhraseInvalid)?;
+        let builder = self
+            .backend
+            .as_ref()
+            .ok_or(CoreError::EmbeddedCoreRequired)?
+            .output_builder(&seed)?;
+        let inputs = record
+            .reserved_output_ids
+            .iter()
+            .zip(&record.input_commitments)
+            .map(|(output_id, commitment)| {
+                let output = state
+                    .outputs
+                    .iter()
+                    .find(|output| output.id == *output_id)
+                    .ok_or(CoreError::ScriptlessFundingContextMismatch)?;
+                if output.reserved_by != Some(reservation_id)
+                    || output.state != OutputState::PendingOutgoing
+                    || output.commitment.as_ref().map(<[u8; 33]>::as_slice)
+                        != Some(commitment.as_slice())
+                {
+                    return Err(CoreError::ScriptlessFundingContextMismatch);
+                }
+                let commitment: [u8; 33] = commitment
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| CoreError::ScriptlessFundingContextMismatch)?;
+                Ok(WalletSlateInput::new(
+                    commitment,
+                    state
+                        .output_blinding(*output_id)
+                        .ok_or(CoreError::UnsupportedSpendingEvidence)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, CoreError>>()?;
+        let coordinate = record
+            .change_derivation_index
+            .map(|derivation_index| {
+                state.resume_recovery_coordinate(0, derivation_index, RecoveryOutputClass::Change)
+            })
+            .transpose()?;
+        let prepared = builder.build_scriptless_funding_contribution(
+            &inputs,
+            record.change_value_noms,
+            coordinate,
+        )?;
+        let public = prepared.public.clone();
+        if public.inputs.len() != record.input_commitments.len()
+            || public
+                .inputs
+                .iter()
+                .zip(&record.input_commitments)
+                .any(|(input, expected)| input.commitment.as_bytes().as_slice() != expected)
+            || public.other_outputs.len() != usize::from(record.change_value_noms != 0)
+        {
+            return Err(CoreError::ScriptlessFundingContextMismatch);
+        }
+        let mut wallet_excess = Zeroizing::new([0u8; 32]);
+        prepared.copy_wallet_excess_to(&mut wallet_excess);
+        let mut change_blinding = None;
+        if let Some(change) = &prepared.change {
+            let mut blinding = Zeroizing::new([0u8; 32]);
+            change.copy_blinding_to(&mut blinding);
+            change_blinding = Some(*blinding);
+        }
+
+        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        let index = find_scriptless_funding_index(&state, reservation_id)?;
+        if state.scriptless_funding_reservations[index].state
+            != ScriptlessFundingReservationState::Reserved
+        {
+            return Err(CoreError::ScriptlessFundingContextMismatch);
+        }
+        let (change_commitment, change_output_bytes) =
+            if let Some(output) = public.other_outputs.first() {
+                let output_id = record
+                    .change_output_id
+                    .ok_or(CoreError::ScriptlessFundingContextMismatch)?;
+                let commitment = *output.commitment.as_bytes();
+                let canonical_bytes = output.to_bytes().map_err(|_| CoreError::ProtocolRejected)?;
+                state.outputs.push(OutputRecord {
+                    id: output_id,
+                    account_id: state.default_account.id,
+                    commitment: Some(commitment),
+                    value: record.change_value_noms,
+                    state: OutputState::PendingIncoming,
+                    discovered_height: 0,
+                    reserved_by: None,
+                });
+                state.remember_output_blinding(
+                    output_id,
+                    change_blinding.ok_or(CoreError::ScriptlessFundingContextMismatch)?,
+                );
+                (Some(commitment), canonical_bytes)
+            } else {
+                (None, Vec::new())
+            };
+        let record_mut = &mut state.scriptless_funding_reservations[index];
+        record_mut.change_commitment = change_commitment;
+        record_mut.change_output_bytes = change_output_bytes;
+        record_mut.offset_contribution = Some(public.offset_contribution);
+        record_mut.wallet_excess_public_key = public.wallet_excess_public_key.to_vec();
+        record_mut.private_context = Some(PrivateScriptlessFundingContext::new(
+            *wallet_excess,
+            change_blinding,
+        ));
+        record_mut.state = ScriptlessFundingReservationState::Prepared;
+        self.commit(state)?; // Exact public bytes and private context become durable together.
+        Ok(())
+    }
+
+    fn scriptless_funding_summary(
+        &self,
+        reservation_id: Uuid,
+    ) -> Result<ScriptlessFundingReservationSummaryV1, CoreError> {
+        let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
+        let record = &state.scriptless_funding_reservations
+            [find_scriptless_funding_index(state, reservation_id)?];
+        Ok(ScriptlessFundingReservationSummaryV1 {
+            reservation_id,
+            state: record.state,
+            selected_input_count: u32::try_from(record.reserved_output_ids.len())
+                .map_err(|_| CoreError::ArithmeticOverflow)?,
+            has_change: record.change_value_noms != 0,
+            template_bound: record.template_hash.is_some(),
+        })
+    }
+
+    /// Durably reserve and prepare one participant-owned output for either the
+    /// real claim or real refund template. The `(session, role)` key is
+    /// idempotent; Claim and Refund always burn distinct SelfTransfer recovery
+    /// coordinates and retain distinct encrypted excess contributions.
+    pub fn scriptless_payout_prepare(
+        &mut self,
+        request: ScriptlessPayoutReservationRequestV1,
+    ) -> Result<ScriptlessPayoutReservationSummaryV1, CoreError> {
+        let role_lock_is_valid = match request.role {
+            ScriptlessPayoutRoleV1::Claim => request.refund_lock_height == 0,
+            ScriptlessPayoutRoleV1::Refund => request.refund_lock_height != 0,
+        };
+        if request.session_id == [0u8; 32]
+            || request.shared_output_commitment == [0u8; 33]
+            || request.payout_value_noms > dom_crypto::MAX_PROVABLE_VALUE
+            || request.kernel_fee_noms == 0
+            || request.expected_output_count == 0
+            || !role_lock_is_valid
+        {
+            return Err(CoreError::InvalidScriptlessPayoutRequest);
+        }
+        self.ensure_phrase_confirmed()?;
+        let identity = self
+            .backend
+            .as_ref()
+            .ok_or(CoreError::EmbeddedCoreRequired)?
+            .current_identity()?;
+        dom_crypto::pedersen::Commitment::from_compressed_bytes(&request.shared_output_commitment)
+            .map_err(|_| CoreError::InvalidScriptlessPayoutRequest)?;
+
+        if let Some(existing) = self
+            .unlocked
+            .as_ref()
+            .ok_or(CoreError::Locked)?
+            .scriptless_payout_reservations
+            .iter()
+            .find(|reservation| {
+                reservation.session_id == request.session_id && reservation.role == request.role
+            })
+        {
+            if existing.shared_output_commitment != request.shared_output_commitment
+                || existing.payout_value_noms != request.payout_value_noms
+                || existing.kernel_fee_noms != request.kernel_fee_noms
+                || existing.expected_output_count != request.expected_output_count
+                || existing.refund_lock_height != request.refund_lock_height
+            {
+                return Err(CoreError::ScriptlessPayoutSessionConflict);
+            }
+            let reservation_id = existing.id;
+            if !matches!(
+                existing.state,
+                ScriptlessPayoutReservationState::Cancelled
+                    | ScriptlessPayoutReservationState::AbandonedRetained
+            ) {
+                self.scriptless_payout_resume_preparation(reservation_id)?;
+            }
+            return self.scriptless_payout_summary(reservation_id);
+        }
+
+        if request.role == ScriptlessPayoutRoleV1::Refund
+            && request.refund_lock_height <= identity.current_tip.height
+        {
+            return Err(CoreError::InvalidScriptlessPayoutRequest);
+        }
+        let minimum = self
+            .backend
+            .as_ref()
+            .ok_or(CoreError::EmbeddedCoreRequired)?
+            .minimum_fee(WalletTransactionShape {
+                input_count: 1,
+                output_count: request.expected_output_count,
+                kernel_count: 1,
+            })?;
+        if request.kernel_fee_noms < minimum.minimum_fee_noms {
+            return Err(CoreError::FeeTooLow);
+        }
+
+        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        let (derivation_index, output_id) = if request.payout_value_noms == 0 {
+            (None, None)
+        } else {
+            let coordinate =
+                state.reserve_recovery_coordinate(0, RecoveryOutputClass::SelfTransfer)?;
+            (Some(coordinate.derivation_index()), Some(Uuid::new_v4()))
+        };
+        let reservation_id = Uuid::new_v4();
+        state
+            .scriptless_payout_reservations
+            .push(ScriptlessPayoutReservation {
+                version: SCRIPTLESS_PAYOUT_RESERVATION_VERSION,
+                id: reservation_id,
+                session_id: request.session_id,
+                role: request.role,
+                created_at_height: identity.current_tip.height,
+                shared_output_commitment: request.shared_output_commitment,
+                payout_value_noms: request.payout_value_noms,
+                kernel_fee_noms: request.kernel_fee_noms,
+                expected_output_count: request.expected_output_count,
+                refund_lock_height: request.refund_lock_height,
+                output_id,
+                derivation_index,
+                output_commitment: None,
+                output_bytes: Vec::new(),
+                offset_contribution: None,
+                payout_excess_public_key: Vec::new(),
+                template_hash: None,
+                session_share_binding_digest: None,
+                participant_position: None,
+                template_participants: None,
+                private_context: None,
+                state: ScriptlessPayoutReservationState::Reserved,
+            });
+        self.commit(state)?; // Burn the role-specific coordinate before construction.
+        self.scriptless_payout_resume_preparation(reservation_id)?;
+        self.scriptless_payout_summary(reservation_id)
+    }
+
+    /// Bind the exact durable DOM shared-blinding capability before any
+    /// Claim/Refund component leaves Wallet V3, then return only this
+    /// participant's public composed kernel point `E_i - R_i`.
+    pub fn scriptless_payout_prepare_kernel_excess_point(
+        &mut self,
+        reservation_id: Uuid,
+        session_share: &SessionBlindingShareCapabilityV1,
+    ) -> Result<[u8; 33], CoreError> {
+        self.scriptless_payout_resume_preparation(reservation_id)?;
+        let identity = self
+            .backend
+            .as_ref()
+            .ok_or(CoreError::EmbeddedCoreRequired)?
+            .current_identity()?;
+        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        let index = find_scriptless_payout_index(&state, reservation_id)?;
+        let (binding_digest, participant_position) = validate_session_share_binding(
+            identity.chain_id,
+            state.scriptless_payout_reservations[index].session_id,
+            session_share,
+        )?;
+        match state.scriptless_payout_reservations[index].state {
+            ScriptlessPayoutReservationState::Prepared => {
+                let record = &mut state.scriptless_payout_reservations[index];
+                record.session_share_binding_digest = Some(binding_digest);
+                record.participant_position = Some(u32::from(participant_position));
+                record.state = ScriptlessPayoutReservationState::SessionBound;
+                self.commit(state)?; // Binding is durable before returning the public point.
+            }
+            ScriptlessPayoutReservationState::SessionBound
+            | ScriptlessPayoutReservationState::ComponentsExposed
+            | ScriptlessPayoutReservationState::TemplateBound => {
+                require_persisted_payout_session_binding(
+                    &state.scriptless_payout_reservations[index],
+                    binding_digest,
+                    participant_position,
+                )?;
+            }
+            ScriptlessPayoutReservationState::Reserved => {
+                return Err(CoreError::ScriptlessPayoutNotPrepared)
+            }
+            ScriptlessPayoutReservationState::AbandonedRetained
+            | ScriptlessPayoutReservationState::Cancelled => {
+                return Err(CoreError::ScriptlessPayoutSigningNotAuthorized)
+            }
+        }
+        let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
+        let record = &state.scriptless_payout_reservations
+            [find_scriptless_payout_index(state, reservation_id)?];
+        require_persisted_payout_session_binding(record, binding_digest, participant_position)?;
+        let payout_excess_point = parse_payout_public_key(&record.payout_excess_public_key)?;
+        session_share
+            .shared_output_spend_kernel_excess_point_v1(&payout_excess_point)
+            .map(|point| point.to_compressed_bytes())
+            .map_err(|_| CoreError::ScriptlessSessionBindingMismatch)
+    }
+
+    /// Mark public payout components exposed before returning them. Every
+    /// retry, including after restart, revalidates and returns identical DOM
+    /// objects and bytes.
+    pub fn scriptless_payout_export(
+        &mut self,
+        reservation_id: Uuid,
+    ) -> Result<ScriptlessPayoutCompositionV1, CoreError> {
+        self.scriptless_payout_resume_preparation(reservation_id)?;
+        let identity = self
+            .backend
+            .as_ref()
+            .ok_or(CoreError::EmbeddedCoreRequired)?
+            .current_identity()?;
+        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        let index = find_scriptless_payout_index(&state, reservation_id)?;
+        match state.scriptless_payout_reservations[index].state {
+            ScriptlessPayoutReservationState::SessionBound => {
+                state.scriptless_payout_reservations[index].state =
+                    ScriptlessPayoutReservationState::ComponentsExposed;
+                self.commit(state)?;
+            }
+            ScriptlessPayoutReservationState::ComponentsExposed
+            | ScriptlessPayoutReservationState::TemplateBound => {}
+            ScriptlessPayoutReservationState::Reserved
+            | ScriptlessPayoutReservationState::Prepared => {
+                return Err(CoreError::ScriptlessSessionBindingRequired)
+            }
+            ScriptlessPayoutReservationState::AbandonedRetained
+            | ScriptlessPayoutReservationState::Cancelled => {
+                return Err(CoreError::ScriptlessPayoutCannotExport)
+            }
+        }
+        let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
+        let record = &state.scriptless_payout_reservations
+            [find_scriptless_payout_index(state, reservation_id)?];
+        scriptless_payout_composition(record, identity.chain_id)
+    }
+
+    /// Validate and durably bind the authoritative real DOM Claim or Refund
+    /// template before allowing an opaque signing-share composition.
+    pub fn scriptless_payout_bind_template(
+        &mut self,
+        reservation_id: Uuid,
+        template: &ScriptlessTransactionTemplateV1,
+        session_share: &SessionBlindingShareCapabilityV1,
+        participants: ScriptlessTemplateParticipantSetV1,
+    ) -> Result<ScriptlessPayoutReservationSummaryV1, CoreError> {
+        let identity = self
+            .backend
+            .as_ref()
+            .ok_or(CoreError::EmbeddedCoreRequired)?
+            .current_identity()?;
+        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        let index = find_scriptless_payout_index(&state, reservation_id)?;
+        let record = state.scriptless_payout_reservations[index].clone();
+        if !matches!(
+            record.state,
+            ScriptlessPayoutReservationState::ComponentsExposed
+                | ScriptlessPayoutReservationState::TemplateBound
+        ) {
+            return Err(CoreError::ScriptlessPayoutSigningNotAuthorized);
+        }
+        let (binding_digest, participant_position) =
+            validate_session_share_binding(identity.chain_id, record.session_id, session_share)?;
+        require_persisted_payout_session_binding(&record, binding_digest, participant_position)?;
+        let expected_role = match record.role {
+            ScriptlessPayoutRoleV1::Claim => ContractTxRoleV1::Claim,
+            ScriptlessPayoutRoleV1::Refund => ContractTxRoleV1::Refund,
+        };
+        if template.role() != expected_role
+            || template.shared_output_commitment() != &record.shared_output_commitment
+            || template.template_hash() == &[0u8; 32]
+        {
+            return Err(CoreError::ScriptlessTemplateBindingMismatch);
+        }
+        let transaction = template.transaction_template();
+        if transaction.inputs.len() != 1
+            || transaction.inputs[0].commitment.as_bytes() != &record.shared_output_commitment
+            || transaction.outputs.is_empty()
+            || transaction.outputs.len() != record.expected_output_count as usize
+            || transaction.kernels.len() != 1
+        {
+            return Err(CoreError::ScriptlessTemplateBindingMismatch);
+        }
+        let kernel = &transaction.kernels[0];
+        let expected_kernel = match record.role {
+            ScriptlessPayoutRoleV1::Claim => {
+                kernel.features == KERNEL_FEAT_PLAIN && kernel.lock_height == 0
+            }
+            ScriptlessPayoutRoleV1::Refund => {
+                kernel.features == KERNEL_FEAT_HEIGHT_LOCKED
+                    && kernel.lock_height == record.refund_lock_height
+            }
+        };
+        if !expected_kernel
+            || kernel.fee.noms() != record.kernel_fee_noms
+            || kernel.excess_signature != [0u8; 65]
+        {
+            return Err(CoreError::ScriptlessTemplateBindingMismatch);
+        }
+        let composition = scriptless_payout_composition(&record, identity.chain_id)?;
+        if composition.outputs.iter().any(|local| {
+            transaction
+                .outputs
+                .iter()
+                .filter(|candidate| *candidate == local)
+                .count()
+                != 1
+        }) {
+            return Err(CoreError::ScriptlessTemplateBindingMismatch);
+        }
+        let payout_excess_point = parse_payout_public_key(&record.payout_excess_public_key)?;
+        let local_kernel_point = session_share
+            .shared_output_spend_kernel_excess_point_v1(&payout_excess_point)
+            .map_err(|_| CoreError::ScriptlessSessionBindingMismatch)?
+            .to_compressed_bytes();
+        let participant_binding = validate_template_participant_set(
+            transaction,
+            record
+                .offset_contribution
+                .ok_or(CoreError::ScriptlessPayoutNotPrepared)?,
+            local_kernel_point,
+            participant_position,
+            participants,
+        )?;
+
+        if record.state == ScriptlessPayoutReservationState::TemplateBound {
+            if record.template_hash.as_ref() != Some(template.template_hash())
+                || record.template_participants.as_ref() != Some(&participant_binding)
+            {
+                return Err(CoreError::ScriptlessTemplateBindingMismatch);
+            }
+            return self.scriptless_payout_summary(reservation_id);
+        }
+        let record = &mut state.scriptless_payout_reservations[index];
+        record.template_hash = Some(*template.template_hash());
+        record.template_participants = Some(participant_binding);
+        record.state = ScriptlessPayoutReservationState::TemplateBound;
+        self.commit(state)?;
+        self.scriptless_payout_summary(reservation_id)
+    }
+
+    /// Rehydrate the role-specific wallet excess only after binding the exact
+    /// real DOM Claim/Refund template. The returned capability exposes one
+    /// purpose-specific `e_i-r_i` operation and no bytes or generic callback.
+    pub fn scriptless_payout_signing_capability(
+        &self,
+        reservation_id: Uuid,
+    ) -> Result<ScriptlessPayoutSigningCapabilityV1, CoreError> {
+        let identity = self
+            .backend
+            .as_ref()
+            .ok_or(CoreError::EmbeddedCoreRequired)?
+            .current_identity()?;
+        let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
+        let record = &state.scriptless_payout_reservations
+            [find_scriptless_payout_index(state, reservation_id)?];
+        if record.state != ScriptlessPayoutReservationState::TemplateBound {
+            return Err(CoreError::ScriptlessPayoutSigningNotAuthorized);
+        }
+        let context = record
+            .private_context
+            .as_ref()
+            .ok_or(CoreError::ScriptlessPayoutNotPrepared)?;
+        let mut contribution = Zeroizing::new([0u8; 32]);
+        context.copy_payout_excess_contribution_to(&mut contribution);
+        let capability =
+            ScriptlessPayoutSigningCapabilityV1::from_template_bound_encrypted_context(
+                *contribution,
+                bound_payout_signing_context(record, identity.chain_id)?,
+            )?;
+        if capability.public_key_bytes().as_slice() != record.payout_excess_public_key.as_slice() {
+            return Err(CoreError::ScriptlessPayoutContextMismatch);
+        }
+        Ok(capability)
+    }
+
+    /// Cancel only while the exact payout components have never crossed the
+    /// wallet boundary. The recovery coordinate remains burned in the
+    /// tombstone so Claim and Refund can never reuse it.
+    pub fn scriptless_payout_cancel_unexposed(
+        &mut self,
+        reservation_id: Uuid,
+    ) -> Result<ScriptlessPayoutReservationSummaryV1, CoreError> {
+        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        let index = find_scriptless_payout_index(&state, reservation_id)?;
+        let record = state.scriptless_payout_reservations[index].clone();
+        if !record.state.may_cancel_unexposed() {
+            return Err(CoreError::ScriptlessPayoutCannotRelease);
+        }
+        if let Some(output_id) = record.output_id {
+            state.outputs.retain(|output| output.id != output_id);
+            state
+                .private_output_blindings
+                .retain(|secret| secret.output_id != output_id);
+        }
+        let record = &mut state.scriptless_payout_reservations[index];
+        record.output_commitment = None;
+        record.output_bytes.clear();
+        record.offset_contribution = None;
+        record.payout_excess_public_key.clear();
+        record.template_hash = None;
+        record.session_share_binding_digest = None;
+        record.participant_position = None;
+        record.template_participants = None;
+        record.private_context = None;
+        record.state = ScriptlessPayoutReservationState::Cancelled;
+        self.commit(state)?;
+        self.scriptless_payout_summary(reservation_id)
+    }
+
+    /// Record abandonment without releasing an exposed output or its private
+    /// material. A later authenticated DOM terminal authority is required for
+    /// any release; none is inferred locally.
+    pub fn scriptless_payout_abandon_exposed(
+        &mut self,
+        reservation_id: Uuid,
+    ) -> Result<ScriptlessPayoutReservationSummaryV1, CoreError> {
+        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        let index = find_scriptless_payout_index(&state, reservation_id)?;
+        match state.scriptless_payout_reservations[index].state {
+            ScriptlessPayoutReservationState::SessionBound
+            | ScriptlessPayoutReservationState::ComponentsExposed
+            | ScriptlessPayoutReservationState::TemplateBound => {
+                state.scriptless_payout_reservations[index].state =
+                    ScriptlessPayoutReservationState::AbandonedRetained;
+                self.commit(state)?;
+            }
+            ScriptlessPayoutReservationState::AbandonedRetained => {}
+            _ => return Err(CoreError::ScriptlessPayoutCannotRelease),
+        }
+        self.scriptless_payout_summary(reservation_id)
+    }
+
+    pub fn scriptless_payout_status(
+        &self,
+        reservation_id: Uuid,
+    ) -> Result<ScriptlessPayoutReservationSummaryV1, CoreError> {
+        self.scriptless_payout_summary(reservation_id)
+    }
+
+    fn scriptless_payout_resume_preparation(
+        &mut self,
+        reservation_id: Uuid,
+    ) -> Result<(), CoreError> {
+        let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
+        let record = state.scriptless_payout_reservations
+            [find_scriptless_payout_index(state, reservation_id)?]
+        .clone();
+        match record.state {
+            ScriptlessPayoutReservationState::Prepared
+            | ScriptlessPayoutReservationState::SessionBound
+            | ScriptlessPayoutReservationState::ComponentsExposed
+            | ScriptlessPayoutReservationState::TemplateBound => return Ok(()),
+            ScriptlessPayoutReservationState::Reserved => {}
+            ScriptlessPayoutReservationState::AbandonedRetained
+            | ScriptlessPayoutReservationState::Cancelled => {
+                return Err(CoreError::ScriptlessPayoutCannotExport)
+            }
+        }
+
+        let seed = CanonicalWalletSeed::from_entropy(&state.root_material)
+            .map_err(|_| CoreError::RecoveryPhraseInvalid)?;
+        let builder = self
+            .backend
+            .as_ref()
+            .ok_or(CoreError::EmbeddedCoreRequired)?
+            .output_builder(&seed)?;
+        let coordinate = record
+            .derivation_index
+            .map(|derivation_index| {
+                state.resume_recovery_coordinate(
+                    0,
+                    derivation_index,
+                    RecoveryOutputClass::SelfTransfer,
+                )
+            })
+            .transpose()?;
+        let prepared = builder.build_scriptless_shared_output_spend_contribution(
+            record.payout_value_noms,
+            coordinate,
+        )?;
+        let public = prepared.public.clone();
+        let has_output = record.payout_value_noms != 0;
+        if public.outputs.len() != usize::from(has_output)
+            || prepared.owned_output.is_some() != has_output
+            || prepared
+                .owned_output
+                .as_ref()
+                .zip(public.outputs.first())
+                .is_some_and(|(owned, output)| {
+                    owned.commitment != *output.commitment.as_bytes()
+                        || owned.value != record.payout_value_noms
+                })
+        {
+            return Err(CoreError::ScriptlessPayoutContextMismatch);
+        }
+        let output_bytes = public
+            .outputs
+            .first()
+            .map(|output| output.to_bytes().map_err(|_| CoreError::ProtocolRejected))
+            .transpose()?
+            .unwrap_or_default();
+        let mut payout_excess = Zeroizing::new([0u8; 32]);
+        prepared.copy_payout_excess_to(&mut payout_excess);
+        let mut output_blinding = Zeroizing::new([0u8; 32]);
+        let has_output_blinding = if let Some(owned) = &prepared.owned_output {
+            owned.copy_blinding_to(&mut output_blinding);
+            true
+        } else {
+            false
+        };
+
+        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        let index = find_scriptless_payout_index(&state, reservation_id)?;
+        if state.scriptless_payout_reservations[index].state
+            != ScriptlessPayoutReservationState::Reserved
+            || record
+                .output_id
+                .is_some_and(|output_id| state.outputs.iter().any(|output| output.id == output_id))
+            || public.outputs.first().is_some_and(|public_output| {
+                state
+                    .outputs
+                    .iter()
+                    .any(|output| output.commitment == Some(*public_output.commitment.as_bytes()))
+            })
+        {
+            return Err(CoreError::ScriptlessPayoutContextMismatch);
+        }
+        if let (Some(output_id), Some(public_output)) = (record.output_id, public.outputs.first()) {
+            state.outputs.push(OutputRecord {
+                id: output_id,
+                account_id: state.default_account.id,
+                commitment: Some(*public_output.commitment.as_bytes()),
+                value: record.payout_value_noms,
+                state: OutputState::PendingIncoming,
+                discovered_height: 0,
+                reserved_by: None,
+            });
+            state.remember_output_blinding(output_id, *output_blinding);
+        }
+        let record_mut = &mut state.scriptless_payout_reservations[index];
+        record_mut.output_commitment = public
+            .outputs
+            .first()
+            .map(|output| *output.commitment.as_bytes());
+        record_mut.output_bytes = output_bytes;
+        record_mut.offset_contribution = Some(public.offset_contribution);
+        record_mut.payout_excess_public_key = public.payout_excess_public_key.to_vec();
+        record_mut.private_context = Some(PrivateScriptlessPayoutContext::new(
+            *payout_excess,
+            has_output_blinding.then_some(*output_blinding),
+        ));
+        record_mut.state = ScriptlessPayoutReservationState::Prepared;
+        self.commit(state)?; // Public output and private recovery state commit atomically.
+        Ok(())
+    }
+
+    fn scriptless_payout_summary(
+        &self,
+        reservation_id: Uuid,
+    ) -> Result<ScriptlessPayoutReservationSummaryV1, CoreError> {
+        let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
+        let record = &state.scriptless_payout_reservations
+            [find_scriptless_payout_index(state, reservation_id)?];
+        Ok(ScriptlessPayoutReservationSummaryV1 {
+            reservation_id,
+            role: record.role,
+            state: record.state,
+            template_bound: record.template_hash.is_some(),
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1133,8 +2523,58 @@ impl WalletService {
             requested_fee,
             Some(sender),
             Some(receiver),
+            0,
             expires_at_height,
         )
+    }
+
+    /// Create an ordinary recovery-capable send under the canonical G-COVER
+    /// policy, before any Slate byte or signature is created.
+    ///
+    /// The validated height comes from the currently attached canonical Core,
+    /// not a peer claim or cached startup tip. A genesis-only snapshot has no
+    /// valid nonzero HEIGHT_LOCKED value, so it produces an explicit PLAIN
+    /// fallback. Rollout non-selection is also explicit and is not a fallback.
+    pub fn transaction_send_create_with_cover(
+        &mut self,
+        amount: u64,
+        requested_fee: Option<u64>,
+        expires_at_height: u64,
+        policy: CoverLockPolicyV1,
+    ) -> Result<CoverSendResult, CoreError> {
+        let identity = self
+            .backend
+            .as_ref()
+            .ok_or(CoreError::EmbeddedCoreRequired)?
+            .current_identity()?;
+        let snapshot = ValidatedChainSnapshotV1::from_validated_height(identity.current_tip.height);
+        let decision = match policy.cover_lock_for_send(&snapshot, &mut rand::rngs::OsRng) {
+            Ok(CoverLockOutcomeV1::Cover(lock_height)) => {
+                CoverSendDecision::HeightLocked { lock_height }
+            }
+            Ok(CoverLockOutcomeV1::NotSelected) => CoverSendDecision::NotSelectedPlain,
+            Err(_) if identity.current_tip.height == 0 => {
+                CoverSendDecision::NoSatisfiedHeightPlainFallback
+            }
+            Err(_) => return Err(CoreError::CoverPolicyRejected),
+        };
+        let lock_height = match decision {
+            CoverSendDecision::HeightLocked { lock_height } => lock_height,
+            CoverSendDecision::NotSelectedPlain
+            | CoverSendDecision::NoSatisfiedHeightPlainFallback => 0,
+        };
+        let transaction = self.transaction_send_create_with_identities(
+            amount,
+            requested_fee,
+            None,
+            None,
+            lock_height,
+            expires_at_height,
+        )?;
+        Ok(CoverSendResult {
+            transaction,
+            decision,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1144,6 +2584,7 @@ impl WalletService {
         requested_fee: Option<u64>,
         sender: Option<&WalletAddress>,
         receiver: Option<&WalletAddress>,
+        lock_height: u64,
         expires_at_height: u64,
     ) -> Result<TransactionSummary, CoreError> {
         if amount == 0 {
@@ -1154,8 +2595,10 @@ impl WalletService {
             .backend
             .as_ref()
             .ok_or(CoreError::EmbeddedCoreRequired)?
-            .identity()
-            .clone();
+            .current_identity()?;
+        if lock_height > identity.current_tip.height {
+            return Err(CoreError::CoverPolicyRejected);
+        }
         validate_transaction_expiry(expires_at_height, identity.current_tip.height)?;
         let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
         let mut selected = Vec::new();
@@ -1265,7 +2708,14 @@ impl WalletService {
             })
             .collect::<Result<Vec<_>, CoreError>>()?;
         let sender_parts = builder
-            .build_sender_offer(&inputs, change_value, amount, fee, coordinate)?
+            .build_sender_offer_with_lock_height(
+                &inputs,
+                change_value,
+                amount,
+                fee,
+                lock_height,
+                coordinate,
+            )?
             .into_sender_parts()?;
         let (automatic_sender, automatic_receiver);
         let (sender, receiver) = match (sender, receiver) {
@@ -1368,8 +2818,7 @@ impl WalletService {
             .backend
             .as_ref()
             .ok_or(CoreError::EmbeddedCoreRequired)?
-            .identity()
-            .clone();
+            .current_identity()?;
         let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
         let index = find_transaction_index(state, slate_id, TransactionRole::Sender)?;
         let transaction = state
@@ -1395,8 +2844,7 @@ impl WalletService {
             .backend
             .as_ref()
             .ok_or(CoreError::EmbeddedCoreRequired)?
-            .identity()
-            .clone();
+            .current_identity()?;
         let slate = CanonicalSlate::from_text(text, &identity, identity.current_tip.height)?;
         validate_transaction_expiry(slate.expires_at_height(), identity.current_tip.height)?;
         if slate.phase()? != SlatePhase::SenderOffer {
@@ -1450,8 +2898,7 @@ impl WalletService {
             .backend
             .as_ref()
             .ok_or(CoreError::EmbeddedCoreRequired)?
-            .identity()
-            .clone();
+            .current_identity()?;
         let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
         let index = find_transaction_index(&state, slate_id, TransactionRole::Recipient)?;
         let coordinate = state.reserve_recovery_coordinate(0, RecoveryOutputClass::ReceiveSlate)?;
@@ -1511,8 +2958,7 @@ impl WalletService {
             .backend
             .as_ref()
             .ok_or(CoreError::EmbeddedCoreRequired)?
-            .identity()
-            .clone();
+            .current_identity()?;
         let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
         let index = find_transaction_index(state, slate_id, TransactionRole::Recipient)?;
         let transaction = state
@@ -1538,8 +2984,7 @@ impl WalletService {
             .backend
             .as_ref()
             .ok_or(CoreError::EmbeddedCoreRequired)?
-            .identity()
-            .clone();
+            .current_identity()?;
         let response = CanonicalSlate::from_text(text, &identity, identity.current_tip.height)?;
         validate_transaction_expiry(response.expires_at_height(), identity.current_tip.height)?;
         if response.phase()? != SlatePhase::ReceiverResponse {
@@ -1576,8 +3021,7 @@ impl WalletService {
             .backend
             .as_ref()
             .ok_or(CoreError::EmbeddedCoreRequired)?
-            .identity()
-            .clone();
+            .current_identity()?;
         let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
         let index = find_transaction_index(state, slate_id, TransactionRole::Sender)?;
         if state.transactions[index].lifecycle == TransactionLifecycle::Finalized {
@@ -1624,6 +3068,11 @@ impl WalletService {
             sender,
             identity.chain_id,
         )?;
+        verify_recoverable_transaction_against_response(
+            &finalized.canonical_bytes,
+            &response.recovery_body()?,
+            &identity,
+        )?;
         let transaction = Transaction::from_bytes(&finalized.canonical_bytes)
             .map_err(|_| CoreError::ProtocolRejected)?;
         if transaction.outputs.iter().any(|output| {
@@ -1647,6 +3096,90 @@ impl WalletService {
         )?;
         self.commit(state)?;
         self.transaction_summary(state_transaction_id(self.unlocked.as_ref(), index)?)
+    }
+
+    /// Export exact finalized transaction bytes after sender-side canonical DOM
+    /// verification. This is the third, public-only message in the G0 manual
+    /// exchange; it never exposes Slate private context.
+    pub fn transaction_finalized_export(
+        &self,
+        slate_id: Uuid,
+    ) -> Result<FinalizedTransactionExport, CoreError> {
+        let identity = self
+            .backend
+            .as_ref()
+            .ok_or(CoreError::EmbeddedCoreRequired)?
+            .current_identity()?;
+        let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
+        let index = find_transaction_index(state, slate_id, TransactionRole::Sender)?;
+        let transaction = &state.transactions[index];
+        if transaction.lifecycle != TransactionLifecycle::Finalized {
+            return Err(CoreError::InvalidTransactionTransition);
+        }
+        let response = CanonicalSlate::from_recovery_bytes(
+            &transaction.response_bytes,
+            &identity,
+            identity.current_tip.height,
+        )?;
+        let verified = verify_recoverable_transaction_against_response(
+            &transaction.finalized_transaction_bytes,
+            &response.recovery_body()?,
+            &identity,
+        )?;
+        if transaction.transaction_hash != Some(verified.transaction_hash) {
+            return Err(CoreError::ProtocolRejected);
+        }
+        Ok(FinalizedTransactionExport {
+            transaction_id: transaction.id,
+            slate_id,
+            canonical_bytes: transaction.finalized_transaction_bytes.clone(),
+            transaction_hash: verified.transaction_hash,
+        })
+    }
+
+    /// Independently verify and durably retain a sender's exact finalized
+    /// transaction against this recipient's persisted response.
+    ///
+    /// Repeating the identical import is idempotent. Different bytes for the
+    /// same Slate fail closed, preventing a post-response substitution before
+    /// broadcast.
+    pub fn transaction_finalized_verify_and_import(
+        &mut self,
+        slate_id: Uuid,
+        canonical_bytes: &[u8],
+    ) -> Result<VerifiedRecoverableTransaction, CoreError> {
+        let identity = self
+            .backend
+            .as_ref()
+            .ok_or(CoreError::EmbeddedCoreRequired)?
+            .current_identity()?;
+        let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
+        let index = find_transaction_index(state, slate_id, TransactionRole::Recipient)?;
+        let response = CanonicalSlate::from_recovery_bytes(
+            &state.transactions[index].response_bytes,
+            &identity,
+            identity.current_tip.height,
+        )?;
+        let verified = verify_recoverable_transaction_against_response(
+            canonical_bytes,
+            &response.recovery_body()?,
+            &identity,
+        )?;
+        if !state.transactions[index]
+            .finalized_transaction_bytes
+            .is_empty()
+            && state.transactions[index].finalized_transaction_bytes != canonical_bytes
+        {
+            return Err(CoreError::FinalizedTransactionConflict);
+        }
+
+        let mut state = state.clone();
+        let transaction = &mut state.transactions[index];
+        transaction.finalized_transaction_bytes = canonical_bytes.to_vec();
+        transaction.transaction_hash = Some(verified.transaction_hash);
+        transaction.kernel_excess = verified.kernel_excess.to_vec();
+        self.commit(state)?;
+        Ok(verified)
     }
 
     pub fn transaction_submit(&mut self, slate_id: Uuid) -> Result<TransactionSummary, CoreError> {
@@ -1939,6 +3472,7 @@ struct WalletRecoverySink {
     seed: CanonicalWalletSeed,
     identity: CoreChainIdentity,
     observed_tip_height: Option<u64>,
+    last_recovery_error: Option<SeedRestoreError>,
 }
 
 impl WalletRecoverySink {
@@ -1958,6 +3492,7 @@ impl WalletRecoverySink {
             seed,
             identity,
             observed_tip_height: None,
+            last_recovery_error: None,
         }
     }
 
@@ -1971,7 +3506,7 @@ impl WalletRecoverySink {
         if let Some(anchor) = reorg {
             rewind_recovery_state(&mut next, anchor.height, batch.observed_tip.height)?;
         }
-        apply_recovery_batch(
+        if let Err(error) = apply_recovery_batch(
             &self.seed,
             dom_crypto::recovery::RecoveryChainContext {
                 network_magic: self.identity.network_magic,
@@ -1980,7 +3515,10 @@ impl WalletRecoverySink {
             &self.identity,
             &mut next,
             batch,
-        )?;
+        ) {
+            self.last_recovery_error = Some(error);
+            return Err(error.into());
+        }
         for transaction_id in
             cancel_expired_unfinalized_reservations(&mut next, batch.observed_tip.height)?
         {
@@ -2134,6 +3672,14 @@ fn require_mainnet_identity(identity: &NetworkIdentity) -> Result<(), CoreError>
     }
 }
 
+fn require_canonical_mainnet_when_applicable(identity: &NetworkIdentity) -> Result<(), CoreError> {
+    if identity.network == Network::Mainnet {
+        require_mainnet_identity(identity)
+    } else {
+        Ok(())
+    }
+}
+
 fn map_network(network: dom_wallet_core_api::CoreNetwork) -> Network {
     match network {
         dom_wallet_core_api::CoreNetwork::Mainnet => Network::Mainnet,
@@ -2160,6 +3706,431 @@ fn spendable_outputs(state: &WalletState) -> Vec<&OutputRecord> {
             .then_with(|| left.id.cmp(&right.id))
     });
     outputs
+}
+
+fn find_scriptless_funding_index(
+    state: &WalletState,
+    reservation_id: Uuid,
+) -> Result<usize, CoreError> {
+    state
+        .scriptless_funding_reservations
+        .iter()
+        .position(|reservation| reservation.id == reservation_id)
+        .ok_or(CoreError::ScriptlessFundingReservationNotFound)
+}
+
+fn validate_session_share_binding(
+    chain_id: [u8; 32],
+    session_id: [u8; 32],
+    session_share: &SessionBlindingShareCapabilityV1,
+) -> Result<([u8; 32], u16), CoreError> {
+    let binding = session_share.binding();
+    let participant_position = binding.participant_index();
+    let binding_digest = binding.binding_digest_v1();
+    if chain_id == [0u8; 32]
+        || session_id == [0u8; 32]
+        || binding.chain_id() != &chain_id
+        || binding.session_id() != &session_id
+        || binding.roster().len() != SCRIPTLESS_PARTICIPANT_COUNT_V1 as usize
+        || participant_position >= SCRIPTLESS_PARTICIPANT_COUNT_V1 as u16
+        || binding.terms_hash() == &[0u8; 32]
+        || binding.capsule_hash() == &[0u8; 32]
+        || binding_digest == [0u8; 32]
+        || binding.roster().get(usize::from(participant_position)) != Some(binding.participant_id())
+        || binding.share_point() != session_share.public_key()
+    {
+        return Err(CoreError::ScriptlessSessionBindingMismatch);
+    }
+    Ok((binding_digest, participant_position))
+}
+
+fn require_persisted_session_binding(
+    record: &ScriptlessFundingReservation,
+    binding_digest: [u8; 32],
+    participant_position: u16,
+) -> Result<(), CoreError> {
+    if record.session_share_binding_digest != Some(binding_digest)
+        || record.participant_position != Some(u32::from(participant_position))
+    {
+        return Err(CoreError::ScriptlessSessionBindingMismatch);
+    }
+    Ok(())
+}
+
+fn require_persisted_payout_session_binding(
+    record: &ScriptlessPayoutReservation,
+    binding_digest: [u8; 32],
+    participant_position: u16,
+) -> Result<(), CoreError> {
+    if record.session_share_binding_digest != Some(binding_digest)
+        || record.participant_position != Some(u32::from(participant_position))
+    {
+        return Err(CoreError::ScriptlessSessionBindingMismatch);
+    }
+    Ok(())
+}
+
+fn bound_signing_context(
+    record: &ScriptlessFundingReservation,
+    chain_id: [u8; 32],
+) -> Result<BoundScriptlessSigningContextV1, CoreError> {
+    Ok(BoundScriptlessSigningContextV1 {
+        chain_id,
+        session_id: record.session_id,
+        session_share_binding_digest: record
+            .session_share_binding_digest
+            .ok_or(CoreError::ScriptlessSessionBindingRequired)?,
+        participant_position: record
+            .participant_position
+            .ok_or(CoreError::ScriptlessSessionBindingRequired)?
+            .try_into()
+            .map_err(|_| CoreError::ScriptlessSessionBindingMismatch)?,
+        template_hash: record
+            .template_hash
+            .ok_or(CoreError::ScriptlessTemplateBindingMismatch)?,
+    })
+}
+
+fn bound_payout_signing_context(
+    record: &ScriptlessPayoutReservation,
+    chain_id: [u8; 32],
+) -> Result<BoundScriptlessSigningContextV1, CoreError> {
+    Ok(BoundScriptlessSigningContextV1 {
+        chain_id,
+        session_id: record.session_id,
+        session_share_binding_digest: record
+            .session_share_binding_digest
+            .ok_or(CoreError::ScriptlessSessionBindingRequired)?,
+        participant_position: record
+            .participant_position
+            .ok_or(CoreError::ScriptlessSessionBindingRequired)?
+            .try_into()
+            .map_err(|_| CoreError::ScriptlessSessionBindingMismatch)?,
+        template_hash: record
+            .template_hash
+            .ok_or(CoreError::ScriptlessTemplateBindingMismatch)?,
+    })
+}
+
+fn parse_funding_public_key(bytes: &[u8]) -> Result<PublicKey, CoreError> {
+    let bytes: [u8; 33] = bytes
+        .try_into()
+        .map_err(|_| CoreError::ScriptlessFundingContextMismatch)?;
+    PublicKey::from_compressed_bytes(&bytes)
+        .map_err(|_| CoreError::ScriptlessFundingContextMismatch)
+}
+
+fn parse_payout_public_key(bytes: &[u8]) -> Result<PublicKey, CoreError> {
+    let bytes: [u8; 33] = bytes
+        .try_into()
+        .map_err(|_| CoreError::ScriptlessPayoutContextMismatch)?;
+    PublicKey::from_compressed_bytes(&bytes).map_err(|_| CoreError::ScriptlessPayoutContextMismatch)
+}
+
+/// Check only the participant-local portion of a frozen aggregate funding
+/// shape. The shared output is global, so it is counted exactly once for every
+/// participant regardless of which wallet contributes the real inputs. Exact
+/// aggregate equality and uniqueness are enforced later against the typed DOM
+/// template.
+fn validate_scriptless_funding_local_shape(
+    local_input_count: usize,
+    local_other_output_count: usize,
+    expected_input_count: u32,
+    expected_output_count: u32,
+) -> Result<(), CoreError> {
+    let minimum_global_output_count = local_other_output_count
+        .checked_add(1)
+        .ok_or(CoreError::ArithmeticOverflow)?;
+    if local_input_count > expected_input_count as usize
+        || minimum_global_output_count > expected_output_count as usize
+    {
+        return Err(CoreError::ScriptlessFundingShapeMismatch);
+    }
+    Ok(())
+}
+
+fn validate_template_participant_set(
+    transaction: &Transaction,
+    local_offset: [u8; 32],
+    local_kernel_excess_point: [u8; 33],
+    participant_position: u16,
+    participants: ScriptlessTemplateParticipantSetV1,
+) -> Result<ScriptlessTemplateParticipantBindingV1, CoreError> {
+    let position = usize::from(participant_position);
+    if participants.ordered_offset_contributions.get(position) != Some(&local_offset)
+        || participants.ordered_kernel_excess_points.get(position)
+            != Some(&local_kernel_excess_point)
+        || transaction.kernels.len() != 1
+    {
+        return Err(CoreError::ScriptlessTemplateBindingMismatch);
+    }
+    let aggregate_offset =
+        aggregate_transaction_offset_contributions_v1(&participants.ordered_offset_contributions)
+            .map_err(|_| CoreError::ScriptlessTemplateBindingMismatch)?;
+    if transaction.offset != aggregate_offset {
+        return Err(CoreError::ScriptlessTemplateBindingMismatch);
+    }
+    let points = participants
+        .ordered_kernel_excess_points
+        .iter()
+        .map(|point| PublicKey::from_compressed_bytes(point.as_slice()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| CoreError::ScriptlessTemplateBindingMismatch)?;
+    let aggregate_point = scriptless_add_public_points(&points)
+        .map_err(|_| CoreError::ScriptlessTemplateBindingMismatch)?;
+    if transaction.kernels[0].excess.as_bytes() != &aggregate_point.to_compressed_bytes() {
+        return Err(CoreError::ScriptlessTemplateBindingMismatch);
+    }
+    Ok(ScriptlessTemplateParticipantBindingV1::new(
+        participants.ordered_offset_contributions,
+        participants.ordered_kernel_excess_points,
+    ))
+}
+
+fn scriptless_funding_composition(
+    record: &ScriptlessFundingReservation,
+    chain_id: [u8; 32],
+) -> Result<ScriptlessFundingCompositionV1, CoreError> {
+    if !matches!(
+        record.state,
+        ScriptlessFundingReservationState::Exported
+            | ScriptlessFundingReservationState::TemplateBound
+    ) || record.offset_contribution.is_none()
+        || record.wallet_excess_public_key.len() != 33
+        || record.reserved_output_ids.len() != record.input_commitments.len()
+    {
+        return Err(CoreError::ScriptlessFundingNotPrepared);
+    }
+    let inputs = record
+        .input_commitments
+        .iter()
+        .map(|commitment| {
+            let commitment: [u8; 33] = commitment
+                .as_slice()
+                .try_into()
+                .map_err(|_| CoreError::ScriptlessFundingContextMismatch)?;
+            Ok(TransactionInput {
+                commitment: dom_crypto::pedersen::Commitment::from_compressed_bytes(&commitment)
+                    .map_err(|_| CoreError::ScriptlessFundingContextMismatch)?,
+            })
+        })
+        .collect::<Result<Vec<_>, CoreError>>()?;
+    let other_outputs = if record.change_output_bytes.is_empty() {
+        Vec::new()
+    } else {
+        let output = TransactionOutput::from_bytes(&record.change_output_bytes)
+            .map_err(|_| CoreError::ScriptlessFundingContextMismatch)?;
+        if output
+            .to_bytes()
+            .map_err(|_| CoreError::ScriptlessFundingContextMismatch)?
+            != record.change_output_bytes
+            || Some(*output.commitment.as_bytes()) != record.change_commitment
+        {
+            return Err(CoreError::ScriptlessFundingContextMismatch);
+        }
+        let capsule = output
+            .recovery_capsule()
+            .map_err(|_| CoreError::ScriptlessFundingContextMismatch)?
+            .ok_or(CoreError::ScriptlessFundingContextMismatch)?;
+        let proof = output
+            .range_proof_bytes()
+            .map_err(|_| CoreError::ScriptlessFundingContextMismatch)?;
+        if !dom_crypto::range_proof_verify_with_extra_commit(
+            output.commitment.as_bytes(),
+            proof,
+            capsule.as_bytes(),
+        )
+        .map_err(|_| CoreError::ScriptlessFundingContextMismatch)?
+        {
+            return Err(CoreError::ScriptlessFundingContextMismatch);
+        }
+        vec![output]
+    };
+    validate_scriptless_funding_local_shape(
+        inputs.len(),
+        other_outputs.len(),
+        record.expected_input_count,
+        record.expected_output_count,
+    )?;
+    dom_crypto::pedersen::Commitment::from_compressed_bytes(&record.shared_output_commitment)
+        .map_err(|_| CoreError::ScriptlessFundingContextMismatch)?;
+    dom_crypto::pedersen::BlindingFactor::from_bytes(
+        record
+            .offset_contribution
+            .ok_or(CoreError::ScriptlessFundingNotPrepared)?,
+    )
+    .map_err(|_| CoreError::ScriptlessFundingContextMismatch)?;
+    let wallet_excess_public_key: [u8; 33] = record
+        .wallet_excess_public_key
+        .as_slice()
+        .try_into()
+        .map_err(|_| CoreError::ScriptlessFundingContextMismatch)?;
+    dom_crypto::PublicKey::from_compressed_bytes(&wallet_excess_public_key)
+        .map_err(|_| CoreError::ScriptlessFundingContextMismatch)?;
+
+    let context = record
+        .private_context
+        .as_ref()
+        .ok_or(CoreError::ScriptlessFundingNotPrepared)?;
+    let mut private = Zeroizing::new([0u8; 32]);
+    context.copy_wallet_excess_contribution_to(&mut private);
+    let opaque = OpaqueScriptlessFundingExcessV1::from_encrypted_context(*private)?;
+    if opaque.public_key_bytes() != wallet_excess_public_key {
+        return Err(CoreError::ScriptlessFundingContextMismatch);
+    }
+
+    Ok(ScriptlessFundingCompositionV1 {
+        reservation_id: record.id,
+        session_id: record.session_id,
+        chain_id,
+        shared_output_commitment: record.shared_output_commitment,
+        inputs,
+        other_outputs,
+        offset_contribution: record
+            .offset_contribution
+            .ok_or(CoreError::ScriptlessFundingNotPrepared)?,
+        wallet_excess_public_key,
+        funding_fee_noms: record.funding_fee_noms,
+        expected_input_count: record.expected_input_count,
+        expected_output_count: record.expected_output_count,
+    })
+}
+
+fn find_scriptless_payout_index(
+    state: &WalletState,
+    reservation_id: Uuid,
+) -> Result<usize, CoreError> {
+    state
+        .scriptless_payout_reservations
+        .iter()
+        .position(|reservation| reservation.id == reservation_id)
+        .ok_or(CoreError::ScriptlessPayoutReservationNotFound)
+}
+
+fn scriptless_payout_composition(
+    record: &ScriptlessPayoutReservation,
+    chain_id: [u8; 32],
+) -> Result<ScriptlessPayoutCompositionV1, CoreError> {
+    let has_output = record.payout_value_noms != 0;
+    if !matches!(
+        record.state,
+        ScriptlessPayoutReservationState::ComponentsExposed
+            | ScriptlessPayoutReservationState::TemplateBound
+    ) || record.output_bytes.is_empty() == has_output
+        || record.output_commitment.is_some() != has_output
+        || record.offset_contribution.is_none()
+        || record.payout_excess_public_key.len() != 33
+        || record.expected_output_count == 0
+    {
+        return Err(CoreError::ScriptlessPayoutNotPrepared);
+    }
+    let outputs = if has_output {
+        let output = TransactionOutput::from_bytes(&record.output_bytes)
+            .map_err(|_| CoreError::ScriptlessPayoutContextMismatch)?;
+        if output
+            .to_bytes()
+            .map_err(|_| CoreError::ScriptlessPayoutContextMismatch)?
+            != record.output_bytes
+            || record.output_commitment != Some(*output.commitment.as_bytes())
+        {
+            return Err(CoreError::ScriptlessPayoutContextMismatch);
+        }
+        let capsule = output
+            .recovery_capsule()
+            .map_err(|_| CoreError::ScriptlessPayoutContextMismatch)?
+            .ok_or(CoreError::ScriptlessPayoutContextMismatch)?;
+        let proof = output
+            .range_proof_bytes()
+            .map_err(|_| CoreError::ScriptlessPayoutContextMismatch)?;
+        if !dom_crypto::range_proof_verify_with_extra_commit(
+            output.commitment.as_bytes(),
+            proof,
+            capsule.as_bytes(),
+        )
+        .map_err(|_| CoreError::ScriptlessPayoutContextMismatch)?
+        {
+            return Err(CoreError::ScriptlessPayoutContextMismatch);
+        }
+        vec![output]
+    } else {
+        Vec::new()
+    };
+    if outputs.len() > record.expected_output_count as usize {
+        return Err(CoreError::ScriptlessPayoutContextMismatch);
+    }
+    dom_crypto::pedersen::Commitment::from_compressed_bytes(&record.shared_output_commitment)
+        .map_err(|_| CoreError::ScriptlessPayoutContextMismatch)?;
+    dom_crypto::pedersen::BlindingFactor::from_bytes(
+        record
+            .offset_contribution
+            .ok_or(CoreError::ScriptlessPayoutNotPrepared)?,
+    )
+    .map_err(|_| CoreError::ScriptlessPayoutContextMismatch)?;
+    let payout_excess_public_key: [u8; 33] = record
+        .payout_excess_public_key
+        .as_slice()
+        .try_into()
+        .map_err(|_| CoreError::ScriptlessPayoutContextMismatch)?;
+    dom_crypto::PublicKey::from_compressed_bytes(&payout_excess_public_key)
+        .map_err(|_| CoreError::ScriptlessPayoutContextMismatch)?;
+
+    let context = record
+        .private_context
+        .as_ref()
+        .ok_or(CoreError::ScriptlessPayoutNotPrepared)?;
+    let mut private = Zeroizing::new([0u8; 32]);
+    context.copy_payout_excess_contribution_to(&mut private);
+    let mut output_blinding = Zeroizing::new([0u8; 32]);
+    let has_output_blinding = context.copy_output_blinding_to(&mut output_blinding);
+    if has_output_blinding != has_output {
+        return Err(CoreError::ScriptlessPayoutContextMismatch);
+    }
+    if let Some(output) = outputs.first() {
+        let output_blinding_factor =
+            dom_crypto::pedersen::BlindingFactor::from_bytes(*output_blinding)
+                .map_err(|_| CoreError::ScriptlessPayoutContextMismatch)?;
+        if dom_crypto::pedersen::Commitment::commit(
+            record.payout_value_noms,
+            &output_blinding_factor,
+        ) != output.commitment
+        {
+            return Err(CoreError::ScriptlessPayoutContextMismatch);
+        }
+    }
+    let recomputed = Zeroizing::new(
+        sender_excess_blinding(
+            std::iter::empty::<&[u8; 32]>(),
+            has_output.then_some(&*output_blinding),
+            record
+                .offset_contribution
+                .as_ref()
+                .ok_or(CoreError::ScriptlessPayoutNotPrepared)?,
+        )
+        .map_err(|_| CoreError::ScriptlessPayoutContextMismatch)?,
+    );
+    if *recomputed != *private {
+        return Err(CoreError::ScriptlessPayoutContextMismatch);
+    }
+    let opaque = OpaqueScriptlessPayoutExcessV1::from_encrypted_context(*private)?;
+    if opaque.public_key_bytes() != payout_excess_public_key {
+        return Err(CoreError::ScriptlessPayoutContextMismatch);
+    }
+
+    Ok(ScriptlessPayoutCompositionV1 {
+        reservation_id: record.id,
+        session_id: record.session_id,
+        chain_id,
+        role: record.role,
+        shared_output_commitment: record.shared_output_commitment,
+        outputs,
+        offset_contribution: record
+            .offset_contribution
+            .ok_or(CoreError::ScriptlessPayoutNotPrepared)?,
+        payout_excess_public_key,
+        kernel_fee_noms: record.kernel_fee_noms,
+        expected_output_count: record.expected_output_count,
+        refund_lock_height: record.refund_lock_height,
+    })
 }
 
 fn find_transaction_index(
@@ -2532,6 +4503,46 @@ pub enum CoreError {
     ArithmeticOverflow,
     #[error("input is already reserved")]
     ReservationConflict,
+    #[error("Scriptless funding reservation request is invalid")]
+    InvalidScriptlessFundingRequest,
+    #[error("Scriptless funding session already has different frozen terms")]
+    ScriptlessFundingSessionConflict,
+    #[error("Scriptless funding components disagree with the frozen aggregate shape")]
+    ScriptlessFundingShapeMismatch,
+    #[error("Scriptless funding reservation was not found")]
+    ScriptlessFundingReservationNotFound,
+    #[error("Scriptless funding components are not durably prepared")]
+    ScriptlessFundingNotPrepared,
+    #[error("Scriptless funding components cannot be exported in this state")]
+    ScriptlessFundingCannotExport,
+    #[error("Scriptless funding signing handoff is not authorized in this state")]
+    ScriptlessFundingSigningNotAuthorized,
+    #[error("Scriptless funding encrypted and public contexts disagree")]
+    ScriptlessFundingContextMismatch,
+    #[error("Scriptless funding reservation cannot be released after exposure or chain change")]
+    ScriptlessFundingCannotRelease,
+    #[error("the complete authenticated Scriptless session binding is required before exposure")]
+    ScriptlessSessionBindingRequired,
+    #[error("the Scriptless session-share capability disagrees with durable wallet state")]
+    ScriptlessSessionBindingMismatch,
+    #[error("the real DOM Scriptless template disagrees with durable wallet state")]
+    ScriptlessTemplateBindingMismatch,
+    #[error("Scriptless claim/refund payout reservation request is invalid")]
+    InvalidScriptlessPayoutRequest,
+    #[error("Scriptless claim/refund payout role already has different frozen terms")]
+    ScriptlessPayoutSessionConflict,
+    #[error("Scriptless claim/refund payout reservation was not found")]
+    ScriptlessPayoutReservationNotFound,
+    #[error("Scriptless claim/refund payout components are not durably prepared")]
+    ScriptlessPayoutNotPrepared,
+    #[error("Scriptless claim/refund payout components cannot be exported in this state")]
+    ScriptlessPayoutCannotExport,
+    #[error("Scriptless claim/refund payout encrypted and public contexts disagree")]
+    ScriptlessPayoutContextMismatch,
+    #[error("Scriptless claim/refund payout signing handoff is not authorized in this state")]
+    ScriptlessPayoutSigningNotAuthorized,
+    #[error("Scriptless claim/refund payout cannot be released after exposure")]
+    ScriptlessPayoutCannotRelease,
     #[error("canonical Slate transport is invalid")]
     InvalidSlateTransport,
     #[error("canonical Slate replay conflicts with durable state")]
@@ -2542,6 +4553,10 @@ pub enum CoreError {
     MissingPrivateContext,
     #[error("DOM protocol transaction validation failed")]
     ProtocolRejected,
+    #[error("ordinary-send cover policy rejected the chain snapshot")]
+    CoverPolicyRejected,
+    #[error("different finalized bytes were already retained for this Slate")]
+    FinalizedTransactionConflict,
     #[error("mixed recoverable and proof-only output regime")]
     MixedOutputRegime,
     #[error("transaction cannot be cancelled after submission evidence")]
@@ -2593,11 +4608,39 @@ impl CoreError {
             Self::FeeTooLow => "FEE_TOO_LOW",
             Self::ArithmeticOverflow => "ARITHMETIC_OVERFLOW",
             Self::ReservationConflict => "OUTPUT_RESERVATION_CONFLICT",
+            Self::InvalidScriptlessFundingRequest => "SCRIPTLESS_FUNDING_REQUEST_INVALID",
+            Self::ScriptlessFundingSessionConflict => "SCRIPTLESS_FUNDING_SESSION_CONFLICT",
+            Self::ScriptlessFundingShapeMismatch => "SCRIPTLESS_FUNDING_SHAPE_MISMATCH",
+            Self::ScriptlessFundingReservationNotFound => {
+                "SCRIPTLESS_FUNDING_RESERVATION_NOT_FOUND"
+            }
+            Self::ScriptlessFundingNotPrepared => "SCRIPTLESS_FUNDING_NOT_PREPARED",
+            Self::ScriptlessFundingCannotExport => "SCRIPTLESS_FUNDING_CANNOT_EXPORT",
+            Self::ScriptlessFundingSigningNotAuthorized => {
+                "SCRIPTLESS_FUNDING_SIGNING_NOT_AUTHORIZED"
+            }
+            Self::ScriptlessFundingContextMismatch => "SCRIPTLESS_FUNDING_CONTEXT_MISMATCH",
+            Self::ScriptlessFundingCannotRelease => "SCRIPTLESS_FUNDING_CANNOT_RELEASE",
+            Self::ScriptlessSessionBindingRequired => "SCRIPTLESS_SESSION_BINDING_REQUIRED",
+            Self::ScriptlessSessionBindingMismatch => "SCRIPTLESS_SESSION_BINDING_MISMATCH",
+            Self::ScriptlessTemplateBindingMismatch => "SCRIPTLESS_TEMPLATE_BINDING_MISMATCH",
+            Self::InvalidScriptlessPayoutRequest => "SCRIPTLESS_PAYOUT_REQUEST_INVALID",
+            Self::ScriptlessPayoutSessionConflict => "SCRIPTLESS_PAYOUT_SESSION_CONFLICT",
+            Self::ScriptlessPayoutReservationNotFound => "SCRIPTLESS_PAYOUT_RESERVATION_NOT_FOUND",
+            Self::ScriptlessPayoutNotPrepared => "SCRIPTLESS_PAYOUT_NOT_PREPARED",
+            Self::ScriptlessPayoutCannotExport => "SCRIPTLESS_PAYOUT_CANNOT_EXPORT",
+            Self::ScriptlessPayoutContextMismatch => "SCRIPTLESS_PAYOUT_CONTEXT_MISMATCH",
+            Self::ScriptlessPayoutSigningNotAuthorized => {
+                "SCRIPTLESS_PAYOUT_SIGNING_NOT_AUTHORIZED"
+            }
+            Self::ScriptlessPayoutCannotRelease => "SCRIPTLESS_PAYOUT_CANNOT_RELEASE",
             Self::InvalidSlateTransport => "SLATE_V4_TRANSPORT_INVALID",
             Self::SlateReplayConflict => "SLATE_REPLAY_CONFLICT",
             Self::InvalidTransactionTransition => "TRANSACTION_STATE_INVALID",
             Self::MissingPrivateContext => "SLATE_PRIVATE_CONTEXT_MISSING",
             Self::ProtocolRejected => "PROTOCOL_REJECTED",
+            Self::CoverPolicyRejected => "COVER_POLICY_REJECTED",
+            Self::FinalizedTransactionConflict => "FINALIZED_TRANSACTION_CONFLICT",
             Self::MixedOutputRegime => "MIXED_OUTPUT_REGIME",
             Self::CannotCancelTransaction => "TRANSACTION_CANNOT_CANCEL",
             Self::ConfirmationRequired => "CONFIRMATION_REQUIRED",
@@ -3027,6 +5070,357 @@ mod tests {
         );
         assert_eq!(state.outputs[0].reserved_by, None);
         assert_eq!(state.balance().total, 0);
+    }
+
+    #[test]
+    fn scriptless_reorg_restores_input_reservation_and_pending_change_from_encrypted_context() {
+        let mut state = WalletState::new(
+            backup_identity(),
+            [7; 32],
+            default_node_configuration(backup_identity()),
+        );
+        let reservation_id = Uuid::new_v4();
+        let input_id = Uuid::new_v4();
+        let change_id = Uuid::new_v4();
+        state.outputs.push(OutputRecord {
+            id: input_id,
+            account_id: state.default_account.id,
+            commitment: Some([2; 33]),
+            value: 100,
+            state: OutputState::Spent { spent_height: 11 },
+            discovered_height: 1,
+            reserved_by: None,
+        });
+        state.remember_output_blinding(input_id, [3; 32]);
+        state.outputs.push(OutputRecord {
+            id: change_id,
+            account_id: state.default_account.id,
+            commitment: Some([4; 33]),
+            value: 9,
+            state: OutputState::Confirmed,
+            discovered_height: 11,
+            reserved_by: None,
+        });
+        state.remember_output_blinding(change_id, [5; 32]);
+        state
+            .scriptless_funding_reservations
+            .push(ScriptlessFundingReservation {
+                version: SCRIPTLESS_FUNDING_RESERVATION_VERSION,
+                id: reservation_id,
+                session_id: [6; 32],
+                shared_output_commitment: [11; 33],
+                created_at_height: 10,
+                local_debit_noms: 91,
+                funding_fee_noms: 1,
+                expected_input_count: 1,
+                expected_output_count: 2,
+                reserved_output_ids: vec![input_id],
+                input_commitments: vec![vec![2; 33]],
+                change_value_noms: 9,
+                change_derivation_index: Some(1),
+                change_output_id: Some(change_id),
+                change_commitment: Some([4; 33]),
+                change_output_bytes: vec![7],
+                offset_contribution: Some([8; 32]),
+                wallet_excess_public_key: vec![9; 33],
+                template_hash: None,
+                session_share_binding_digest: Some([10; 32]),
+                participant_position: Some(0),
+                template_participants: None,
+                private_context: Some(PrivateScriptlessFundingContext::new(
+                    [10; 32],
+                    Some([5; 32]),
+                )),
+                state: ScriptlessFundingReservationState::Exported,
+            });
+        state.recovery_allocation_floors.change = 1;
+        state.non_reuse_floor = 1;
+        state.validate().unwrap();
+
+        rewind_recovery_state(&mut state, 0, 10).unwrap();
+        assert!(state.outputs.iter().all(|output| output.id != input_id));
+        let change = state
+            .outputs
+            .iter()
+            .find(|output| output.id == change_id)
+            .unwrap();
+        assert_eq!(change.state, OutputState::PendingIncoming);
+        assert_eq!(change.discovered_height, 0);
+        assert_eq!(state.output_blinding(change_id), Some([5; 32]));
+        assert_eq!(
+            state.scriptless_funding_reservations[0].state,
+            ScriptlessFundingReservationState::Exported
+        );
+        state.validate().unwrap();
+
+        // A full scanner replay may assign a new local UUID to the same
+        // canonical commitment. The reservation follows the commitment and
+        // immediately makes that rediscovered output unavailable.
+        let rebound_input_id = Uuid::new_v4();
+        state.outputs.push(OutputRecord {
+            id: rebound_input_id,
+            account_id: state.default_account.id,
+            commitment: Some([2; 33]),
+            value: 100,
+            state: OutputState::Confirmed,
+            discovered_height: 1,
+            reserved_by: None,
+        });
+        state.remember_output_blinding(rebound_input_id, [3; 32]);
+        state.restore_scriptless_funding_reservations().unwrap();
+        let input = state
+            .outputs
+            .iter()
+            .find(|output| output.id == rebound_input_id)
+            .unwrap();
+        assert_eq!(input.state, OutputState::PendingOutgoing);
+        assert_eq!(input.reserved_by, Some(reservation_id));
+        assert_eq!(
+            state.scriptless_funding_reservations[0].reserved_output_ids,
+            vec![rebound_input_id]
+        );
+        state.validate().unwrap();
+    }
+
+    #[test]
+    fn scriptless_reorg_restores_payout_and_preserves_no_output_signer_contribution() {
+        let mut state = WalletState::new(
+            backup_identity(),
+            [7; 32],
+            default_node_configuration(backup_identity()),
+        );
+        let session_id = [0x61; 32];
+        let payout_id = Uuid::new_v4();
+        let payout_output_id = Uuid::new_v4();
+        let payout_commitment = [0x62; 33];
+        let payout_bytes = vec![0x63; 835];
+        let payout_blinding = [0x64; 32];
+        state.outputs.push(OutputRecord {
+            id: payout_output_id,
+            account_id: state.default_account.id,
+            commitment: Some(payout_commitment),
+            value: 900,
+            state: OutputState::Confirmed,
+            discovered_height: 11,
+            reserved_by: None,
+        });
+        state.remember_output_blinding(payout_output_id, payout_blinding);
+        state
+            .scriptless_payout_reservations
+            .push(ScriptlessPayoutReservation {
+                version: SCRIPTLESS_PAYOUT_RESERVATION_VERSION,
+                id: payout_id,
+                session_id,
+                role: ScriptlessPayoutRoleV1::Claim,
+                created_at_height: 10,
+                shared_output_commitment: [0x65; 33],
+                payout_value_noms: 900,
+                kernel_fee_noms: 100,
+                expected_output_count: 1,
+                refund_lock_height: 0,
+                output_id: Some(payout_output_id),
+                derivation_index: Some(1),
+                output_commitment: Some(payout_commitment),
+                output_bytes: payout_bytes.clone(),
+                offset_contribution: Some([0x66; 32]),
+                payout_excess_public_key: vec![0x67; 33],
+                template_hash: None,
+                session_share_binding_digest: Some([0x68; 32]),
+                participant_position: Some(0),
+                template_participants: None,
+                private_context: Some(PrivateScriptlessPayoutContext::new(
+                    [0x68; 32],
+                    Some(payout_blinding),
+                )),
+                state: ScriptlessPayoutReservationState::ComponentsExposed,
+            });
+        state
+            .scriptless_payout_reservations
+            .push(ScriptlessPayoutReservation {
+                version: SCRIPTLESS_PAYOUT_RESERVATION_VERSION,
+                id: Uuid::new_v4(),
+                session_id,
+                role: ScriptlessPayoutRoleV1::Refund,
+                created_at_height: 10,
+                shared_output_commitment: [0x65; 33],
+                payout_value_noms: 0,
+                kernel_fee_noms: 100,
+                expected_output_count: 1,
+                refund_lock_height: 20,
+                output_id: None,
+                derivation_index: None,
+                output_commitment: None,
+                output_bytes: Vec::new(),
+                offset_contribution: Some([0x69; 32]),
+                payout_excess_public_key: vec![0x6a; 33],
+                template_hash: None,
+                session_share_binding_digest: Some([0x6b; 32]),
+                participant_position: Some(1),
+                template_participants: None,
+                private_context: Some(PrivateScriptlessPayoutContext::new([0x6b; 32], None)),
+                state: ScriptlessPayoutReservationState::ComponentsExposed,
+            });
+        state.recovery_allocation_floors.self_transfer = 1;
+        state.non_reuse_floor = 1;
+        state.validate().unwrap();
+
+        rewind_recovery_state(&mut state, 10, 10).unwrap();
+        let restored = state
+            .outputs
+            .iter()
+            .find(|output| output.id == payout_output_id)
+            .expect("reorg restores the exact retained payout projection");
+        assert_eq!(restored.commitment, Some(payout_commitment));
+        assert_eq!(restored.value, 900);
+        assert_eq!(restored.state, OutputState::PendingIncoming);
+        assert_eq!(restored.discovered_height, 0);
+        assert_eq!(
+            state.output_blinding(payout_output_id),
+            Some(payout_blinding)
+        );
+        assert_eq!(state.scriptless_payout_reservations.len(), 2);
+        assert_eq!(
+            state.scriptless_payout_reservations[0].output_bytes,
+            payout_bytes
+        );
+        assert!(state.scriptless_payout_reservations[1].output_id.is_none());
+        assert!(state.scriptless_payout_reservations[1]
+            .output_bytes
+            .is_empty());
+
+        rewind_recovery_state(&mut state, 10, 10).unwrap();
+        assert_eq!(
+            state
+                .outputs
+                .iter()
+                .filter(|output| output.commitment == Some(payout_commitment))
+                .count(),
+            1
+        );
+        state.validate().unwrap();
+    }
+
+    #[test]
+    fn scriptless_template_participant_binding_requires_both_exact_ordered_slots() {
+        let mut offset_a = [0u8; 32];
+        offset_a[31] = 3;
+        let mut offset_b = [0u8; 32];
+        offset_b[31] = 5;
+        let mut secret_a = [0u8; 32];
+        secret_a[31] = 7;
+        let mut secret_b = [0u8; 32];
+        secret_b[31] = 11;
+        let point_a = dom_crypto::SecretKey::from_bytes(&secret_a)
+            .unwrap()
+            .public_key();
+        let point_b = dom_crypto::SecretKey::from_bytes(&secret_b)
+            .unwrap()
+            .public_key();
+        let aggregate_point = scriptless_add_public_points(&[point_a.clone(), point_b.clone()])
+            .expect("aggregate canonical public kernel contributions");
+        let aggregate_offset = aggregate_transaction_offset_contributions_v1(&[offset_a, offset_b])
+            .expect("aggregate canonical public offsets");
+        let transaction = Transaction {
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            kernels: vec![dom_consensus::TransactionKernel {
+                features: KERNEL_FEAT_PLAIN,
+                fee: dom_core::Amount::from_noms(1).unwrap(),
+                lock_height: 0,
+                excess: dom_crypto::pedersen::Commitment::from_compressed_bytes(
+                    &aggregate_point.to_compressed_bytes(),
+                )
+                .unwrap(),
+                excess_signature: [0u8; 65],
+            }],
+            offset: aggregate_offset,
+        };
+        let participants = ScriptlessTemplateParticipantSetV1 {
+            ordered_offset_contributions: [offset_a, offset_b],
+            ordered_kernel_excess_points: [
+                point_a.to_compressed_bytes(),
+                point_b.to_compressed_bytes(),
+            ],
+        };
+        let binding = validate_template_participant_set(
+            &transaction,
+            offset_a,
+            point_a.to_compressed_bytes(),
+            0,
+            participants,
+        )
+        .expect("bind the complete ordered two-party decomposition");
+        assert_eq!(
+            binding.ordered_offset_contributions[0].as_slice(),
+            offset_a.as_slice()
+        );
+        assert_eq!(
+            binding.ordered_offset_contributions[1].as_slice(),
+            offset_b.as_slice()
+        );
+        assert_eq!(
+            binding.ordered_kernel_excess_points[0].as_slice(),
+            point_a.to_compressed_bytes().as_slice()
+        );
+
+        let mut replaced_local = participants;
+        replaced_local.ordered_offset_contributions[0] = offset_b;
+        assert!(matches!(
+            validate_template_participant_set(
+                &transaction,
+                offset_a,
+                point_a.to_compressed_bytes(),
+                0,
+                replaced_local,
+            ),
+            Err(CoreError::ScriptlessTemplateBindingMismatch)
+        ));
+        let mut replaced_remote = participants;
+        replaced_remote.ordered_kernel_excess_points[1] = point_a.to_compressed_bytes();
+        assert!(matches!(
+            validate_template_participant_set(
+                &transaction,
+                offset_a,
+                point_a.to_compressed_bytes(),
+                0,
+                replaced_remote,
+            ),
+            Err(CoreError::ScriptlessTemplateBindingMismatch)
+        ));
+        assert!(matches!(
+            validate_template_participant_set(
+                &transaction,
+                offset_a,
+                point_a.to_compressed_bytes(),
+                2,
+                participants,
+            ),
+            Err(CoreError::ScriptlessTemplateBindingMismatch)
+        ));
+    }
+
+    #[test]
+    fn scriptless_funding_local_shape_counts_the_global_shared_output_once() {
+        // A payer with no change contributes one input and no ordinary output;
+        // the frozen aggregate still contains the one global shared output.
+        validate_scriptless_funding_local_shape(1, 0, 1, 1).unwrap();
+
+        // A payer with change needs room for that ordinary output in addition
+        // to the same single global shared output.
+        validate_scriptless_funding_local_shape(1, 1, 1, 2).unwrap();
+        assert!(matches!(
+            validate_scriptless_funding_local_shape(1, 1, 1, 1),
+            Err(CoreError::ScriptlessFundingShapeMismatch)
+        ));
+
+        // A zero-debit participant contributes neither input nor output, but
+        // sees the same aggregate shape and must not add a second shared output.
+        validate_scriptless_funding_local_shape(0, 0, 1, 1).unwrap();
+        validate_scriptless_funding_local_shape(0, 0, 0, 1).unwrap();
+        assert!(matches!(
+            validate_scriptless_funding_local_shape(0, 0, 0, 0),
+            Err(CoreError::ScriptlessFundingShapeMismatch)
+        ));
     }
 
     #[test]

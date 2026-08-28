@@ -1,16 +1,33 @@
-use dom_consensus::TransactionOutput;
+use dom_adaptor::{
+    contribute_vault_backed_blinding_share_v1, DirectionV1, DurableShareBackupAckCapabilityV1,
+    PendingSharedBlindingBindingV1, SessionBlindingShareCapabilityV1, ShareBackupAckV1,
+    SharedBlindingBindingUpgradeCapabilityV1, SharedBlindingBindingV1,
+    SharedBlindingImportCapabilityV1, SharedBlindingMaterialV1,
+    SharedBlindingRetirementCapabilityV1, SharedBlindingSealCapabilityV1, SharedBlindingVaultV1,
+    SigningShareV1, TrustedChainIdV1,
+};
+use dom_consensus::{
+    validate_balance_equation, validate_range_proofs, validate_transaction_structure, Transaction,
+    TransactionKernel, TransactionOutput,
+};
+use dom_core::{Amount, Hash256, KERNEL_FEAT_PLAIN};
 use dom_crypto::{
     pedersen::{BlindingFactor, Commitment},
-    range_proof_verify_with_extra_commit,
-    recovery::{RecoveryCapsule, RECOVERY_CAPSULE_SIZE, RECOVERY_VERSION},
-    MAX_PROVABLE_VALUE, RANGE_PROOF_SERIALIZATION_VERSION, RANGE_PROOF_SIZE,
+    range_proof_prove_bytes, range_proof_verify_with_extra_commit,
+    recovery::{
+        RecoveryCapsule, RECOVERY_CAPSULE_SIZE, RECOVERY_CIPHERTEXT_SIZE, RECOVERY_VERSION,
+    },
+    schnorr_add_public_keys, PublicKey, SecretKey, MAX_PROVABLE_VALUE,
+    RANGE_PROOF_SERIALIZATION_VERSION, RANGE_PROOF_SIZE,
 };
 use dom_serialization::{DomDeserialize, DomSerialize};
+use dom_slate::sender_excess_blinding;
 use dom_wallet_core_api::CoreNetwork;
 use dom_wallet_core_recovery::{
     finalize_recoverable_transaction, frozen_versions, public_output_kind,
-    state_uses_canonical_seed, CanonicalWalletSeed, RecoverableOutputBuilder,
-    RecoveryMaterialError, WalletSlateInput, CANONICAL_TRANSACTION_OUTPUT_SIZE,
+    state_uses_canonical_seed, BoundScriptlessSigningContextV1, CanonicalWalletSeed,
+    RecoverableOutputBuilder, RecoveryMaterialError, ScriptlessFundingSigningCapabilityV1,
+    ScriptlessPayoutSigningCapabilityV1, WalletSlateInput, CANONICAL_TRANSACTION_OUTPUT_SIZE,
     PRODUCTION_OUTPUT_PATHS, RECOVERY_PROOF_ENVELOPE_SIZE,
 };
 use dom_wallet_core_sync::{CoreBlockReference, CoreChainIdentity};
@@ -31,6 +48,182 @@ use std::{
     },
 };
 use tempfile::TempDir;
+use zeroize::Zeroizing;
+
+#[derive(Debug, thiserror::Error)]
+#[error("test shared-blinding vault rejected operation")]
+struct TestSharedBlindingVaultError;
+
+#[derive(Default)]
+struct TestSharedBlindingVault {
+    pending: Option<PendingSharedBlindingBindingV1>,
+    bound: Option<SharedBlindingBindingV1>,
+    primary: Option<[u8; 32]>,
+    backup: Option<[u8; 32]>,
+    pending_tombstone: bool,
+    bound_tombstone: bool,
+}
+
+impl SharedBlindingVaultV1 for TestSharedBlindingVault {
+    type Error = TestSharedBlindingVaultError;
+
+    fn seal_fresh_share(
+        &mut self,
+        binding: &PendingSharedBlindingBindingV1,
+        material: SharedBlindingMaterialV1,
+        capability: SharedBlindingSealCapabilityV1,
+    ) -> Result<(), Self::Error> {
+        if self.pending.is_some()
+            || self.bound.is_some()
+            || self.primary.is_some()
+            || self.backup.is_some()
+            || self.pending_tombstone
+        {
+            return Err(TestSharedBlindingVaultError);
+        }
+        let plaintext = capability.into_plaintext(material);
+        self.pending = Some(binding.clone());
+        self.primary = Some(*plaintext);
+        self.backup = Some(*plaintext);
+        Ok(())
+    }
+
+    fn open_persisted_pending_share(
+        &mut self,
+        binding: &PendingSharedBlindingBindingV1,
+        capability: SharedBlindingImportCapabilityV1,
+    ) -> Result<SharedBlindingMaterialV1, Self::Error> {
+        if self.pending.as_ref() != Some(binding) || self.pending_tombstone {
+            return Err(TestSharedBlindingVaultError);
+        }
+        capability
+            .import(Zeroizing::new(
+                self.primary.ok_or(TestSharedBlindingVaultError)?,
+            ))
+            .map_err(|_| TestSharedBlindingVaultError)
+    }
+
+    fn confirm_pending_backup_roundtrip(
+        &mut self,
+        binding: &PendingSharedBlindingBindingV1,
+        capability: DurableShareBackupAckCapabilityV1,
+    ) -> Result<ShareBackupAckV1, Self::Error> {
+        if self.pending.as_ref() != Some(binding) || self.pending_tombstone {
+            return Err(TestSharedBlindingVaultError);
+        }
+        let recovered =
+            SigningShareV1::from_be_bytes(self.backup.ok_or(TestSharedBlindingVaultError)?)
+                .map_err(|_| TestSharedBlindingVaultError)?;
+        capability
+            .acknowledge_pending(binding, recovered.public_key().clone())
+            .map_err(|_| TestSharedBlindingVaultError)
+    }
+
+    fn bind_recovery_capsule(
+        &mut self,
+        pending: &PendingSharedBlindingBindingV1,
+        bound: &SharedBlindingBindingV1,
+        capability: SharedBlindingBindingUpgradeCapabilityV1,
+    ) -> Result<(), Self::Error> {
+        capability
+            .authorize_upgrade(pending, bound)
+            .map_err(|_| TestSharedBlindingVaultError)?;
+        if self.pending.as_ref() != Some(pending)
+            || self.pending_tombstone
+            || self.bound.is_some()
+            || self.primary.is_none()
+            || self.backup.is_none()
+        {
+            return Err(TestSharedBlindingVaultError);
+        }
+        self.bound = Some(bound.clone());
+        self.pending = None;
+        self.pending_tombstone = true;
+        Ok(())
+    }
+
+    fn open_persisted_share(
+        &mut self,
+        binding: &SharedBlindingBindingV1,
+        capability: SharedBlindingImportCapabilityV1,
+    ) -> Result<SharedBlindingMaterialV1, Self::Error> {
+        if self.bound.as_ref() != Some(binding) || self.bound_tombstone {
+            return Err(TestSharedBlindingVaultError);
+        }
+        capability
+            .import(Zeroizing::new(
+                self.primary.ok_or(TestSharedBlindingVaultError)?,
+            ))
+            .map_err(|_| TestSharedBlindingVaultError)
+    }
+
+    fn confirm_backup_roundtrip(
+        &mut self,
+        binding: &SharedBlindingBindingV1,
+        capability: DurableShareBackupAckCapabilityV1,
+    ) -> Result<ShareBackupAckV1, Self::Error> {
+        if self.bound.as_ref() != Some(binding) || self.bound_tombstone {
+            return Err(TestSharedBlindingVaultError);
+        }
+        let recovered =
+            SigningShareV1::from_be_bytes(self.backup.ok_or(TestSharedBlindingVaultError)?)
+                .map_err(|_| TestSharedBlindingVaultError)?;
+        capability
+            .acknowledge(binding, recovered.public_key().clone())
+            .map_err(|_| TestSharedBlindingVaultError)
+    }
+
+    fn retire_pending_share(
+        &mut self,
+        binding: &PendingSharedBlindingBindingV1,
+        capability: SharedBlindingRetirementCapabilityV1,
+    ) -> Result<(), Self::Error> {
+        capability
+            .authorize_pending(binding)
+            .map_err(|_| TestSharedBlindingVaultError)?;
+        Err(TestSharedBlindingVaultError)
+    }
+
+    fn retire_bound_share(
+        &mut self,
+        binding: &SharedBlindingBindingV1,
+        capability: SharedBlindingRetirementCapabilityV1,
+    ) -> Result<(), Self::Error> {
+        capability
+            .authorize_bound(binding)
+            .map_err(|_| TestSharedBlindingVaultError)?;
+        Err(TestSharedBlindingVaultError)
+    }
+}
+
+fn public_recovery_capsule_fixture(marker: u8) -> RecoveryCapsule {
+    let mut bytes = [marker; RECOVERY_CAPSULE_SIZE];
+    bytes[..2].copy_from_slice(&RECOVERY_VERSION.to_le_bytes());
+    bytes[14..16].copy_from_slice(&(RECOVERY_CIPHERTEXT_SIZE as u16).to_le_bytes());
+    RecoveryCapsule::from_bytes(&bytes)
+        .expect("construct canonical public recovery capsule fixture")
+}
+
+fn test_session_share() -> SessionBlindingShareCapabilityV1 {
+    let trusted = TrustedChainIdV1::from_authenticated_genesis(
+        dom_core::NETWORK_MAGIC_REGTEST,
+        &Hash256::from_bytes([0x41; 32]),
+    );
+    let mut vault = TestSharedBlindingVault::default();
+    let pending = contribute_vault_backed_blinding_share_v1(
+        &trusted,
+        [0x42; 32],
+        &[[0x11; 32], [0x22; 32]],
+        DirectionV1::Initiator,
+        0,
+        [0x43; 32],
+        &mut vault,
+    )
+    .expect("create real provisional DOM session share");
+    pending
+        .bind_recovery_capsule_v1(&public_recovery_capsule_fixture(0x44), &mut vault)
+        .expect("bind real opaque DOM session share to its public capsule")
+}
 
 fn identity(network: CoreNetwork, chain_id: [u8; 32]) -> CoreChainIdentity {
     CoreChainIdentity {
@@ -537,6 +730,228 @@ fn slate_wrong_coordinate_roles_fail_closed() {
         builder.build_sender_offer(&[input], 500, 1_000, 100, received),
         Err(RecoveryMaterialError::CoordinateDomainMismatch)
     ));
+}
+
+#[test]
+fn scriptless_funding_components_use_real_change_proof_and_balance_authority() {
+    let id = identity(CoreNetwork::Regtest, [8; 32]);
+    let builder = RecoverableOutputBuilder::new(&seed(24), &id).unwrap();
+    let input_blinding = BlindingFactor::from_bytes([4; 32]).unwrap();
+    let input = WalletSlateInput::new(
+        *Commitment::commit(1_600, &input_blinding).as_bytes(),
+        *input_blinding.as_bytes(),
+    );
+    let mut wallet = state();
+    let change_coordinate = wallet
+        .reserve_recovery_coordinate(0, RecoveryOutputClass::Change)
+        .unwrap();
+    let prepared = builder
+        .build_scriptless_funding_contribution(&[input], 500, Some(change_coordinate))
+        .unwrap();
+    assert_eq!(prepared.public.inputs.len(), 1);
+    assert_eq!(prepared.public.other_outputs.len(), 1);
+    let change = &prepared.public.other_outputs[0];
+    let capsule = change.recovery_capsule().unwrap().unwrap();
+    assert!(range_proof_verify_with_extra_commit(
+        change.commitment.as_bytes(),
+        change.range_proof_bytes().unwrap(),
+        capsule.as_bytes(),
+    )
+    .unwrap());
+
+    // Complete a public balance fixture using an ordinary proof for the
+    // shared output. The wallet's secret `e_i` is never read: only e_i*G is
+    // combined with the fixture participant's public r_i*G.
+    let shared_blinding = BlindingFactor::from_bytes([7; 32]).unwrap();
+    let (shared_proof, shared_commitment) =
+        range_proof_prove_bytes(1_000, &shared_blinding).unwrap();
+    let shared_output = TransactionOutput {
+        commitment: Commitment::from_compressed_bytes(&shared_commitment).unwrap(),
+        proof: shared_proof.to_vec(),
+    };
+    let wallet_public =
+        PublicKey::from_compressed_bytes(&prepared.public.wallet_excess_public_key).unwrap();
+    let shared_public = SecretKey::from_bytes(shared_blinding.as_bytes())
+        .unwrap()
+        .public_key();
+    let aggregate_excess = schnorr_add_public_keys(&[wallet_public, shared_public]).unwrap();
+    let transaction = Transaction {
+        inputs: prepared.public.inputs.clone(),
+        outputs: vec![change.clone(), shared_output],
+        kernels: vec![TransactionKernel {
+            features: KERNEL_FEAT_PLAIN,
+            fee: Amount::from_noms(100).unwrap(),
+            lock_height: 0,
+            excess: Commitment::from_compressed_bytes(&aggregate_excess.to_compressed_bytes())
+                .unwrap(),
+            excess_signature: [0u8; 65],
+        }],
+        offset: prepared.public.offset_contribution,
+    };
+    validate_transaction_structure(&transaction).unwrap();
+    validate_range_proofs(&transaction).unwrap();
+    validate_balance_equation(&transaction).unwrap();
+    assert!(format!("{prepared:?}").contains("REDACTED"));
+
+    let no_change_input = WalletSlateInput::new(
+        *Commitment::commit(1_600, &input_blinding).as_bytes(),
+        *input_blinding.as_bytes(),
+    );
+    let no_change = builder
+        .build_scriptless_funding_contribution(&[no_change_input], 0, None)
+        .unwrap();
+    assert_eq!(no_change.public.inputs.len(), 1);
+    assert!(no_change.public.other_outputs.is_empty());
+    assert!(no_change.change.is_none());
+
+    let zero_debit = builder
+        .build_scriptless_funding_contribution(&[], 0, None)
+        .unwrap();
+    assert!(zero_debit.public.inputs.is_empty());
+    assert!(zero_debit.public.other_outputs.is_empty());
+    assert!(zero_debit.change.is_none());
+    BlindingFactor::from_bytes(zero_debit.public.offset_contribution).unwrap();
+    PublicKey::from_compressed_bytes(&zero_debit.public.wallet_excess_public_key).unwrap();
+    let expected_zero_debit_excess = sender_excess_blinding(
+        std::iter::empty::<&[u8; 32]>(),
+        None,
+        &zero_debit.public.offset_contribution,
+    )
+    .unwrap();
+    assert_eq!(
+        SecretKey::from_bytes(&expected_zero_debit_excess)
+            .unwrap()
+            .public_key()
+            .to_compressed_bytes(),
+        zero_debit.public.wallet_excess_public_key
+    );
+}
+
+#[test]
+fn scriptless_payout_uses_recoverable_self_transfer_and_opaque_excess() {
+    let id = identity(CoreNetwork::Regtest, [8; 32]);
+    let builder = RecoverableOutputBuilder::new(&seed(25), &id).unwrap();
+    let mut wallet = state();
+    let coordinate = wallet
+        .reserve_recovery_coordinate(0, RecoveryOutputClass::SelfTransfer)
+        .unwrap();
+    let prepared = builder
+        .build_scriptless_shared_output_spend_contribution(900, Some(coordinate))
+        .unwrap();
+    assert_eq!(prepared.public.outputs.len(), 1);
+    let output = &prepared.public.outputs[0];
+    let capsule = output.recovery_capsule().unwrap().unwrap();
+    assert!(range_proof_verify_with_extra_commit(
+        output.commitment.as_bytes(),
+        output.range_proof_bytes().unwrap(),
+        capsule.as_bytes(),
+    )
+    .unwrap());
+    assert_eq!(
+        prepared.owned_output.as_ref().unwrap().commitment,
+        *output.commitment.as_bytes()
+    );
+    assert_eq!(prepared.owned_output.as_ref().unwrap().value, 900);
+    BlindingFactor::from_bytes(prepared.public.offset_contribution).unwrap();
+    PublicKey::from_compressed_bytes(&prepared.public.payout_excess_public_key).unwrap();
+    assert!(format!("{prepared:?}").contains("REDACTED"));
+
+    let wrong_coordinate = wallet
+        .reserve_recovery_coordinate(0, RecoveryOutputClass::Change)
+        .unwrap();
+    assert!(matches!(
+        builder.build_scriptless_shared_output_spend_contribution(900, Some(wrong_coordinate)),
+        Err(RecoveryMaterialError::CoordinateDomainMismatch)
+    ));
+
+    let no_output = builder
+        .build_scriptless_shared_output_spend_contribution(0, None)
+        .unwrap();
+    assert!(no_output.public.outputs.is_empty());
+    assert!(no_output.owned_output.is_none());
+    BlindingFactor::from_bytes(no_output.public.offset_contribution).unwrap();
+    PublicKey::from_compressed_bytes(&no_output.public.payout_excess_public_key).unwrap();
+    let expected_no_output_excess = sender_excess_blinding(
+        std::iter::empty::<&[u8; 32]>(),
+        None,
+        &no_output.public.offset_contribution,
+    )
+    .unwrap();
+    assert_eq!(
+        SecretKey::from_bytes(&expected_no_output_excess)
+            .unwrap()
+            .public_key()
+            .to_compressed_bytes(),
+        no_output.public.payout_excess_public_key
+    );
+    assert!(matches!(
+        builder.build_scriptless_shared_output_spend_contribution(0, Some(coordinate)),
+        Err(RecoveryMaterialError::CoordinateDomainMismatch)
+    ));
+}
+
+#[test]
+fn scriptless_signing_handoffs_are_purpose_specific_and_exactly_session_bound() {
+    let session_share = test_session_share();
+    let binding = session_share.binding();
+    let context = BoundScriptlessSigningContextV1 {
+        chain_id: *binding.chain_id(),
+        session_id: *binding.session_id(),
+        session_share_binding_digest: binding.binding_digest_v1(),
+        participant_position: binding.participant_index(),
+        template_hash: [0x45; 32],
+    };
+
+    let mut funding_excess = [0u8; 32];
+    funding_excess[31] = 7;
+    let funding_public = SigningShareV1::from_be_bytes(funding_excess)
+        .unwrap()
+        .public_key()
+        .clone();
+    let expected_funding = session_share
+        .funding_kernel_excess_point_v1(&funding_public)
+        .unwrap();
+    let funding = ScriptlessFundingSigningCapabilityV1::from_template_bound_encrypted_context(
+        funding_excess,
+        context,
+    )
+    .unwrap();
+    let composed_funding = funding
+        .compose_local_funding_share_v1(&session_share)
+        .unwrap();
+    assert_eq!(composed_funding.public_key(), &expected_funding);
+
+    let mut payout_excess = [0u8; 32];
+    payout_excess[31] = 11;
+    let payout_public = SigningShareV1::from_be_bytes(payout_excess)
+        .unwrap()
+        .public_key()
+        .clone();
+    let expected_payout = session_share
+        .shared_output_spend_kernel_excess_point_v1(&payout_public)
+        .unwrap();
+    let payout = ScriptlessPayoutSigningCapabilityV1::from_template_bound_encrypted_context(
+        payout_excess,
+        context,
+    )
+    .unwrap();
+    let composed_payout = payout
+        .compose_local_shared_output_spend_share_v1(&session_share)
+        .unwrap();
+    assert_eq!(composed_payout.public_key(), &expected_payout);
+
+    let mut wrong_context = context;
+    wrong_context.session_share_binding_digest[0] ^= 1;
+    let wrong = ScriptlessFundingSigningCapabilityV1::from_template_bound_encrypted_context(
+        funding_excess,
+        wrong_context,
+    )
+    .unwrap();
+    assert!(matches!(
+        wrong.compose_local_funding_share_v1(&session_share),
+        Err(RecoveryMaterialError::ScriptlessSigningBinding)
+    ));
+    assert!(format!("{context:?}").contains("REDACTED"));
 }
 
 #[test]

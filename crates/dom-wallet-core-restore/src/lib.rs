@@ -665,6 +665,16 @@ pub fn apply_recovery_batch(
         .sort_by_key(|block| block.height);
     prune_recovery_canonical_window(state);
     refresh_maturity(state, batch.observed_tip.height, identity.coinbase_maturity)?;
+    // Whole-history rescans temporarily remove wallet-local output records.
+    // Rebind any rediscovered Scriptless funding input and claim/refund payout
+    // by canonical commitment before this batch is committed. This preserves
+    // fail-closed input reservations and byte-identical local payout material.
+    state
+        .restore_scriptless_funding_reservations()
+        .map_err(|_| SeedRestoreError::MalformedRecovery)?;
+    state
+        .restore_scriptless_payout_reservations()
+        .map_err(|_| SeedRestoreError::MalformedRecovery)?;
     Ok(())
 }
 
@@ -771,30 +781,67 @@ fn merge_restored_output(
         restored.derivation_index,
     );
     state.non_reuse_floor = state.non_reuse_floor.max(restored.derivation_index);
-    if let Some(existing) = state
+    if let Some(existing_index) = state
         .outputs
         .iter()
-        .find(|output| output.commitment == Some(restored.commitment))
+        .position(|output| output.commitment == Some(restored.commitment))
     {
-        let metadata = state
+        let existing_id = state.outputs[existing_index].id;
+        let blinding = state
+            .output_blinding(existing_id)
+            .ok_or(SeedRestoreError::ConflictingOutput)?;
+        if let Some(metadata) = state
             .recovered_output_metadata
             .iter()
-            .find(|metadata| metadata.output_id == existing.id)
-            .ok_or(SeedRestoreError::ConflictingOutput)?;
-        let blinding = state
-            .output_blinding(existing.id)
-            .ok_or(SeedRestoreError::ConflictingOutput)?;
+            .find(|metadata| metadata.output_id == existing_id)
+        {
+            let existing = &state.outputs[existing_index];
+            if existing.value != restored.value
+                || existing.discovered_height != restored.block_height
+                || metadata.recovery_account != restored.account
+                || metadata.derivation_index != restored.derivation_index
+                || metadata.domain != domain
+                || metadata.block_hash != restored.block_hash
+                || metadata.output_position != output_position
+                || blinding != restored.blinding
+            {
+                return Err(SeedRestoreError::ConflictingOutput);
+            }
+            return Ok(());
+        }
+
+        // The interactive wallet creates change/recipient outputs before the
+        // transaction can be broadcast. The first canonical scan therefore
+        // meets the locally persisted pending record before recovery metadata
+        // exists. Adopt it only when every private and public binding matches;
+        // a commitment collision, wrong value/account/blinding, or a record in
+        // any non-pending state remains a hard conflict.
+        let expected_account = account_id_for(state, restored.account)?;
+        let existing = &state.outputs[existing_index];
         if existing.value != restored.value
-            || existing.discovered_height != restored.block_height
-            || metadata.recovery_account != restored.account
-            || metadata.derivation_index != restored.derivation_index
-            || metadata.domain != domain
-            || metadata.block_hash != restored.block_hash
-            || metadata.output_position != output_position
+            || existing.account_id != expected_account
+            || existing.discovered_height != 0
+            || existing.reserved_by.is_some()
+            || existing.state != OutputState::PendingIncoming
             || blinding != restored.blinding
         {
             return Err(SeedRestoreError::ConflictingOutput);
         }
+        let confirmed_state = recovered_output_state(restored, tip_height, coinbase_maturity)?;
+        let existing = &mut state.outputs[existing_index];
+        existing.discovered_height = restored.block_height;
+        existing.state = confirmed_state;
+        state
+            .recovered_output_metadata
+            .push(RecoveredOutputMetadata {
+                output_id: existing_id,
+                recovery_account: restored.account,
+                derivation_index: restored.derivation_index,
+                domain,
+                is_coinbase: restored.is_coinbase,
+                block_hash: restored.block_hash,
+                output_position,
+            });
         return Ok(());
     }
     let account_id = account_id_for(state, restored.account)?;
@@ -990,6 +1037,7 @@ fn to_core_block(block: &dom_wallet_core_sync::CoreScanBlock) -> ScanBlock {
         height: block.height,
         block_hash: block.block_hash,
         previous_block_hash: block.previous_block_hash,
+        canonical_header_bytes: block.canonical_header_bytes.clone(),
         timestamp: block.timestamp,
         canonical_marker: block.canonical_marker,
         outputs: block
@@ -1021,12 +1069,18 @@ fn to_core_block(block: &dom_wallet_core_sync::CoreScanBlock) -> ScanBlock {
                 features: kernel.features,
                 fee: kernel.fee,
                 lock_height: kernel.lock_height,
+                excess_signature: kernel.excess_signature,
             })
             .collect(),
+        transactions: block.transactions.clone(),
         coinbase: CoinbaseScanMetadata {
             output_commitment: block.coinbase.output_commitment,
             explicit_value: block.coinbase.explicit_value,
             kernel_excess: block.coinbase.kernel_excess,
+            kernel_features: block.coinbase.kernel_features,
+            kernel_excess_signature: block.coinbase.kernel_excess_signature,
+            offset: block.coinbase.offset,
+            output_proof_envelope: block.coinbase.output_proof_envelope.clone(),
         },
         total_fees_noms: block.total_fees_noms,
         protocol_version: block.protocol_version,
@@ -1329,5 +1383,88 @@ impl From<StorageError> for SeedRestoreError {
 impl From<CoreScanError> for SeedRestoreError {
     fn from(error: CoreScanError) -> Self {
         map_scan_error(error)
+    }
+}
+
+#[cfg(test)]
+mod pending_output_tests {
+    use super::*;
+
+    fn pending_fixture() -> (WalletState, RestoredOutput, Uuid) {
+        let identity = NetworkIdentity {
+            network: Network::PrivateTestnet,
+            chain_id: [0x41; 32],
+            genesis_id: [0x42; 32],
+        };
+        let mut state = WalletState::new(
+            identity.clone(),
+            [0x43; 32],
+            default_node_configuration(identity),
+        );
+        let blinding = [0x44; 32];
+        let factor = BlindingFactor::from_bytes(blinding).expect("valid test scalar");
+        let commitment = *Commitment::commit(500, &factor).as_bytes();
+        let output_id = Uuid::new_v4();
+        state.outputs.push(OutputRecord {
+            id: output_id,
+            account_id: state.default_account.id,
+            commitment: Some(commitment),
+            value: 500,
+            state: OutputState::PendingIncoming,
+            discovered_height: 0,
+            reserved_by: None,
+        });
+        state.remember_output_blinding(output_id, blinding);
+        let restored = RestoredOutput {
+            commitment,
+            value: 500,
+            blinding,
+            account: 0,
+            derivation_index: 7,
+            domain: OutputRecoveryDomain::Change,
+            block_height: 12,
+            block_hash: [0x45; 32],
+            is_coinbase: false,
+            spent_at_height: None,
+        };
+        (state, restored, output_id)
+    }
+
+    #[test]
+    fn canonical_scan_adopts_exact_locally_pending_output() {
+        let (mut state, restored, output_id) = pending_fixture();
+        merge_restored_output(&mut state, &restored, 3, 12, 1)
+            .expect("exact pending output must become canonical");
+
+        assert_eq!(state.outputs.len(), 1);
+        assert_eq!(state.outputs[0].id, output_id);
+        assert_eq!(state.outputs[0].discovered_height, 12);
+        assert_eq!(state.outputs[0].state, OutputState::Confirmed);
+        assert_eq!(state.recovered_output_metadata.len(), 1);
+        assert_eq!(state.recovered_output_metadata[0].output_id, output_id);
+        assert_eq!(
+            state.recovered_output_metadata[0].domain,
+            RecoveredOutputDomain::Change
+        );
+        assert_eq!(state.recovery_allocation_floors.change, 7);
+    }
+
+    #[test]
+    fn canonical_scan_rejects_pending_output_with_different_private_binding() {
+        let (mut state, mut restored, output_id) = pending_fixture();
+        restored.blinding = [0x46; 32];
+
+        assert_eq!(
+            merge_restored_output(&mut state, &restored, 3, 12, 1),
+            Err(SeedRestoreError::ConflictingOutput)
+        );
+        assert!(state.recovered_output_metadata.is_empty());
+        let output = state
+            .outputs
+            .iter()
+            .find(|output| output.id == output_id)
+            .expect("pending output remains present");
+        assert_eq!(output.state, OutputState::PendingIncoming);
+        assert_eq!(output.discovered_height, 0);
     }
 }

@@ -233,7 +233,12 @@ impl EmbeddedCoreConfiguration {
         config.min_outbound = if self.network == EmbeddedCoreNetwork::Mainnet {
             MAINNET_OUTBOUND_PEER_TARGET
         } else {
-            0
+            // An explicit local seed is an instruction to establish the
+            // laboratory/testnet session. Leaving the target at zero makes
+            // Core's connector correctly decide that no outbound peer is
+            // needed, so `with_seed_peers` would only populate an inert list.
+            // No-seed isolated regtest retains the prior zero-outbound shape.
+            self.seed_peers.len()
         };
         // The Wallet owns DNS discovery so each seed has independent bounded
         // backoff. Core's resolver logs every failed seed on every connector
@@ -1263,7 +1268,19 @@ mod tests {
             let configuration = regtest_configuration(directory.path())
                 .with_seed_peers(vec![value.parse().expect("test socket address")]);
             assert!(configuration.validate().is_ok(), "rejected {value}");
+            assert_eq!(
+                configuration.node_config().min_outbound,
+                1,
+                "an explicit Regtest seed must activate Core's connector"
+            );
         }
+        assert_eq!(
+            regtest_configuration(directory.path())
+                .node_config()
+                .min_outbound,
+            0,
+            "an isolated Regtest node must not dial public peers"
+        );
     }
 
     #[test]

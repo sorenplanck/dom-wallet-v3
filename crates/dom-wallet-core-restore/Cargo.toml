@@ -22,8 +22,10 @@ uuid.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+dom-chain.workspace = true
 dom-consensus.workspace = true
 dom-core.workspace = true
+dom-serialization.workspace = true
 dom-wallet.workspace = true
 dom-wallet-embedded-core = { path = "../dom-wallet-embedded-core" }
 tempfile.workspace = true

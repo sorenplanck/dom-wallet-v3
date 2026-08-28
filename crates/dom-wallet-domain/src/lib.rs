@@ -14,6 +14,12 @@ use uuid::Uuid;
 pub const MODEL_VERSION: u16 = 1;
 pub const SECRET_PROFILE_VERSION: u16 = 1;
 pub const TRANSACTION_EXPOSURE_VERSION: u16 = 1;
+/// Frozen version of the common-wallet funding reservation handoff.
+pub const SCRIPTLESS_FUNDING_RESERVATION_VERSION: u16 = 1;
+/// Frozen version of the common-wallet claim/refund payout handoff.
+pub const SCRIPTLESS_PAYOUT_RESERVATION_VERSION: u16 = 1;
+/// The frozen DOM Interop Scriptless profile is strictly bilateral.
+pub const SCRIPTLESS_PARTICIPANT_COUNT_V1: u32 = 2;
 pub const MAX_ACCOUNTS: usize = 64;
 pub const MAX_OUTPUTS: usize = 100_000;
 
@@ -322,6 +328,393 @@ pub struct PrivateOutputBlinding {
     pub output_id: Uuid,
     #[serde(with = "serde_bytes_32")]
     pub blinding: [u8; 32],
+}
+
+/// Secret common-wallet contribution retained only inside encrypted wallet
+/// state.  It is not a Scriptless shared-output blinding share: it is the
+/// local ordinary-wallet excess contribution from selected inputs, change and
+/// the participant's public transaction offset.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrivateScriptlessFundingContext {
+    #[serde(with = "serde_bytes_32")]
+    wallet_excess_contribution: [u8; 32],
+    #[serde(default, with = "serde_option_bytes_32")]
+    change_output_blinding: Option<[u8; 32]>,
+}
+
+impl PrivateScriptlessFundingContext {
+    pub fn new(
+        wallet_excess_contribution: [u8; 32],
+        change_output_blinding: Option<[u8; 32]>,
+    ) -> Self {
+        Self {
+            wallet_excess_contribution,
+            change_output_blinding,
+        }
+    }
+
+    /// Copy the contribution only into the in-process opaque adaptor boundary.
+    pub fn copy_wallet_excess_contribution_to(&self, destination: &mut [u8; 32]) {
+        destination.copy_from_slice(&self.wallet_excess_contribution);
+    }
+
+    /// Copy change spending evidence only while rebuilding encrypted state
+    /// after a chain rollback.
+    pub fn copy_change_output_blinding_to(&self, destination: &mut [u8; 32]) -> bool {
+        if let Some(blinding) = self.change_output_blinding {
+            destination.copy_from_slice(&blinding);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn is_structurally_valid(&self, expects_change: bool) -> bool {
+        self.wallet_excess_contribution != [0u8; 32]
+            && self.change_output_blinding.is_some() == expects_change
+            && self
+                .change_output_blinding
+                .is_none_or(|blinding| blinding != [0u8; 32])
+    }
+}
+
+impl fmt::Debug for PrivateScriptlessFundingContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PrivateScriptlessFundingContext(REDACTED)")
+    }
+}
+
+/// Monotonic exposure state of a common-wallet funding reservation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ScriptlessFundingReservationState {
+    /// Inputs and any recovery coordinate are durable, but no component exists.
+    Reserved,
+    /// Exact components exist durably but have never left the wallet boundary.
+    Prepared,
+    /// The complete DOM session-share binding is durable; only its derived
+    /// public kernel point may now be returned.
+    SessionBound,
+    /// Public components may have left the process; inputs stay reserved.
+    Exported,
+    /// The exact authoritative funding template is durably bound.
+    TemplateBound,
+    /// Operator abandoned an exposed attempt; reservations remain fail-closed.
+    AbandonedRetained,
+    /// No component was exposed and all input reservations were released.
+    Cancelled,
+}
+
+impl ScriptlessFundingReservationState {
+    pub fn retains_inputs(self) -> bool {
+        self != Self::Cancelled
+    }
+
+    pub fn may_cancel_and_release(self) -> bool {
+        matches!(self, Self::Reserved | Self::Prepared)
+    }
+}
+
+/// Exact public two-party decomposition accepted with a Scriptless template.
+///
+/// These values are ordinary public transaction contributions, not wallet
+/// secrets. They are retained so an idempotent retry cannot replace the other
+/// participant's contribution while preserving only the aggregate offset or
+/// kernel excess. Byte vectors keep the encrypted-state schema compatible
+/// with serde versions that do not implement arrays longer than 32 bytes.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScriptlessTemplateParticipantBindingV1 {
+    pub ordered_offset_contributions: Vec<Vec<u8>>,
+    pub ordered_kernel_excess_points: Vec<Vec<u8>>,
+}
+
+impl ScriptlessTemplateParticipantBindingV1 {
+    pub fn new(
+        ordered_offset_contributions: [[u8; 32]; 2],
+        ordered_kernel_excess_points: [[u8; 33]; 2],
+    ) -> Self {
+        Self {
+            ordered_offset_contributions: ordered_offset_contributions
+                .into_iter()
+                .map(|bytes| bytes.to_vec())
+                .collect(),
+            ordered_kernel_excess_points: ordered_kernel_excess_points
+                .into_iter()
+                .map(|bytes| bytes.to_vec())
+                .collect(),
+        }
+    }
+
+    pub fn is_structurally_valid(&self) -> bool {
+        self.ordered_offset_contributions.len() == SCRIPTLESS_PARTICIPANT_COUNT_V1 as usize
+            && self.ordered_kernel_excess_points.len() == SCRIPTLESS_PARTICIPANT_COUNT_V1 as usize
+            && self
+                .ordered_offset_contributions
+                .iter()
+                .all(|contribution| {
+                    contribution.len() == 32 && contribution.iter().any(|b| *b != 0)
+                })
+            && self
+                .ordered_kernel_excess_points
+                .iter()
+                .all(|point| point.len() == 33 && point.iter().any(|b| *b != 0))
+    }
+}
+
+impl fmt::Debug for ScriptlessTemplateParticipantBindingV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ScriptlessTemplateParticipantBindingV1")
+            .field(
+                "participant_count",
+                &self.ordered_offset_contributions.len(),
+            )
+            .field("contributions", &"[PUBLIC TRANSACTION MATERIAL]")
+            .finish()
+    }
+}
+
+/// Durable common-wallet side of one Scriptless funding transaction.
+///
+/// The state is encrypted by the existing Wallet V3 generation envelope. Its
+/// custom Debug implementation deliberately redacts amount, session and all
+/// private context even though inputs/change/offset become normal public DOM
+/// transaction data after export.
+const fn empty_bytes_33() -> [u8; 33] {
+    [0; 33]
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScriptlessFundingReservation {
+    pub version: u16,
+    pub id: Uuid,
+    #[serde(with = "serde_bytes_32")]
+    pub session_id: [u8; 32],
+    /// Exact collaborative output this funding transaction must create.
+    #[serde(default = "empty_bytes_33", with = "serde_bytes_33")]
+    pub shared_output_commitment: [u8; 33],
+    pub created_at_height: u64,
+    /// Exact local debit assigned by the frozen funding terms. For a sole
+    /// funder this is shared-output value plus the full funding fee.
+    pub local_debit_noms: u64,
+    pub funding_fee_noms: u64,
+    pub expected_input_count: u32,
+    /// Aggregate count: one global shared output plus every ordinary change
+    /// output across all participants. The shared output is never local-owned.
+    pub expected_output_count: u32,
+    pub reserved_output_ids: Vec<Uuid>,
+    pub input_commitments: Vec<Vec<u8>>,
+    pub change_value_noms: u64,
+    pub change_derivation_index: Option<u64>,
+    pub change_output_id: Option<Uuid>,
+    #[serde(default, with = "serde_option_bytes_33")]
+    pub change_commitment: Option<[u8; 33]>,
+    #[serde(default)]
+    pub change_output_bytes: Vec<u8>,
+    #[serde(default, with = "serde_option_bytes_32")]
+    pub offset_contribution: Option<[u8; 32]>,
+    #[serde(default)]
+    pub wallet_excess_public_key: Vec<u8>,
+    #[serde(default, with = "serde_option_bytes_32")]
+    pub template_hash: Option<[u8; 32]>,
+    /// Digest of the exact durable DOM shared-blinding capability binding.
+    #[serde(default, with = "serde_option_bytes_32")]
+    pub session_share_binding_digest: Option<[u8; 32]>,
+    /// Frozen participant/offset position in the canonical two-party roster.
+    #[serde(default)]
+    pub participant_position: Option<u32>,
+    /// Complete ordered public decomposition accepted with `template_hash`.
+    #[serde(default)]
+    pub template_participants: Option<ScriptlessTemplateParticipantBindingV1>,
+    #[serde(default)]
+    pub private_context: Option<PrivateScriptlessFundingContext>,
+    pub state: ScriptlessFundingReservationState,
+}
+
+impl fmt::Debug for ScriptlessFundingReservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ScriptlessFundingReservation")
+            .field("version", &self.version)
+            .field("id", &self.id)
+            .field("created_at_height", &self.created_at_height)
+            .field("state", &self.state)
+            .field("reserved_input_count", &self.reserved_output_ids.len())
+            .field("has_change", &self.change_output_id.is_some())
+            .field("session_id", &"[REDACTED]")
+            .field("shared_output_commitment", &"[PUBLIC COMMITMENT]")
+            .field("amounts", &"[REDACTED]")
+            .field("template_hash", &"[REDACTED]")
+            .field("private_context", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Secret contribution for one wallet-owned claim or refund payout. The
+/// output blinding and `e_i = payout_blinding_i - offset_i` remain only in the
+/// encrypted wallet generation and are never serialized into a handoff DTO.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrivateScriptlessPayoutContext {
+    #[serde(with = "serde_bytes_32")]
+    payout_excess_contribution: [u8; 32],
+    #[serde(default, with = "serde_option_bytes_32")]
+    output_blinding: Option<[u8; 32]>,
+}
+
+impl PrivateScriptlessPayoutContext {
+    pub fn new(payout_excess_contribution: [u8; 32], output_blinding: Option<[u8; 32]>) -> Self {
+        Self {
+            payout_excess_contribution,
+            output_blinding,
+        }
+    }
+
+    /// Copy only into the in-process opaque DOM adaptor boundary.
+    pub fn copy_payout_excess_contribution_to(&self, destination: &mut [u8; 32]) {
+        destination.copy_from_slice(&self.payout_excess_contribution);
+    }
+
+    /// Copy only while reconstructing the encrypted local output projection.
+    pub fn copy_output_blinding_to(&self, destination: &mut [u8; 32]) -> bool {
+        if let Some(blinding) = self.output_blinding {
+            destination.copy_from_slice(&blinding);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn is_structurally_valid(&self, expects_output: bool) -> bool {
+        self.payout_excess_contribution != [0u8; 32]
+            && self.output_blinding.is_some() == expects_output
+            && self
+                .output_blinding
+                .is_none_or(|blinding| blinding != [0u8; 32])
+    }
+}
+
+impl fmt::Debug for PrivateScriptlessPayoutContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PrivateScriptlessPayoutContext(REDACTED)")
+    }
+}
+
+/// The two shared-output spend roles that require wallet-owned payout output.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ScriptlessPayoutRoleV1 {
+    Claim,
+    Refund,
+}
+
+/// Monotonic exposure state of one claim/refund payout reservation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ScriptlessPayoutReservationState {
+    /// A distinct recovery coordinate is durable; no output exists yet.
+    Reserved,
+    /// Exact output and local excess exist durably but have not left Wallet V3.
+    Prepared,
+    /// The complete DOM session-share binding is durable; only its derived
+    /// public kernel point may now be returned.
+    SessionBound,
+    /// Public components left Wallet V3 so the real template can be composed.
+    ComponentsExposed,
+    /// The exact authoritative claim/refund template is durably bound.
+    TemplateBound,
+    /// The attempt was abandoned, but exact output material remains retained.
+    AbandonedRetained,
+    /// Nothing was exposed; material was erased but the coordinate stays burned.
+    Cancelled,
+}
+
+impl ScriptlessPayoutReservationState {
+    pub fn has_prepared_material(self) -> bool {
+        matches!(
+            self,
+            Self::Prepared
+                | Self::SessionBound
+                | Self::ComponentsExposed
+                | Self::TemplateBound
+                | Self::AbandonedRetained
+        )
+    }
+
+    pub fn may_cancel_unexposed(self) -> bool {
+        matches!(self, Self::Reserved | Self::Prepared)
+    }
+}
+
+/// Durable Wallet V3 side of one participant's claim or refund payout.
+///
+/// Claim and refund use separate records and separate SelfTransfer recovery
+/// coordinates even when their public values are equal. The template hash is
+/// absent until public components have been used to construct and validate the
+/// real DOM template; after binding it is immutable.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScriptlessPayoutReservation {
+    pub version: u16,
+    pub id: Uuid,
+    #[serde(with = "serde_bytes_32")]
+    pub session_id: [u8; 32],
+    pub role: ScriptlessPayoutRoleV1,
+    pub created_at_height: u64,
+    #[serde(with = "serde_bytes_33")]
+    pub shared_output_commitment: [u8; 33],
+    pub payout_value_noms: u64,
+    pub kernel_fee_noms: u64,
+    pub expected_output_count: u32,
+    pub refund_lock_height: u64,
+    pub output_id: Option<Uuid>,
+    pub derivation_index: Option<u64>,
+    #[serde(default, with = "serde_option_bytes_33")]
+    pub output_commitment: Option<[u8; 33]>,
+    #[serde(default)]
+    pub output_bytes: Vec<u8>,
+    #[serde(default, with = "serde_option_bytes_32")]
+    pub offset_contribution: Option<[u8; 32]>,
+    #[serde(default)]
+    pub payout_excess_public_key: Vec<u8>,
+    #[serde(default, with = "serde_option_bytes_32")]
+    pub template_hash: Option<[u8; 32]>,
+    /// Digest of the exact durable DOM shared-blinding capability binding.
+    #[serde(default, with = "serde_option_bytes_32")]
+    pub session_share_binding_digest: Option<[u8; 32]>,
+    /// Frozen participant/offset position in the canonical two-party roster.
+    /// This is independent of the aggregate output position because a
+    /// participant can contribute no payout output. It is absent until
+    /// the complete DOM session-share binding is persisted.
+    #[serde(default)]
+    pub participant_position: Option<u32>,
+    /// Complete ordered public decomposition accepted with `template_hash`.
+    #[serde(default)]
+    pub template_participants: Option<ScriptlessTemplateParticipantBindingV1>,
+    #[serde(default)]
+    pub private_context: Option<PrivateScriptlessPayoutContext>,
+    pub state: ScriptlessPayoutReservationState,
+}
+
+impl fmt::Debug for ScriptlessPayoutReservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ScriptlessPayoutReservation")
+            .field("version", &self.version)
+            .field("id", &self.id)
+            .field("role", &self.role)
+            .field("created_at_height", &self.created_at_height)
+            .field("state", &self.state)
+            .field("session_id", &"[REDACTED]")
+            .field("shared_output_commitment", &"[REDACTED]")
+            .field("amounts", &"[REDACTED]")
+            .field("template_hash", &"[REDACTED]")
+            .field("private_context", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for PrivateOutputBlinding {
@@ -774,6 +1167,14 @@ pub struct WalletState {
     pub private_output_blindings: Vec<PrivateOutputBlinding>,
     #[serde(default)]
     pub transactions: Vec<LocalTransactionIntent>,
+    /// Common-wallet UTXO reservations used by the independent Scriptless
+    /// session/store. This contains no session nonce or shared blinding share.
+    #[serde(default)]
+    pub scriptless_funding_reservations: Vec<ScriptlessFundingReservation>,
+    /// Wallet-owned claim/refund payout outputs and opaque local excesses.
+    /// Claim and refund always occupy distinct records and burned coordinates.
+    #[serde(default)]
+    pub scriptless_payout_reservations: Vec<ScriptlessPayoutReservation>,
     /// Version of the transaction exposure migration applied to this state.
     /// Missing legacy values deserialize as zero and are upgraded before use.
     #[serde(default)]
@@ -854,6 +1255,8 @@ impl WalletState {
             outputs: Vec::new(),
             private_output_blindings: Vec::new(),
             transactions: Vec::new(),
+            scriptless_funding_reservations: Vec::new(),
+            scriptless_payout_reservations: Vec::new(),
             transaction_exposure_version: TRANSACTION_EXPOSURE_VERSION,
             sync_status: SyncStatus::Idle,
             provisional_target: None,
@@ -917,6 +1320,8 @@ impl WalletState {
                 return Err(DomainError::InvalidTransactionIntent);
             }
         }
+        self.validate_scriptless_funding_reservations()?;
+        self.validate_scriptless_payout_reservations()?;
         if let Some(plan) = &self.rescan_plan {
             if plan.wallet_id != self.wallet_id
                 || plan.identity != self.identity
@@ -990,6 +1395,457 @@ impl WalletState {
         Ok(())
     }
 
+    fn validate_scriptless_funding_reservations(&self) -> Result<(), DomainError> {
+        if self.scriptless_funding_reservations.len() > MAX_OUTPUTS {
+            return Err(DomainError::InvalidScriptlessFundingReservation);
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        let mut sessions = std::collections::BTreeSet::new();
+        let mut reserved_inputs = std::collections::BTreeSet::new();
+        let mut reserved_commitments = std::collections::BTreeSet::new();
+        for reservation in &self.scriptless_funding_reservations {
+            let is_zero_debit_signer = reservation.local_debit_noms == 0;
+            let has_change = reservation.change_value_noms != 0;
+            let prepared = matches!(
+                reservation.state,
+                ScriptlessFundingReservationState::Prepared
+                    | ScriptlessFundingReservationState::SessionBound
+                    | ScriptlessFundingReservationState::Exported
+                    | ScriptlessFundingReservationState::TemplateBound
+                    | ScriptlessFundingReservationState::AbandonedRetained
+            );
+            if reservation.version != SCRIPTLESS_FUNDING_RESERVATION_VERSION
+                || reservation.id.is_nil()
+                || reservation.session_id == [0u8; 32]
+                || reservation.shared_output_commitment == [0u8; 33]
+                || reservation.funding_fee_noms == 0
+                || (!is_zero_debit_signer && reservation.expected_input_count == 0)
+                || reservation.expected_output_count == 0
+                || reservation.reserved_output_ids.is_empty() != is_zero_debit_signer
+                || reservation.reserved_output_ids.len() != reservation.input_commitments.len()
+                || reservation.reserved_output_ids.len() > reservation.expected_input_count as usize
+                // The collaborative output is global, not owned by the payer.
+                // Nevertheless every participant's frozen aggregate shape
+                // must have room for that one output plus its local change.
+                || usize::from(has_change).saturating_add(1)
+                    > reservation.expected_output_count as usize
+                || (is_zero_debit_signer
+                    && (has_change
+                        || reservation.change_derivation_index.is_some()
+                        || reservation.change_output_id.is_some()))
+                || reservation
+                    .input_commitments
+                    .iter()
+                    .any(|commitment| commitment.len() != 33)
+                || !ids.insert(reservation.id)
+                || !sessions.insert(reservation.session_id)
+                || (has_change != reservation.change_derivation_index.is_some())
+                || (has_change != reservation.change_output_id.is_some())
+                || reservation.change_derivation_index.is_some_and(|index| {
+                    index == 0 || index > self.recovery_allocation_floors.change
+                })
+            {
+                return Err(DomainError::InvalidScriptlessFundingReservation);
+            }
+
+            let has_prepared_fields = reservation.change_commitment.is_some() == has_change
+                && (!reservation.change_output_bytes.is_empty()) == has_change
+                && reservation.offset_contribution.is_some()
+                && reservation.wallet_excess_public_key.len() == 33
+                && reservation
+                    .private_context
+                    .as_ref()
+                    .is_some_and(|context| context.is_structurally_valid(has_change));
+            match reservation.state {
+                ScriptlessFundingReservationState::Reserved => {
+                    if reservation.change_commitment.is_some()
+                        || !reservation.change_output_bytes.is_empty()
+                        || reservation.offset_contribution.is_some()
+                        || !reservation.wallet_excess_public_key.is_empty()
+                        || reservation.template_hash.is_some()
+                        || reservation.session_share_binding_digest.is_some()
+                        || reservation.participant_position.is_some()
+                        || reservation.template_participants.is_some()
+                        || reservation.private_context.is_some()
+                    {
+                        return Err(DomainError::InvalidScriptlessFundingReservation);
+                    }
+                }
+                ScriptlessFundingReservationState::Prepared => {
+                    if !has_prepared_fields
+                        || reservation.template_hash.is_some()
+                        || reservation.session_share_binding_digest.is_some()
+                        || reservation.participant_position.is_some()
+                        || reservation.template_participants.is_some()
+                    {
+                        return Err(DomainError::InvalidScriptlessFundingReservation);
+                    }
+                }
+                ScriptlessFundingReservationState::SessionBound
+                | ScriptlessFundingReservationState::Exported => {
+                    if !has_prepared_fields
+                        || reservation.template_hash.is_some()
+                        || reservation
+                            .session_share_binding_digest
+                            .is_none_or(|binding| binding == [0u8; 32])
+                        || reservation
+                            .participant_position
+                            .is_none_or(|position| position >= SCRIPTLESS_PARTICIPANT_COUNT_V1)
+                        || reservation.template_participants.is_some()
+                    {
+                        return Err(DomainError::InvalidScriptlessFundingReservation);
+                    }
+                }
+                ScriptlessFundingReservationState::TemplateBound => {
+                    if !has_prepared_fields
+                        || reservation
+                            .template_hash
+                            .is_none_or(|template_hash| template_hash == [0u8; 32])
+                        || reservation
+                            .session_share_binding_digest
+                            .is_none_or(|binding| binding == [0u8; 32])
+                        || reservation
+                            .participant_position
+                            .is_none_or(|position| position >= SCRIPTLESS_PARTICIPANT_COUNT_V1)
+                        || reservation
+                            .template_participants
+                            .as_ref()
+                            .is_none_or(|participants| !participants.is_structurally_valid())
+                    {
+                        return Err(DomainError::InvalidScriptlessFundingReservation);
+                    }
+                }
+                ScriptlessFundingReservationState::AbandonedRetained => {
+                    if !has_prepared_fields
+                        || reservation
+                            .session_share_binding_digest
+                            .is_none_or(|binding| binding == [0u8; 32])
+                        || reservation
+                            .participant_position
+                            .is_none_or(|position| position >= SCRIPTLESS_PARTICIPANT_COUNT_V1)
+                        || reservation.template_hash.is_some()
+                            != reservation.template_participants.is_some()
+                        || reservation
+                            .template_hash
+                            .is_some_and(|template_hash| template_hash == [0u8; 32])
+                        || reservation
+                            .template_participants
+                            .as_ref()
+                            .is_some_and(|participants| !participants.is_structurally_valid())
+                    {
+                        return Err(DomainError::InvalidScriptlessFundingReservation);
+                    }
+                }
+                ScriptlessFundingReservationState::Cancelled => {
+                    if reservation.change_commitment.is_some()
+                        || !reservation.change_output_bytes.is_empty()
+                        || reservation.offset_contribution.is_some()
+                        || !reservation.wallet_excess_public_key.is_empty()
+                        || reservation.template_hash.is_some()
+                        || reservation.session_share_binding_digest.is_some()
+                        || reservation.participant_position.is_some()
+                        || reservation.template_participants.is_some()
+                        || reservation.private_context.is_some()
+                    {
+                        return Err(DomainError::InvalidScriptlessFundingReservation);
+                    }
+                }
+            }
+
+            let mut local_output_ids = std::collections::BTreeSet::new();
+            let mut local_commitments = std::collections::BTreeSet::new();
+            let mut present_input_total = 0u64;
+            let mut all_inputs_present = true;
+            for (output_id, commitment) in reservation
+                .reserved_output_ids
+                .iter()
+                .zip(&reservation.input_commitments)
+            {
+                if !local_output_ids.insert(*output_id)
+                    || !local_commitments.insert(commitment.as_slice())
+                {
+                    return Err(DomainError::InvalidScriptlessFundingReservation);
+                }
+                if reservation.state.retains_inputs()
+                    && (!reserved_inputs.insert(*output_id)
+                        || !reserved_commitments.insert(commitment.as_slice()))
+                {
+                    return Err(DomainError::InvalidScriptlessFundingReservation);
+                }
+                let Some(output) = self.outputs.iter().find(|output| output.id == *output_id)
+                else {
+                    // A whole-history rescan can temporarily remove the local
+                    // projection of an input whose creation height is above
+                    // the rewind point. The durable commitment remains the
+                    // authority and is rebound when the scanner rediscovers
+                    // it; absence never makes an output selectable.
+                    all_inputs_present = false;
+                    continue;
+                };
+                if output.commitment.as_ref().map(<[u8; 33]>::as_slice)
+                    != Some(commitment.as_slice())
+                {
+                    return Err(DomainError::InvalidScriptlessFundingReservation);
+                }
+                present_input_total = present_input_total
+                    .checked_add(output.value)
+                    .ok_or(DomainError::InvalidScriptlessFundingReservation)?;
+                if reservation.state.retains_inputs() {
+                    match output.state {
+                        OutputState::Spent { .. } if output.reserved_by.is_none() => {}
+                        _ if output.reserved_by == Some(reservation.id)
+                            && output.state == OutputState::PendingOutgoing => {}
+                        _ => return Err(DomainError::InvalidScriptlessFundingReservation),
+                    }
+                } else if output.reserved_by == Some(reservation.id) {
+                    return Err(DomainError::InvalidScriptlessFundingReservation);
+                }
+            }
+            if all_inputs_present
+                && present_input_total
+                    != reservation
+                        .local_debit_noms
+                        .checked_add(reservation.change_value_noms)
+                        .ok_or(DomainError::InvalidScriptlessFundingReservation)?
+            {
+                return Err(DomainError::InvalidScriptlessFundingReservation);
+            }
+
+            if prepared && has_change {
+                let output_id = reservation
+                    .change_output_id
+                    .ok_or(DomainError::InvalidScriptlessFundingReservation)?;
+                let change = self
+                    .outputs
+                    .iter()
+                    .find(|output| output.id == output_id)
+                    .ok_or(DomainError::InvalidScriptlessFundingReservation)?;
+                if change.commitment != reservation.change_commitment
+                    || change.value != reservation.change_value_noms
+                    || change.account_id != self.default_account.id
+                    || self.output_blinding(output_id).is_none()
+                {
+                    return Err(DomainError::InvalidScriptlessFundingReservation);
+                }
+            } else if reservation.state == ScriptlessFundingReservationState::Cancelled
+                && reservation.change_output_id.is_some_and(|output_id| {
+                    self.outputs.iter().any(|output| output.id == output_id)
+                })
+            {
+                return Err(DomainError::InvalidScriptlessFundingReservation);
+            }
+        }
+        for output in self.outputs.iter().filter(|output| {
+            output.reserved_by.is_some() && !matches!(output.state, OutputState::Spent { .. })
+        }) {
+            let owner = output
+                .reserved_by
+                .ok_or(DomainError::InvalidScriptlessFundingReservation)?;
+            let ordinary_owner = self.transactions.iter().any(|transaction| {
+                transaction.id == owner
+                    && transaction.reserved_output_ids.contains(&output.id)
+                    && !matches!(
+                        transaction.lifecycle,
+                        TransactionLifecycle::Cancelled | TransactionLifecycle::Failed
+                    )
+            });
+            let scriptless_owner = self
+                .scriptless_funding_reservations
+                .iter()
+                .any(|reservation| {
+                    reservation.id == owner
+                        && reservation.state.retains_inputs()
+                        && reservation.reserved_output_ids.contains(&output.id)
+                });
+            if ordinary_owner == scriptless_owner {
+                return Err(DomainError::InvalidState);
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_scriptless_payout_reservations(&self) -> Result<(), DomainError> {
+        if self.scriptless_payout_reservations.len() > MAX_OUTPUTS {
+            return Err(DomainError::InvalidScriptlessPayoutReservation);
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        let mut sessions_and_roles = std::collections::BTreeSet::new();
+        let mut output_ids = std::collections::BTreeSet::new();
+        let mut output_commitments = std::collections::BTreeSet::new();
+        for reservation in &self.scriptless_payout_reservations {
+            let has_output = reservation.payout_value_noms != 0;
+            let has_material = reservation.state.has_prepared_material();
+            let role_lock_is_valid = match reservation.role {
+                ScriptlessPayoutRoleV1::Claim => reservation.refund_lock_height == 0,
+                ScriptlessPayoutRoleV1::Refund => reservation.refund_lock_height != 0,
+            };
+            if reservation.version != SCRIPTLESS_PAYOUT_RESERVATION_VERSION
+                || reservation.id.is_nil()
+                || reservation.session_id == [0u8; 32]
+                || reservation.shared_output_commitment == [0u8; 33]
+                || reservation.kernel_fee_noms == 0
+                || reservation.expected_output_count == 0
+                || reservation.output_id.is_some() != has_output
+                || reservation.derivation_index.is_some() != has_output
+                || reservation
+                    .output_id
+                    .is_some_and(|output_id| output_id.is_nil())
+                || reservation
+                    .derivation_index
+                    .is_some_and(|derivation_index| {
+                        derivation_index == 0
+                            || derivation_index > self.recovery_allocation_floors.self_transfer
+                    })
+                || !role_lock_is_valid
+                || !ids.insert(reservation.id)
+                || !sessions_and_roles.insert((reservation.session_id, reservation.role))
+                || reservation
+                    .output_id
+                    .is_some_and(|output_id| !output_ids.insert(output_id))
+            {
+                return Err(DomainError::InvalidScriptlessPayoutReservation);
+            }
+
+            let complete_material = reservation.output_commitment.is_some() == has_output
+                && (!reservation.output_bytes.is_empty()) == has_output
+                && reservation.offset_contribution.is_some()
+                && reservation.payout_excess_public_key.len() == 33
+                && reservation
+                    .private_context
+                    .as_ref()
+                    .is_some_and(|context| context.is_structurally_valid(has_output));
+            if has_material != complete_material
+                || (!has_material
+                    && (reservation.output_commitment.is_some()
+                        || !reservation.output_bytes.is_empty()
+                        || reservation.offset_contribution.is_some()
+                        || !reservation.payout_excess_public_key.is_empty()
+                        || reservation.template_hash.is_some()
+                        || reservation.session_share_binding_digest.is_some()
+                        || reservation.participant_position.is_some()
+                        || reservation.template_participants.is_some()
+                        || reservation.private_context.is_some()))
+                || reservation
+                    .offset_contribution
+                    .is_some_and(|offset| offset == [0u8; 32])
+                || reservation
+                    .template_hash
+                    .is_some_and(|template_hash| template_hash == [0u8; 32])
+            {
+                return Err(DomainError::InvalidScriptlessPayoutReservation);
+            }
+            match reservation.state {
+                ScriptlessPayoutReservationState::Reserved
+                | ScriptlessPayoutReservationState::Cancelled => {
+                    if reservation.template_hash.is_some()
+                        || reservation.session_share_binding_digest.is_some()
+                        || reservation.participant_position.is_some()
+                        || reservation.template_participants.is_some()
+                    {
+                        return Err(DomainError::InvalidScriptlessPayoutReservation);
+                    }
+                }
+                ScriptlessPayoutReservationState::Prepared => {
+                    if reservation.template_hash.is_some()
+                        || reservation.session_share_binding_digest.is_some()
+                        || reservation.participant_position.is_some()
+                        || reservation.template_participants.is_some()
+                    {
+                        return Err(DomainError::InvalidScriptlessPayoutReservation);
+                    }
+                }
+                ScriptlessPayoutReservationState::SessionBound
+                | ScriptlessPayoutReservationState::ComponentsExposed => {
+                    if reservation.template_hash.is_some()
+                        || reservation
+                            .session_share_binding_digest
+                            .is_none_or(|binding| binding == [0u8; 32])
+                        || reservation
+                            .participant_position
+                            .is_none_or(|position| position >= SCRIPTLESS_PARTICIPANT_COUNT_V1)
+                        || reservation.template_participants.is_some()
+                    {
+                        return Err(DomainError::InvalidScriptlessPayoutReservation);
+                    }
+                }
+                ScriptlessPayoutReservationState::TemplateBound => {
+                    if reservation
+                        .template_hash
+                        .is_none_or(|template_hash| template_hash == [0u8; 32])
+                        || reservation
+                            .session_share_binding_digest
+                            .is_none_or(|binding| binding == [0u8; 32])
+                        || reservation
+                            .participant_position
+                            .is_none_or(|position| position >= SCRIPTLESS_PARTICIPANT_COUNT_V1)
+                        || reservation
+                            .template_participants
+                            .as_ref()
+                            .is_none_or(|participants| !participants.is_structurally_valid())
+                    {
+                        return Err(DomainError::InvalidScriptlessPayoutReservation);
+                    }
+                }
+                ScriptlessPayoutReservationState::AbandonedRetained => {
+                    if reservation
+                        .session_share_binding_digest
+                        .is_none_or(|binding| binding == [0u8; 32])
+                        || reservation
+                            .participant_position
+                            .is_none_or(|position| position >= SCRIPTLESS_PARTICIPANT_COUNT_V1)
+                        || reservation.template_hash.is_some()
+                            != reservation.template_participants.is_some()
+                        || reservation
+                            .template_participants
+                            .as_ref()
+                            .is_some_and(|participants| !participants.is_structurally_valid())
+                    {
+                        return Err(DomainError::InvalidScriptlessPayoutReservation);
+                    }
+                }
+            }
+
+            if has_material && has_output {
+                let commitment = reservation
+                    .output_commitment
+                    .ok_or(DomainError::InvalidScriptlessPayoutReservation)?;
+                if !output_commitments.insert(commitment) {
+                    return Err(DomainError::InvalidScriptlessPayoutReservation);
+                }
+                let output = self
+                    .outputs
+                    .iter()
+                    .find(|output| Some(output.id) == reservation.output_id)
+                    .ok_or(DomainError::InvalidScriptlessPayoutReservation)?;
+                let mut expected_blinding = [0u8; 32];
+                if !reservation
+                    .private_context
+                    .as_ref()
+                    .ok_or(DomainError::InvalidScriptlessPayoutReservation)?
+                    .copy_output_blinding_to(&mut expected_blinding)
+                {
+                    return Err(DomainError::InvalidScriptlessPayoutReservation);
+                }
+                if output.account_id != self.default_account.id
+                    || output.commitment != Some(commitment)
+                    || output.value != reservation.payout_value_noms
+                    || self.output_blinding(output.id) != Some(expected_blinding)
+                {
+                    return Err(DomainError::InvalidScriptlessPayoutReservation);
+                }
+            } else if reservation.output_id.is_some_and(|output_id| {
+                self.outputs.iter().any(|output| output.id == output_id)
+                    || self
+                        .private_output_blindings
+                        .iter()
+                        .any(|secret| secret.output_id == output_id)
+            }) {
+                return Err(DomainError::InvalidScriptlessPayoutReservation);
+            }
+        }
+        Ok(())
+    }
+
     /// Upgrade pre-exposure wallet generations conservatively. This is
     /// idempotent and never lowers exposure already persisted by a newer
     /// writer.
@@ -1051,6 +1907,33 @@ impl WalletState {
         })
     }
 
+    /// Rehydrate an already-burned coordinate after restart. This can never
+    /// advance or lower a floor and rejects a coordinate that was not durably
+    /// reserved by an earlier generation.
+    pub fn resume_recovery_coordinate(
+        &self,
+        account: u32,
+        derivation_index: u64,
+        class: RecoveryOutputClass,
+    ) -> Result<ReservedRecoveryCoordinate, DomainError> {
+        let floor = match class {
+            RecoveryOutputClass::ReceiveRequest | RecoveryOutputClass::ReceiveSlate => {
+                self.recovery_allocation_floors.received
+            }
+            RecoveryOutputClass::Change => self.recovery_allocation_floors.change,
+            RecoveryOutputClass::SelfTransfer => self.recovery_allocation_floors.self_transfer,
+            RecoveryOutputClass::Coinbase => self.recovery_allocation_floors.coinbase,
+        };
+        if derivation_index == 0 || derivation_index > floor {
+            return Err(DomainError::InvalidState);
+        }
+        Ok(ReservedRecoveryCoordinate {
+            account,
+            derivation_index,
+            class,
+        })
+    }
+
     pub fn begin_scan(&mut self, target: ScanTarget) -> Result<(), DomainError> {
         target.validate()?;
         self.provisional_target = Some(target);
@@ -1074,6 +1957,8 @@ impl WalletState {
             return Err(DomainError::InvalidState);
         }
         self.outputs = observations;
+        self.restore_scriptless_funding_reservations()?;
+        self.restore_scriptless_payout_reservations()?;
         self.cursor = Some(target.cursor());
         self.provisional_target = None;
         self.sync_status = SyncStatus::Synced;
@@ -1314,6 +2199,195 @@ impl WalletState {
                 output.state = OutputState::PendingOutgoing;
             }
         }
+        self.restore_scriptless_funding_reservations()?;
+        self.restore_scriptless_payout_reservations()?;
+        Ok(())
+    }
+
+    /// Restore fail-closed common-wallet reservations after a reversible chain
+    /// projection moves an input back to unspent. Exposed funding components
+    /// are never forgotten or made selectable by a reorg.
+    pub fn restore_scriptless_funding_reservations(&mut self) -> Result<(), DomainError> {
+        let reservation_indexes = self
+            .scriptless_funding_reservations
+            .iter()
+            .enumerate()
+            .filter(|(_, reservation)| reservation.state.retains_inputs())
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        for reservation_index in reservation_indexes {
+            let reservation = self.scriptless_funding_reservations[reservation_index].clone();
+            if let (Some(output_id), Some(commitment), Some(context)) = (
+                reservation.change_output_id,
+                reservation.change_commitment,
+                reservation.private_context.as_ref(),
+            ) {
+                if !self.outputs.iter().any(|output| output.id == output_id) {
+                    let mut blinding = [0u8; 32];
+                    if !context.copy_change_output_blinding_to(&mut blinding) {
+                        return Err(DomainError::InvalidScriptlessFundingReservation);
+                    }
+                    self.outputs.push(OutputRecord {
+                        id: output_id,
+                        account_id: self.default_account.id,
+                        commitment: Some(commitment),
+                        value: reservation.change_value_noms,
+                        state: OutputState::PendingIncoming,
+                        discovered_height: 0,
+                        reserved_by: None,
+                    });
+                    self.remember_output_blinding(output_id, blinding);
+                }
+            }
+            for (input_index, (output_id, commitment)) in reservation
+                .reserved_output_ids
+                .iter()
+                .zip(&reservation.input_commitments)
+                .enumerate()
+            {
+                let exact = self
+                    .outputs
+                    .iter()
+                    .position(|output| output.id == *output_id);
+                let output_index = match exact {
+                    Some(index)
+                        if self.outputs[index]
+                            .commitment
+                            .as_ref()
+                            .map(<[u8; 33]>::as_slice)
+                            == Some(commitment.as_slice()) =>
+                    {
+                        Some(index)
+                    }
+                    Some(_) => return Err(DomainError::InvalidScriptlessFundingReservation),
+                    None => {
+                        let matches = self
+                            .outputs
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, output)| {
+                                output.commitment.as_ref().map(<[u8; 33]>::as_slice)
+                                    == Some(commitment.as_slice())
+                            })
+                            .map(|(index, _)| index)
+                            .collect::<Vec<_>>();
+                        if matches.len() > 1 {
+                            return Err(DomainError::InvalidScriptlessFundingReservation);
+                        }
+                        matches.first().copied()
+                    }
+                };
+                let Some(output_index) = output_index else {
+                    continue;
+                };
+                let rebound_id = self.outputs[output_index].id;
+                self.scriptless_funding_reservations[reservation_index].reserved_output_ids
+                    [input_index] = rebound_id;
+                let output = &mut self.outputs[output_index];
+                if matches!(output.state, OutputState::Spent { .. }) {
+                    continue;
+                }
+                if output
+                    .reserved_by
+                    .is_some_and(|owner| owner != reservation.id)
+                {
+                    return Err(DomainError::InvalidScriptlessFundingReservation);
+                }
+                output.reserved_by = Some(reservation.id);
+                output.state = OutputState::PendingOutgoing;
+            }
+        }
+        Ok(())
+    }
+
+    /// Reconstruct or rebind exact wallet-owned claim/refund payout outputs
+    /// after a scanner rewind. Publicly exposed components and their private
+    /// spend evidence remain durable and byte-identical across restart/reorg.
+    pub fn restore_scriptless_payout_reservations(&mut self) -> Result<(), DomainError> {
+        let reservation_indexes = self
+            .scriptless_payout_reservations
+            .iter()
+            .enumerate()
+            .filter(|(_, reservation)| reservation.state.has_prepared_material())
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        for reservation_index in reservation_indexes {
+            let reservation = self.scriptless_payout_reservations[reservation_index].clone();
+            let Some(output_id) = reservation.output_id else {
+                if reservation.payout_value_noms != 0
+                    || reservation.output_commitment.is_some()
+                    || !reservation.output_bytes.is_empty()
+                {
+                    return Err(DomainError::InvalidScriptlessPayoutReservation);
+                }
+                continue;
+            };
+            let commitment = reservation
+                .output_commitment
+                .ok_or(DomainError::InvalidScriptlessPayoutReservation)?;
+            let context = reservation
+                .private_context
+                .as_ref()
+                .ok_or(DomainError::InvalidScriptlessPayoutReservation)?;
+            let mut blinding = [0u8; 32];
+            if !context.copy_output_blinding_to(&mut blinding) {
+                return Err(DomainError::InvalidScriptlessPayoutReservation);
+            }
+
+            let exact = self
+                .outputs
+                .iter()
+                .position(|output| output.id == output_id);
+            let output_index = match exact {
+                Some(index) if self.outputs[index].commitment == Some(commitment) => index,
+                Some(_) => return Err(DomainError::InvalidScriptlessPayoutReservation),
+                None => {
+                    let matching = self
+                        .outputs
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, output)| output.commitment == Some(commitment))
+                        .map(|(index, _)| index)
+                        .collect::<Vec<_>>();
+                    if matching.len() > 1 {
+                        return Err(DomainError::InvalidScriptlessPayoutReservation);
+                    }
+                    if let Some(index) = matching.first().copied() {
+                        let rebound_id = self.outputs[index].id;
+                        self.scriptless_payout_reservations[reservation_index].output_id =
+                            Some(rebound_id);
+                        self.private_output_blindings
+                            .retain(|secret| secret.output_id != output_id);
+                        index
+                    } else {
+                        self.outputs.push(OutputRecord {
+                            id: output_id,
+                            account_id: self.default_account.id,
+                            commitment: Some(commitment),
+                            value: reservation.payout_value_noms,
+                            state: OutputState::PendingIncoming,
+                            discovered_height: 0,
+                            reserved_by: None,
+                        });
+                        self.outputs.len() - 1
+                    }
+                }
+            };
+            let output = &self.outputs[output_index];
+            if output.account_id != self.default_account.id
+                || output.value != reservation.payout_value_noms
+            {
+                return Err(DomainError::InvalidScriptlessPayoutReservation);
+            }
+            let output_id = output.id;
+            if let Some(existing) = self.output_blinding(output_id) {
+                if existing != blinding {
+                    return Err(DomainError::InvalidScriptlessPayoutReservation);
+                }
+            } else {
+                self.remember_output_blinding(output_id, blinding);
+            }
+        }
         Ok(())
     }
 
@@ -1430,6 +2504,8 @@ impl WalletState {
         }
         self.outputs = plan.provisional_outputs;
         self.transactions = plan.provisional_transactions;
+        self.restore_scriptless_funding_reservations()?;
+        self.restore_scriptless_payout_reservations()?;
         self.cursor = Some(plan.target.cursor());
         self.sync_status = SyncStatus::Synced;
         Ok(())
@@ -1454,6 +2530,27 @@ pub mod serde_bytes_32 {
         bytes
             .try_into()
             .map_err(|_| serde::de::Error::custom("expected exactly 32 bytes"))
+    }
+}
+
+pub mod serde_bytes_33 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &[u8; 33], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(value)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 33], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        bytes
+            .try_into()
+            .map_err(|_| serde::de::Error::custom("expected exactly 33 bytes"))
     }
 }
 
@@ -1535,6 +2632,10 @@ pub enum DomainError {
     NonReuseFloorRegression,
     #[error("invalid local transaction intent")]
     InvalidTransactionIntent,
+    #[error("invalid Scriptless funding reservation")]
+    InvalidScriptlessFundingReservation,
+    #[error("invalid Scriptless claim/refund payout reservation")]
+    InvalidScriptlessPayoutReservation,
     #[error("invalid transaction lifecycle transition")]
     InvalidTransactionTransition,
     #[error("duplicate kernel evidence")]
@@ -2000,6 +3101,8 @@ mod tests {
             "legacy_proof_only_outputs",
             "recovery_scanned_blocks",
             "recovery_scanned_outputs",
+            "scriptless_funding_reservations",
+            "scriptless_payout_reservations",
         ] {
             object.remove(field);
         }
@@ -2012,6 +3115,8 @@ mod tests {
         assert_eq!(decoded.legacy_proof_only_outputs, 0);
         assert_eq!(decoded.recovery_scanned_blocks, 0);
         assert_eq!(decoded.recovery_scanned_outputs, 0);
+        assert!(decoded.scriptless_funding_reservations.is_empty());
+        assert!(decoded.scriptless_payout_reservations.is_empty());
         decoded.validate().unwrap();
 
         let mut legacy_transaction =
@@ -2030,6 +3135,238 @@ mod tests {
         assert_eq!(decoded.created_at_unix_seconds, 0);
         assert!(decoded.cancellation_reason.is_none());
         assert!(decoded.cancelled_at_height.is_none());
+    }
+
+    #[test]
+    fn scriptless_claim_and_refund_payouts_are_distinct_and_reorg_restorable() {
+        let mut state = WalletState::new(identity(), [7; 32], configuration());
+        let session_id = [8u8; 32];
+        for (marker, role, refund_lock_height) in [
+            (3u8, ScriptlessPayoutRoleV1::Claim, 0u64),
+            (4u8, ScriptlessPayoutRoleV1::Refund, 42u64),
+        ] {
+            let coordinate = state
+                .reserve_recovery_coordinate(0, RecoveryOutputClass::SelfTransfer)
+                .unwrap();
+            let reservation_id = Uuid::new_v4();
+            let output_id = Uuid::new_v4();
+            let commitment = [marker; 33];
+            let output_blinding = [marker.saturating_add(20); 32];
+            state.outputs.push(OutputRecord {
+                id: output_id,
+                account_id: state.default_account.id,
+                commitment: Some(commitment),
+                value: 900,
+                state: OutputState::PendingIncoming,
+                discovered_height: 0,
+                reserved_by: None,
+            });
+            state.remember_output_blinding(output_id, output_blinding);
+            state
+                .scriptless_payout_reservations
+                .push(ScriptlessPayoutReservation {
+                    version: SCRIPTLESS_PAYOUT_RESERVATION_VERSION,
+                    id: reservation_id,
+                    session_id,
+                    role,
+                    created_at_height: 1,
+                    shared_output_commitment: [9; 33],
+                    payout_value_noms: 900,
+                    kernel_fee_noms: 100,
+                    expected_output_count: 2,
+                    refund_lock_height,
+                    output_id: Some(output_id),
+                    derivation_index: Some(coordinate.derivation_index()),
+                    output_commitment: Some(commitment),
+                    output_bytes: vec![marker; 16],
+                    offset_contribution: Some([marker.saturating_add(1); 32]),
+                    payout_excess_public_key: vec![marker.saturating_add(2); 33],
+                    template_hash: None,
+                    session_share_binding_digest: Some([marker.saturating_add(4); 32]),
+                    participant_position: Some(0),
+                    template_participants: None,
+                    private_context: Some(PrivateScriptlessPayoutContext::new(
+                        [marker.saturating_add(3); 32],
+                        Some(output_blinding),
+                    )),
+                    state: ScriptlessPayoutReservationState::ComponentsExposed,
+                });
+        }
+        state.validate().unwrap();
+        assert_ne!(
+            state.scriptless_payout_reservations[0].derivation_index,
+            state.scriptless_payout_reservations[1].derivation_index
+        );
+
+        let removed_output = state.scriptless_payout_reservations[0].output_id.unwrap();
+        state.outputs.retain(|output| output.id != removed_output);
+        state
+            .private_output_blindings
+            .retain(|secret| secret.output_id != removed_output);
+        state.restore_scriptless_payout_reservations().unwrap();
+        state.validate().unwrap();
+        assert!(state
+            .outputs
+            .iter()
+            .any(|output| output.id == removed_output));
+
+        state.scriptless_payout_reservations[0].template_hash = Some([12; 32]);
+        state.scriptless_payout_reservations[0].session_share_binding_digest = Some([11; 32]);
+        state.scriptless_payout_reservations[0].template_participants = Some(
+            ScriptlessTemplateParticipantBindingV1::new([[1; 32], [2; 32]], [[3; 33], [4; 33]]),
+        );
+        state.scriptless_payout_reservations[0].state =
+            ScriptlessPayoutReservationState::TemplateBound;
+        state.validate().unwrap();
+        state.scriptless_payout_reservations[0].participant_position = Some(2);
+        assert_eq!(
+            state.validate(),
+            Err(DomainError::InvalidScriptlessPayoutReservation)
+        );
+        state.scriptless_payout_reservations[0].participant_position = Some(0);
+        state.scriptless_payout_reservations[0]
+            .template_participants
+            .as_mut()
+            .unwrap()
+            .ordered_kernel_excess_points
+            .pop();
+        assert_eq!(
+            state.validate(),
+            Err(DomainError::InvalidScriptlessPayoutReservation)
+        );
+        state.scriptless_payout_reservations[0]
+            .template_participants
+            .as_mut()
+            .unwrap()
+            .ordered_kernel_excess_points
+            .push(vec![4; 33]);
+        state.validate().unwrap();
+
+        let output_count = state.outputs.len();
+        state
+            .scriptless_payout_reservations
+            .push(ScriptlessPayoutReservation {
+                version: SCRIPTLESS_PAYOUT_RESERVATION_VERSION,
+                id: Uuid::new_v4(),
+                session_id: [13; 32],
+                role: ScriptlessPayoutRoleV1::Claim,
+                created_at_height: 1,
+                shared_output_commitment: [14; 33],
+                payout_value_noms: 0,
+                kernel_fee_noms: 100,
+                expected_output_count: 1,
+                refund_lock_height: 0,
+                output_id: None,
+                derivation_index: None,
+                output_commitment: None,
+                output_bytes: Vec::new(),
+                offset_contribution: Some([15; 32]),
+                payout_excess_public_key: vec![16; 33],
+                template_hash: None,
+                session_share_binding_digest: Some([18; 32]),
+                participant_position: Some(1),
+                template_participants: None,
+                private_context: Some(PrivateScriptlessPayoutContext::new([17; 32], None)),
+                state: ScriptlessPayoutReservationState::ComponentsExposed,
+            });
+        state.validate().unwrap();
+        state.restore_scriptless_payout_reservations().unwrap();
+        assert_eq!(state.outputs.len(), output_count);
+
+        let mut duplicate_role = state.scriptless_payout_reservations[0].clone();
+        duplicate_role.id = Uuid::new_v4();
+        duplicate_role.output_id = Some(Uuid::new_v4());
+        duplicate_role.output_commitment = Some([7; 33]);
+        duplicate_role.output_bytes = vec![7; 16];
+        duplicate_role.offset_contribution = Some([8; 32]);
+        duplicate_role.payout_excess_public_key = vec![9; 33];
+        duplicate_role.private_context = Some(PrivateScriptlessPayoutContext::new(
+            [10; 32],
+            Some([11; 32]),
+        ));
+        state.outputs.push(OutputRecord {
+            id: duplicate_role.output_id.unwrap(),
+            account_id: state.default_account.id,
+            commitment: duplicate_role.output_commitment,
+            value: duplicate_role.payout_value_noms,
+            state: OutputState::PendingIncoming,
+            discovered_height: 0,
+            reserved_by: None,
+        });
+        state.remember_output_blinding(duplicate_role.output_id.unwrap(), [11; 32]);
+        state.scriptless_payout_reservations.push(duplicate_role);
+        assert_eq!(
+            state.validate(),
+            Err(DomainError::InvalidScriptlessPayoutReservation)
+        );
+    }
+
+    #[test]
+    fn scriptless_zero_debit_funding_signer_has_no_wallet_input_or_output() {
+        let mut state = WalletState::new(identity(), [7; 32], configuration());
+        state
+            .scriptless_funding_reservations
+            .push(ScriptlessFundingReservation {
+                version: SCRIPTLESS_FUNDING_RESERVATION_VERSION,
+                id: Uuid::new_v4(),
+                session_id: [18; 32],
+                shared_output_commitment: [22; 33],
+                created_at_height: 1,
+                local_debit_noms: 0,
+                funding_fee_noms: 100,
+                expected_input_count: 1,
+                expected_output_count: 1,
+                reserved_output_ids: Vec::new(),
+                input_commitments: Vec::new(),
+                change_value_noms: 0,
+                change_derivation_index: None,
+                change_output_id: None,
+                change_commitment: None,
+                change_output_bytes: Vec::new(),
+                offset_contribution: Some([19; 32]),
+                wallet_excess_public_key: vec![20; 33],
+                template_hash: None,
+                session_share_binding_digest: Some([22; 32]),
+                participant_position: Some(1),
+                template_participants: None,
+                private_context: Some(PrivateScriptlessFundingContext::new([21; 32], None)),
+                state: ScriptlessFundingReservationState::Exported,
+            });
+        state.validate().unwrap();
+        assert!(state.outputs.is_empty());
+        state.restore_scriptless_funding_reservations().unwrap();
+        assert!(state.outputs.is_empty());
+
+        // The usual request carries the frozen aggregate input count, but a
+        // strictly local no-input description remains valid. Binding to the
+        // real funding template later still requires at least one aggregate
+        // input and the shared output.
+        state.scriptless_funding_reservations[0].expected_input_count = 0;
+        state.validate().unwrap();
+
+        state.scriptless_funding_reservations[0].template_hash = Some([23; 32]);
+        state.scriptless_funding_reservations[0].session_share_binding_digest = Some([24; 32]);
+        state.scriptless_funding_reservations[0].template_participants = Some(
+            ScriptlessTemplateParticipantBindingV1::new([[1; 32], [2; 32]], [[3; 33], [4; 33]]),
+        );
+        state.scriptless_funding_reservations[0].state =
+            ScriptlessFundingReservationState::TemplateBound;
+        state.validate().unwrap();
+        state.scriptless_funding_reservations[0].participant_position = Some(2);
+        assert_eq!(
+            state.validate(),
+            Err(DomainError::InvalidScriptlessFundingReservation)
+        );
+        state.scriptless_funding_reservations[0].participant_position = Some(1);
+        state.scriptless_funding_reservations[0]
+            .template_participants
+            .as_mut()
+            .unwrap()
+            .ordered_offset_contributions[0] = vec![0; 32];
+        assert_eq!(
+            state.validate(),
+            Err(DomainError::InvalidScriptlessFundingReservation)
+        );
     }
 
     #[test]

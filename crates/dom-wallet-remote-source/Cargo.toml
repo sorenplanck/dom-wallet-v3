@@ -8,8 +8,11 @@ license.workspace = true
 publish = false
 
 [dependencies]
-base64.workspace = true
 dom-consensus.workspace = true
+dom-chain.workspace = true
+dom-core.workspace = true
+dom-crypto.workspace = true
+dom-serialization.workspace = true
 dom-wallet-core-api.workspace = true
 hex.workspace = true
 reqwest.workspace = true
