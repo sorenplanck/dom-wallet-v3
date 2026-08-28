@@ -1,0 +1,18 @@
+[package]
+name = "dom-wallet-multichain"
+description = "Level-1 multichain key derivation for the DOM wallet: Bitcoin taproot (m/86'/0') and EVM (m/44'/60') accounts from the wallet's own BIP-39 seed, for signing swap legs. Funds transit; they do not rest here."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+dom-wallet-keys.workspace = true
+secp256k1.workspace = true
+sha2.workspace = true
+sha3.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
