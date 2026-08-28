@@ -79,7 +79,7 @@ The `main-v0.4` branch is the principal line. It integrates, on top of `wallet-v
 | Multichain derivation (Taproot + EVM) | Implemented on main-v0.4 |
 | Swap tab user interface | Implemented on main-v0.4, fail-closed |
 | Swap execution | Blocked on the interop daemon |
-| Packaged Mainnet acceptance | In progress |
+| Packaged Mainnet acceptance | Operationally attested; see `reports/WALLET_V0.4_OPERATIONAL_STATUS.md` |
 
 ---
 
