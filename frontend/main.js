@@ -451,6 +451,9 @@ const renderMining = (value, node) => {
   byId("mining-candidate").textContent = value.last_block_candidate_time ? new Date(value.last_block_candidate_time * 1000).toLocaleString() : "Never";
   byId("mining-last-height").textContent = value.last_accepted_block_height ?? "—";
   byId("mining-uptime").textContent = `${value.uptime_seconds}s`;
+  byId("mining-estimated-value").textContent = value.estimated_production_cost_usd_per_dom != null
+    ? `~US$ ${Number(value.estimated_production_cost_usd_per_dom).toPrecision(3)} / DOM`
+    : "—";
   byId("mining-warning").hidden = presentation.warning == null;
   byId("mining-warning").textContent = presentation.warning ?? "";
   byId("mining-start").disabled = !presentation.canStart;
@@ -618,6 +621,14 @@ byId("backup-import-form").addEventListener("submit", async (event) => {
   } finally { clearPasswords(form); }
 });
 
+// Display conversion only: 1 DOM = 100,000,000 noms (consensus COIN_UNIT).
+// Fee arithmetic itself stays in Core; the frontend only presents it.
+const NOMS_PER_DOM = 100000000;
+const domText = (noms) => `${noms} noms (${(noms / NOMS_PER_DOM).toLocaleString("en-US", { maximumFractionDigits: 8 })} DOM)`;
+const feeSummary = byId("send-fee-summary");
+const renderFeeSummary = (amountNoms, feeNoms) => {
+  feeSummary.textContent = `Amount ${domText(amountNoms)} · Network fee ${domText(feeNoms)} · Total ${domText(amountNoms + feeNoms)}`;
+};
 const output = byId("transaction-output");
 const slateId = byId("transaction-slate-id");
 const slateText = byId("transaction-text");
@@ -627,16 +638,36 @@ const requiredSlate = () => { const text = slateText.value.trim(); if (!text.sta
 byId("transaction-create").addEventListener("submit", async (event) => {
   event.preventDefault(); const data = new FormData(event.currentTarget);
   try {
+    const amount = integerNoms(data.get("amount"));
+    const requestedFee = integerNoms(data.get("requested_fee"), true);
+    let estimate;
+    try {
+      estimate = await run(() => invoke("transaction_fee_estimate", { amount, selectedInputCount: 1, changeOutput: true }));
+    } catch (error) {
+      feeSummary.textContent = "The network fee is unavailable; the payment was not created.";
+      show(`Network fee unavailable: ${redactedError(error)}`, true);
+      return;
+    }
+    const feeNoms = requestedFee ?? estimate.minimum_fee;
+    renderFeeSummary(amount, feeNoms);
+    if (!window.confirm(`Send ${domText(amount)} with a network fee of ${domText(feeNoms)}? Total ${domText(amount + feeNoms)}.`)) return;
     const network = await run(() => invoke("node_network_status"));
     const expiry = data.get("expires_at_height") === "" ? network.canonical_height + 1440 : integerNoms(data.get("expires_at_height"));
-    const result = await run(() => invoke("transaction_send_create", { amount: integerNoms(data.get("amount")), requestedFee: integerNoms(data.get("requested_fee"), true), expiresAtHeight: expiry }));
+    const result = await run(() => invoke("transaction_send_create", { amount, requestedFee, expiresAtHeight: expiry }));
     renderTransaction(result); show("Recoverable Slate v4 request created.");
   } catch (error) { show(redactedError(error), true); }
 });
 byId("transaction-estimate").addEventListener("click", async () => {
   const data = new FormData(byId("transaction-create"));
-  try { renderTransaction(await run(() => invoke("transaction_fee_estimate", { amount: integerNoms(data.get("amount")), selectedInputCount: 1, changeOutput: true }))); }
-  catch (error) { show(redactedError(error), true); }
+  try {
+    const amount = integerNoms(data.get("amount"));
+    const estimate = await run(() => invoke("transaction_fee_estimate", { amount, selectedInputCount: 1, changeOutput: true }));
+    renderFeeSummary(amount, estimate.minimum_fee);
+    renderTransaction(estimate);
+  } catch (error) {
+    feeSummary.textContent = "The network fee is unavailable.";
+    show(redactedError(error), true);
+  }
 });
 const tx = (id, command, args = () => ({ slateId: requiredId() })) => byId(id).addEventListener("click", async () => {
   try { renderTransaction(await run(() => invoke(command, args()))); show(`${command.replaceAll("_", " ")} completed.`); }
