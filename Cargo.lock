@@ -1716,6 +1716,7 @@ dependencies = [
  "dom-wallet-crypto 0.3.2",
  "dom-wallet-domain",
  "fs2",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

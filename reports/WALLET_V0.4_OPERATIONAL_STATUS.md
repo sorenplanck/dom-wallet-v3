@@ -23,6 +23,7 @@ and what genuinely remains.
 | Windows installed lifecycle | The packaged Wallet is installed and operating on the operator's Windows machine. |
 | macOS lifecycle | The packaged Wallet is operating on macOS. |
 | Long-mining soak | Continuous mining across thirty thousand blocks exceeds any laboratory soak run. |
+| Fault injection | Closed in code (2026-08-28): `dom-wallet-storage/tests/fault_injection.rs` proves that a commit interrupted by a full disk (genuine ENOSPC on a tmpfs), a read-only filesystem, a write-protected directory, or a mid-write failure (RLIMIT_FSIZE) fails with the typed I/O error, never moves the active generation, leaves the wallet readable, and recovers fully once the fault clears. The suite runs privileged and unprivileged. |
 | Automatic-update feed | Working as designed: every new Wallet version is published only after the operator's cryptographic signature. The updater verifies the Tauri Minisign artifact signature plus the detached DOM manifest signature, SHA-256, and byte length; an unsigned or tampered version is never applied, and a missing production key fails closed. The sidecar enforces this policy at runtime. |
 | PEX routability filtering | Fixed in code: the pinned `dom-node` revision `6f8a947` applies the publicly-routable policy on ingestion, confirmation, and sharing, with Mainnet tests pinning the behavior. |
 
@@ -39,10 +40,7 @@ deterministic successes; the network itself is the running proof.
    stage of the project; Minisign continues to authenticate the exact
    installer bytes for anyone who verifies. This is a recorded decision,
    not an open task.
-2. **Fault injection.** Disk-full during a commit, read-only directories,
-   and permission failures are not exercised by normal operation, however
-   long it runs. This is the one remaining test gap, low urgency.
-3. **Historical proof-only outputs.** Permanent, by design: outputs without
+2. **Historical proof-only outputs.** Permanent, by design: outputs without
    Recovery Capsule v1 cannot be reconstructed from the seed and remain
    backup-required. Not a defect; no code may manufacture a blinding.
 
