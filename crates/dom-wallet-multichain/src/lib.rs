@@ -1,10 +1,11 @@
 //! Level-1 multichain accounts for the DOM wallet swap tab.
 //!
 //! The swap tab design (docs/SWAP_TAB_DESIGN.md, premise 1) fixes the model:
-//! the wallet derives Bitcoin and EVM keys from the same BIP-39 seed it
-//! already uses. DOM lives at `coin_type` 330, Bitcoin taproot at `m/86'/0'`
-//! and EVM at `m/44'/60'`. Those keys exist to sign swap legs; funds transit,
-//! they do not rest here.
+//! the wallet derives every swap-leg key from the same BIP-39 seed it
+//! already uses. DOM lives at `coin_type` 330, Bitcoin taproot at `m/86'/0'`,
+//! EVM at `m/44'/60'`, Solana at `m/44'/501'` (SLIP-0010 ed25519) and Monero
+//! at `m/44'/128'` (DOM XMR leg convention v1). Those keys exist to sign
+//! swap legs; funds transit, they do not rest here.
 //!
 //! Everything cryptographic is reused, not reimplemented: BIP-32 derivation
 //! comes from the audited `dom-wallet-keys` crate at the same pinned protocol
@@ -23,9 +24,13 @@
 mod bech32m;
 mod bitcoin;
 mod evm;
+mod solana;
+mod xmr;
 
 pub use bitcoin::{BitcoinNetwork, TaprootAccount};
 pub use evm::EvmAccount;
+pub use solana::SolanaAccount;
+pub use xmr::MoneroAccount;
 
 use dom_wallet_keys::ExtendedPrivKey;
 use thiserror::Error;
@@ -52,6 +57,7 @@ pub enum MultichainError {
 /// do not persist.
 pub struct MultichainRoot {
     master: Zeroizing<ExtendedPrivKey>,
+    seed: Zeroizing<[u8; 64]>,
 }
 
 impl MultichainRoot {
@@ -60,6 +66,7 @@ impl MultichainRoot {
         let master = ExtendedPrivKey::from_seed(seed).map_err(|_| MultichainError::Derivation)?;
         Ok(Self {
             master: Zeroizing::new(master),
+            seed: Zeroizing::new(*seed),
         })
     }
 
@@ -75,6 +82,18 @@ impl MultichainRoot {
         index: u32,
     ) -> Result<TaprootAccount, MultichainError> {
         TaprootAccount::derive(&self.master, network, index)
+    }
+
+    /// Derive the Solana account at `m/44'/501'/index'/0'` (SLIP-0010
+    /// ed25519, hardened-only).
+    pub fn solana_account(&self, index: u32) -> Result<SolanaAccount, MultichainError> {
+        SolanaAccount::derive(&self.seed, index)
+    }
+
+    /// Derive the Monero account at `m/44'/128'/account'` under the DOM
+    /// XMR leg convention v1.
+    pub fn monero_account(&self, account: u32) -> Result<MoneroAccount, MultichainError> {
+        MoneroAccount::derive(&self.master, account)
     }
 }
 

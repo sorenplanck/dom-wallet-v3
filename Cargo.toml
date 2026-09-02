@@ -16,6 +16,7 @@ members = [
     "crates/dom-wallet-node-manager",
     "crates/dom-wallet-production-backend",
     "crates/dom-wallet-multichain",
+    "crates/dom-wallet-swap-client",
     "src-tauri",
 ]
 
@@ -30,6 +31,9 @@ license = "MIT"
 argon2 = "0.5"
 base64 = "0.22"
 bip39 = "2.1"
+bs58 = "0.5"
+curve25519-dalek = "4"
+hmac = "0.12"
 chacha20poly1305 = "0.10"
 fs2 = "0.4"
 futures-util = "0.3"
@@ -83,3 +87,15 @@ dom-adaptor = { git = "https://github.com/sorenplanck/dom-protocol", rev = "6f8a
 # consumed from their reviewed protocol commit. This does not move the wallet's
 # consensus crates away from the immutable revision above.
 dom-sidecar = { git = "https://github.com/sorenplanck/dom-protocol", rev = "ab45a2944f22fe00f9b12984354f0d5d7cdd229a" }
+
+# The F6 RFQ/relay interoperability layer, pinned at the mainnetswap head that
+# hardened the sidecar channel. These crates carry no consensus code; the
+# wallet consumes the normative RFQ objects, the ratified relay envelope and
+# the pinned BIP340 backend so the client speaks byte-exact protocol. This
+# does not move the wallet's consensus crates away from the immutable
+# revision above.
+rfq = { git = "https://github.com/sorenplanck/dom-protocol", rev = "5d8f5db333d3223f74f5df935b4b2d453ab25b22" }
+relay = { git = "https://github.com/sorenplanck/dom-protocol", rev = "5d8f5db333d3223f74f5df935b4b2d453ab25b22", default-features = false, features = ["real-bip340"] }
+btc-crypto = { git = "https://github.com/sorenplanck/dom-protocol", rev = "5d8f5db333d3223f74f5df935b4b2d453ab25b22" }
+kaystra-core = { git = "https://github.com/sorenplanck/dom-protocol", rev = "5d8f5db333d3223f74f5df935b4b2d453ab25b22", default-features = false }
+solver = { git = "https://github.com/sorenplanck/dom-protocol", rev = "5d8f5db333d3223f74f5df935b4b2d453ab25b22" }

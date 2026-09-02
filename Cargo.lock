@@ -377,6 +377,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "btc-crypto"
+version = "0.2.0"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=5d8f5db333d3223f74f5df935b4b2d453ab25b22#5d8f5db333d3223f74f5df935b4b2d453ab25b22"
+dependencies = [
+ "btc-secp-sys",
+ "zeroize",
+]
+
+[[package]]
+name = "btc-secp-sys"
+version = "0.2.0"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=5d8f5db333d3223f74f5df935b4b2d453ab25b22#5d8f5db333d3223f74f5df935b4b2d453ab25b22"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -732,6 +749,15 @@ dependencies = [
  "bitflags 2.13.0",
  "core-foundation",
  "libc",
+]
+
+[[package]]
+name = "counterparty-api"
+version = "0.2.0"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=5d8f5db333d3223f74f5df935b4b2d453ab25b22#5d8f5db333d3223f74f5df935b4b2d453ab25b22"
+dependencies = [
+ "thiserror 1.0.69",
+ "zeroize",
 ]
 
 [[package]]
@@ -1617,8 +1643,11 @@ dependencies = [
 name = "dom-wallet-multichain"
 version = "0.3.2"
 dependencies = [
+ "bs58",
+ "curve25519-dalek",
  "dom-wallet-keys",
  "hex",
+ "hmac",
  "secp256k1 0.28.2",
  "sha2",
  "sha3",
@@ -1726,6 +1755,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "dom-wallet-swap-client"
+version = "0.3.2"
+dependencies = [
+ "btc-crypto",
+ "hex",
+ "hkdf",
+ "kaystra-core",
+ "relay",
+ "rfq",
+ "serde",
+ "serde_json",
+ "sha2",
+ "solver",
+ "thiserror 2.0.18",
+ "zeroize",
+]
+
+[[package]]
 name = "dom-wallet-tauri-shell"
 version = "0.3.2"
 dependencies = [
@@ -1741,6 +1788,7 @@ dependencies = [
  "dom-wallet-node-manager",
  "dom-wallet-remote-source",
  "dom-wallet-storage",
+ "dom-wallet-swap-client",
  "dom-wallet-updater",
  "hex",
  "reqwest 0.13.4",
@@ -1948,6 +1996,18 @@ dependencies = [
  "libc",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "fallible-iterator"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649"
+
+[[package]]
+name = "fallible-streaming-iterator"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
 name = "fastrand"
@@ -3074,6 +3134,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kaystra-core"
+version = "0.2.0"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=5d8f5db333d3223f74f5df935b4b2d453ab25b22#5d8f5db333d3223f74f5df935b4b2d453ab25b22"
+dependencies = [
+ "blake2",
+ "counterparty-api",
+ "store",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "keccak"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3127,6 +3198,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c943259e342f1e06ff2da7a83eabdfe7f92ce10262688dbf1895ff0b3e6e4652"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "libsqlite3-sys"
+version = "0.38.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8"
+dependencies = [
+ "cc",
+ "pkg-config",
+ "vcpkg",
 ]
 
 [[package]]
@@ -4306,6 +4388,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "relay"
+version = "0.2.0"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=5d8f5db333d3223f74f5df935b4b2d453ab25b22#5d8f5db333d3223f74f5df935b4b2d453ab25b22"
+dependencies = [
+ "blake2",
+ "btc-crypto",
+ "kaystra-core",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "reqwest"
 version = "0.12.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4397,6 +4490,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rfq"
+version = "0.2.0"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=5d8f5db333d3223f74f5df935b4b2d453ab25b22#5d8f5db333d3223f74f5df935b4b2d453ab25b22"
+dependencies = [
+ "blake2",
+ "kaystra-core",
+ "thiserror 1.0.69",
+ "uspe",
+]
+
+[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4429,6 +4533,19 @@ checksum = "50a0e551c1e27e1731aba276dbeaeac73f53c7cd34d1bda485d02bd1e0f36844"
 dependencies = [
  "libc",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "rusqlite"
+version = "0.40.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11438310b19e3109b6446c33d1ed5e889428cf2e278407bc7896bc4aaea43323"
+dependencies = [
+ "bitflags 2.13.0",
+ "fallible-iterator",
+ "fallible-streaming-iterator",
+ "libsqlite3-sys",
+ "smallvec",
 ]
 
 [[package]]
@@ -5107,6 +5224,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "solver"
+version = "0.2.0"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=5d8f5db333d3223f74f5df935b4b2d453ab25b22#5d8f5db333d3223f74f5df935b4b2d453ab25b22"
+dependencies = [
+ "btc-crypto",
+ "kaystra-core",
+ "rfq",
+ "thiserror 1.0.69",
+ "zeroize",
+]
+
+[[package]]
 name = "soup3"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5162,6 +5291,16 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
+name = "store"
+version = "0.2.0"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=5d8f5db333d3223f74f5df935b4b2d453ab25b22#5d8f5db333d3223f74f5df935b4b2d453ab25b22"
+dependencies = [
+ "rusqlite",
+ "rustix",
+ "thiserror 1.0.69",
+]
 
 [[package]]
 name = "string_cache"
@@ -6190,6 +6329,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "uspe"
+version = "0.2.0"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=5d8f5db333d3223f74f5df935b4b2d453ab25b22#5d8f5db333d3223f74f5df935b4b2d453ab25b22"
+dependencies = [
+ "blake2",
+ "counterparty-api",
+ "kaystra-core",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "utf-8"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6224,6 +6374,12 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+
+[[package]]
+name = "vcpkg"
+version = "0.2.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "version-compare"
