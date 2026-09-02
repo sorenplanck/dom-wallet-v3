@@ -672,6 +672,42 @@ byId("swap-export-clear").addEventListener("click", () => {
   output.hidden = true;
   byId("swap-export-clear").hidden = true;
 });
+byId("swap-identity-show").addEventListener("click", async () => {
+  try {
+    const identity = await run(() => invoke("swap_initiator_identity"));
+    if (!identity) return;
+    const output = byId("swap-identity-output");
+    output.replaceChildren(...[
+      ["Initiator public key", identity.public_key_hex],
+      ["Derivation domain", identity.derivation_domain],
+      ["Roster role", identity.role],
+    ].map(([label, value]) => {
+      const row = document.createElement("div");
+      const name = document.createElement("span"); name.textContent = label;
+      const code = document.createElement("code"); code.textContent = value;
+      row.append(name, code); return row;
+    }));
+    output.hidden = false;
+  } catch (error) { show(redactedError(error), true); }
+});
+byId("swap-descriptor-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const verdict = byId("swap-descriptor-verdict");
+  try {
+    const status = await run(() => invoke("swap_network_descriptor_check", {
+      descriptorJson: byId("swap-descriptor-json").value,
+    }));
+    if (!status) return;
+    verdict.textContent = status.valid
+      ? `${status.message} Solvers: ${status.solvers}. Assets: ${status.assets.join(", ")}.`
+      : status.message;
+    verdict.hidden = false;
+  } catch (error) {
+    verdict.textContent = "The descriptor could not be checked.";
+    verdict.hidden = false;
+    show(redactedError(error), true);
+  }
+});
 byId("swap-quotes-refresh").addEventListener("click", async () => {
   try { await run(() => invoke("swap_quotes_list")); }
   catch { markSwapDaemon(true); byId("swap-quotes-list").textContent = `${SWAP_DAEMON_MESSAGE}; no quotes were fetched.`; }

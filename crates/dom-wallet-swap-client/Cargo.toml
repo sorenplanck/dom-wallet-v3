@@ -1,0 +1,23 @@
+[package]
+name = "dom-wallet-swap-client"
+description = "User-side (Initiator) client of the DOM interop F6 RFQ flow: authors RfqV1 from the wallet's durable intent, signs ratified relay envelopes with the pinned BIP340 backend, runs the §5.4 acceptance pipeline and §4.1 admissibility on incoming quotes, and freezes TermsBindingV1 on acceptance. Fail-closed: without an operator-supplied network descriptor and transport, nothing is sent."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+btc-crypto.workspace = true
+hex.workspace = true
+hkdf.workspace = true
+kaystra-core.workspace = true
+relay.workspace = true
+rfq.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+solver.workspace = true

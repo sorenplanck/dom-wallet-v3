@@ -1105,6 +1105,24 @@ fn swap_fee_quote(
         .map_err(Into::into)
 }
 #[tauri::command]
+fn swap_initiator_identity(
+    app: tauri::State<'_, DesktopApplication>,
+) -> Result<dom_wallet_tauri_shell::SwapInitiatorIdentityDto, dom_wallet_tauri_shell::CommandErrorDto>
+{
+    app.swap_initiator_identity().map_err(Into::into)
+}
+#[tauri::command]
+fn swap_network_descriptor_check(
+    app: tauri::State<'_, DesktopApplication>,
+    descriptor_json: String,
+) -> Result<
+    dom_wallet_tauri_shell::SwapNetworkDescriptorStatusDto,
+    dom_wallet_tauri_shell::CommandErrorDto,
+> {
+    app.swap_network_descriptor_check(&descriptor_json)
+        .map_err(Into::into)
+}
+#[tauri::command]
 fn swap_intent_create(
     handle: tauri::AppHandle,
     app: tauri::State<'_, DesktopApplication>,

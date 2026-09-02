@@ -184,6 +184,8 @@ macro_rules! wallet_command_registry {
             swap_deposit_status,
             swap_manual_refund,
             swap_leg_keys_export,
+            swap_initiator_identity,
+            swap_network_descriptor_check,
             swap_intent_create,
             swap_quotes_list,
             swap_accept_quote,
@@ -1354,6 +1356,32 @@ impl Serialize for SwapLegKeysDto {
         state.serialize_field("warning", self.warning)?;
         state.end()
     }
+}
+
+/// The wallet's swap-network identity: the BIP340 x-only public key the
+/// operator registers in the roster as this wallet's Initiator entry.
+/// Public data — the signing secret never leaves the seed derivation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwapInitiatorIdentityDto {
+    pub public_key_hex: String,
+    pub derivation_domain: String,
+    pub role: String,
+}
+
+/// Validation verdict over an operator-supplied swap network
+/// descriptor. Honest and fail-closed: `valid` reports the descriptor's
+/// own consistency, `user_key_registered` whether its roster carries
+/// THIS wallet's seed-derived key — both must hold before a client can
+/// exist, and neither is ever assumed.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwapNetworkDescriptorStatusDto {
+    pub valid: bool,
+    pub user_key_registered: bool,
+    pub solvers: usize,
+    pub assets: Vec<String>,
+    pub message: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3685,6 +3713,77 @@ impl DesktopApplication {
                       them can take those funds. Import them only into a tool you trust, \
                       then treat them as compromised.",
         })
+    }
+
+    /// The wallet's Initiator identity on the swap network: the BIP340
+    /// x-only key derived from the wallet's own seed under the frozen
+    /// domain, which the operator registers in the roster. Requires the
+    /// unlocked wallet; exposes only public material.
+    pub fn swap_initiator_identity(&self) -> Result<SwapInitiatorIdentityDto, CommandError> {
+        self.ensure_running()?;
+        let seed = self
+            .lock_service()?
+            .multichain_bip39_seed()
+            .map_err(CommandError::from)?;
+        let key = dom_wallet_swap_client::initiator_public_identity(&seed)
+            .map_err(|_| CommandError::Unavailable)?;
+        Ok(SwapInitiatorIdentityDto {
+            public_key_hex: hex::encode(key),
+            derivation_domain: String::from_utf8_lossy(
+                dom_wallet_swap_client::identity::INITIATOR_KEY_DOMAIN,
+            )
+            .into_owned(),
+            role: "initiator".into(),
+        })
+    }
+
+    /// Validates an operator-supplied swap network descriptor against
+    /// the client's fail-closed rules and this wallet's own identity.
+    /// A verdict, never a connection: the transport stays disconnected
+    /// until an endpoint exists.
+    pub fn swap_network_descriptor_check(
+        &self,
+        descriptor_json: &str,
+    ) -> Result<SwapNetworkDescriptorStatusDto, CommandError> {
+        self.ensure_running()?;
+        let seed = self
+            .lock_service()?
+            .multichain_bip39_seed()
+            .map_err(CommandError::from)?;
+        let key = dom_wallet_swap_client::initiator_public_identity(&seed)
+            .map_err(|_| CommandError::Unavailable)?;
+        match dom_wallet_swap_client::SwapNetworkDescriptorV1::from_json(descriptor_json) {
+            Err(_) => Ok(SwapNetworkDescriptorStatusDto {
+                valid: false,
+                user_key_registered: false,
+                solvers: 0,
+                assets: Vec::new(),
+                message: "The descriptor does not validate; nothing was configured.".into(),
+            }),
+            Ok(descriptor) => {
+                let registered = descriptor.member_xonly(&descriptor.user) == Some(key);
+                let message = if registered {
+                    "The descriptor validates and its roster carries this wallet's key. \
+                     The transport stays disconnected until an endpoint is configured."
+                        .into()
+                } else {
+                    "The descriptor validates, but its roster does not carry this wallet's \
+                     Initiator key; register the key shown by the swap identity first."
+                        .into()
+                };
+                Ok(SwapNetworkDescriptorStatusDto {
+                    valid: true,
+                    user_key_registered: registered,
+                    solvers: descriptor.solvers.len(),
+                    assets: descriptor
+                        .assets()
+                        .iter()
+                        .map(|asset| asset.code.clone())
+                        .collect(),
+                    message,
+                })
+            }
+        }
     }
 
     /// List quotes for the open intent. FAIL-CLOSED until the authenticated

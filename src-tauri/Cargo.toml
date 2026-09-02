@@ -9,6 +9,7 @@ license.workspace = true
 base64.workspace = true
 dom-wallet-core = { path = "../crates/dom-wallet-core" }
 dom-wallet-multichain = { path = "../crates/dom-wallet-multichain" }
+dom-wallet-swap-client = { path = "../crates/dom-wallet-swap-client" }
 dom-wallet-core-api.workspace = true
 dom-wallet-core-restore = { path = "../crates/dom-wallet-core-restore" }
 dom-wallet-core-sync = { path = "../crates/dom-wallet-core-sync" }

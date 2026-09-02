@@ -120,3 +120,14 @@ test("all four external legs are first-class: BTC, EVM, XMR and SOL", async () =
     assert.equal(js.includes(field), true, `hatch must render ${field}`);
   }
 });
+
+test("the swap network card exposes identity and descriptor validation, never a fake connection", async () => {
+  const html = await source("index.html");
+  for (const id of ["swap-identity-show", "swap-identity-output", "swap-descriptor-form", "swap-descriptor-json", "swap-descriptor-verdict"]) {
+    assert.equal(html.includes(`id="${id}"`), true, `missing swap network element ${id}`);
+  }
+  assert.equal(html.includes("Nothing connects until an endpoint exists"), true, "the card must state the disconnected truth");
+  const js = await source("main.js");
+  assert.equal(js.includes('invoke("swap_initiator_identity")'), true, "identity must come from the command");
+  assert.equal(js.includes('invoke("swap_network_descriptor_check"'), true, "validation must go through the command");
+});
