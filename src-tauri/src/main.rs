@@ -1106,9 +1106,81 @@ fn swap_fee_quote(
 }
 #[tauri::command]
 fn swap_intent_create(
+    handle: tauri::AppHandle,
     app: tauri::State<'_, DesktopApplication>,
+    amount: u64,
+    from_asset: String,
+    to_asset: String,
+    minimum_output: u64,
+    fee_asset: String,
+) -> Result<dom_wallet_tauri_shell::SwapIntentResultDto, dom_wallet_tauri_shell::CommandErrorDto> {
+    let result = app
+        .swap_intent_create(amount, &from_asset, &to_asset, minimum_output, &fee_asset)
+        .map_err(dom_wallet_tauri_shell::CommandErrorDto::from)?;
+    emit_swap_session_update(&handle, &result.session);
+    Ok(result)
+}
+
+#[tauri::command]
+fn swap_sessions_open(
+    app: tauri::State<'_, DesktopApplication>,
+) -> Result<dom_wallet_tauri_shell::SwapOpenSessionsDto, dom_wallet_tauri_shell::CommandErrorDto> {
+    app.swap_sessions_open().map_err(Into::into)
+}
+
+#[tauri::command]
+fn swap_session_detail(
+    app: tauri::State<'_, DesktopApplication>,
+    session_id: String,
+) -> Result<dom_wallet_domain::SwapSessionRecord, dom_wallet_tauri_shell::CommandErrorDto> {
+    app.swap_session_detail(&session_id).map_err(Into::into)
+}
+
+#[tauri::command]
+fn swap_session_cancel(
+    handle: tauri::AppHandle,
+    app: tauri::State<'_, DesktopApplication>,
+    session_id: String,
+) -> Result<dom_wallet_domain::SwapSessionRecord, dom_wallet_tauri_shell::CommandErrorDto> {
+    let session = app
+        .swap_session_cancel(&session_id)
+        .map_err(dom_wallet_tauri_shell::CommandErrorDto::from)?;
+    emit_swap_session_update(&handle, &session);
+    Ok(session)
+}
+
+#[tauri::command]
+fn swap_deposit_status(
+    app: tauri::State<'_, DesktopApplication>,
+    session_id: String,
+) -> Result<dom_wallet_tauri_shell::SwapDepositStatusDto, dom_wallet_tauri_shell::CommandErrorDto> {
+    app.swap_deposit_status(&session_id).map_err(Into::into)
+}
+
+#[tauri::command]
+fn swap_manual_refund(
+    app: tauri::State<'_, DesktopApplication>,
+    session_id: String,
 ) -> Result<(), dom_wallet_tauri_shell::CommandErrorDto> {
-    app.swap_intent_create().map_err(Into::into)
+    app.swap_manual_refund(&session_id).map_err(Into::into)
+}
+
+#[tauri::command]
+fn swap_leg_keys_export(
+    app: tauri::State<'_, DesktopApplication>,
+    acknowledged: bool,
+) -> Result<dom_wallet_tauri_shell::SwapLegKeysDto, dom_wallet_tauri_shell::CommandErrorDto> {
+    app.swap_leg_keys_export(acknowledged).map_err(Into::into)
+}
+
+/// Typed session event pushed on every durable mutation, so the UI mirrors
+/// committed state instead of polling or parsing logs.
+fn emit_swap_session_update(
+    handle: &tauri::AppHandle,
+    session: &dom_wallet_domain::SwapSessionRecord,
+) {
+    use tauri::Emitter;
+    let _ = handle.emit("swap-session-update", session);
 }
 #[tauri::command]
 fn swap_quotes_list(
@@ -1131,7 +1203,7 @@ fn swap_session_status(
 #[tauri::command]
 fn swap_history(
     app: tauri::State<'_, DesktopApplication>,
-) -> Result<(), dom_wallet_tauri_shell::CommandErrorDto> {
+) -> Result<Vec<dom_wallet_domain::SwapSessionRecord>, dom_wallet_tauri_shell::CommandErrorDto> {
     app.swap_history().map_err(Into::into)
 }
 #[tauri::command]

@@ -1,5 +1,6 @@
 import QRCode from "qrcode";
 import QrScanner from "qr-scanner";
+import { listen } from "@tauri-apps/api/event";
 import { nativeBridge } from "./bridge.js";
 import {
   chainSourcePresentation,
@@ -340,6 +341,14 @@ byId("unlock-form").addEventListener("submit", async (event) => {
     enterApp();
     await refreshSummary();
     show("Wallet unlocked.");
+    try {
+      const open = await invoke("swap_sessions_open");
+      await renderSwapSessions(open);
+      if (open.sessions.length) {
+        const clock = open.sessions[open.sessions.length - 1]?.refund_unlock_unix;
+        show(`${open.sessions.length} swap${open.sessions.length === 1 ? "" : "s"} in progress — resumed from durable state.${clock != null ? ` Your refund unlocks at ${swapUnlockClock(clock)}.` : ""}`);
+      }
+    } catch { /* the swap surface may be unavailable while the node warms up */ }
   } catch (error) { clearPasswords(form); show(redactedError(error), true); }
 });
 
@@ -515,10 +524,54 @@ const previewSwapFee = async () => {
   const quote = await run(() => invoke("swap_fee_quote", { amount, fromAsset: byId("swap-from").value, toAsset: byId("swap-to").value, paymentAsset: byId("swap-fee-asset").value }));
   if (quote) renderSwapFee(quote);
 };
+// Resume is a read of committed state: every open session survives restart
+// because the backend persists each transition before acting on it.
+let activeSwapSession = null;
+const swapUnlockClock = (unix) => new Date(unix * 1000).toLocaleString();
+const renderSwapDeposit = async (session) => {
+  const panel = byId("swap-deposit-panel");
+  const deposit = session?.deposit;
+  panel.hidden = !deposit;
+  if (!deposit) return;
+  byId("swap-deposit-address").textContent = deposit.address;
+  byId("swap-deposit-bounds").textContent = `min ${deposit.minimum_base_units} — max ${deposit.maximum_base_units} (base units)`;
+  byId("swap-deposit-confirmations").textContent = `${deposit.observed_confirmations} / ${deposit.required_confirmations}`;
+  byId("swap-deposit-warning").hidden = !deposit.insufficient_after_fees;
+  await QRCode.toCanvas(byId("swap-deposit-qr"), deposit.address, { errorCorrectionLevel: "M", margin: 2, width: 220 });
+};
+const renderSwapSessions = async (dto) => {
+  markSwapDaemon(!dto.daemon_connected);
+  const sessions = dto.sessions ?? [];
+  activeSwapSession = sessions.length ? sessions[sessions.length - 1] : null;
+  const banner = byId("swap-resume-banner");
+  if (sessions.length) {
+    banner.textContent = `${sessions.length} swap${sessions.length === 1 ? "" : "s"} in progress — resumed from durable state.`;
+    banner.hidden = false;
+  } else {
+    banner.hidden = true;
+  }
+  const clock = byId("swap-refund-clock");
+  if (activeSwapSession?.refund_unlock_unix != null) {
+    clock.textContent = `If anything fails, your refund unlocks at ${swapUnlockClock(activeSwapSession.refund_unlock_unix)}.`;
+    clock.hidden = false;
+  } else {
+    clock.hidden = true;
+  }
+  const status = byId("swap-session-status");
+  if (activeSwapSession) {
+    const s = activeSwapSession;
+    status.textContent = `${s.from_asset} → ${s.to_asset} · ${s.amount_base_units} base units · state ${s.state}` + (s.last_error ? ` · ${s.last_error}` : "");
+  } else {
+    status.textContent = "No active swap session.";
+  }
+  byId("swap-session-cancel").disabled = !activeSwapSession;
+  byId("swap-manual-refund").disabled = !activeSwapSession;
+  byId("swap-session-details").disabled = !activeSwapSession;
+  await renderSwapDeposit(activeSwapSession);
+};
 const refreshSwap = async () => {
   try {
-    await invoke("swap_session_status");
-    markSwapDaemon(false);
+    await renderSwapSessions(await invoke("swap_sessions_open"));
   } catch {
     markSwapDaemon(true);
   }
@@ -537,22 +590,98 @@ byId("swap-addresses-refresh").addEventListener("click", async () => {
 });
 byId("swap-intent-form").addEventListener("submit", async (event) => {
   event.preventDefault();
+  const data = new FormData(event.currentTarget);
   try {
     await previewSwapFee();
-    await run(() => invoke("swap_intent_create"));
-    show("Swap intent published.");
+    const result = await run(() => invoke("swap_intent_create", {
+      amount: integerNoms(data.get("amount")),
+      fromAsset: byId("swap-from").value,
+      toAsset: byId("swap-to").value,
+      minimumOutput: integerNoms(data.get("minimum_output")),
+      feeAsset: byId("swap-fee-asset").value,
+    }));
+    if (!result) return;
+    if (result.published) {
+      show("Swap intent published.");
+    } else {
+      markSwapDaemon(true);
+      show(result.message ?? `${SWAP_DAEMON_MESSAGE}; the intent was not published.`, true);
+    }
+    await refreshSwap();
   } catch (error) {
     markSwapDaemon(true);
-    show(`${SWAP_DAEMON_MESSAGE}; the intent was not published.`, true);
+    show(`${SWAP_DAEMON_MESSAGE}; the intent was not published. Your draft was saved and can be cancelled for free.`, true);
+    await refreshSwap().catch(() => {});
   }
+});
+byId("swap-session-cancel").addEventListener("click", async () => {
+  if (!activeSwapSession) return;
+  if (!window.confirm("Cancel this swap session? While nothing is locked, cancellation is free.")) return;
+  try { await run(() => invoke("swap_session_cancel", { sessionId: activeSwapSession.id })); show("Swap session cancelled."); await refreshSwap(); }
+  catch (error) { show(redactedError(error), true); }
+});
+byId("swap-manual-refund").addEventListener("click", async () => {
+  if (!activeSwapSession) return;
+  try { await run(() => invoke("swap_manual_refund", { sessionId: activeSwapSession.id })); show("Refund broadcast requested."); }
+  catch (error) { show(redactedError(error), true); }
+});
+byId("swap-session-details").addEventListener("click", async () => {
+  if (!activeSwapSession) return;
+  try {
+    const detail = await run(() => invoke("swap_session_detail", { sessionId: activeSwapSession.id }));
+    if (!detail) return;
+    const panel = byId("swap-session-detail");
+    redactJson(panel, detail);
+    panel.hidden = !panel.hidden;
+  } catch (error) { show(redactedError(error), true); }
+});
+// Display-once recovery hatch: rendered on explicit demand, cleared on hide,
+// never logged, never persisted by the frontend.
+byId("swap-export-keys").addEventListener("click", async () => {
+  if (!window.confirm("Export the private keys of your Bitcoin and EVM swap legs? Anyone who sees them can take the funds on those chains. They will be shown once, on screen only.")) return;
+  try {
+    const keys = await run(() => invoke("swap_leg_keys_export", { acknowledged: true }));
+    if (!keys) return;
+    const output = byId("swap-export-output");
+    output.replaceChildren(...[
+      ["Warning", keys.warning],
+      [`Bitcoin ${keys.bitcoin_derivation_path}`, keys.bitcoin_address],
+      ["Bitcoin secret (hex)", keys.bitcoin_secret_hex],
+      [`EVM ${keys.evm_derivation_path}`, keys.evm_address],
+      ["EVM secret (hex)", keys.evm_secret_hex],
+    ].map(([label, value]) => {
+      const row = document.createElement("div");
+      const name = document.createElement("span"); name.textContent = label;
+      const code = document.createElement("code"); code.textContent = value;
+      row.append(name, code); return row;
+    }));
+    output.hidden = false;
+    byId("swap-export-clear").hidden = false;
+  } catch (error) { show(redactedError(error), true); }
+});
+byId("swap-export-clear").addEventListener("click", () => {
+  const output = byId("swap-export-output");
+  output.replaceChildren();
+  output.hidden = true;
+  byId("swap-export-clear").hidden = true;
 });
 byId("swap-quotes-refresh").addEventListener("click", async () => {
   try { await run(() => invoke("swap_quotes_list")); }
   catch { markSwapDaemon(true); byId("swap-quotes-list").textContent = `${SWAP_DAEMON_MESSAGE}; no quotes were fetched.`; }
 });
 byId("swap-history-refresh").addEventListener("click", async () => {
-  try { await run(() => invoke("swap_history")); }
-  catch { markSwapDaemon(true); byId("swap-history-list").textContent = `${SWAP_DAEMON_MESSAGE}; history is unavailable.`; }
+  try {
+    const history = await run(() => invoke("swap_history"));
+    if (!history) return;
+    const list = byId("swap-history-list");
+    if (!history.length) { list.textContent = "No swaps recorded."; return; }
+    list.replaceChildren(...history.map((session) => {
+      const row = document.createElement("article");
+      row.className = "history-item";
+      row.textContent = `${session.from_asset} → ${session.to_asset} · ${session.amount_base_units} base units · ${session.state}`;
+      return row;
+    }));
+  } catch (error) { byId("swap-history-list").textContent = "History is unavailable."; show(redactedError(error), true); }
 });
 
 const refreshMining = async () => {
@@ -934,4 +1063,5 @@ const refresh = async () => {
   refreshTimer = setTimeout(refresh, gateVisible ? 5000 : 15000);
 };
 refreshTimer = setTimeout(refresh, 15000);
+listen("swap-session-update", () => { refreshSwap().catch(() => {}); }).catch(() => { /* events unavailable outside the shell */ });
 window.addEventListener("beforeunload", () => { clearTimeout(refreshTimer); stopRestoreScanPolling(); stopQrAnimation(); clearPhrase(); clearSecretForms(); stopScanner(); }, { once: true });

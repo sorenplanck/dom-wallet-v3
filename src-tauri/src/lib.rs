@@ -178,6 +178,12 @@ macro_rules! wallet_command_registry {
             mining_status,
             swap_leg_addresses,
             swap_fee_quote,
+            swap_sessions_open,
+            swap_session_detail,
+            swap_session_cancel,
+            swap_deposit_status,
+            swap_manual_refund,
+            swap_leg_keys_export,
             swap_intent_create,
             swap_quotes_list,
             swap_accept_quote,
@@ -1242,6 +1248,84 @@ pub struct SwapFeeQuoteDto {
     /// exists only in an accepted quote's implied ratio.
     pub fee_payment_estimated: Option<f64>,
     pub depc_basket_version: String,
+}
+
+/// The resume set read from durable state, with the daemon channel's truth.
+#[derive(Clone, Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwapOpenSessionsDto {
+    /// Whether the authenticated interop daemon channel is connected. False
+    /// until that channel lands; the wallet never fabricates liveness.
+    pub daemon_connected: bool,
+    /// Every non-terminal session, exactly as committed to encrypted state.
+    pub sessions: Vec<dom_wallet_domain::SwapSessionRecord>,
+}
+
+/// Outcome of publishing an intent. The draft is durable either way:
+/// persist-before-act means a failed publish can never lose the intent.
+#[derive(Clone, Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwapIntentResultDto {
+    pub published: bool,
+    /// Honest, stable message when publishing did not happen.
+    pub message: Option<String>,
+    pub session: dom_wallet_domain::SwapSessionRecord,
+}
+
+/// Deposit-panel projection for one session: the bounds the accepted quote
+/// declared and the watch progress last observed. Confirmations only ever
+/// come from the daemon's chain observations, never from the wallet.
+#[derive(Clone, Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwapDepositStatusDto {
+    pub daemon_connected: bool,
+    pub session_id: Uuid,
+    pub state: dom_wallet_domain::SwapSessionState,
+    pub deposit: Option<dom_wallet_domain::SwapDepositWatch>,
+    pub refund_unlock_unix: Option<u64>,
+}
+
+/// Display-once recovery hatch: the level-1 leg secrets, so the user can
+/// claim a leg in any external tool if the daemon is gone forever. Held in
+/// scrubbing buffers, serialized by value exactly once for the ceremony,
+/// never rendered by Debug and never logged.
+pub struct SwapLegKeysDto {
+    pub bitcoin_address: String,
+    pub bitcoin_derivation_path: String,
+    pub bitcoin_secret_hex: Zeroizing<String>,
+    pub evm_address: String,
+    pub evm_derivation_path: String,
+    pub evm_secret_hex: Zeroizing<String>,
+    pub warning: &'static str,
+}
+
+impl std::fmt::Debug for SwapLegKeysDto {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SwapLegKeysDto")
+            .field("bitcoin_address", &self.bitcoin_address)
+            .field("evm_address", &self.evm_address)
+            .field("secrets", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Serialize for SwapLegKeysDto {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("SwapLegKeysDto", 7)?;
+        state.serialize_field("bitcoin_address", &self.bitcoin_address)?;
+        state.serialize_field("bitcoin_derivation_path", &self.bitcoin_derivation_path)?;
+        state.serialize_field("bitcoin_secret_hex", self.bitcoin_secret_hex.as_str())?;
+        state.serialize_field("evm_address", &self.evm_address)?;
+        state.serialize_field("evm_derivation_path", &self.evm_derivation_path)?;
+        state.serialize_field("evm_secret_hex", self.evm_secret_hex.as_str())?;
+        state.serialize_field("warning", self.warning)?;
+        state.end()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3329,30 +3413,258 @@ impl DesktopApplication {
         })
     }
 
-    /// Publish a swap intent. FAIL-CLOSED until the authenticated channel to
-    /// the interop daemon lands: no daemon, no intent, no fabricated state.
-    pub fn swap_intent_create(&self) -> Result<(), CommandError> {
-        Err(CommandError::Unavailable)
+    /// Whether the authenticated interop daemon channel is connected. This is
+    /// the single place that truth lands when the channel arrives; until then
+    /// it is constantly false and everything that needs the daemon fails
+    /// closed with an honest message.
+    fn swap_daemon_connected(&self) -> bool {
+        false
     }
 
-    /// List quotes for the open intent. Fail-closed like `swap_intent_create`.
+    /// Stable honest message for every daemon-dependent refusal.
+    const SWAP_DAEMON_MESSAGE: &'static str = "The interop daemon is not connected";
+
+    /// Create a durable intent draft, then attempt to publish it.
+    ///
+    /// Persist-before-act, exactly as proven production atomic swaps do it:
+    /// the draft is committed to the encrypted store before the publish
+    /// attempt, so an absent daemon or a crash never loses the intent — it
+    /// stays resumable and freely cancellable. Nothing is fabricated: when
+    /// the daemon is absent the result says the intent was not published.
+    pub fn swap_intent_create(
+        &self,
+        amount_base_units: u64,
+        from_asset: &str,
+        to_asset: &str,
+        minimum_output_base_units: u64,
+        fee_payment_asset: &str,
+    ) -> Result<SwapIntentResultDto, CommandError> {
+        self.ensure_running()?;
+        if !matches!(fee_payment_asset, "DOM" | "BTC" | "USDT") {
+            return Err(CommandError::InvalidInput(
+                "payment asset must be DOM, BTC or USDT".into(),
+            ));
+        }
+        let fee_bps = swap::fee_bps_for_route(from_asset, to_asset)
+            .ok_or_else(|| CommandError::InvalidInput("route has no ratified fee tier".into()))?;
+        if amount_base_units == 0 {
+            return Err(CommandError::InvalidInput("amount must be positive".into()));
+        }
+        let now = unix_seconds();
+        let record = dom_wallet_domain::SwapSessionRecord {
+            id: Uuid::new_v4(),
+            created_unix: now,
+            updated_unix: now,
+            from_asset: from_asset.to_owned(),
+            to_asset: to_asset.to_owned(),
+            amount_base_units,
+            minimum_output_base_units,
+            fee_payment_asset: fee_payment_asset.to_owned(),
+            fee_bps,
+            state: dom_wallet_domain::SwapSessionState::IntentDraft,
+            state_history: Vec::new(),
+            last_error: None,
+            quote: None,
+            deposit: None,
+            refund_unlock_unix: None,
+            user_leg_funding_txid: None,
+            solver_leg_funding_txid: None,
+            claim_txid: None,
+            cancel_txid: None,
+            refund_txid: None,
+        };
+        let draft = self
+            .lock_service()?
+            .swap_session_create_draft(record)
+            .map_err(CommandError::from)?;
+        if self.swap_daemon_connected() {
+            // The publish path lands with the daemon channel. Unreachable
+            // today by construction of `swap_daemon_connected`.
+            return Err(CommandError::Unavailable);
+        }
+        let message = format!(
+            "{}; the intent was not published",
+            Self::SWAP_DAEMON_MESSAGE
+        );
+        let session = self
+            .lock_service()?
+            .swap_session_note_error(draft.id, &message, unix_seconds())
+            .map_err(CommandError::from)?;
+        Ok(SwapIntentResultDto {
+            published: false,
+            message: Some(message),
+            session,
+        })
+    }
+
+    /// The resume set: every open session from the durable store, plus the
+    /// daemon channel's truth for the banner. Called on unlock and whenever
+    /// the swap screen refreshes — resuming is reading committed state.
+    pub fn swap_sessions_open(&self) -> Result<SwapOpenSessionsDto, CommandError> {
+        self.ensure_running()?;
+        let sessions = self
+            .lock_service()?
+            .swap_open_sessions()
+            .map_err(CommandError::from)?;
+        Ok(SwapOpenSessionsDto {
+            daemon_connected: self.swap_daemon_connected(),
+            sessions,
+        })
+    }
+
+    /// One session, raw and complete, for the details panel.
+    pub fn swap_session_detail(
+        &self,
+        session_id: &str,
+    ) -> Result<dom_wallet_domain::SwapSessionRecord, CommandError> {
+        self.ensure_running()?;
+        let id = Uuid::parse_str(session_id)
+            .map_err(|_| CommandError::InvalidInput("session id is invalid".into()))?;
+        self.lock_service()?
+            .swap_session(id)
+            .map_err(CommandError::from)
+    }
+
+    /// Free cancellation while nothing is locked. Once funds are locked the
+    /// domain refuses this and the refund ladder is the only exit.
+    pub fn swap_session_cancel(
+        &self,
+        session_id: &str,
+    ) -> Result<dom_wallet_domain::SwapSessionRecord, CommandError> {
+        self.ensure_running()?;
+        let id = Uuid::parse_str(session_id)
+            .map_err(|_| CommandError::InvalidInput("session id is invalid".into()))?;
+        self.lock_service()?
+            .swap_session_cancel_free(id, unix_seconds())
+            .map_err(CommandError::from)
+    }
+
+    /// Deposit-panel projection: quoted bounds and last observed progress.
+    /// Confirmation counts only ever come from the daemon's observations.
+    pub fn swap_deposit_status(
+        &self,
+        session_id: &str,
+    ) -> Result<SwapDepositStatusDto, CommandError> {
+        self.ensure_running()?;
+        let id = Uuid::parse_str(session_id)
+            .map_err(|_| CommandError::InvalidInput("session id is invalid".into()))?;
+        let session = self
+            .lock_service()?
+            .swap_session(id)
+            .map_err(CommandError::from)?;
+        Ok(SwapDepositStatusDto {
+            daemon_connected: self.swap_daemon_connected(),
+            session_id: session.id,
+            state: session.state,
+            deposit: session.deposit,
+            refund_unlock_unix: session.refund_unlock_unix,
+        })
+    }
+
+    /// Manual refund, the user-visible fallback of the automatic path. The
+    /// gate is exact about why a refund cannot happen yet; when it can, the
+    /// broadcast itself still requires the daemon channel and fails closed
+    /// with an honest message until that channel lands.
+    pub fn swap_manual_refund(&self, session_id: &str) -> Result<(), CommandError> {
+        self.ensure_running()?;
+        let id = Uuid::parse_str(session_id)
+            .map_err(|_| CommandError::InvalidInput("session id is invalid".into()))?;
+        let gate = self
+            .lock_service()?
+            .swap_manual_refund_gate(id, unix_seconds())
+            .map_err(CommandError::from)?;
+        match gate {
+            dom_wallet_core::SwapRefundGate::NothingLocked => Err(CommandError::InvalidInput(
+                "nothing is locked on any chain; cancel the session instead".into(),
+            )),
+            dom_wallet_core::SwapRefundGate::AlreadyTerminal => Err(CommandError::InvalidInput(
+                "this swap already ended; there is nothing to refund".into(),
+            )),
+            dom_wallet_core::SwapRefundGate::NotYetUnlocked { unlock_unix } => {
+                Err(CommandError::InvalidInput(format!(
+                    "the refund timelock has not matured; it unlocks at unix {unlock_unix}"
+                )))
+            }
+            dom_wallet_core::SwapRefundGate::RefundUnknown => Err(CommandError::InvalidInput(
+                "no refund maturity is recorded for this session; reconnect the daemon".into(),
+            )),
+            dom_wallet_core::SwapRefundGate::Broadcastable => {
+                if self.swap_daemon_connected() {
+                    return Err(CommandError::Unavailable);
+                }
+                Err(CommandError::InvalidInput(format!(
+                    "{}; the refund transaction was not broadcast",
+                    Self::SWAP_DAEMON_MESSAGE
+                )))
+            }
+        }
+    }
+
+    /// Display-once recovery hatch (design premise 1 taken to its honest
+    /// conclusion): the leg secrets derived from the wallet's own seed, so a
+    /// locked leg can be claimed in any external tool even if the daemon is
+    /// gone forever. Requires explicit acknowledgment; the response is held
+    /// in scrubbing buffers and never rendered by Debug or written to a log.
+    pub fn swap_leg_keys_export(&self, acknowledged: bool) -> Result<SwapLegKeysDto, CommandError> {
+        self.ensure_running()?;
+        if !acknowledged {
+            return Err(CommandError::InvalidInput(
+                "exporting leg keys requires explicit acknowledgment".into(),
+            ));
+        }
+        let seed = self
+            .lock_service()?
+            .multichain_bip39_seed()
+            .map_err(CommandError::from)?;
+        let root = dom_wallet_multichain::MultichainRoot::from_bip39_seed(&seed)
+            .map_err(|_| CommandError::Unavailable)?;
+        let evm = root.evm_account(0).map_err(|_| CommandError::Unavailable)?;
+        let bitcoin = root
+            .taproot_account(dom_wallet_multichain::BitcoinNetwork::Mainnet, 0)
+            .map_err(|_| CommandError::Unavailable)?;
+        Ok(SwapLegKeysDto {
+            bitcoin_address: bitcoin.address().to_owned(),
+            bitcoin_derivation_path: "m/86'/0'/0'/0/0".into(),
+            bitcoin_secret_hex: Zeroizing::new(hex::encode(bitcoin.secret_bytes())),
+            evm_address: evm.address(),
+            evm_derivation_path: "m/44'/60'/0'/0/0".into(),
+            evm_secret_hex: Zeroizing::new(hex::encode(evm.secret_bytes())),
+            warning: "These secrets control real funds on external chains. Anyone who sees \
+                      them can take those funds. Import them only into a tool you trust, \
+                      then treat them as compromised.",
+        })
+    }
+
+    /// List quotes for the open intent. FAIL-CLOSED until the authenticated
+    /// channel to the interop daemon lands: no daemon, no quotes, no
+    /// fabricated market.
     pub fn swap_quotes_list(&self) -> Result<(), CommandError> {
         Err(CommandError::Unavailable)
     }
 
-    /// Accept a quote. Fail-closed like `swap_intent_create`.
+    /// Accept a quote. Fail-closed like `swap_quotes_list`.
     pub fn swap_accept_quote(&self) -> Result<(), CommandError> {
         Err(CommandError::Unavailable)
     }
 
-    /// Live session status. Fail-closed like `swap_intent_create`.
+    /// Live session status is the daemon channel's; it fails closed. The
+    /// durable resume set is `swap_sessions_open`, which needs no daemon.
     pub fn swap_session_status(&self) -> Result<(), CommandError> {
         Err(CommandError::Unavailable)
     }
 
-    /// Durable swap history. Fail-closed like `swap_intent_create`.
-    pub fn swap_history(&self) -> Result<(), CommandError> {
-        Err(CommandError::Unavailable)
+    /// The receipt view: terminal sessions read from the durable store, as
+    /// the design requires — never inferred from the UI's last known state.
+    pub fn swap_history(&self) -> Result<Vec<dom_wallet_domain::SwapSessionRecord>, CommandError> {
+        self.ensure_running()?;
+        let sessions = self
+            .lock_service()?
+            .swap_sessions()
+            .map_err(CommandError::from)?;
+        Ok(sessions
+            .into_iter()
+            .filter(|session| !session.is_open())
+            .collect())
     }
 
     pub fn slate_request_import(&self, text: &str) -> Result<TransactionSummary, CommandError> {
