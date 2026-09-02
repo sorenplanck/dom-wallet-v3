@@ -518,6 +518,40 @@ const renderSwapFee = (quote) => {
   }
   swapFeeSummary().textContent = `Protocol fee ${quote.fee_percent}% (${legs}): ${quote.fee_noms} noms (${dom} DOM), ${paid}${usd}.`;
 };
+// The pickers are built from the curated registry, never from hard-coded
+// tickers: a bare "USDT" hides which network settles it, and that is how
+// funds reach a chain nobody can spend them from.
+let swapAssets = [];
+const swapAssetByCode = (code) => swapAssets.find((asset) => asset.code === code);
+const renderSwapReceivingLeg = () => {
+  const chosen = swapAssetByCode(byId("swap-to").value);
+  const note = byId("swap-receiving-leg");
+  if (!chosen) { note.hidden = true; return; }
+  note.textContent = chosen.is_dom
+    ? "You receive DOM into this wallet."
+    : `You receive ${chosen.ticker} on ${chosen.network}, into your ${chosen.receiving_leg} leg address. Paying it to any other network would put it beyond this wallet's reach.`;
+  note.hidden = false;
+};
+const populateSwapAssets = async () => {
+  const assets = await invoke("swap_asset_registry");
+  if (!Array.isArray(assets) || assets.length === 0) return;
+  swapAssets = assets;
+  for (const [id, preferred] of [["swap-from", "DOM"], ["swap-to", "USDT.ETH"], ["swap-fee-asset", "DOM"]]) {
+    const select = byId(id);
+    const previous = select.value;
+    select.replaceChildren(...assets.map((asset) => {
+      const option = document.createElement("option");
+      option.value = asset.code;
+      option.textContent = asset.label;
+      return option;
+    }));
+    const wanted = assets.some((asset) => asset.code === previous) ? previous : preferred;
+    if (assets.some((asset) => asset.code === wanted)) select.value = wanted;
+  }
+  renderSwapReceivingLeg();
+};
+byId("swap-to").addEventListener("change", renderSwapReceivingLeg);
+
 const previewSwapFee = async () => {
   const data = new FormData(byId("swap-intent-form"));
   const amount = integerNoms(data.get("amount"));
@@ -570,6 +604,9 @@ const renderSwapSessions = async (dto) => {
   await renderSwapDeposit(activeSwapSession);
 };
 const refreshSwap = async () => {
+  try {
+    await populateSwapAssets();
+  } catch { /* the pickers keep whatever the registry last supplied */ }
   try {
     await renderSwapSessions(await invoke("swap_sessions_open"));
   } catch {

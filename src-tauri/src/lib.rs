@@ -185,6 +185,7 @@ macro_rules! wallet_command_registry {
             swap_manual_refund,
             swap_leg_keys_export,
             swap_leg_scan_plan,
+            swap_asset_registry,
             swap_initiator_identity,
             swap_network_descriptor_check,
             swap_intent_create,
@@ -1107,8 +1108,98 @@ pub mod swap {
     /// The ratified external set is the wallet's four leg families: BTC,
     /// the EVM leg (USDT), XMR and SOL — each backed by a seed-derived key
     /// in `dom-wallet-multichain`, never by a custodial account.
+    /// Which seed-derived leg of the wallet receives an asset. The swap
+    /// tab only ever offers assets this wallet can actually hold: an
+    /// asset with no leg here has no business in the picker.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum ReceivingLeg {
+        Dom,
+        Bitcoin,
+        Evm,
+        Solana,
+        Monero,
+    }
+
+    impl ReceivingLeg {
+        pub fn name(self) -> &'static str {
+            match self {
+                ReceivingLeg::Dom => "DOM",
+                ReceivingLeg::Bitcoin => "Bitcoin",
+                ReceivingLeg::Evm => "EVM",
+                ReceivingLeg::Solana => "Solana",
+                ReceivingLeg::Monero => "Monero",
+            }
+        }
+    }
+
+    /// One curated asset identity.
+    ///
+    /// Asset identity is the (ticker, network) pair, never the ticker
+    /// alone: USDT on Ethereum and USDT on Solana are different assets
+    /// that happen to share a name, and paying one to the other's chain
+    /// destroys the funds. A native coin IS its network, so it needs no
+    /// qualifier; a token always carries one.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct AssetIdentity {
+        /// Wire code — the string that reaches the RFQ and the durable
+        /// session record.
+        pub code: &'static str,
+        pub ticker: &'static str,
+        pub network: &'static str,
+        pub leg: ReceivingLeg,
+    }
+
+    /// The curated registry. Adding a network for a token is one entry
+    /// here and nothing else: the pickers, the fee tiers and the
+    /// receiving-leg guard all read from this list.
+    pub const ASSET_REGISTRY: &[AssetIdentity] = &[
+        AssetIdentity {
+            code: "DOM",
+            ticker: "DOM",
+            network: "DOM",
+            leg: ReceivingLeg::Dom,
+        },
+        AssetIdentity {
+            code: "BTC",
+            ticker: "BTC",
+            network: "Bitcoin",
+            leg: ReceivingLeg::Bitcoin,
+        },
+        AssetIdentity {
+            code: "XMR",
+            ticker: "XMR",
+            network: "Monero",
+            leg: ReceivingLeg::Monero,
+        },
+        AssetIdentity {
+            code: "SOL",
+            ticker: "SOL",
+            network: "Solana",
+            leg: ReceivingLeg::Solana,
+        },
+        AssetIdentity {
+            code: "USDT.ETH",
+            ticker: "USDT",
+            network: "Ethereum",
+            leg: ReceivingLeg::Evm,
+        },
+        AssetIdentity {
+            code: "USDT.SOL",
+            ticker: "USDT",
+            network: "Solana",
+            leg: ReceivingLeg::Solana,
+        },
+    ];
+
+    /// Resolve a wire code. A bare token ticker resolves to nothing:
+    /// there is no default network, because guessing one is exactly the
+    /// mistake that loses funds.
+    pub fn asset(code: &str) -> Option<&'static AssetIdentity> {
+        ASSET_REGISTRY.iter().find(|asset| asset.code == code)
+    }
+
     pub fn external_legs(from_asset: &str, to_asset: &str) -> Option<u64> {
-        let valid = |asset: &str| matches!(asset, "DOM" | "BTC" | "USDT" | "XMR" | "SOL");
+        let valid = |code: &str| asset(code).is_some();
         if !valid(from_asset) || !valid(to_asset) {
             return None;
         }
@@ -1431,6 +1522,24 @@ impl Serialize for SwapLegKeysDto {
         state.serialize_field("warning", self.warning)?;
         state.end()
     }
+}
+
+/// One curated asset the swap tab may offer, named by the (ticker,
+/// network) pair the protocol actually settles on.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwapAssetDto {
+    /// Wire code carried by the RFQ and the durable session.
+    pub code: String,
+    pub ticker: String,
+    pub network: String,
+    /// What the picker shows. A token always names its network here, so
+    /// the choice can never be read as "USDT, somewhere".
+    pub label: String,
+    /// The wallet leg that would receive it — the guard against paying a
+    /// token to a chain this wallet cannot spend from.
+    pub receiving_leg: String,
+    pub is_dom: bool,
 }
 
 /// The wallet's swap-network identity: the BIP340 x-only public key the
@@ -3564,9 +3673,9 @@ impl DesktopApplication {
         to_asset: &str,
         payment_asset: &str,
     ) -> Result<SwapFeeQuoteDto, CommandError> {
-        if !matches!(payment_asset, "DOM" | "BTC" | "USDT") {
+        if swap::asset(payment_asset).is_none() {
             return Err(CommandError::InvalidInput(
-                "payment asset must be DOM, BTC or USDT".into(),
+                "the fee payment asset must name a curated asset, and a token must name its network".into(),
             ));
         }
         let external_legs = swap::external_legs(from_asset, to_asset).ok_or_else(|| {
@@ -3607,9 +3716,11 @@ impl DesktopApplication {
             fee_noms,
             payment_asset: payment_asset.to_owned(),
             fee_usd_estimated,
-            fee_payment_estimated: match payment_asset {
-                "DOM" => Some(fee_noms as f64 / 100_000_000.0),
-                "USDT" => fee_usd_estimated,
+            fee_payment_estimated: match swap::asset(payment_asset).map(|a| a.ticker) {
+                Some("DOM") => Some(fee_noms as f64 / 100_000_000.0),
+                // Any USDT is the USD leg of the DEPC reference; which
+                // network carries it does not change the estimate.
+                Some("USDT") => fee_usd_estimated,
                 _ => None,
             },
             depc_basket_version: depc::DEPC_BASKET_VERSION.to_owned(),
@@ -3643,9 +3754,9 @@ impl DesktopApplication {
         fee_payment_asset: &str,
     ) -> Result<SwapIntentResultDto, CommandError> {
         self.ensure_running()?;
-        if !matches!(fee_payment_asset, "DOM" | "BTC" | "USDT") {
+        if swap::asset(fee_payment_asset).is_none() {
             return Err(CommandError::InvalidInput(
-                "payment asset must be DOM, BTC or USDT".into(),
+                "the fee payment asset must name a curated asset, and a token must name its network".into(),
             ));
         }
         let fee_bps = swap::fee_bps_for_route(from_asset, to_asset)
@@ -3862,6 +3973,30 @@ impl DesktopApplication {
                       them can take those funds. Import them only into a tool you trust, \
                       then treat them as compromised.",
         })
+    }
+
+    /// The curated asset registry the pickers are built from.
+    ///
+    /// The tab must never hard-code a ticker: a bare "USDT" hides which
+    /// network settles it, and that ambiguity is how funds are sent to a
+    /// chain nobody can spend them from. Every entry here names its
+    /// network and the wallet leg that receives it.
+    pub fn swap_asset_registry(&self) -> Result<Vec<SwapAssetDto>, CommandError> {
+        Ok(swap::ASSET_REGISTRY
+            .iter()
+            .map(|asset| SwapAssetDto {
+                code: asset.code.to_owned(),
+                ticker: asset.ticker.to_owned(),
+                network: asset.network.to_owned(),
+                label: if asset.ticker == asset.network {
+                    asset.ticker.to_owned()
+                } else {
+                    format!("{} · {}", asset.ticker, asset.network)
+                },
+                receiving_leg: asset.leg.name().to_owned(),
+                is_dom: asset.leg == swap::ReceivingLeg::Dom,
+            })
+            .collect())
     }
 
     /// The wallet's Initiator identity on the swap network: the BIP340
@@ -7091,8 +7226,8 @@ mod swap_tests {
         for (from, to) in [
             ("DOM", "BTC"),
             ("BTC", "DOM"),
-            ("DOM", "USDT"),
-            ("USDT", "DOM"),
+            ("DOM", "USDT.ETH"),
+            ("USDT.ETH", "DOM"),
             ("DOM", "XMR"),
             ("XMR", "DOM"),
             ("DOM", "SOL"),
@@ -7112,13 +7247,16 @@ mod swap_tests {
         // Same-asset round trips through the DOM are valid two-leg routes:
         // BTC->DOM->BTC and EVM->DOM->EVM (operator, 2026-08-28).
         for (from, to) in [
-            ("BTC", "USDT"),
-            ("USDT", "BTC"),
+            ("BTC", "USDT.ETH"),
+            ("USDT.ETH", "BTC"),
             ("BTC", "BTC"),
-            ("USDT", "USDT"),
+            ("USDT.ETH", "USDT.ETH"),
+            // Same ticker, different networks: still two external legs,
+            // and emphatically not the same asset.
+            ("USDT.ETH", "USDT.SOL"),
             ("XMR", "BTC"),
             ("BTC", "XMR"),
-            ("SOL", "USDT"),
+            ("SOL", "USDT.ETH"),
             ("XMR", "SOL"),
             ("XMR", "XMR"),
             ("SOL", "SOL"),
@@ -7132,9 +7270,59 @@ mod swap_tests {
         }
     }
 
+    /// A token ticker with no network names no asset. This is the rule
+    /// that keeps a user from sending USDT to a chain the recipient leg
+    /// cannot spend from, so it is a refusal and never a default.
+    #[test]
+    fn a_token_without_its_network_is_refused_not_defaulted() {
+        assert!(swap::asset("USDT").is_none());
+        assert_eq!(swap::external_legs("DOM", "USDT"), None);
+        assert_eq!(swap::fee_bps_for_route("USDT", "DOM"), None);
+        // Qualified, it resolves — and says which leg receives it.
+        let ethereum = swap::asset("USDT.ETH").expect("curated");
+        let solana = swap::asset("USDT.SOL").expect("curated");
+        assert_eq!(ethereum.ticker, solana.ticker);
+        assert_ne!(ethereum.network, solana.network);
+        assert_eq!(ethereum.leg, swap::ReceivingLeg::Evm);
+        assert_eq!(solana.leg, swap::ReceivingLeg::Solana);
+    }
+
+    /// Every curated asset must land on a leg this wallet derives, or the
+    /// picker would offer funds it cannot spend.
+    #[test]
+    fn every_curated_asset_has_a_leg_this_wallet_holds() {
+        for asset in swap::ASSET_REGISTRY {
+            assert!(!asset.code.is_empty());
+            assert!(!asset.ticker.is_empty());
+            assert!(!asset.network.is_empty());
+            // A native coin's ticker is unambiguous on its own (BTC
+            // exists on exactly one chain), so its code is the ticker.
+            // A token's ticker is not, so its code must qualify it.
+            match asset.code.split_once('.') {
+                None => assert_eq!(
+                    asset.code, asset.ticker,
+                    "an unqualified code is a native coin and equals its ticker"
+                ),
+                Some((ticker, network)) => {
+                    assert_eq!(ticker, asset.ticker, "the code's prefix is the ticker");
+                    assert!(!network.is_empty(), "the qualifier names a network");
+                }
+            }
+        }
+        // No two entries may share a wire code.
+        let mut codes = swap::ASSET_REGISTRY
+            .iter()
+            .map(|asset| asset.code)
+            .collect::<Vec<_>>();
+        codes.sort_unstable();
+        let total = codes.len();
+        codes.dedup();
+        assert_eq!(codes.len(), total, "wire codes are unique");
+    }
+
     #[test]
     fn degenerate_routes_have_no_fee_tier() {
-        for (from, to) in [("ETH", "DOM"), ("DOM", "eth"), ("", "BTC")] {
+        for (from, to) in [("ETH", "DOM"), ("DOM", "eth"), ("", "BTC"), ("USDT", "DOM")] {
             assert_eq!(swap::external_legs(from, to), None, "{from}->{to}");
             assert_eq!(swap::fee_bps_for_route(from, to), None, "{from}->{to}");
         }
