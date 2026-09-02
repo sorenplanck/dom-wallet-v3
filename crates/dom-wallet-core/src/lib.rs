@@ -40,15 +40,15 @@ use dom_wallet_core_sync::{
 };
 use dom_wallet_crypto::{KdfParameters, SecretBytes};
 use dom_wallet_domain::{
-    cancellation_decision, BalanceProjection, BroadcastExposure, CancellationDecision,
+    cancellation_decision, BalanceProjection, BroadcastExposure, CancellationDecision, DomainError,
     LocalTransactionIntent, MiningPreferences, Network, NetworkIdentity, NodeConfiguration,
     OutputRecord, OutputState, PrivateScriptlessFundingContext, PrivateScriptlessPayoutContext,
     PrivateTransactionContext, RecoveryMetadata, RecoveryOutputClass, RedactedNodeConfiguration,
     ScriptlessFundingReservation, ScriptlessFundingReservationState, ScriptlessPayoutReservation,
     ScriptlessPayoutReservationState, ScriptlessPayoutRoleV1,
-    ScriptlessTemplateParticipantBindingV1, SeedRestoreStatus, SyncStatus,
-    TransactionCancellationReason, TransactionLifecycle, TransactionRole,
-    TransactionTransitionEvidence, WalletState, RECOVERY_SCHEME_BIP39_256_V1,
+    ScriptlessTemplateParticipantBindingV1, SeedRestoreStatus, SwapSessionRecord, SwapSessionState,
+    SwapSessionTransition, SyncStatus, TransactionCancellationReason, TransactionLifecycle,
+    TransactionRole, TransactionTransitionEvidence, WalletState, RECOVERY_SCHEME_BIP39_256_V1,
     SCRIPTLESS_FUNDING_RESERVATION_VERSION, SCRIPTLESS_PARTICIPANT_COUNT_V1,
     SCRIPTLESS_PAYOUT_RESERVATION_VERSION,
 };
@@ -730,6 +730,146 @@ impl WalletService {
         let mut bytes = Zeroizing::new([0u8; 64]);
         bytes.copy_from_slice(bip39.seed_bytes());
         Ok(bytes)
+    }
+
+    /// Every durable swap session, terminal ones included (the receipt view).
+    pub fn swap_sessions(&self) -> Result<Vec<SwapSessionRecord>, CoreError> {
+        Ok(self
+            .unlocked
+            .as_ref()
+            .ok_or(CoreError::Locked)?
+            .swap_sessions
+            .clone())
+    }
+
+    /// The resume set: every session not yet terminal.
+    pub fn swap_open_sessions(&self) -> Result<Vec<SwapSessionRecord>, CoreError> {
+        Ok(self
+            .unlocked
+            .as_ref()
+            .ok_or(CoreError::Locked)?
+            .swap_sessions
+            .iter()
+            .filter(|session| session.is_open())
+            .cloned()
+            .collect())
+    }
+
+    /// One durable session by id.
+    pub fn swap_session(&self, id: Uuid) -> Result<SwapSessionRecord, CoreError> {
+        self.unlocked
+            .as_ref()
+            .ok_or(CoreError::Locked)?
+            .swap_sessions
+            .iter()
+            .find(|session| session.id == id)
+            .cloned()
+            .ok_or(CoreError::Domain(DomainError::SwapSessionNotFound))
+    }
+
+    /// Persist a new intent draft. Persist-before-act: the draft is committed
+    /// to the encrypted store before any attempt to publish it, so a crash or
+    /// an absent daemon can never lose the user's intent.
+    pub fn swap_session_create_draft(
+        &mut self,
+        mut record: SwapSessionRecord,
+    ) -> Result<SwapSessionRecord, CoreError> {
+        record.state = SwapSessionState::IntentDraft;
+        if record.state_history.is_empty() {
+            record.state_history.push(SwapSessionTransition {
+                state: SwapSessionState::IntentDraft,
+                at_unix: record.created_unix,
+            });
+        }
+        record.validate()?;
+        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        if state
+            .swap_sessions
+            .iter()
+            .any(|session| session.id == record.id)
+        {
+            return Err(CoreError::Domain(DomainError::InvalidState));
+        }
+        state.swap_sessions.push(record.clone());
+        self.commit(state)?;
+        Ok(record)
+    }
+
+    /// Apply one forward lifecycle transition and commit it before returning.
+    /// Illegal transitions are refused by the domain map.
+    pub fn swap_session_transition(
+        &mut self,
+        id: Uuid,
+        next: SwapSessionState,
+        now_unix: u64,
+    ) -> Result<SwapSessionRecord, CoreError> {
+        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        let session = state
+            .swap_sessions
+            .iter_mut()
+            .find(|session| session.id == id)
+            .ok_or(CoreError::Domain(DomainError::SwapSessionNotFound))?;
+        session.transition(next, now_unix)?;
+        let updated = session.clone();
+        self.commit(state)?;
+        Ok(updated)
+    }
+
+    /// Record the last honest failure on a session, durably, without moving
+    /// its lifecycle. The message is truncated to the bounded field size.
+    pub fn swap_session_note_error(
+        &mut self,
+        id: Uuid,
+        error: &str,
+        now_unix: u64,
+    ) -> Result<SwapSessionRecord, CoreError> {
+        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        let session = state
+            .swap_sessions
+            .iter_mut()
+            .find(|session| session.id == id)
+            .ok_or(CoreError::Domain(DomainError::SwapSessionNotFound))?;
+        let mut message = error.to_owned();
+        message.truncate(256);
+        session.last_error = Some(message);
+        session.updated_unix = now_unix;
+        let updated = session.clone();
+        self.commit(state)?;
+        Ok(updated)
+    }
+
+    /// Free cancellation while nothing is locked on any chain (adjudicated
+    /// decision 2). Once funds are locked the domain map refuses this and the
+    /// refund ladder is the only exit.
+    pub fn swap_session_cancel_free(
+        &mut self,
+        id: Uuid,
+        now_unix: u64,
+    ) -> Result<SwapSessionRecord, CoreError> {
+        self.swap_session_transition(id, SwapSessionState::SafelyAborted, now_unix)
+    }
+
+    /// Decide whether a manual refund broadcast is permitted right now.
+    /// Read-only: broadcasting itself is the daemon channel's act.
+    pub fn swap_manual_refund_gate(
+        &self,
+        id: Uuid,
+        now_unix: u64,
+    ) -> Result<SwapRefundGate, CoreError> {
+        let session = self.swap_session(id)?;
+        if session.state.is_terminal() {
+            return Ok(SwapRefundGate::AlreadyTerminal);
+        }
+        if session.state.free_cancellation() {
+            return Ok(SwapRefundGate::NothingLocked);
+        }
+        Ok(match session.refund_unlock_unix {
+            None => SwapRefundGate::RefundUnknown,
+            Some(unlock_unix) if now_unix < unlock_unix => {
+                SwapRefundGate::NotYetUnlocked { unlock_unix }
+            }
+            Some(_) => SwapRefundGate::Broadcastable,
+        })
     }
 
     pub fn embedded_peer_status(&self) -> Result<EmbeddedPeerStatus, CoreError> {
@@ -4457,6 +4597,22 @@ fn application_state_name(state: &ApplicationState) -> &'static str {
     }
 }
 
+/// Whether a manual refund broadcast is permitted for a swap session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwapRefundGate {
+    /// Nothing is locked: free cancellation applies, not a refund.
+    NothingLocked,
+    /// The session already ended; there is nothing to refund.
+    AlreadyTerminal,
+    /// Funds are locked and the refund path matures later.
+    NotYetUnlocked { unlock_unix: u64 },
+    /// Funds are locked but no refund maturity is recorded; only the daemon
+    /// channel can recompute it, so the wallet fails closed.
+    RefundUnknown,
+    /// The refund timelock has matured; broadcasting is permitted.
+    Broadcastable,
+}
+
 #[derive(Debug, Error)]
 pub enum CoreError {
     #[error("wallet is not open")]
@@ -4653,6 +4809,8 @@ impl CoreError {
             Self::Storage(StorageError::InvalidMetadata) => "WALLET_METADATA_CORRUPT",
             Self::Storage(StorageError::NotFound) => "WALLET_NOT_FOUND",
             Self::Storage(_) => "WALLET_STORAGE_FAILED",
+            Self::Domain(DomainError::SwapSessionNotFound) => "SWAP_SESSION_NOT_FOUND",
+            Self::Domain(DomainError::InvalidSwapTransition) => "SWAP_TRANSITION_INVALID",
             Self::Domain(_) => "WALLET_STATE_VALIDATION_FAILED",
             Self::Backend(_) => "EMBEDDED_NODE_OPERATION_FAILED",
             Self::Protocol(_) => "PROTOCOL_VALIDATION_FAILED",
@@ -6016,5 +6174,152 @@ mod tests {
             .unwrap();
         assert!(service.embedded_core_identity().is_ok());
         service.stop_embedded_core().unwrap();
+    }
+
+    fn draft_swap_record() -> SwapSessionRecord {
+        SwapSessionRecord {
+            id: Uuid::new_v4(),
+            created_unix: 100,
+            updated_unix: 100,
+            from_asset: "BTC".into(),
+            to_asset: "DOM".into(),
+            amount_base_units: 250_000,
+            minimum_output_base_units: 240_000,
+            fee_payment_asset: "DOM".into(),
+            fee_bps: 50,
+            state: SwapSessionState::IntentDraft,
+            state_history: Vec::new(),
+            last_error: None,
+            quote: None,
+            deposit: None,
+            refund_unlock_unix: None,
+            user_leg_funding_txid: None,
+            solver_leg_funding_txid: None,
+            claim_txid: None,
+            cancel_txid: None,
+            refund_txid: None,
+        }
+    }
+
+    #[test]
+    fn swap_draft_is_durable_before_any_publish_attempt_and_survives_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let wallet_path = temp.path().join("wallet");
+        let password = "password-1";
+        let mut service = test_service();
+        service
+            .create_recoverable(&wallet_path, password, backup_identity())
+            .unwrap();
+        service.recovery_phrase_confirmed(password).unwrap();
+        service.unlock(password).unwrap();
+
+        let draft = service
+            .swap_session_create_draft(draft_swap_record())
+            .unwrap();
+        let noted = service
+            .swap_session_note_error(draft.id, "the interop daemon is not connected", 101)
+            .unwrap();
+        assert_eq!(noted.state, SwapSessionState::IntentDraft);
+
+        // Process death right after the failed publish attempt: the draft and
+        // its honest error must already be durable (persist-before-act).
+        drop(service);
+        let mut restarted = test_service();
+        restarted.open(&wallet_path).unwrap();
+        restarted.unlock(password).unwrap();
+        let open_sessions = restarted.swap_open_sessions().unwrap();
+        assert_eq!(open_sessions.len(), 1);
+        assert_eq!(open_sessions[0].id, draft.id);
+        assert_eq!(open_sessions[0].state, SwapSessionState::IntentDraft);
+        assert_eq!(
+            open_sessions[0].last_error.as_deref(),
+            Some("the interop daemon is not connected")
+        );
+
+        // Free cancellation is durable too, and the resume set empties.
+        restarted.swap_session_cancel_free(draft.id, 102).unwrap();
+        drop(restarted);
+        let mut reopened = test_service();
+        reopened.open(&wallet_path).unwrap();
+        reopened.unlock(password).unwrap();
+        assert!(reopened.swap_open_sessions().unwrap().is_empty());
+        let all = reopened.swap_sessions().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].state, SwapSessionState::SafelyAborted);
+    }
+
+    #[test]
+    fn swap_transitions_are_committed_and_illegal_ones_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut service = test_service();
+        service
+            .create_recoverable(temp.path().join("wallet"), "password-1", backup_identity())
+            .unwrap();
+        service.recovery_phrase_confirmed("password-1").unwrap();
+        service.unlock("password-1").unwrap();
+        let draft = service
+            .swap_session_create_draft(draft_swap_record())
+            .unwrap();
+        service
+            .swap_session_transition(draft.id, SwapSessionState::IntentPublished, 101)
+            .unwrap();
+        assert!(matches!(
+            service.swap_session_transition(draft.id, SwapSessionState::Settled, 102),
+            Err(CoreError::Domain(DomainError::InvalidSwapTransition))
+        ));
+        assert!(matches!(
+            service.swap_session_transition(Uuid::new_v4(), SwapSessionState::QuoteAccepted, 103),
+            Err(CoreError::Domain(DomainError::SwapSessionNotFound))
+        ));
+    }
+
+    #[test]
+    fn swap_manual_refund_gate_is_time_and_state_aware() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut service = test_service();
+        service
+            .create_recoverable(temp.path().join("wallet"), "password-1", backup_identity())
+            .unwrap();
+        service.recovery_phrase_confirmed("password-1").unwrap();
+        service.unlock("password-1").unwrap();
+        let draft = service
+            .swap_session_create_draft(draft_swap_record())
+            .unwrap();
+        assert_eq!(
+            service.swap_manual_refund_gate(draft.id, 200).unwrap(),
+            SwapRefundGate::NothingLocked
+        );
+
+        // Walk to a funds-locked state with a recorded refund maturity.
+        for next in [
+            SwapSessionState::IntentPublished,
+            SwapSessionState::QuoteAccepted,
+            SwapSessionState::RefundsArmed,
+            SwapSessionState::UserFunding,
+        ] {
+            service
+                .swap_session_transition(draft.id, next, 201)
+                .unwrap();
+        }
+        assert_eq!(
+            service.swap_manual_refund_gate(draft.id, 300).unwrap(),
+            SwapRefundGate::RefundUnknown
+        );
+        let mut state = service.unlocked.as_ref().unwrap().clone();
+        state
+            .swap_sessions
+            .iter_mut()
+            .find(|session| session.id == draft.id)
+            .unwrap()
+            .refund_unlock_unix = Some(500);
+        service.commit(state).unwrap();
+        assert_eq!(
+            service.swap_manual_refund_gate(draft.id, 300).unwrap(),
+            SwapRefundGate::NotYetUnlocked { unlock_unix: 500 }
+        );
+        assert_eq!(
+            service.swap_manual_refund_gate(draft.id, 501).unwrap(),
+            SwapRefundGate::Broadcastable
+        );
     }
 }

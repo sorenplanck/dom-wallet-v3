@@ -1219,6 +1219,10 @@ pub struct WalletState {
     /// Non-secret local CPU mining preferences. Runtime mining state is never persisted.
     #[serde(default)]
     pub mining_preferences: MiningPreferences,
+    /// Durable swap sessions. Persist-before-act: a session state only exists
+    /// once committed here, which is what makes every swap resumable.
+    #[serde(default)]
+    pub swap_sessions: Vec<SwapSessionRecord>,
     #[serde(with = "serde_bytes_32")]
     pub root_material: [u8; 32],
 }
@@ -1229,6 +1233,249 @@ pub struct MiningPreferences {
     pub enabled: bool,
     /// Zero means not selected yet; the desktop maps it to its recommended count.
     pub cpu_threads: usize,
+}
+
+/// Bounded number of durable swap sessions retained in encrypted state.
+pub const MAX_SWAP_SESSIONS: usize = 256;
+
+/// Durable swap-session lifecycle.
+///
+/// The progression mirrors the execution screen of docs/SWAP_TAB_DESIGN.md
+/// and the resumable-swap discipline proven by production atomic-swap
+/// implementations: every state is committed to the encrypted store before
+/// the action it authorizes is taken, so closing the application mid-swap is
+/// a supported case, not an accident. States never move backward; the three
+/// terminals are final.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SwapSessionState {
+    /// Durable local draft. Nothing left this machine; cancellation is free.
+    IntentDraft,
+    /// The intent reached the relay. Still nothing locked on any chain.
+    IntentPublished,
+    /// One quote was accepted and the terms are frozen. Nothing broadcast.
+    QuoteAccepted,
+    /// Refund transactions are signed, validated and persisted (design I5).
+    /// From here on the worst case is a delay, never a loss.
+    RefundsArmed,
+    /// Waiting for the user's leg deposit to appear and confirm.
+    UserFunding,
+    /// The user's leg is funded to the required confirmation depth.
+    UserFunded,
+    /// The solver's leg is funded and verified.
+    SolverFunded,
+    /// Revealing the secret and claiming the destination leg.
+    Claiming,
+    /// Terminal: both legs settled.
+    Settled,
+    /// The cancel timelock matured before settlement completed.
+    CancelTimelockExpired,
+    /// The cancel transaction is published; the refund follows.
+    CancelPublished,
+    /// Terminal: the user's leg returned home.
+    Refunded,
+    /// Terminal: abandoned while nothing was locked on any chain.
+    SafelyAborted,
+}
+
+impl SwapSessionState {
+    /// Terminal states never transition again.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Settled | Self::Refunded | Self::SafelyAborted)
+    }
+
+    /// States from which abandoning the session loses nothing, because no
+    /// chain holds a lock yet (docs/SWAP_TAB_DESIGN.md, adjudicated
+    /// decision 2: cancellation is free before anything is locked).
+    pub fn free_cancellation(self) -> bool {
+        matches!(
+            self,
+            Self::IntentDraft | Self::IntentPublished | Self::QuoteAccepted | Self::RefundsArmed
+        )
+    }
+
+    /// Forward-only transition legality. The map is the design's execution
+    /// screen plus the failure ladder; anything not listed is refused.
+    pub fn may_transition_to(self, next: Self) -> bool {
+        use SwapSessionState::*;
+        if self.is_terminal() {
+            return false;
+        }
+        matches!(
+            (self, next),
+            (IntentDraft, IntentPublished)
+                | (IntentPublished, QuoteAccepted)
+                | (QuoteAccepted, RefundsArmed)
+                | (RefundsArmed, UserFunding)
+                | (UserFunding, UserFunded)
+                | (UserFunded, SolverFunded)
+                | (SolverFunded, Claiming)
+                | (Claiming, Settled)
+                | (UserFunding, CancelTimelockExpired)
+                | (UserFunded, CancelTimelockExpired)
+                | (SolverFunded, CancelTimelockExpired)
+                | (Claiming, CancelTimelockExpired)
+                | (CancelTimelockExpired, CancelPublished)
+                | (CancelPublished, Refunded)
+        ) || (self.free_cancellation() && next == SafelyAborted)
+    }
+}
+
+/// One recorded lifecycle transition, for the raw details panel.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwapSessionTransition {
+    pub state: SwapSessionState,
+    pub at_unix: u64,
+}
+
+/// The deposit the user must make on their external leg, with the bounds the
+/// accepted quote declared and the watch progress last observed. Confirmation
+/// counts are chain observations relayed by the interop daemon; the wallet
+/// never fabricates them.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwapDepositWatch {
+    /// Deposit address on the user's leg, derived from the wallet's own seed.
+    pub address: String,
+    /// Quoted minimum, in the leg asset's base units.
+    pub minimum_base_units: u64,
+    /// Quoted maximum, in the leg asset's base units.
+    pub maximum_base_units: u64,
+    /// Confirmations required by the destination chain profile's finality.
+    pub required_confirmations: u64,
+    /// Confirmations last observed for the deposit transaction.
+    #[serde(default)]
+    pub observed_confirmations: u64,
+    /// Deposit amount last observed, in the leg asset's base units.
+    #[serde(default)]
+    pub observed_base_units: u64,
+    /// The observed deposit does not cover the minimum once network fees are
+    /// accounted for; the watcher keeps waiting for a top-up.
+    #[serde(default)]
+    pub insufficient_after_fees: bool,
+}
+
+/// The quote the user accepted, kept for the receipt and the deposit bounds.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwapAcceptedQuote {
+    /// Curated solver label. Never an endpoint or key.
+    pub solver_label: String,
+    /// Quoted output, in the destination asset's base units.
+    pub output_base_units: u64,
+    /// Quoted fee, in the destination asset's base units.
+    pub quote_fee_base_units: u64,
+    /// Settlement estimate derived from the destination profile's finality.
+    pub estimated_seconds: u64,
+}
+
+/// One durable swap session. Persisted inside the encrypted wallet state so
+/// a session survives crash, restart and reinstall-from-backup, and so
+/// enumeration of open sessions is exactly a read of committed state.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwapSessionRecord {
+    pub id: Uuid,
+    pub created_unix: u64,
+    pub updated_unix: u64,
+    /// Route assets as (ticker, network-qualified when external) strings.
+    pub from_asset: String,
+    pub to_asset: String,
+    /// Intent amount in the source asset's base units.
+    pub amount_base_units: u64,
+    /// The user's protection floor in the destination asset's base units.
+    pub minimum_output_base_units: u64,
+    /// Asset chosen to pay the DOM-denominated protocol fee.
+    pub fee_payment_asset: String,
+    /// Ratified fee tier applied to this route.
+    pub fee_bps: u64,
+    pub state: SwapSessionState,
+    /// Every transition with its timestamp, oldest first.
+    #[serde(default)]
+    pub state_history: Vec<SwapSessionTransition>,
+    /// Last honest failure shown to the user. Redacted, never phrase or key.
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub quote: Option<SwapAcceptedQuote>,
+    #[serde(default)]
+    pub deposit: Option<SwapDepositWatch>,
+    /// When the user's refund path unlocks, once refunds are armed.
+    #[serde(default)]
+    pub refund_unlock_unix: Option<u64>,
+    #[serde(default)]
+    pub user_leg_funding_txid: Option<String>,
+    #[serde(default)]
+    pub solver_leg_funding_txid: Option<String>,
+    #[serde(default)]
+    pub claim_txid: Option<String>,
+    #[serde(default)]
+    pub cancel_txid: Option<String>,
+    #[serde(default)]
+    pub refund_txid: Option<String>,
+}
+
+impl SwapSessionRecord {
+    /// Open sessions are the resume set: everything not terminal.
+    pub fn is_open(&self) -> bool {
+        !self.state.is_terminal()
+    }
+
+    /// Apply one forward transition, recording it in the history. Illegal
+    /// transitions are refused so a bug cannot resurrect a settled session.
+    pub fn transition(&mut self, next: SwapSessionState, now_unix: u64) -> Result<(), DomainError> {
+        if !self.state.may_transition_to(next) {
+            return Err(DomainError::InvalidSwapTransition);
+        }
+        self.state = next;
+        self.updated_unix = now_unix;
+        self.state_history.push(SwapSessionTransition {
+            state: next,
+            at_unix: now_unix,
+        });
+        Ok(())
+    }
+
+    /// Bounded-field validation, called from the wallet state validator.
+    pub fn validate(&self) -> Result<(), DomainError> {
+        let bounded = |value: &str, limit: usize| !value.is_empty() && value.len() <= limit;
+        if !bounded(&self.from_asset, 32)
+            || !bounded(&self.to_asset, 32)
+            || !bounded(&self.fee_payment_asset, 32)
+            || self.state_history.len() > 64
+            || self.last_error.as_deref().is_some_and(|e| e.len() > 256)
+        {
+            return Err(DomainError::InvalidState);
+        }
+        if let Some(deposit) = &self.deposit {
+            if !bounded(&deposit.address, 128)
+                || deposit.minimum_base_units > deposit.maximum_base_units
+            {
+                return Err(DomainError::InvalidState);
+            }
+        }
+        if let Some(quote) = &self.quote {
+            if !bounded(&quote.solver_label, 64) {
+                return Err(DomainError::InvalidState);
+            }
+        }
+        for txid in [
+            &self.user_leg_funding_txid,
+            &self.solver_leg_funding_txid,
+            &self.claim_txid,
+            &self.cancel_txid,
+            &self.refund_txid,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !bounded(txid, 128) {
+                return Err(DomainError::InvalidState);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl WalletState {
@@ -1273,6 +1520,7 @@ impl WalletState {
             recovery_scanned_outputs: 0,
             node_configuration,
             mining_preferences: MiningPreferences::default(),
+            swap_sessions: Vec::new(),
             root_material,
         }
     }
@@ -1322,6 +1570,12 @@ impl WalletState {
         }
         self.validate_scriptless_funding_reservations()?;
         self.validate_scriptless_payout_reservations()?;
+        if self.swap_sessions.len() > MAX_SWAP_SESSIONS {
+            return Err(DomainError::InvalidState);
+        }
+        for session in &self.swap_sessions {
+            session.validate()?;
+        }
         if let Some(plan) = &self.rescan_plan {
             if plan.wallet_id != self.wallet_id
                 || plan.identity != self.identity
@@ -2628,6 +2882,10 @@ pub enum DomainError {
     AllocationOverflow,
     #[error("generation overflow")]
     GenerationOverflow,
+    #[error("swap session transition is not permitted")]
+    InvalidSwapTransition,
+    #[error("swap session was not found")]
+    SwapSessionNotFound,
     #[error("non-reuse floor regressed")]
     NonReuseFloorRegression,
     #[error("invalid local transaction intent")]
@@ -3382,5 +3640,123 @@ mod tests {
             reserved_by: None,
         });
         assert_eq!(state.balance(), BalanceProjection::default());
+    }
+
+    fn swap_record(state: SwapSessionState) -> SwapSessionRecord {
+        SwapSessionRecord {
+            id: Uuid::new_v4(),
+            created_unix: 1,
+            updated_unix: 1,
+            from_asset: "BTC".into(),
+            to_asset: "DOM".into(),
+            amount_base_units: 100_000,
+            minimum_output_base_units: 90_000,
+            fee_payment_asset: "DOM".into(),
+            fee_bps: 50,
+            state,
+            state_history: Vec::new(),
+            last_error: None,
+            quote: None,
+            deposit: None,
+            refund_unlock_unix: None,
+            user_leg_funding_txid: None,
+            solver_leg_funding_txid: None,
+            claim_txid: None,
+            cancel_txid: None,
+            refund_txid: None,
+        }
+    }
+
+    #[test]
+    fn swap_session_walks_the_settlement_ladder_and_records_history() {
+        use SwapSessionState::*;
+        let mut record = swap_record(IntentDraft);
+        for (step, next) in [
+            IntentPublished,
+            QuoteAccepted,
+            RefundsArmed,
+            UserFunding,
+            UserFunded,
+            SolverFunded,
+            Claiming,
+            Settled,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            record.transition(next, 10 + step as u64).unwrap();
+        }
+        assert_eq!(record.state, Settled);
+        assert_eq!(record.state_history.len(), 8);
+        assert_eq!(record.state_history.last().unwrap().state, Settled);
+        assert!(!record.is_open());
+        assert_eq!(
+            record.transition(Refunded, 99),
+            Err(DomainError::InvalidSwapTransition)
+        );
+    }
+
+    #[test]
+    fn swap_session_failure_ladder_reaches_refunded_only_forward() {
+        use SwapSessionState::*;
+        let mut record = swap_record(UserFunding);
+        record.transition(CancelTimelockExpired, 2).unwrap();
+        record.transition(CancelPublished, 3).unwrap();
+        record.transition(Refunded, 4).unwrap();
+        assert!(!record.is_open());
+        // A settled or refunded session can never be resurrected.
+        for next in [IntentDraft, UserFunding, Settled, SafelyAborted] {
+            assert_eq!(
+                record.transition(next, 5),
+                Err(DomainError::InvalidSwapTransition)
+            );
+        }
+    }
+
+    #[test]
+    fn swap_free_cancellation_covers_exactly_the_nothing_locked_states() {
+        use SwapSessionState::*;
+        for state in [IntentDraft, IntentPublished, QuoteAccepted, RefundsArmed] {
+            let mut record = swap_record(state);
+            record.transition(SafelyAborted, 2).unwrap();
+        }
+        for state in [UserFunding, UserFunded, SolverFunded, Claiming] {
+            let mut record = swap_record(state);
+            assert_eq!(
+                record.transition(SafelyAborted, 2),
+                Err(DomainError::InvalidSwapTransition),
+                "{state:?} must not abort freely once a chain holds a lock"
+            );
+        }
+    }
+
+    #[test]
+    fn swap_sessions_are_bounded_and_validated_in_state() {
+        let mut state = WalletState::new(
+            identity(),
+            [6; 32],
+            crate::NodeConfiguration {
+                endpoint_url: "https://example.invalid/dom-rpc".into(),
+                expected_identity: identity(),
+                source_identity: "configured-dom-node".into(),
+                api_compatibility_version: 1,
+                connect_timeout_ms: 5_000,
+                request_timeout_ms: 10_000,
+                poll_interval_ms: 5_000,
+                retry_ceiling: 6,
+                max_backoff_ms: 60_000,
+                stable_success_threshold: 3,
+                tls_required: true,
+                credential_reference: None,
+            },
+        );
+        state
+            .swap_sessions
+            .push(swap_record(SwapSessionState::IntentDraft));
+        state.validate().unwrap();
+        let mut oversized = swap_record(SwapSessionState::IntentDraft);
+        oversized.last_error = Some("x".repeat(300));
+        state.swap_sessions.push(oversized);
+        assert_eq!(state.validate(), Err(DomainError::InvalidState));
     }
 }
