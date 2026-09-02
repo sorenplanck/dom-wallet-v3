@@ -586,6 +586,8 @@ byId("swap-addresses-refresh").addEventListener("click", async () => {
     if (!value) return;
     byId("swap-btc-address").textContent = value.bitcoin_address;
     byId("swap-evm-address").textContent = value.evm_address;
+    byId("swap-sol-address").textContent = value.solana_address;
+    byId("swap-xmr-address").textContent = value.monero_address;
   } catch (error) { show(redactedError(error), true); }
 });
 byId("swap-intent-form").addEventListener("submit", async (event) => {
@@ -638,7 +640,7 @@ byId("swap-session-details").addEventListener("click", async () => {
 // Display-once recovery hatch: rendered on explicit demand, cleared on hide,
 // never logged, never persisted by the frontend.
 byId("swap-export-keys").addEventListener("click", async () => {
-  if (!window.confirm("Export the private keys of your Bitcoin and EVM swap legs? Anyone who sees them can take the funds on those chains. They will be shown once, on screen only.")) return;
+  if (!window.confirm("Export the private keys of your Bitcoin, EVM, Solana and Monero swap legs? Anyone who sees them can take the funds on those chains. They will be shown once, on screen only.")) return;
   try {
     const keys = await run(() => invoke("swap_leg_keys_export", { acknowledged: true }));
     if (!keys) return;
@@ -649,6 +651,11 @@ byId("swap-export-keys").addEventListener("click", async () => {
       ["Bitcoin secret (hex)", keys.bitcoin_secret_hex],
       [`EVM ${keys.evm_derivation_path}`, keys.evm_address],
       ["EVM secret (hex)", keys.evm_secret_hex],
+      [`Solana ${keys.solana_derivation_path}`, keys.solana_address],
+      ["Solana secret (hex)", keys.solana_secret_hex],
+      [`Monero ${keys.monero_derivation_path}`, keys.monero_address],
+      ["Monero spend secret (hex)", keys.monero_spend_secret_hex],
+      ["Monero view secret (hex)", keys.monero_view_secret_hex],
     ].map(([label, value]) => {
       const row = document.createElement("div");
       const name = document.createElement("span"); name.textContent = label;

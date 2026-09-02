@@ -98,3 +98,25 @@ test("the recovery hatch is display-once, acknowledged and never logged", async 
   assert.equal(exportBlock.includes("console.log"), false, "keys must never reach the console");
   assert.equal(js.includes("replaceChildren()"), true, "hiding the keys must clear the DOM");
 });
+
+test("all four external legs are first-class: BTC, EVM, XMR and SOL", async () => {
+  const html = await source("index.html");
+  // The intent selects offer every leg family plus the DOM itself.
+  for (const asset of ["DOM", "BTC", "USDT", "XMR", "SOL"]) {
+    assert.equal(html.includes(`<option value="${asset}">`), true, `missing ${asset} option`);
+  }
+  // Leg addresses state every derivation path and render every chain.
+  for (const path of ["m/86'/0'", "m/44'/60'", "m/44'/501'", "m/44'/128'"]) {
+    assert.equal(html.includes(path), true, `the ${path} path is stated to the user`);
+  }
+  for (const id of ["swap-btc-address", "swap-evm-address", "swap-sol-address", "swap-xmr-address"]) {
+    assert.equal(html.includes(`id="${id}"`), true, `missing leg address element ${id}`);
+  }
+  const js = await source("main.js");
+  assert.equal(js.includes("solana_address"), true, "the Solana address must be rendered");
+  assert.equal(js.includes("monero_address"), true, "the Monero address must be rendered");
+  // The recovery hatch covers all four legs, Monero with both secrets.
+  for (const field of ["solana_secret_hex", "monero_spend_secret_hex", "monero_view_secret_hex"]) {
+    assert.equal(js.includes(field), true, `hatch must render ${field}`);
+  }
+});

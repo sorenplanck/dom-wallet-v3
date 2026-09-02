@@ -1617,8 +1617,11 @@ dependencies = [
 name = "dom-wallet-multichain"
 version = "0.3.2"
 dependencies = [
+ "bs58",
+ "curve25519-dalek",
  "dom-wallet-keys",
  "hex",
+ "hmac",
  "secp256k1 0.28.2",
  "sha2",
  "sha3",

@@ -1100,8 +1100,12 @@ pub mod swap {
     /// two-leg route. The tier rule needs only the DOM-or-external
     /// distinction, so it stays correct when the curated registry brings
     /// per-network identities (docs/SWAP_TAB_DESIGN.md).
+    ///
+    /// The ratified external set is the wallet's four leg families: BTC,
+    /// the EVM leg (USDT), XMR and SOL — each backed by a seed-derived key
+    /// in `dom-wallet-multichain`, never by a custodial account.
     pub fn external_legs(from_asset: &str, to_asset: &str) -> Option<u64> {
-        let valid = |asset: &str| matches!(asset, "DOM" | "BTC" | "USDT");
+        let valid = |asset: &str| matches!(asset, "DOM" | "BTC" | "USDT" | "XMR" | "SOL");
         if !valid(from_asset) || !valid(to_asset) {
             return None;
         }
@@ -1222,6 +1226,10 @@ pub struct SwapLegAddressesDto {
     pub evm_derivation_path: String,
     pub bitcoin_address: String,
     pub bitcoin_derivation_path: String,
+    pub solana_address: String,
+    pub solana_derivation_path: String,
+    pub monero_address: String,
+    pub monero_derivation_path: String,
 }
 
 /// The fee minute for one intended swap amount, before any quote exists.
@@ -1296,6 +1304,13 @@ pub struct SwapLegKeysDto {
     pub evm_address: String,
     pub evm_derivation_path: String,
     pub evm_secret_hex: Zeroizing<String>,
+    pub solana_address: String,
+    pub solana_derivation_path: String,
+    pub solana_secret_hex: Zeroizing<String>,
+    pub monero_address: String,
+    pub monero_derivation_path: String,
+    pub monero_spend_secret_hex: Zeroizing<String>,
+    pub monero_view_secret_hex: Zeroizing<String>,
     pub warning: &'static str,
 }
 
@@ -1316,13 +1331,26 @@ impl Serialize for SwapLegKeysDto {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("SwapLegKeysDto", 7)?;
+        let mut state = serializer.serialize_struct("SwapLegKeysDto", 14)?;
         state.serialize_field("bitcoin_address", &self.bitcoin_address)?;
         state.serialize_field("bitcoin_derivation_path", &self.bitcoin_derivation_path)?;
         state.serialize_field("bitcoin_secret_hex", self.bitcoin_secret_hex.as_str())?;
         state.serialize_field("evm_address", &self.evm_address)?;
         state.serialize_field("evm_derivation_path", &self.evm_derivation_path)?;
         state.serialize_field("evm_secret_hex", self.evm_secret_hex.as_str())?;
+        state.serialize_field("solana_address", &self.solana_address)?;
+        state.serialize_field("solana_derivation_path", &self.solana_derivation_path)?;
+        state.serialize_field("solana_secret_hex", self.solana_secret_hex.as_str())?;
+        state.serialize_field("monero_address", &self.monero_address)?;
+        state.serialize_field("monero_derivation_path", &self.monero_derivation_path)?;
+        state.serialize_field(
+            "monero_spend_secret_hex",
+            self.monero_spend_secret_hex.as_str(),
+        )?;
+        state.serialize_field(
+            "monero_view_secret_hex",
+            self.monero_view_secret_hex.as_str(),
+        )?;
         state.serialize_field("warning", self.warning)?;
         state.end()
     }
@@ -3327,8 +3355,9 @@ impl DesktopApplication {
         self.clear_qr_buffers()
     }
 
-    /// Level-1 swap-leg addresses (design premise 1): taproot at m/86'/0'
-    /// and EVM at m/44'/60', derived on demand from the wallet's own seed.
+    /// Level-1 swap-leg addresses (design premise 1): taproot at m/86'/0',
+    /// EVM at m/44'/60', Solana at m/44'/501' and Monero at m/44'/128',
+    /// derived on demand from the wallet's own seed.
     pub fn swap_leg_addresses(&self) -> Result<SwapLegAddressesDto, CommandError> {
         self.ensure_running()?;
         let seed = self
@@ -3343,11 +3372,21 @@ impl DesktopApplication {
         let bitcoin = root
             .taproot_account(dom_wallet_multichain::BitcoinNetwork::Mainnet, 0)
             .map_err(|_| CommandError::Unavailable)?;
+        let solana = root
+            .solana_account(0)
+            .map_err(|_| CommandError::Unavailable)?;
+        let monero = root
+            .monero_account(0)
+            .map_err(|_| CommandError::Unavailable)?;
         Ok(SwapLegAddressesDto {
             evm_address: evm.address(),
             evm_derivation_path: "m/44'/60'/0'/0/0".into(),
             bitcoin_address: bitcoin.address().to_owned(),
             bitcoin_derivation_path: "m/86'/0'/0'/0/0".into(),
+            solana_address: solana.address(),
+            solana_derivation_path: "m/44'/501'/0'/0'".into(),
+            monero_address: monero.address(),
+            monero_derivation_path: "m/44'/128'/0'".into(),
         })
     }
 
@@ -3622,6 +3661,12 @@ impl DesktopApplication {
         let bitcoin = root
             .taproot_account(dom_wallet_multichain::BitcoinNetwork::Mainnet, 0)
             .map_err(|_| CommandError::Unavailable)?;
+        let solana = root
+            .solana_account(0)
+            .map_err(|_| CommandError::Unavailable)?;
+        let monero = root
+            .monero_account(0)
+            .map_err(|_| CommandError::Unavailable)?;
         Ok(SwapLegKeysDto {
             bitcoin_address: bitcoin.address().to_owned(),
             bitcoin_derivation_path: "m/86'/0'/0'/0/0".into(),
@@ -3629,6 +3674,13 @@ impl DesktopApplication {
             evm_address: evm.address(),
             evm_derivation_path: "m/44'/60'/0'/0/0".into(),
             evm_secret_hex: Zeroizing::new(hex::encode(evm.secret_bytes())),
+            solana_address: solana.address(),
+            solana_derivation_path: "m/44'/501'/0'/0'".into(),
+            solana_secret_hex: Zeroizing::new(hex::encode(solana.secret_bytes())),
+            monero_address: monero.address(),
+            monero_derivation_path: "m/44'/128'/0'".into(),
+            monero_spend_secret_hex: Zeroizing::new(hex::encode(monero.spend_secret_bytes())),
+            monero_view_secret_hex: Zeroizing::new(hex::encode(monero.view_secret_bytes())),
             warning: "These secrets control real funds on external chains. Anyone who sees \
                       them can take those funds. Import them only into a tool you trust, \
                       then treat them as compromised.",
@@ -6793,6 +6845,10 @@ mod swap_tests {
             ("BTC", "DOM"),
             ("DOM", "USDT"),
             ("USDT", "DOM"),
+            ("DOM", "XMR"),
+            ("XMR", "DOM"),
+            ("DOM", "SOL"),
+            ("SOL", "DOM"),
         ] {
             assert_eq!(swap::external_legs(from, to), Some(1), "{from}->{to}");
             assert_eq!(
@@ -6812,6 +6868,12 @@ mod swap_tests {
             ("USDT", "BTC"),
             ("BTC", "BTC"),
             ("USDT", "USDT"),
+            ("XMR", "BTC"),
+            ("BTC", "XMR"),
+            ("SOL", "USDT"),
+            ("XMR", "SOL"),
+            ("XMR", "XMR"),
+            ("SOL", "SOL"),
         ] {
             assert_eq!(swap::external_legs(from, to), Some(2), "{from}->{to}");
             assert_eq!(
