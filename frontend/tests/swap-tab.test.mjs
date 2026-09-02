@@ -131,3 +131,26 @@ test("the swap network card exposes identity and descriptor validation, never a 
   assert.equal(js.includes('invoke("swap_initiator_identity")'), true, "identity must come from the command");
   assert.equal(js.includes('invoke("swap_network_descriptor_check"'), true, "validation must go through the command");
 });
+
+test("leg addresses rotate per swap and the hatch reaches every index used", async () => {
+  const html = await source("index.html");
+  const js = await source("main.js");
+  // The index is stated to the user, not hidden behind the address.
+  assert.equal(html.includes('id="swap-legs-index"'), true, "missing derivation index line");
+  assert.equal(js.includes("Derivation index"), true, "the index must be named on screen");
+  // The hatch iterates the recorded index sets; exporting only one index
+  // would strand funds left on an earlier one.
+  assert.equal(js.includes("keys.indices"), true, "the hatch must export every recorded index");
+  assert.equal(js.includes("set.bitcoin_secret_hex"), true, "per-index bitcoin secret");
+  assert.equal(js.includes("set.solana_secret_hex"), true, "per-index solana secret");
+  // Monero keeps a single account on purpose — stealth addresses already
+  // give each payment its own destination.
+  assert.equal(js.includes("keys.monero_spend_secret_hex"), true, "monero stays single-account");
+  // The seed-only recovery path exists and carries no secret.
+  assert.equal(html.includes('id="swap-scan-plan"'), true, "missing scan plan button");
+  assert.equal(html.includes('id="swap-scan-output"'), true, "missing scan plan output");
+  assert.equal(js.includes('invoke("swap_leg_scan_plan")'), true, "scan plan must come from the command");
+  assert.equal(js.includes("gap margin"), true, "gap-limit entries must be marked as such");
+  const scanBlock = js.slice(js.indexOf('swap-scan-plan"'), js.indexOf('swap-export-clear")'));
+  assert.equal(/secret/i.test(scanBlock), false, "the scan plan must never render a secret");
+});

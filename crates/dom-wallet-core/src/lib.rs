@@ -48,9 +48,9 @@ use dom_wallet_domain::{
     ScriptlessPayoutReservationState, ScriptlessPayoutRoleV1,
     ScriptlessTemplateParticipantBindingV1, SeedRestoreStatus, SwapSessionRecord, SwapSessionState,
     SwapSessionTransition, SyncStatus, TransactionCancellationReason, TransactionLifecycle,
-    TransactionRole, TransactionTransitionEvidence, WalletState, RECOVERY_SCHEME_BIP39_256_V1,
-    SCRIPTLESS_FUNDING_RESERVATION_VERSION, SCRIPTLESS_PARTICIPANT_COUNT_V1,
-    SCRIPTLESS_PAYOUT_RESERVATION_VERSION,
+    TransactionRole, TransactionTransitionEvidence, WalletState, MAX_SWAP_LEG_INDEX,
+    RECOVERY_SCHEME_BIP39_256_V1, SCRIPTLESS_FUNDING_RESERVATION_VERSION,
+    SCRIPTLESS_PARTICIPANT_COUNT_V1, SCRIPTLESS_PAYOUT_RESERVATION_VERSION, SWAP_LEG_GAP_LIMIT,
 };
 use dom_wallet_embedded_core::{EmbeddedCoreConfiguration, EmbeddedPeerStatus, MiningEconomics};
 use dom_wallet_production_backend::{ProductionBackendError, PRODUCTION_BACKEND_KIND};
@@ -781,7 +781,6 @@ impl WalletService {
                 at_unix: record.created_unix,
             });
         }
-        record.validate()?;
         let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
         if state
             .swap_sessions
@@ -790,9 +789,61 @@ impl WalletService {
         {
             return Err(CoreError::Domain(DomainError::InvalidState));
         }
+        // The external-leg index is allocated here, inside the same commit
+        // that persists the draft: an index handed out but not durably
+        // recorded could later be reused by a second session, putting two
+        // swaps on one address — exactly the clustering this exists to
+        // prevent. Allocation is monotonic, so abandoning a draft burns
+        // its index rather than recycling it.
+        record.leg_index = state.next_swap_leg_index;
+        state.next_swap_leg_index = state
+            .next_swap_leg_index
+            .checked_add(1)
+            .filter(|next| *next <= MAX_SWAP_LEG_INDEX)
+            .ok_or(CoreError::Domain(DomainError::InvalidState))?;
+        record.validate()?;
         state.swap_sessions.push(record.clone());
         self.commit(state)?;
         Ok(record)
+    }
+
+    /// Every external-leg index this wallet has committed, ascending and
+    /// deduplicated, index 0 always included.
+    ///
+    /// This is the recovery hatch's index set. It reads terminal sessions
+    /// too: a settled swap can still have dust or a late refund sitting on
+    /// its leg address, and a hatch that only exported the live indices
+    /// would silently fail to reach it. Index 0 is unconditional because
+    /// every session written before per-session indices existed used it.
+    pub fn swap_used_leg_indices(&self) -> Result<Vec<u32>, CoreError> {
+        let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
+        let mut indices = state
+            .swap_sessions
+            .iter()
+            .map(|session| session.leg_index)
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        indices.sort_unstable();
+        indices.dedup();
+        Ok(indices)
+    }
+
+    /// The index a new swap session would receive, and the index through
+    /// which a seed-only restoration must scan to be sure it missed
+    /// nothing: the highest index the wallet knows about plus the
+    /// gap limit.
+    ///
+    /// With the wallet file present the first value makes scanning
+    /// unnecessary. Without it the caller starts from 0 and scans the gap
+    /// limit, which is what this bound degrades to when no session is
+    /// recorded.
+    pub fn swap_leg_scan_bounds(&self) -> Result<(u32, u32), CoreError> {
+        let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
+        let next = state.next_swap_leg_index;
+        let scan_through = next
+            .saturating_add(SWAP_LEG_GAP_LIMIT)
+            .min(MAX_SWAP_LEG_INDEX);
+        Ok((next, scan_through))
     }
 
     /// Apply one forward lifecycle transition and commit it before returning.
@@ -6209,6 +6260,7 @@ mod tests {
             amount_base_units: 250_000,
             minimum_output_base_units: 240_000,
             fee_payment_asset: "DOM".into(),
+            leg_index: 0,
             fee_bps: 50,
             state: SwapSessionState::IntentDraft,
             state_history: Vec::new(),
@@ -6222,6 +6274,75 @@ mod tests {
             cancel_txid: None,
             refund_txid: None,
         }
+    }
+
+    #[test]
+    fn swap_leg_indices_are_allocated_once_survive_restart_and_stay_reachable() {
+        let temp = tempfile::tempdir().unwrap();
+        let wallet_path = temp.path().join("wallet");
+        let password = "password-1";
+        let mut service = test_service();
+        service
+            .create_recoverable(&wallet_path, password, backup_identity())
+            .unwrap();
+        service.recovery_phrase_confirmed(password).unwrap();
+        service.unlock(password).unwrap();
+
+        // A fresh wallet starts at index 0 and scans one gap limit ahead.
+        assert_eq!(
+            service.swap_leg_scan_bounds().unwrap(),
+            (0, SWAP_LEG_GAP_LIMIT)
+        );
+        assert_eq!(service.swap_used_leg_indices().unwrap(), vec![0]);
+
+        // Successive sessions never share an address.
+        let first = service
+            .swap_session_create_draft(draft_swap_record())
+            .unwrap();
+        let second = service
+            .swap_session_create_draft(draft_swap_record())
+            .unwrap();
+        assert_eq!(first.leg_index, 0);
+        assert_eq!(second.leg_index, 1);
+
+        // Abandoning a session burns its index rather than recycling it:
+        // reuse would put two swaps on one address, which is the whole
+        // point of allocating per session.
+        service.swap_session_cancel_free(second.id, 102).unwrap();
+        let third = service
+            .swap_session_create_draft(draft_swap_record())
+            .unwrap();
+        assert_eq!(third.leg_index, 2);
+
+        // The counter is committed, not held in memory: a restart must not
+        // hand index 2 out a second time.
+        drop(service);
+        let mut restarted = test_service();
+        restarted.open(&wallet_path).unwrap();
+        restarted.unlock(password).unwrap();
+        assert_eq!(restarted.swap_leg_scan_bounds().unwrap().0, 3);
+        let fourth = restarted
+            .swap_session_create_draft(draft_swap_record())
+            .unwrap();
+        assert_eq!(fourth.leg_index, 3);
+
+        // The hatch index set reaches the terminal session too: a settled
+        // swap can still hold dust or a late refund on its leg address.
+        let indices = restarted.swap_used_leg_indices().unwrap();
+        assert_eq!(indices, vec![0, 1, 2, 3]);
+        assert!(
+            restarted
+                .swap_sessions()
+                .unwrap()
+                .iter()
+                .any(|session| session.leg_index == 1 && session.state.is_terminal()),
+            "the burnt index belongs to a terminal session and is still exported"
+        );
+
+        // The scan bound always covers every allocated index plus the gap.
+        let (next, through) = restarted.swap_leg_scan_bounds().unwrap();
+        assert_eq!(next, 4);
+        assert_eq!(through, 4 + SWAP_LEG_GAP_LIMIT);
     }
 
     #[test]

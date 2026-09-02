@@ -184,6 +184,7 @@ macro_rules! wallet_command_registry {
             swap_deposit_status,
             swap_manual_refund,
             swap_leg_keys_export,
+            swap_leg_scan_plan,
             swap_initiator_identity,
             swap_network_descriptor_check,
             swap_intent_create,
@@ -1224,14 +1225,52 @@ pub mod depc {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SwapLegAddressesDto {
+    /// Derivation index these addresses belong to: the one the next swap
+    /// session will use, so the user funds the address that session will
+    /// actually watch.
+    pub index: u32,
     pub evm_address: String,
     pub evm_derivation_path: String,
     pub bitcoin_address: String,
     pub bitcoin_derivation_path: String,
     pub solana_address: String,
     pub solana_derivation_path: String,
+    /// Monero stays on account 0 by design: its stealth addresses already
+    /// give every incoming payment a distinct one-time destination, so
+    /// extra accounts would add recovery scanning for no privacy gain.
     pub monero_address: String,
     pub monero_derivation_path: String,
+}
+
+/// The public addresses of one derivation index, for the seed-only
+/// recovery scan. Public data only — no secret ever enters this shape.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwapLegScanEntryDto {
+    pub index: u32,
+    pub bitcoin_address: String,
+    pub evm_address: String,
+    pub solana_address: String,
+    /// Whether a committed session records this index. False entries are
+    /// the gap-limit margin: addresses this wallet has no record of, kept
+    /// in the plan so a restoration missing its wallet file still finds
+    /// funds the file would have pointed at.
+    pub recorded: bool,
+}
+
+/// The scan plan a restoration works through when it has the recovery
+/// phrase but not the wallet file.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwapLegScanPlanDto {
+    pub gap_limit: u32,
+    /// Index the next session would take — everything below it is either
+    /// used or burnt by an abandoned draft.
+    pub next_index: u32,
+    pub scan_through_index: u32,
+    pub entries: Vec<SwapLegScanEntryDto>,
+    pub monero_address: String,
+    pub note: String,
 }
 
 /// The fee minute for one intended swap amount, before any quote exists.
@@ -1300,6 +1339,21 @@ pub struct SwapDepositStatusDto {
 /// scrubbing buffers, serialized by value exactly once for the ceremony,
 /// never rendered by Debug and never logged.
 pub struct SwapLegKeysDto {
+    /// One entry per derivation index the durable state records, index 0
+    /// always included. Exporting only the live index would strand funds
+    /// left on an earlier one — a privacy fix must never become a
+    /// fund-loss path.
+    pub indices: Vec<SwapLegKeySetDto>,
+    pub monero_address: String,
+    pub monero_derivation_path: String,
+    pub monero_spend_secret_hex: Zeroizing<String>,
+    pub monero_view_secret_hex: Zeroizing<String>,
+    pub warning: &'static str,
+}
+
+/// The three transparent-chain leg keys of one derivation index.
+pub struct SwapLegKeySetDto {
+    pub index: u32,
     pub bitcoin_address: String,
     pub bitcoin_derivation_path: String,
     pub bitcoin_secret_hex: Zeroizing<String>,
@@ -1309,19 +1363,48 @@ pub struct SwapLegKeysDto {
     pub solana_address: String,
     pub solana_derivation_path: String,
     pub solana_secret_hex: Zeroizing<String>,
-    pub monero_address: String,
-    pub monero_derivation_path: String,
-    pub monero_spend_secret_hex: Zeroizing<String>,
-    pub monero_view_secret_hex: Zeroizing<String>,
-    pub warning: &'static str,
+}
+
+impl std::fmt::Debug for SwapLegKeySetDto {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SwapLegKeySetDto")
+            .field("index", &self.index)
+            .field("bitcoin_address", &self.bitcoin_address)
+            .field("evm_address", &self.evm_address)
+            .field("solana_address", &self.solana_address)
+            .field("secrets", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Serialize for SwapLegKeySetDto {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("SwapLegKeySetDto", 10)?;
+        state.serialize_field("index", &self.index)?;
+        state.serialize_field("bitcoin_address", &self.bitcoin_address)?;
+        state.serialize_field("bitcoin_derivation_path", &self.bitcoin_derivation_path)?;
+        state.serialize_field("bitcoin_secret_hex", self.bitcoin_secret_hex.as_str())?;
+        state.serialize_field("evm_address", &self.evm_address)?;
+        state.serialize_field("evm_derivation_path", &self.evm_derivation_path)?;
+        state.serialize_field("evm_secret_hex", self.evm_secret_hex.as_str())?;
+        state.serialize_field("solana_address", &self.solana_address)?;
+        state.serialize_field("solana_derivation_path", &self.solana_derivation_path)?;
+        state.serialize_field("solana_secret_hex", self.solana_secret_hex.as_str())?;
+        state.end()
+    }
 }
 
 impl std::fmt::Debug for SwapLegKeysDto {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("SwapLegKeysDto")
-            .field("bitcoin_address", &self.bitcoin_address)
-            .field("evm_address", &self.evm_address)
+            .field("indices", &self.indices.len())
+            .field("monero_address", &self.monero_address)
             .field("secrets", &"[REDACTED]")
             .finish()
     }
@@ -1333,16 +1416,8 @@ impl Serialize for SwapLegKeysDto {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("SwapLegKeysDto", 14)?;
-        state.serialize_field("bitcoin_address", &self.bitcoin_address)?;
-        state.serialize_field("bitcoin_derivation_path", &self.bitcoin_derivation_path)?;
-        state.serialize_field("bitcoin_secret_hex", self.bitcoin_secret_hex.as_str())?;
-        state.serialize_field("evm_address", &self.evm_address)?;
-        state.serialize_field("evm_derivation_path", &self.evm_derivation_path)?;
-        state.serialize_field("evm_secret_hex", self.evm_secret_hex.as_str())?;
-        state.serialize_field("solana_address", &self.solana_address)?;
-        state.serialize_field("solana_derivation_path", &self.solana_derivation_path)?;
-        state.serialize_field("solana_secret_hex", self.solana_secret_hex.as_str())?;
+        let mut state = serializer.serialize_struct("SwapLegKeysDto", 6)?;
+        state.serialize_field("indices", &self.indices)?;
         state.serialize_field("monero_address", &self.monero_address)?;
         state.serialize_field("monero_derivation_path", &self.monero_derivation_path)?;
         state.serialize_field(
@@ -3396,25 +3471,86 @@ impl DesktopApplication {
             .map_err(CommandError::from)?;
         let root = dom_wallet_multichain::MultichainRoot::from_bip39_seed(&seed)
             .map_err(|_| CommandError::Unavailable)?;
-        let evm = root.evm_account(0).map_err(|_| CommandError::Unavailable)?;
+        let index = self.lock_service()?.swap_leg_scan_bounds()?.0;
+        let evm = root
+            .evm_account(index)
+            .map_err(|_| CommandError::Unavailable)?;
         let bitcoin = root
-            .taproot_account(dom_wallet_multichain::BitcoinNetwork::Mainnet, 0)
+            .taproot_account(dom_wallet_multichain::BitcoinNetwork::Mainnet, index)
             .map_err(|_| CommandError::Unavailable)?;
         let solana = root
-            .solana_account(0)
+            .solana_account(index)
             .map_err(|_| CommandError::Unavailable)?;
         let monero = root
             .monero_account(0)
             .map_err(|_| CommandError::Unavailable)?;
         Ok(SwapLegAddressesDto {
+            index,
             evm_address: evm.address(),
-            evm_derivation_path: "m/44'/60'/0'/0/0".into(),
+            evm_derivation_path: format!("m/44'/60'/0'/0/{index}"),
             bitcoin_address: bitcoin.address().to_owned(),
-            bitcoin_derivation_path: "m/86'/0'/0'/0/0".into(),
+            bitcoin_derivation_path: format!("m/86'/0'/0'/0/{index}"),
             solana_address: solana.address(),
-            solana_derivation_path: "m/44'/501'/0'/0'".into(),
+            solana_derivation_path: format!("m/44'/501'/{index}'/0'"),
             monero_address: monero.address(),
             monero_derivation_path: "m/44'/128'/0'".into(),
+        })
+    }
+
+    /// The seed-only recovery scan plan: the public leg addresses of every
+    /// index this wallet recorded, plus a gap-limit margin beyond them.
+    ///
+    /// With the wallet file present the recorded entries are exhaustive
+    /// and the margin is belt-and-braces. Restoring from the recovery
+    /// phrase alone, the wallet has no sessions, so the plan degrades to
+    /// indices 0..gap_limit — the BIP-44 behaviour every external wallet
+    /// already implements. Public addresses only.
+    pub fn swap_leg_scan_plan(&self) -> Result<SwapLegScanPlanDto, CommandError> {
+        self.ensure_running()?;
+        let (next_index, scan_through_index, recorded) = {
+            let service = self.lock_service()?;
+            let (next, through) = service.swap_leg_scan_bounds()?;
+            (next, through, service.swap_used_leg_indices()?)
+        };
+        let seed = self
+            .lock_service()?
+            .multichain_bip39_seed()
+            .map_err(CommandError::from)?;
+        let root = dom_wallet_multichain::MultichainRoot::from_bip39_seed(&seed)
+            .map_err(|_| CommandError::Unavailable)?;
+        let mut entries = Vec::new();
+        for index in 0..=scan_through_index {
+            let evm = root
+                .evm_account(index)
+                .map_err(|_| CommandError::Unavailable)?;
+            let bitcoin = root
+                .taproot_account(dom_wallet_multichain::BitcoinNetwork::Mainnet, index)
+                .map_err(|_| CommandError::Unavailable)?;
+            let solana = root
+                .solana_account(index)
+                .map_err(|_| CommandError::Unavailable)?;
+            entries.push(SwapLegScanEntryDto {
+                index,
+                bitcoin_address: bitcoin.address().to_owned(),
+                evm_address: evm.address(),
+                solana_address: solana.address(),
+                recorded: recorded.contains(&index),
+            });
+        }
+        let monero = root
+            .monero_account(0)
+            .map_err(|_| CommandError::Unavailable)?;
+        Ok(SwapLegScanPlanDto {
+            gap_limit: dom_wallet_domain::SWAP_LEG_GAP_LIMIT,
+            next_index,
+            scan_through_index,
+            entries,
+            monero_address: monero.address(),
+            note: "Check each address on its own chain. Your recovery phrase alone \
+                   regenerates every one of them, so the wallet file is a convenience \
+                   here, never a requirement. Monero needs no scan: its stealth \
+                   addresses are recovered by the account's view key."
+                .into(),
         })
     }
 
@@ -3528,6 +3664,9 @@ impl DesktopApplication {
             minimum_output_base_units,
             fee_payment_asset: fee_payment_asset.to_owned(),
             fee_bps,
+            // Replaced by the durable allocator inside the same commit
+            // that persists the draft; never chosen here.
+            leg_index: 0,
             state: dom_wallet_domain::SwapSessionState::IntentDraft,
             state_history: Vec::new(),
             last_error: None,
@@ -3685,26 +3824,36 @@ impl DesktopApplication {
             .map_err(CommandError::from)?;
         let root = dom_wallet_multichain::MultichainRoot::from_bip39_seed(&seed)
             .map_err(|_| CommandError::Unavailable)?;
-        let evm = root.evm_account(0).map_err(|_| CommandError::Unavailable)?;
-        let bitcoin = root
-            .taproot_account(dom_wallet_multichain::BitcoinNetwork::Mainnet, 0)
-            .map_err(|_| CommandError::Unavailable)?;
-        let solana = root
-            .solana_account(0)
-            .map_err(|_| CommandError::Unavailable)?;
+        let indices = self.lock_service()?.swap_used_leg_indices()?;
+        let mut sets = Vec::with_capacity(indices.len());
+        for index in indices {
+            let evm = root
+                .evm_account(index)
+                .map_err(|_| CommandError::Unavailable)?;
+            let bitcoin = root
+                .taproot_account(dom_wallet_multichain::BitcoinNetwork::Mainnet, index)
+                .map_err(|_| CommandError::Unavailable)?;
+            let solana = root
+                .solana_account(index)
+                .map_err(|_| CommandError::Unavailable)?;
+            sets.push(SwapLegKeySetDto {
+                index,
+                bitcoin_address: bitcoin.address().to_owned(),
+                bitcoin_derivation_path: format!("m/86'/0'/0'/0/{index}"),
+                bitcoin_secret_hex: Zeroizing::new(hex::encode(bitcoin.secret_bytes())),
+                evm_address: evm.address(),
+                evm_derivation_path: format!("m/44'/60'/0'/0/{index}"),
+                evm_secret_hex: Zeroizing::new(hex::encode(evm.secret_bytes())),
+                solana_address: solana.address(),
+                solana_derivation_path: format!("m/44'/501'/{index}'/0'"),
+                solana_secret_hex: Zeroizing::new(hex::encode(solana.secret_bytes())),
+            });
+        }
         let monero = root
             .monero_account(0)
             .map_err(|_| CommandError::Unavailable)?;
         Ok(SwapLegKeysDto {
-            bitcoin_address: bitcoin.address().to_owned(),
-            bitcoin_derivation_path: "m/86'/0'/0'/0/0".into(),
-            bitcoin_secret_hex: Zeroizing::new(hex::encode(bitcoin.secret_bytes())),
-            evm_address: evm.address(),
-            evm_derivation_path: "m/44'/60'/0'/0/0".into(),
-            evm_secret_hex: Zeroizing::new(hex::encode(evm.secret_bytes())),
-            solana_address: solana.address(),
-            solana_derivation_path: "m/44'/501'/0'/0'".into(),
-            solana_secret_hex: Zeroizing::new(hex::encode(solana.secret_bytes())),
+            indices: sets,
             monero_address: monero.address(),
             monero_derivation_path: "m/44'/128'/0'".into(),
             monero_spend_secret_hex: Zeroizing::new(hex::encode(monero.spend_secret_bytes())),

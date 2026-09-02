@@ -1105,6 +1105,12 @@ fn swap_fee_quote(
         .map_err(Into::into)
 }
 #[tauri::command]
+fn swap_leg_scan_plan(
+    app: tauri::State<'_, DesktopApplication>,
+) -> Result<dom_wallet_tauri_shell::SwapLegScanPlanDto, dom_wallet_tauri_shell::CommandErrorDto> {
+    app.swap_leg_scan_plan().map_err(Into::into)
+}
+#[tauri::command]
 fn swap_initiator_identity(
     app: tauri::State<'_, DesktopApplication>,
 ) -> Result<dom_wallet_tauri_shell::SwapInitiatorIdentityDto, dom_wallet_tauri_shell::CommandErrorDto>
