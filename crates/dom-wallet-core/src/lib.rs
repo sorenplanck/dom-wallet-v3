@@ -3346,7 +3346,16 @@ impl WalletService {
         let hash = state.transactions[index]
             .transaction_hash
             .ok_or(CoreError::ProtocolRejected)?;
-        let identifier = WalletTransactionIdentifier::TransactionHash(hash);
+        // The canonical chain indexes kernels, not transaction hashes: a
+        // mined transaction leaves the mempool and only its kernel excess can
+        // prove confirmation. Reconciliation therefore queries by kernel
+        // whenever the wallet holds it, and by hash only for records that
+        // never reached finalization.
+        let identifier =
+            match <[u8; 33]>::try_from(state.transactions[index].kernel_excess.as_slice()) {
+                Ok(excess) => WalletTransactionIdentifier::KernelExcess(excess),
+                Err(_) => WalletTransactionIdentifier::TransactionHash(hash),
+            };
         let query = backend.query_submission(identifier)?;
         let status = if matches!(query, WalletSubmissionQuery::Unknown) {
             Some(backend.transaction_status(identifier)?)
@@ -3658,6 +3667,20 @@ impl WalletRecoverySink {
         ) {
             self.last_recovery_error = Some(error);
             return Err(error.into());
+        }
+        // Kernel evidence inside the committed canonical blocks is what
+        // proves a wallet transaction on-chain: it re-confirms records a
+        // rescan demoted to `Reorged` and settles in-flight sends the moment
+        // their block is scanned, without a separate node query.
+        for block in &batch.blocks {
+            let kernels = block
+                .kernels
+                .iter()
+                .map(|kernel| kernel.excess)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            next.apply_kernel_evidence(block.height, block.block_hash, &kernels)?;
         }
         for transaction_id in
             cancel_expired_unfinalized_reservations(&mut next, batch.observed_tip.height)?
