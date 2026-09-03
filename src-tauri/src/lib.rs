@@ -3768,25 +3768,22 @@ impl DesktopApplication {
         };
         let sync_context = self.sync_status_context();
         let fee_usd_estimated = fee_noms.and_then(|fee_noms| {
-            self.service
-                .lock()
-                .ok()
-                .and_then(|service| {
-                    let synchronized = sync_status_from_service(
-                        &service,
-                        SyncStatusContext {
-                            remote_source: false,
-                            ..sync_context
-                        },
-                    )
-                    .synchronized;
-                    let economics = service.embedded_mining_economics().ok()?;
-                    network_mining_presentation(&economics, synchronized)
-                        .estimated_cost_central_usd_per_dom
-                        .map(|usd_per_dom| {
+            self.service.lock().ok().and_then(|service| {
+                let synchronized = sync_status_from_service(
+                    &service,
+                    SyncStatusContext {
+                        remote_source: false,
+                        ..sync_context
+                    },
+                )
+                .synchronized;
+                let economics = service.embedded_mining_economics().ok()?;
+                network_mining_presentation(&economics, synchronized)
+                    .estimated_cost_central_usd_per_dom
+                    .map(|usd_per_dom| {
                         (fee_noms as f64 / economics.noms_per_dom as f64) * usd_per_dom
                     })
-                })
+            })
         });
         Ok(SwapFeeQuoteDto {
             amount_base_units,
@@ -5705,7 +5702,7 @@ mod tests {
     fn native_bridge_probe_is_static_redacted_and_versioned() {
         let status = native_bridge_status();
         assert_eq!(status.bridge, "ready");
-        assert_eq!(status.app_version, "0.3.3");
+        assert_eq!(status.app_version, "0.3.4");
         fn assert_serializable<T: serde::Serialize>(_: &T) {}
         assert_serializable(&status);
     }
@@ -5713,7 +5710,7 @@ mod tests {
     #[test]
     fn build_and_update_status_are_separate_redacted_channels() {
         let build = get_build_info();
-        assert_eq!(build.wallet_version, "0.3.3");
+        assert_eq!(build.wallet_version, "0.3.4");
         assert_eq!(build.embedded_node_revision, EMBEDDED_NODE_REVISION);
         assert_eq!(build.update_channel, "stable");
 
