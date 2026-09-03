@@ -1382,6 +1382,10 @@ pub struct SwapAcceptedQuote {
     pub output_base_units: u64,
     /// Quoted fee, in the destination asset's base units.
     pub quote_fee_base_units: u64,
+    /// Value of this route's DOM leg, declared by the accepted solver quote.
+    /// Older sessions did not persist it and decode as zero.
+    #[serde(default)]
+    pub dom_leg_amount_base_units: u64,
     /// Settlement estimate derived from the destination profile's finality.
     pub estimated_seconds: u64,
 }
@@ -1406,6 +1410,10 @@ pub struct SwapSessionRecord {
     pub fee_payment_asset: String,
     /// Ratified fee tier applied to this route.
     pub fee_bps: u64,
+    /// Protocol fee in noms, calculated from the accepted quote's DOM leg.
+    /// Intent drafts and legacy sessions without this datum decode as zero.
+    #[serde(default)]
+    pub fee_noms: u64,
     /// Derivation index of this session's external legs. Every session
     /// gets its own index so repeated swaps do not reuse one address on
     /// the transparent chains, where an observer clusters by address and
@@ -1451,6 +1459,9 @@ impl SwapSessionRecord {
         if !self.state.may_transition_to(next) {
             return Err(DomainError::InvalidSwapTransition);
         }
+        if next == SwapSessionState::QuoteAccepted && (self.quote.is_none() || self.fee_noms == 0) {
+            return Err(DomainError::InvalidState);
+        }
         self.state = next;
         self.updated_unix = now_unix;
         self.state_history.push(SwapSessionTransition {
@@ -1458,6 +1469,30 @@ impl SwapSessionRecord {
             at_unix: now_unix,
         });
         Ok(())
+    }
+
+    /// Bind an authenticated quote and its DOM-denominated protocol fee to
+    /// the session in the same forward transition. The caller computes the
+    /// fee from `quote.dom_leg_amount_base_units`, never from the intent's
+    /// source-asset amount.
+    pub fn accept_quote(
+        &mut self,
+        quote: SwapAcceptedQuote,
+        fee_noms: u64,
+        now_unix: u64,
+    ) -> Result<(), DomainError> {
+        if quote.dom_leg_amount_base_units == 0 || fee_noms == 0 {
+            return Err(DomainError::InvalidState);
+        }
+        if !self
+            .state
+            .may_transition_to(SwapSessionState::QuoteAccepted)
+        {
+            return Err(DomainError::InvalidSwapTransition);
+        }
+        self.quote = Some(quote);
+        self.fee_noms = fee_noms;
+        self.transition(SwapSessionState::QuoteAccepted, now_unix)
     }
 
     /// Bounded-field validation, called from the wallet state validator.
@@ -3680,6 +3715,7 @@ mod tests {
             minimum_output_base_units: 90_000,
             fee_payment_asset: "DOM".into(),
             fee_bps: 50,
+            fee_noms: 0,
             leg_index: 0,
             state,
             state_history: Vec::new(),
@@ -3699,9 +3735,21 @@ mod tests {
     fn swap_session_walks_the_settlement_ladder_and_records_history() {
         use SwapSessionState::*;
         let mut record = swap_record(IntentDraft);
+        record.transition(IntentPublished, 10).unwrap();
+        record
+            .accept_quote(
+                SwapAcceptedQuote {
+                    solver_label: "solver-1".into(),
+                    output_base_units: 90_000,
+                    quote_fee_base_units: 1_000,
+                    dom_leg_amount_base_units: 100_000_000,
+                    estimated_seconds: 600,
+                },
+                500_000,
+                11,
+            )
+            .unwrap();
         for (step, next) in [
-            IntentPublished,
-            QuoteAccepted,
             RefundsArmed,
             UserFunding,
             UserFunded,
@@ -3712,7 +3760,7 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            record.transition(next, 10 + step as u64).unwrap();
+            record.transition(next, 12 + step as u64).unwrap();
         }
         assert_eq!(record.state, Settled);
         assert_eq!(record.state_history.len(), 8);
@@ -3739,6 +3787,47 @@ mod tests {
                 Err(DomainError::InvalidSwapTransition)
             );
         }
+    }
+
+    #[test]
+    fn legacy_swap_quote_and_session_default_missing_dom_fee_fields() {
+        let mut record = swap_record(SwapSessionState::QuoteAccepted);
+        record.quote = Some(SwapAcceptedQuote {
+            solver_label: "legacy-solver".into(),
+            output_base_units: 90_000,
+            quote_fee_base_units: 1_000,
+            dom_leg_amount_base_units: 100_000_000,
+            estimated_seconds: 600,
+        });
+        record.fee_noms = 500_000;
+        let mut legacy = serde_json::to_value(record).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        object.remove("fee_noms");
+        object
+            .get_mut("quote")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .remove("dom_leg_amount_base_units");
+
+        let decoded: SwapSessionRecord = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.fee_noms, 0);
+        assert_eq!(
+            decoded.quote.unwrap().dom_leg_amount_base_units,
+            0,
+            "legacy accepted quotes remain readable without inventing a DOM leg"
+        );
+    }
+
+    #[test]
+    fn quote_accepted_transition_requires_bound_quote_and_dom_fee() {
+        let mut record = swap_record(SwapSessionState::IntentPublished);
+        assert_eq!(
+            record.transition(SwapSessionState::QuoteAccepted, 2),
+            Err(DomainError::InvalidState)
+        );
+        assert_eq!(record.state, SwapSessionState::IntentPublished);
+        assert!(record.quote.is_none());
+        assert_eq!(record.fee_noms, 0);
     }
 
     #[test]

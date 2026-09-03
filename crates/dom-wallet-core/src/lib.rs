@@ -46,11 +46,12 @@ use dom_wallet_domain::{
     PrivateTransactionContext, RecoveryMetadata, RecoveryOutputClass, RedactedNodeConfiguration,
     ScriptlessFundingReservation, ScriptlessFundingReservationState, ScriptlessPayoutReservation,
     ScriptlessPayoutReservationState, ScriptlessPayoutRoleV1,
-    ScriptlessTemplateParticipantBindingV1, SeedRestoreStatus, SwapSessionRecord, SwapSessionState,
-    SwapSessionTransition, SyncStatus, TransactionCancellationReason, TransactionLifecycle,
-    TransactionRole, TransactionTransitionEvidence, WalletState, MAX_SWAP_LEG_INDEX,
-    RECOVERY_SCHEME_BIP39_256_V1, SCRIPTLESS_FUNDING_RESERVATION_VERSION,
-    SCRIPTLESS_PARTICIPANT_COUNT_V1, SCRIPTLESS_PAYOUT_RESERVATION_VERSION, SWAP_LEG_GAP_LIMIT,
+    ScriptlessTemplateParticipantBindingV1, SeedRestoreStatus, SwapAcceptedQuote,
+    SwapSessionRecord, SwapSessionState, SwapSessionTransition, SyncStatus,
+    TransactionCancellationReason, TransactionLifecycle, TransactionRole,
+    TransactionTransitionEvidence, WalletState, MAX_SWAP_LEG_INDEX, RECOVERY_SCHEME_BIP39_256_V1,
+    SCRIPTLESS_FUNDING_RESERVATION_VERSION, SCRIPTLESS_PARTICIPANT_COUNT_V1,
+    SCRIPTLESS_PAYOUT_RESERVATION_VERSION, SWAP_LEG_GAP_LIMIT,
 };
 use dom_wallet_embedded_core::{EmbeddedCoreConfiguration, EmbeddedPeerStatus, MiningEconomics};
 use dom_wallet_production_backend::{ProductionBackendError, PRODUCTION_BACKEND_KIND};
@@ -861,6 +862,27 @@ impl WalletService {
             .find(|session| session.id == id)
             .ok_or(CoreError::Domain(DomainError::SwapSessionNotFound))?;
         session.transition(next, now_unix)?;
+        let updated = session.clone();
+        self.commit(state)?;
+        Ok(updated)
+    }
+
+    /// Persist an authenticated solver quote and the fee calculated from its
+    /// declared DOM-leg amount. Both land in one encrypted-state commit.
+    pub fn swap_session_accept_quote(
+        &mut self,
+        id: Uuid,
+        quote: SwapAcceptedQuote,
+        fee_noms: u64,
+        now_unix: u64,
+    ) -> Result<SwapSessionRecord, CoreError> {
+        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        let session = state
+            .swap_sessions
+            .iter_mut()
+            .find(|session| session.id == id)
+            .ok_or(CoreError::Domain(DomainError::SwapSessionNotFound))?;
+        session.accept_quote(quote, fee_noms, now_unix)?;
         let updated = session.clone();
         self.commit(state)?;
         Ok(updated)
@@ -6262,6 +6284,7 @@ mod tests {
             fee_payment_asset: "DOM".into(),
             leg_index: 0,
             fee_bps: 50,
+            fee_noms: 0,
             state: SwapSessionState::IntentDraft,
             state_history: Vec::new(),
             last_error: None,
@@ -6418,6 +6441,46 @@ mod tests {
     }
 
     #[test]
+    fn accepted_quote_and_its_dom_leg_fee_are_committed_together() {
+        let temp = tempfile::tempdir().unwrap();
+        let wallet_path = temp.path().join("wallet");
+        let password = "password-1";
+        let mut service = test_service();
+        service
+            .create_recoverable(&wallet_path, password, backup_identity())
+            .unwrap();
+        service.recovery_phrase_confirmed(password).unwrap();
+        service.unlock(password).unwrap();
+        let draft = service
+            .swap_session_create_draft(draft_swap_record())
+            .unwrap();
+        service
+            .swap_session_transition(draft.id, SwapSessionState::IntentPublished, 101)
+            .unwrap();
+        let quote = SwapAcceptedQuote {
+            solver_label: "solver-1".into(),
+            output_base_units: 240_000,
+            quote_fee_base_units: 1_000,
+            dom_leg_amount_base_units: 100_000_000,
+            estimated_seconds: 600,
+        };
+        let accepted = service
+            .swap_session_accept_quote(draft.id, quote.clone(), 500_000, 102)
+            .unwrap();
+        assert_eq!(accepted.state, SwapSessionState::QuoteAccepted);
+        assert_eq!(accepted.quote, Some(quote.clone()));
+        assert_eq!(accepted.fee_noms, 500_000);
+
+        drop(service);
+        let mut reopened = test_service();
+        reopened.open(&wallet_path).unwrap();
+        reopened.unlock(password).unwrap();
+        let persisted = reopened.swap_session(draft.id).unwrap();
+        assert_eq!(persisted.quote, Some(quote));
+        assert_eq!(persisted.fee_noms, 500_000);
+    }
+
+    #[test]
     fn swap_manual_refund_gate_is_time_and_state_aware() {
         let temp = tempfile::tempdir().unwrap();
         let mut service = test_service();
@@ -6435,9 +6498,24 @@ mod tests {
         );
 
         // Walk to a funds-locked state with a recorded refund maturity.
+        service
+            .swap_session_transition(draft.id, SwapSessionState::IntentPublished, 201)
+            .unwrap();
+        service
+            .swap_session_accept_quote(
+                draft.id,
+                SwapAcceptedQuote {
+                    solver_label: "solver-1".into(),
+                    output_base_units: 240_000,
+                    quote_fee_base_units: 1_000,
+                    dom_leg_amount_base_units: 100_000_000,
+                    estimated_seconds: 600,
+                },
+                500_000,
+                201,
+            )
+            .unwrap();
         for next in [
-            SwapSessionState::IntentPublished,
-            SwapSessionState::QuoteAccepted,
             SwapSessionState::RefundsArmed,
             SwapSessionState::UserFunding,
         ] {

@@ -518,20 +518,26 @@ const swapDaemonBanner = () => byId("swap-daemon-banner");
 const markSwapDaemon = (offline) => { swapDaemonBanner().hidden = !offline; };
 const swapFeeSummary = () => byId("swap-fee-summary");
 const renderSwapFee = (quote) => {
+  const legs = quote.external_legs === 0 ? "DOM only" : quote.external_legs === 1 ? "one external leg" : "two external legs";
+  const payment = swapAssetByCode(quote.payment_asset);
+  const paymentLabel = payment?.label ?? quote.payment_asset;
+  if (quote.fee_noms == null) {
+    swapFeeSummary().textContent = `Protocol fee ${quote.fee_percent}% (${legs}): ${quote.fee_message} Fee payment currency: ${paymentLabel}.`;
+    return;
+  }
   const dom = (quote.fee_noms / 100000000).toLocaleString("en-US", { maximumFractionDigits: 8 });
   const usd = quote.fee_usd_estimated != null
     ? ` (~US$ ${Number(quote.fee_usd_estimated).toPrecision(3)}, ${quote.depc_basket_version} estimate)`
     : "";
-  const legs = quote.external_legs === 0 ? "DOM only" : quote.external_legs === 1 ? "one external leg" : "two external legs";
   let paid;
-  if (quote.payment_asset === "DOM") {
+  if (payment?.ticker === "DOM") {
     paid = `paid in DOM`;
-  } else if (quote.payment_asset === "USDT") {
+  } else if (payment?.ticker === "USDT") {
     paid = quote.fee_payment_estimated != null
-      ? `payable as ~${Number(quote.fee_payment_estimated).toPrecision(3)} USDT at the ${quote.depc_basket_version} production-cost reference`
-      : `payable in USDT once the node can supply the production-cost reference`;
+      ? `payable as ~${Number(quote.fee_payment_estimated).toPrecision(3)} ${paymentLabel} at the ${quote.depc_basket_version} production-cost reference`
+      : `payable in ${paymentLabel} once the node can supply the production-cost reference`;
   } else {
-    paid = `payable as the same US$ value in BTC, fixed at the rate implied by the quote you accept`;
+    paid = `payable in ${paymentLabel}, fixed at the rate implied by the quote you accept`;
   }
   swapFeeSummary().textContent = `Protocol fee ${quote.fee_percent}% (${legs}): ${quote.fee_noms} noms (${dom} DOM), ${paid}${usd}.`;
 };
@@ -540,6 +546,19 @@ const renderSwapFee = (quote) => {
 // funds reach a chain nobody can spend them from.
 let swapAssets = [];
 const swapAssetByCode = (code) => swapAssets.find((asset) => asset.code === code);
+const swapBaseUnitDisplayName = (asset) => ({
+  nom: "noms",
+  satoshi: "satoshis",
+  lamport: "lamports",
+  "micro-USDT": "micro-USDT",
+  piconero: "piconero",
+})[asset?.base_unit_name] ?? "base units";
+const renderSwapUnitPlaceholders = () => {
+  const from = swapAssetByCode(byId("swap-from").value);
+  const to = swapAssetByCode(byId("swap-to").value);
+  byId("swap-amount").placeholder = `Amount in ${swapBaseUnitDisplayName(from)}`;
+  byId("swap-minimum-output").placeholder = `Minimum received in ${swapBaseUnitDisplayName(to)}`;
+};
 const renderSwapReceivingLeg = () => {
   const chosen = swapAssetByCode(byId("swap-to").value);
   const note = byId("swap-receiving-leg");
@@ -565,9 +584,14 @@ const populateSwapAssets = async () => {
     const wanted = assets.some((asset) => asset.code === previous) ? previous : preferred;
     if (assets.some((asset) => asset.code === wanted)) select.value = wanted;
   }
+  renderSwapUnitPlaceholders();
   renderSwapReceivingLeg();
 };
-byId("swap-to").addEventListener("change", renderSwapReceivingLeg);
+byId("swap-from").addEventListener("change", renderSwapUnitPlaceholders);
+byId("swap-to").addEventListener("change", () => {
+  renderSwapUnitPlaceholders();
+  renderSwapReceivingLeg();
+});
 
 const previewSwapFee = async () => {
   const data = new FormData(byId("swap-intent-form"));

@@ -177,3 +177,25 @@ test("assets are chosen as (ticker, network), never as a bare ticker", async () 
     "the wrong-network consequence must be stated plainly",
   );
 });
+
+test("swap amount units follow the selected source and destination assets", async () => {
+  const html = await source("index.html");
+  const js = await source("main.js");
+  assert.equal(html.includes('placeholder="Amount in noms"'), false, "DOM units must not be hard-coded on a multi-asset input");
+  assert.equal(html.includes('id="swap-amount"'), true, "source amount needs a dynamic placeholder target");
+  assert.equal(html.includes('id="swap-minimum-output"'), true, "destination floor needs a dynamic placeholder target");
+  assert.equal(js.includes("asset?.base_unit_name"), true, "unit labels must come from the asset registry DTO");
+  assert.equal(js.includes('`Amount in ${swapBaseUnitDisplayName(from)}`'), true, "FROM must drive the source unit");
+  assert.equal(js.includes('`Minimum received in ${swapBaseUnitDisplayName(to)}`'), true, "TO must drive the destination unit");
+  assert.equal(js.includes('byId("swap-from").addEventListener("change", renderSwapUnitPlaceholders)'), true, "FROM changes must refresh units");
+  assert.equal(js.includes('byId("swap-to").addEventListener("change"'), true, "TO changes must refresh units");
+  assert.equal(js.includes('lamport: "lamports"'), true, "SOL must render in lamports");
+  assert.equal(js.includes('nom: "noms"'), true, "DOM must render in noms");
+});
+
+test("fee preview does not invent an absolute DOM fee for external input", async () => {
+  const js = await source("main.js");
+  assert.equal(js.includes("if (quote.fee_noms == null)"), true, "missing fee must have an explicit presentation branch");
+  assert.equal(js.includes("quote.fee_message"), true, "the backend's stable quote-dependent explanation must be shown");
+  assert.equal(js.includes("Fee payment currency:"), true, "the user choice is a currency, not a user-entered fee value");
+});

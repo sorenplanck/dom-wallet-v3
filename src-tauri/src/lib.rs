@@ -1142,6 +1142,10 @@ pub mod swap {
         pub ticker: &'static str,
         pub network: &'static str,
         pub leg: ReceivingLeg,
+        /// Smallest-unit name used by the chain or token contract.
+        pub base_unit_name: &'static str,
+        /// Decimal places between one display unit and one base unit.
+        pub decimals: u8,
     }
 
     /// The curated registry. Adding a network for a token is one entry
@@ -1153,36 +1157,48 @@ pub mod swap {
             ticker: "DOM",
             network: "DOM",
             leg: ReceivingLeg::Dom,
+            base_unit_name: "nom",
+            decimals: 8,
         },
         AssetIdentity {
             code: "BTC",
             ticker: "BTC",
             network: "Bitcoin",
             leg: ReceivingLeg::Bitcoin,
+            base_unit_name: "satoshi",
+            decimals: 8,
         },
         AssetIdentity {
             code: "XMR",
             ticker: "XMR",
             network: "Monero",
             leg: ReceivingLeg::Monero,
+            base_unit_name: "piconero",
+            decimals: 12,
         },
         AssetIdentity {
             code: "SOL",
             ticker: "SOL",
             network: "Solana",
             leg: ReceivingLeg::Solana,
+            base_unit_name: "lamport",
+            decimals: 9,
         },
         AssetIdentity {
             code: "USDT.ETH",
             ticker: "USDT",
             network: "Ethereum",
             leg: ReceivingLeg::Evm,
+            base_unit_name: "micro-USDT",
+            decimals: 6,
         },
         AssetIdentity {
             code: "USDT.SOL",
             ticker: "USDT",
             network: "Solana",
             leg: ReceivingLeg::Solana,
+            base_unit_name: "micro-USDT",
+            decimals: 6,
         },
     ];
 
@@ -1228,6 +1244,20 @@ pub mod swap {
         let denominator = u128::from(BPS_DENOMINATOR);
         let fee = numerator.div_ceil(denominator);
         u64::try_from(fee).ok()
+    }
+
+    /// Calculate a quote's protocol fee from the amount of its DOM leg.
+    pub fn accepted_quote_fee_noms(
+        quote: &dom_wallet_domain::SwapAcceptedQuote,
+        fee_bps: u64,
+    ) -> Option<u64> {
+        swap_fee_noms(quote.dom_leg_amount_base_units, fee_bps)
+    }
+
+    /// Stable fail-closed explanation used before a non-DOM intent has quotes.
+    pub fn pending_quote_fee_message(fee_bps: u64) -> String {
+        let percent = fee_bps as f64 / 100.0;
+        format!("{percent}% over the DOM leg; the exact amount arrives with the quotes.")
     }
 }
 
@@ -1401,20 +1431,23 @@ pub struct SwapLegScanPlanDto {
 
 /// The fee minute for one intended swap amount, before any quote exists.
 ///
-/// The fee is denominated in DOM; the USD figure is the DEPC-3 estimate and
-/// is `None` whenever the node cannot supply its inputs. Conversion into a
-/// non-DOM payment asset happens at quote time from the accepted quote's own
-/// implied rate, never from an external feed.
+/// The fee is denominated in DOM only when the input itself is DOM. For an
+/// external input, the absolute fields stay empty until a solver quote supplies
+/// the route's DOM-leg amount. The USD figure is only a DEPC-3 presentation
+/// estimate and never participates in percentage-fee arithmetic.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SwapFeeQuoteDto {
-    pub amount_noms: u64,
+    pub amount_base_units: u64,
     pub from_asset: String,
     pub to_asset: String,
     pub external_legs: u64,
     pub fee_bps: u64,
     pub fee_percent: f64,
-    pub fee_noms: u64,
+    pub fee_noms: Option<u64>,
+    /// Exact for DOM input; otherwise explains why the absolute fee must wait
+    /// for a solver quote to declare the DOM-leg amount.
+    pub fee_message: String,
     pub payment_asset: String,
     pub fee_usd_estimated: Option<f64>,
     /// Fee expressed in the chosen payment asset. Exact for DOM; for USDT
@@ -1575,6 +1608,8 @@ pub struct SwapAssetDto {
     /// token to a chain this wallet cannot spend from.
     pub receiving_leg: String,
     pub is_dom: bool,
+    pub base_unit_name: String,
+    pub decimals: u8,
 }
 
 /// The wallet's swap-network identity: the BIP340 x-only public key the
@@ -3700,12 +3735,12 @@ impl DesktopApplication {
         })
     }
 
-    /// The fee minute for an intended amount: DOM-denominated fee plus the
-    /// DEPC-3 USD estimate when the node can supply it. Fail-closed: an
-    /// invalid amount or payment asset is an error, never a guess.
+    /// The fee minute for an intended amount. DOM inputs have an exact
+    /// DOM-denominated fee; external inputs expose only the tier until an
+    /// authenticated solver quote supplies the route's DOM-leg amount.
     pub fn swap_fee_quote(
         &self,
-        amount_noms: u64,
+        amount_base_units: u64,
         from_asset: &str,
         to_asset: &str,
         payment_asset: &str,
@@ -3720,38 +3755,59 @@ impl DesktopApplication {
         })?;
         let fee_bps = swap::fee_bps_for_route(from_asset, to_asset)
             .ok_or_else(|| CommandError::InvalidInput("route has no ratified fee tier".into()))?;
-        let fee_noms = swap::swap_fee_noms(amount_noms, fee_bps)
-            .ok_or_else(|| CommandError::InvalidInput("amount must be positive".into()))?;
-        let sync_context = self.sync_status_context();
-        let fee_usd_estimated = self.service.lock().ok().and_then(|service| {
-            let synchronized = sync_status_from_service(
-                &service,
-                SyncStatusContext {
-                    remote_source: false,
-                    ..sync_context
-                },
+        if amount_base_units == 0 {
+            return Err(CommandError::InvalidInput("amount must be positive".into()));
+        }
+        let fee_noms = if from_asset == "DOM" {
+            Some(
+                swap::swap_fee_noms(amount_base_units, fee_bps)
+                    .ok_or_else(|| CommandError::InvalidInput("amount is invalid".into()))?,
             )
-            .synchronized;
-            let economics = service.embedded_mining_economics().ok()?;
-            network_mining_presentation(&economics, synchronized)
-                .estimated_cost_central_usd_per_dom
-                .map(|usd_per_dom| (fee_noms as f64 / economics.noms_per_dom as f64) * usd_per_dom)
+        } else {
+            None
+        };
+        let sync_context = self.sync_status_context();
+        let fee_usd_estimated = fee_noms.and_then(|fee_noms| {
+            self.service
+                .lock()
+                .ok()
+                .and_then(|service| {
+                    let synchronized = sync_status_from_service(
+                        &service,
+                        SyncStatusContext {
+                            remote_source: false,
+                            ..sync_context
+                        },
+                    )
+                    .synchronized;
+                    let economics = service.embedded_mining_economics().ok()?;
+                    network_mining_presentation(&economics, synchronized)
+                        .estimated_cost_central_usd_per_dom
+                        .map(|usd_per_dom| {
+                        (fee_noms as f64 / economics.noms_per_dom as f64) * usd_per_dom
+                    })
+                })
         });
         Ok(SwapFeeQuoteDto {
-            amount_noms,
+            amount_base_units,
             from_asset: from_asset.to_owned(),
             to_asset: to_asset.to_owned(),
             external_legs,
             fee_bps,
             fee_percent: fee_bps as f64 / 100.0,
             fee_noms,
+            fee_message: if from_asset == "DOM" {
+                "Exact fee calculated over the entered DOM amount.".into()
+            } else {
+                swap::pending_quote_fee_message(fee_bps)
+            },
             payment_asset: payment_asset.to_owned(),
             fee_usd_estimated,
-            fee_payment_estimated: match swap::asset(payment_asset).map(|a| a.ticker) {
-                Some("DOM") => Some(fee_noms as f64 / 100_000_000.0),
+            fee_payment_estimated: match (swap::asset(payment_asset).map(|a| a.ticker), fee_noms) {
+                (Some("DOM"), Some(fee_noms)) => Some(fee_noms as f64 / 100_000_000.0),
                 // Any USDT is the USD leg of the DEPC reference; which
                 // network carries it does not change the estimate.
-                Some("USDT") => fee_usd_estimated,
+                (Some("USDT"), Some(_)) => fee_usd_estimated,
                 _ => None,
             },
             depc_basket_version: depc::DEPC_BASKET_VERSION.to_owned(),
@@ -3806,6 +3862,7 @@ impl DesktopApplication {
             minimum_output_base_units,
             fee_payment_asset: fee_payment_asset.to_owned(),
             fee_bps,
+            fee_noms: 0,
             // Replaced by the durable allocator inside the same commit
             // that persists the draft; never chosen here.
             leg_index: 0,
@@ -4026,6 +4083,8 @@ impl DesktopApplication {
                 },
                 receiving_leg: asset.leg.name().to_owned(),
                 is_dom: asset.leg == swap::ReceivingLeg::Dom,
+                base_unit_name: asset.base_unit_name.to_owned(),
+                decimals: asset.decimals,
             })
             .collect())
     }
@@ -4106,6 +4165,26 @@ impl DesktopApplication {
     /// fabricated market.
     pub fn swap_quotes_list(&self) -> Result<(), CommandError> {
         Err(CommandError::Unavailable)
+    }
+
+    /// Commit a quote only after the authenticated daemon adapter has selected
+    /// it. This is intentionally not a Tauri command: browser input cannot
+    /// manufacture solver facts. The fee tier comes from the durable intent,
+    /// and the absolute fee comes exclusively from the quote's DOM leg.
+    pub fn swap_authenticated_quote_commit(
+        &self,
+        session_id: Uuid,
+        quote: dom_wallet_domain::SwapAcceptedQuote,
+    ) -> Result<dom_wallet_domain::SwapSessionRecord, CommandError> {
+        let mut service = self.lock_service()?;
+        let session = service
+            .swap_session(session_id)
+            .map_err(CommandError::from)?;
+        let fee_noms = swap::accepted_quote_fee_noms(&quote, session.fee_bps)
+            .ok_or_else(|| CommandError::InvalidInput("quote DOM leg is invalid".into()))?;
+        service
+            .swap_session_accept_quote(session_id, quote, fee_noms, unix_seconds())
+            .map_err(CommandError::from)
     }
 
     /// Accept a quote. Fail-closed like `swap_quotes_list`.
@@ -7246,7 +7325,8 @@ mod depc_tests {
 
 #[cfg(test)]
 mod swap_tests {
-    use super::swap;
+    use super::{swap, DesktopApplication};
+    use dom_wallet_domain::SwapAcceptedQuote;
 
     #[test]
     fn the_operator_example_holds_exactly() {
@@ -7261,6 +7341,95 @@ mod swap_tests {
             swap::swap_fee_noms(thousand_dom, swap::SWAP_FEE_BPS_DUAL_LEG),
             Some(10 * 100_000_000)
         );
+    }
+
+    #[test]
+    fn accepted_quote_fee_uses_its_dom_leg_at_both_ratified_tiers() {
+        let quote = SwapAcceptedQuote {
+            solver_label: "solver-1".into(),
+            output_base_units: 1,
+            quote_fee_base_units: 1,
+            dom_leg_amount_base_units: 100_000_000,
+            estimated_seconds: 1,
+        };
+        assert_eq!(
+            swap::accepted_quote_fee_noms(&quote, swap::SWAP_FEE_BPS_SINGLE_LEG),
+            Some(500_000)
+        );
+        assert_eq!(
+            swap::accepted_quote_fee_noms(&quote, swap::SWAP_FEE_BPS_DUAL_LEG),
+            Some(1_000_000)
+        );
+    }
+
+    #[test]
+    fn dom_input_fee_preview_has_an_absolute_dom_value() {
+        let quote = DesktopApplication::default()
+            .swap_fee_quote(100_000_000, "DOM", "BTC", "DOM")
+            .expect("DOM fee preview");
+        assert_eq!(quote.fee_bps, swap::SWAP_FEE_BPS_SINGLE_LEG);
+        assert_eq!(quote.fee_noms, Some(500_000));
+        assert_eq!(quote.fee_payment_estimated, Some(0.005));
+        assert_eq!(
+            quote.fee_message,
+            "Exact fee calculated over the entered DOM amount."
+        );
+    }
+
+    #[test]
+    fn external_input_fee_preview_waits_for_the_quoted_dom_leg() {
+        let quote = DesktopApplication::default()
+            .swap_fee_quote(1_000_000_000, "SOL", "USDT.ETH", "DOM")
+            .expect("external fee tier preview");
+        assert_eq!(quote.fee_bps, swap::SWAP_FEE_BPS_DUAL_LEG);
+        assert_eq!(quote.fee_percent, 1.0);
+        assert_eq!(quote.fee_noms, None);
+        assert_eq!(quote.fee_usd_estimated, None);
+        assert_eq!(quote.fee_payment_estimated, None);
+        assert_eq!(
+            quote.fee_message,
+            "1% over the DOM leg; the exact amount arrives with the quotes."
+        );
+    }
+
+    #[test]
+    fn quote_acceptance_persists_fee_from_dom_leg_not_sol_intent_amount() {
+        let directory = tempfile::tempdir().expect("temporary wallet parent");
+        let app = DesktopApplication::default();
+        app.wallet_create_recoverable(directory.path().join("wallet"), "password-1")
+            .expect("create wallet");
+        app.wallet_recovery_phrase_confirm("password-1")
+            .expect("confirm recovery phrase");
+        app.wallet_unlock("password-1").expect("unlock wallet");
+        let draft = app
+            .swap_intent_create(1_000_000_000, "SOL", "USDT.ETH", 1_000_000, "DOM")
+            .expect("durable SOL intent")
+            .session;
+        app.lock_service()
+            .expect("wallet service")
+            .swap_session_transition(
+                draft.id,
+                dom_wallet_domain::SwapSessionState::IntentPublished,
+                1,
+            )
+            .expect("publish intent fixture");
+
+        let accepted = app
+            .swap_authenticated_quote_commit(
+                draft.id,
+                SwapAcceptedQuote {
+                    solver_label: "solver-1".into(),
+                    output_base_units: 900_000,
+                    quote_fee_base_units: 10_000,
+                    dom_leg_amount_base_units: 20_000_000,
+                    estimated_seconds: 600,
+                },
+            )
+            .expect("commit authenticated quote");
+
+        assert_eq!(accepted.fee_bps, swap::SWAP_FEE_BPS_DUAL_LEG);
+        assert_eq!(accepted.fee_noms, 200_000);
+        assert_ne!(accepted.fee_noms, 10_000_000);
     }
 
     #[test]
@@ -7398,6 +7567,33 @@ mod swap_tests {
         let total = codes.len();
         codes.dedup();
         assert_eq!(codes.len(), total, "wire codes are unique");
+    }
+
+    #[test]
+    fn every_curated_asset_declares_its_chain_base_unit() {
+        let expected = [
+            ("DOM", "nom", 8),
+            ("BTC", "satoshi", 8),
+            ("XMR", "piconero", 12),
+            ("SOL", "lamport", 9),
+            ("USDT.ETH", "micro-USDT", 6),
+            ("USDT.SOL", "micro-USDT", 6),
+        ];
+        assert_eq!(swap::ASSET_REGISTRY.len(), expected.len());
+        for (code, base_unit_name, decimals) in expected {
+            let asset = swap::asset(code).expect("curated asset");
+            assert!(!asset.base_unit_name.is_empty());
+            assert_eq!(asset.base_unit_name, base_unit_name, "{code}");
+            assert_eq!(asset.decimals, decimals, "{code}");
+        }
+        let exposed = DesktopApplication::default()
+            .swap_asset_registry()
+            .expect("asset registry DTO");
+        for asset in exposed {
+            let identity = swap::asset(&asset.code).expect("DTO names a curated asset");
+            assert_eq!(asset.base_unit_name, identity.base_unit_name);
+            assert_eq!(asset.decimals, identity.decimals);
+        }
     }
 
     #[test]
