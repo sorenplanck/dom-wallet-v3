@@ -17,6 +17,10 @@ test("release workflow provides pinned experimental dry-run packaging", async ()
     "scripts/test-packaged-native-bridge-linux.mjs", "tauri-driver --version 2.0.6",
     "TAURI_VERSION", "test \"$VERSION\" = \"$TAURI_VERSION\"",
     "\"createUpdaterArtifacts\":true", "--no-sign",
+    "cargo test --locked -p dom-wallet-multichain",
+    "cargo test --locked -p dom-wallet-swap-client",
+    "cargo test --locked -p dom-wallet-updater",
+    "cargo test --locked -p dom-wallet-storage",
   ]) assert.equal(workflow.includes(required), true, `missing ${required}`);
 
   const actionRefs = [...workflow.matchAll(/uses:\s+[^@\s]+@([^\s]+)/g)].map((match) => match[1]);

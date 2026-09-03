@@ -4,7 +4,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/status-Experimental%20Desktop%20Wallet-b87333?style=flat-square" alt="Status: Experimental Desktop Wallet">
-  <img src="https://img.shields.io/badge/latest%20tag-wallet--v0.3.2-7a4a22?style=flat-square" alt="Latest tag: wallet-v0.3.2">
+  <img src="https://img.shields.io/badge/latest%20tag-wallet--v0.3.3-7a4a22?style=flat-square" alt="Latest tag: wallet-v0.3.3">
   <img src="https://img.shields.io/badge/development%20line-main--v0.4-8a6a3f?style=flat-square" alt="Development line: main-v0.4">
   <img src="https://img.shields.io/badge/network-DOM%20Mainnet-3d2f22?style=flat-square" alt="Network: DOM Mainnet">
   <img src="https://img.shields.io/badge/language-Rust-7a4a22?style=flat-square" alt="Language: Rust">
@@ -46,7 +46,7 @@ Before using it, understand the following:
 
 ### Latest tagged release
 
-`wallet-v0.3.2`
+`wallet-v0.3.3`
 
 The complete release history, with per-version artifacts and checksums, is published on the repository's GitHub Releases page.
 
@@ -54,7 +54,7 @@ The complete release history, with per-version artifacts and checksums, is publi
 
 `main-v0.4`
 
-The `main-v0.4` branch is the principal line. It integrates, on top of `wallet-v0.3.2`:
+The `main-v0.4` branch is the principal line and the source of `wallet-v0.3.3`. It integrates, on top of `wallet-v0.3.2`:
 
 - Estimated production cost per DOM (DEPC-3) derived exclusively from network difficulty and the live block subsidy, shown on the Mining screen.
 - Network fee display in the send flow, fail-closed: a payment is not created when the fee cannot be computed.
@@ -879,7 +879,11 @@ Compare the result with the checksum published in the corresponding GitHub Relea
 
 ## Release History
 
-The authoritative per-version record — artifacts, checksums, and release notes from `wallet-v0.1.0` through `wallet-v0.3.2` — is the repository's GitHub Releases page.
+The authoritative per-version record — artifacts, checksums, and release notes from `wallet-v0.1.0` through `wallet-v0.3.3` — is the repository's GitHub Releases page.
+
+### wallet-v0.3.3
+
+Latest tagged release from the `main-v0.4` line. It adds the DEPC-3 mining estimate, fail-closed fee presentation, seed-derived multichain accounts, the resumable Swap interface and protocol client, kernel-evidence confirmation, restart-safe persistence, and remote-input and secret-handling hardening. Swap execution remains fail-closed unless a compatible interop daemon is available.
 
 ### wallet-v0.3.2
 
@@ -887,7 +891,7 @@ Latest tagged release and the base of the current line. It carries the restored 
 
 ### main-v0.4
 
-The principal development line. It merges into one branch, on top of `wallet-v0.3.2`:
+The principal development and release line for `wallet-v0.3.3`. It merges into one branch, on top of `wallet-v0.3.2`:
 
 - the mining production-cost estimate (DEPC-3) and the fail-closed send-flow fee display;
 - the Swap tab and its adjudicated design;
