@@ -3,7 +3,9 @@
 #![forbid(unsafe_code)]
 
 use dom_config::{Network, NodeConfig};
+use dom_consensus::block::BlockHeader;
 use dom_node::{node::DomNode, wallet_core_api::EmbeddedWalletCoreApi};
+use dom_serialization::DomDeserialize;
 use dom_wallet_core_api::{
     BlockSelector, BlockSummary, ChainIdentity, CursorValidation, FeeBreakdown, FeeEstimate,
     FeeEstimateRequest, FeePolicySnapshot, FeeValidation, KernelQueryResult, MempoolPolicySnapshot,
@@ -40,6 +42,8 @@ const SEED_PENDING: u8 = 0;
 const SEED_RESOLVING: u8 = 1;
 const SEED_RESOLVED: u8 = 2;
 const SEED_RETRYING: u8 = 3;
+/// One hour of already-mined blocks at the 120-second target spacing.
+const OBSERVED_DIFFICULTY_WINDOW: u64 = 30;
 
 /// Canonical desktop-wallet Mainnet DNS seeds.
 pub const MAINNET_DNS_SEEDS: [&str; 3] = [
@@ -281,12 +285,46 @@ pub struct MiningEconomics {
     /// Expected proof-of-work difficulty for the next block candidate,
     /// i.e. the expected number of hashes per block.
     pub network_difficulty: u128,
+    /// Mean proof-of-work difficulty of the latest 30 canonical, already-mined
+    /// blocks. Missing until the node has a complete observation window.
+    pub observed_network_difficulty: Option<u128>,
     /// Consensus block subsidy at the next height, in noms.
     pub next_block_reward_noms: u64,
     /// Consensus target block spacing, in seconds.
     pub target_spacing_seconds: u64,
     /// Consensus base unit: noms per DOM.
     pub noms_per_dom: u64,
+}
+
+fn observed_network_difficulty<F>(
+    network_magic: u32,
+    canonical_height: u64,
+    mut header_at_height: F,
+) -> Option<u128>
+where
+    F: FnMut(u64) -> Option<(dom_core::BlockHeight, dom_pow::CompactTarget)>,
+{
+    if canonical_height < OBSERVED_DIFFICULTY_WINDOW {
+        return None;
+    }
+
+    let first_height = canonical_height.checked_sub(OBSERVED_DIFFICULTY_WINDOW - 1)?;
+    let mut total = 0_u128;
+    for height in first_height..=canonical_height {
+        let (header_height, compact_target) = header_at_height(height)?;
+        if header_height.0 != height {
+            return None;
+        }
+        let target = compact_target.to_target().ok()?;
+        let difficulty = dom_pow::target_to_difficulty_for_network_height(
+            network_magic,
+            dom_core::BlockHeight(height),
+            &target,
+        )
+        .ok()?;
+        total = total.checked_add(difficulty)?;
+    }
+    total.checked_div(u128::from(OBSERVED_DIFFICULTY_WINDOW))
 }
 
 /// Privacy-safe live peer counters from the embedded node.
@@ -665,11 +703,8 @@ impl EmbeddedCoreLifecycle {
             .ok_or(EmbeddedCoreAdapterError::Internal {
                 code: "MISSING_NODE",
             })?;
-        let next_height = node
-            .metrics
-            .chain_height
-            .load(Ordering::Relaxed)
-            .saturating_add(1);
+        let canonical_height = node.metrics.chain_height.load(Ordering::Relaxed);
+        let next_height = canonical_height.saturating_add(1);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|_| EmbeddedCoreAdapterError::Internal { code: "CLOCK" })?
@@ -682,9 +717,27 @@ impl EmbeddedCoreLifecycle {
         .map_err(|_| EmbeddedCoreAdapterError::Internal {
             code: "EXPECTED_TARGET",
         })?;
+        let network_magic = node.config.network.magic();
+        let projected_difficulty = dom_pow::target_to_difficulty_for_network_height(
+            network_magic,
+            dom_core::BlockHeight(next_height),
+            &target,
+        )
+        .map_err(|_| EmbeddedCoreAdapterError::Internal {
+            code: "EXPECTED_DIFFICULTY",
+        })?;
+        let observed_network_difficulty = node.chain.try_lock().ok().and_then(|chain| {
+            observed_network_difficulty(network_magic, canonical_height, |height| {
+                let hash = chain.store.get_hash_at_height(height).ok()??;
+                let bytes = chain.store.get_block_header(&hash).ok()??;
+                let header = BlockHeader::from_bytes(&bytes).ok()?;
+                Some((header.height, header.target))
+            })
+        });
         Ok(MiningEconomics {
             next_height,
-            network_difficulty: dom_pow::target_to_difficulty(&target),
+            network_difficulty: projected_difficulty,
+            observed_network_difficulty,
             next_block_reward_noms: dom_core::block_reward(dom_core::BlockHeight(next_height))
                 .noms(),
             target_spacing_seconds: dom_core::constants::TARGET_SPACING,
@@ -1340,6 +1393,94 @@ mod tests {
         assert_eq!(status.highest_known_peer_height, 6_622);
         lifecycle.request_shutdown().expect("shutdown request");
         lifecycle.wait_for_shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn low_local_height_with_a_wall_clock_far_past_genesis_has_no_observed_difficulty() {
+        let directory = TempDir::new().expect("temporary directory");
+        let mut lifecycle = EmbeddedCoreLifecycle::new(regtest_configuration(directory.path()));
+        lifecycle.start().expect("Regtest embedded node starts");
+
+        let economics = lifecycle.mining_economics().expect("mining economics");
+        assert_eq!(economics.next_height, 1);
+        assert!(
+            economics.network_difficulty > 0,
+            "the miner still needs its projected target"
+        );
+        assert_eq!(economics.observed_network_difficulty, None);
+
+        lifecycle.request_shutdown().expect("shutdown request");
+        lifecycle.wait_for_shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn mining_economics_averages_thirty_known_stored_canonical_headers() {
+        let directory = TempDir::new().expect("temporary directory");
+        let mut lifecycle = EmbeddedCoreLifecycle::new(regtest_configuration(directory.path()));
+        lifecycle.start().expect("Regtest embedded node starts");
+        let node = lifecycle.node_handle().expect("node handle");
+        let network_magic = Network::Regtest.magic();
+        let compact = dom_pow::CompactTarget(dom_pow::REGTEST_TARGET_COMPACT);
+        let target = compact.to_target().expect("valid known target");
+        let expected = dom_pow::target_to_difficulty_for_network_height(
+            network_magic,
+            dom_core::BlockHeight(30),
+            &target,
+        )
+        .expect("known difficulty");
+        {
+            let chain = node.chain.try_lock().expect("idle Regtest chain lock");
+            let genesis_hash = chain
+                .store
+                .get_hash_at_height(0)
+                .expect("genesis index read")
+                .expect("genesis hash");
+            let genesis_bytes = chain
+                .store
+                .get_block_header(&genesis_hash)
+                .expect("genesis header read")
+                .expect("genesis header");
+            let mut header = BlockHeader::from_bytes(&genesis_bytes).expect("decode genesis");
+            let mut previous_hash = dom_core::Hash256::from_bytes(genesis_hash);
+            for height in 1..=OBSERVED_DIFFICULTY_WINDOW {
+                header.height = dom_core::BlockHeight(height);
+                header.prev_hash = previous_hash;
+                header.target = compact;
+                let bytes = dom_serialization::DomSerialize::to_bytes(&header)
+                    .expect("serialize known header");
+                let hash = dom_chain::canonical_header_identifier(network_magic, &bytes)
+                    .expect("canonical header hash");
+                chain
+                    .store
+                    .commit_block(hash.as_bytes(), height, &bytes, &[0xBB; 4], &[], &[], &[])
+                    .expect("store canonical header fixture");
+                previous_hash = hash;
+            }
+        }
+        node.metrics
+            .chain_height
+            .store(OBSERVED_DIFFICULTY_WINDOW, Ordering::Release);
+
+        let economics = lifecycle.mining_economics().expect("mining economics");
+        assert_eq!(economics.observed_network_difficulty, Some(expected));
+
+        lifecycle.request_shutdown().expect("shutdown request");
+        lifecycle.wait_for_shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn observed_difficulty_requires_a_complete_header_window() {
+        let mut reads = 0_u64;
+        let actual = observed_network_difficulty(Network::Regtest.magic(), 29, |_| {
+            reads += 1;
+            None
+        });
+
+        assert_eq!(
+            reads, 0,
+            "an incomplete chain must not be partially sampled"
+        );
+        assert_eq!(actual, None);
     }
 
     #[test]

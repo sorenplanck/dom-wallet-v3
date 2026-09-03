@@ -445,6 +445,17 @@ const refreshUpdates = async () => {
   const error = updates.wallet.sanitized_error;
   byId("update-error").textContent = error ?? "No updater error.";
 };
+const formatHashrate = (value) => {
+  if (value == null) return "—";
+  const hashrate = Number(value);
+  if (!Number.isFinite(hashrate) || hashrate < 0) return "—";
+  const [divisor, unit] = hashrate >= 1_000_000
+    ? [1_000_000, "MH/s"]
+    : hashrate >= 1_000
+      ? [1_000, "kH/s"]
+      : [1, "H/s"];
+  return `${(hashrate / divisor).toLocaleString("en-US", { maximumFractionDigits: 2 })} ${unit}`;
+};
 const renderMining = (value, node) => {
   const presentation = miningPresentation(value, node);
   byId("mining-status").textContent = presentation.status;
@@ -452,7 +463,8 @@ const renderMining = (value, node) => {
   byId("mining-threads").value = value.cpu_threads;
   byId("mining-threads").disabled = !value.enabled || value.running;
   byId("mining-address").value = value.mining_address;
-  byId("mining-hashrate").textContent = `${value.hashrate_hps.toFixed(1)} H/s`;
+  byId("mining-hashrate").textContent = formatHashrate(value.hashrate_hps);
+  byId("mining-network-hashrate").textContent = formatHashrate(value.network_hashrate_hps);
   byId("mining-height").textContent = value.current_height;
   byId("mining-peers").textContent = value.connected_peers;
   byId("mining-accepted").textContent = value.accepted_blocks;
@@ -461,8 +473,13 @@ const renderMining = (value, node) => {
   byId("mining-candidate").textContent = value.last_block_candidate_time ? new Date(value.last_block_candidate_time * 1000).toLocaleString() : "Never";
   byId("mining-last-height").textContent = value.last_accepted_block_height ?? "—";
   byId("mining-uptime").textContent = `${value.uptime_seconds}s`;
-  byId("mining-estimated-value").textContent = value.estimated_production_cost_usd_per_dom != null
-    ? `~US$ ${Number(value.estimated_production_cost_usd_per_dom).toPrecision(3)} / DOM`
+  const estimatedCost = Number(value.estimated_production_cost_usd_per_dom);
+  const estimatedLow = Number(value.estimated_production_cost_low_usd_per_dom);
+  const estimatedHigh = Number(value.estimated_production_cost_high_usd_per_dom);
+  const hasEstimatedRange = [estimatedCost, estimatedLow, estimatedHigh]
+    .every((entry) => Number.isFinite(entry) && entry > 0);
+  byId("mining-estimated-value").textContent = hasEstimatedRange
+    ? `~US$ ${estimatedCost.toPrecision(3)} / DOM (range US$ ${estimatedLow.toPrecision(3)}–${estimatedHigh.toPrecision(3)})`
     : "—";
   byId("mining-warning").hidden = presentation.warning == null;
   byId("mining-warning").textContent = presentation.warning ?? "";
@@ -484,9 +501,9 @@ const renderMiningUnavailable = (node) => {
   byId("mining-threads").disabled = true;
   byId("mining-address").value = "";
   for (const id of [
-    "mining-hashrate", "mining-height", "mining-peers", "mining-accepted",
+    "mining-hashrate", "mining-network-hashrate", "mining-height", "mining-peers", "mining-accepted",
     "mining-rejected", "mining-template-refreshes", "mining-candidate",
-    "mining-last-height", "mining-uptime",
+    "mining-last-height", "mining-uptime", "mining-estimated-value",
   ]) byId(id).textContent = "—";
   byId("mining-warning").hidden = false;
   byId("mining-warning").textContent = node?.status_message ?? "The embedded node is unavailable.";

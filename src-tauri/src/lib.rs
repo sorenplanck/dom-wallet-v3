@@ -19,8 +19,8 @@ use dom_wallet_domain::BalanceProjection;
 #[cfg(test)]
 use dom_wallet_domain::{Network, NetworkIdentity};
 use dom_wallet_embedded_core::{
-    default_lmdb_map_size, EmbeddedCoreConfiguration, WalletMiner, WalletMiningOutcome,
-    LMDB_MAP_FULL_ERROR_CODE, MAINNET_DNS_SEEDS, MAINNET_P2P_PORT,
+    default_lmdb_map_size, EmbeddedCoreConfiguration, MiningEconomics, WalletMiner,
+    WalletMiningOutcome, LMDB_MAP_FULL_ERROR_CODE, MAINNET_DNS_SEEDS, MAINNET_P2P_PORT,
 };
 use dom_wallet_node_manager::{
     ManagedNodeConfig, NodeManager, NodeReleaseMetadata, SidecarStatus,
@@ -714,10 +714,6 @@ struct MiningRuntime {
     hashrate_window: Arc<Mutex<HashrateWindow>>,
     cached_current_height: AtomicU64,
     cached_connected_peers: AtomicU64,
-    /// Last computed DEPC-3 estimate, stored as `f64::to_bits`; zero means
-    /// "no estimate yet". Lets `mining_status` stay responsive when the
-    /// service lock is held by background work (regression A4).
-    cached_production_cost_usd_bits: AtomicU64,
     error_code: Arc<Mutex<Option<String>>>,
     cached_config: Mutex<Option<MiningConfigDto>>,
     worker: Option<JoinHandle<()>>,
@@ -739,7 +735,6 @@ impl Default for MiningRuntime {
             hashrate_window: Arc::new(Mutex::new(HashrateWindow::new())),
             cached_current_height: AtomicU64::new(0),
             cached_connected_peers: AtomicU64::new(0),
-            cached_production_cost_usd_bits: AtomicU64::new(0),
             error_code: Arc::new(Mutex::new(None)),
             cached_config: Mutex::new(Some(MiningConfigDto {
                 enabled: false,
@@ -1312,6 +1307,46 @@ pub mod depc {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct NetworkMiningPresentation {
+    network_hashrate_hps: Option<f64>,
+    estimated_cost_low_usd_per_dom: Option<f64>,
+    estimated_cost_central_usd_per_dom: Option<f64>,
+    estimated_cost_high_usd_per_dom: Option<f64>,
+}
+
+fn network_mining_presentation(
+    economics: &MiningEconomics,
+    synchronized: bool,
+) -> NetworkMiningPresentation {
+    if !synchronized {
+        return NetworkMiningPresentation::default();
+    }
+    let Some(difficulty) = economics.observed_network_difficulty else {
+        return NetworkMiningPresentation::default();
+    };
+    let Some(network_hashrate_hps) =
+        depc::network_hashrate_hps(difficulty, economics.target_spacing_seconds)
+    else {
+        return NetworkMiningPresentation::default();
+    };
+    let estimate = |cost| {
+        depc::estimated_production_cost_usd_per_dom(
+            network_hashrate_hps,
+            economics.next_block_reward_noms,
+            economics.noms_per_dom,
+            economics.target_spacing_seconds,
+            cost,
+        )
+    };
+    NetworkMiningPresentation {
+        network_hashrate_hps: Some(network_hashrate_hps),
+        estimated_cost_low_usd_per_dom: estimate(depc::DEPC_COST_LOW_USD_PER_KHS_DAY),
+        estimated_cost_central_usd_per_dom: estimate(depc::DEPC_COST_CENTRAL_USD_PER_KHS_DAY),
+        estimated_cost_high_usd_per_dom: estimate(depc::DEPC_COST_HIGH_USD_PER_KHS_DAY),
+    }
+}
+
 /// Level-1 swap-leg receive addresses, derived from the wallet's own seed.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1588,6 +1623,10 @@ pub struct MiningStatusDto {
     pub mining_address: String,
     pub hash_attempts: u64,
     pub hashrate_hps: f64,
+    /// Observed network hashrate; distinct from this wallet's local miner.
+    /// Missing while unsynchronized or before 30 canonical headers exist.
+    #[serde(default)]
+    pub network_hashrate_hps: Option<f64>,
     pub current_height: u64,
     pub connected_peers: u64,
     pub accepted_blocks: u64,
@@ -1601,6 +1640,10 @@ pub struct MiningStatusDto {
     /// the node cannot supply difficulty or subsidy — the UI shows a dash.
     #[serde(default)]
     pub estimated_production_cost_usd_per_dom: Option<f64>,
+    #[serde(default)]
+    pub estimated_production_cost_low_usd_per_dom: Option<f64>,
+    #[serde(default)]
+    pub estimated_production_cost_high_usd_per_dom: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -2735,6 +2778,7 @@ impl DesktopApplication {
     pub fn mining_status(&self) -> Result<MiningStatusDto, CommandError> {
         self.reap_finished_mining_worker()?;
         let config = self.mining_config_get()?;
+        let sync_context = self.sync_status_context();
         let mining = self.mining.lock().map_err(|_| CommandError::Unavailable)?;
         let raw_state = mining.state.load(Ordering::Acquire);
         let attempts = mining.hash_attempts.load(Ordering::Relaxed);
@@ -2762,62 +2806,49 @@ impl DesktopApplication {
         } else {
             0.0
         };
-        let (current_height, connected_peers, estimated_production_cost_usd_per_dom) =
-            match self.service.try_lock() {
-                Ok(service) => {
-                    let peer_status = service.embedded_peer_status().map_err(CommandError::from)?;
-                    mining
-                        .cached_current_height
-                        .store(peer_status.canonical_height, Ordering::Release);
-                    mining
-                        .cached_connected_peers
-                        .store(peer_status.connected_total, Ordering::Release);
-                    // Fail-closed presentation: any error along the economics
-                    // chain leaves the estimate empty instead of failing the
-                    // whole status query. The same held lock is reused; this arm
-                    // never blocks on the service a second time.
-                    let estimate = service
-                        .embedded_mining_economics()
-                        .ok()
-                        .and_then(|economics| {
-                            depc::network_hashrate_hps(
-                                economics.network_difficulty,
-                                economics.target_spacing_seconds,
-                            )
-                            .and_then(|network_hashrate| {
-                                depc::estimated_production_cost_usd_per_dom(
-                                    network_hashrate,
-                                    economics.next_block_reward_noms,
-                                    economics.noms_per_dom,
-                                    economics.target_spacing_seconds,
-                                    depc::DEPC_COST_CENTRAL_USD_PER_KHS_DAY,
-                                )
-                            })
-                        });
-                    mining
-                        .cached_production_cost_usd_bits
-                        .store(estimate.map_or(0, f64::to_bits), Ordering::Release);
-                    (
-                        peer_status.canonical_height,
-                        peer_status.connected_total,
-                        estimate,
-                    )
-                }
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    let cached_bits = mining
-                        .cached_production_cost_usd_bits
-                        .load(Ordering::Acquire);
-                    (
-                        mining.cached_current_height.load(Ordering::Acquire),
-                        mining.cached_connected_peers.load(Ordering::Acquire),
-                        (cached_bits != 0).then(|| f64::from_bits(cached_bits)),
-                    )
-                }
-                Err(std::sync::TryLockError::Poisoned(_)) => {
-                    self.recovery_required.store(true, Ordering::Release);
-                    return Err(CommandError::RecoveryRequired);
-                }
-            };
+        let (current_height, connected_peers, network_presentation) = match self.service.try_lock()
+        {
+            Ok(service) => {
+                let peer_status = service.embedded_peer_status().map_err(CommandError::from)?;
+                mining
+                    .cached_current_height
+                    .store(peer_status.canonical_height, Ordering::Release);
+                mining
+                    .cached_connected_peers
+                    .store(peer_status.connected_total, Ordering::Release);
+                // Reuse the wallet's authoritative synchronization gate.
+                // The observed metric is never shown during IBD, and a
+                // busy service also fails closed instead of serving a stale
+                // cached estimate after synchronization may have changed.
+                let synchronized = sync_status_from_service(
+                    &service,
+                    SyncStatusContext {
+                        remote_source: false,
+                        ..sync_context
+                    },
+                )
+                .synchronized;
+                let network_presentation = service
+                    .embedded_mining_economics()
+                    .ok()
+                    .map(|economics| network_mining_presentation(&economics, synchronized))
+                    .unwrap_or_default();
+                (
+                    peer_status.canonical_height,
+                    peer_status.connected_total,
+                    network_presentation,
+                )
+            }
+            Err(std::sync::TryLockError::WouldBlock) => (
+                mining.cached_current_height.load(Ordering::Acquire),
+                mining.cached_connected_peers.load(Ordering::Acquire),
+                NetworkMiningPresentation::default(),
+            ),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                self.recovery_required.store(true, Ordering::Release);
+                return Err(CommandError::RecoveryRequired);
+            }
+        };
         let last_candidate = mining.last_candidate_time.load(Ordering::Acquire);
         let last_height = mining.last_accepted_height.load(Ordering::Acquire);
         Ok(MiningStatusDto {
@@ -2828,6 +2859,7 @@ impl DesktopApplication {
             mining_address: config.mining_address,
             hash_attempts: attempts,
             hashrate_hps,
+            network_hashrate_hps: network_presentation.network_hashrate_hps,
             current_height,
             connected_peers,
             accepted_blocks: mining.accepted_blocks.load(Ordering::Relaxed),
@@ -2841,7 +2873,12 @@ impl DesktopApplication {
                 .lock()
                 .ok()
                 .and_then(|error| error.clone()),
-            estimated_production_cost_usd_per_dom,
+            estimated_production_cost_usd_per_dom: network_presentation
+                .estimated_cost_central_usd_per_dom,
+            estimated_production_cost_low_usd_per_dom: network_presentation
+                .estimated_cost_low_usd_per_dom,
+            estimated_production_cost_high_usd_per_dom: network_presentation
+                .estimated_cost_high_usd_per_dom,
         })
     }
 
@@ -3685,27 +3722,21 @@ impl DesktopApplication {
             .ok_or_else(|| CommandError::InvalidInput("route has no ratified fee tier".into()))?;
         let fee_noms = swap::swap_fee_noms(amount_noms, fee_bps)
             .ok_or_else(|| CommandError::InvalidInput("amount must be positive".into()))?;
-        let fee_usd_estimated = self
-            .service
-            .lock()
-            .ok()
-            .and_then(|service| service.embedded_mining_economics().ok())
-            .and_then(|economics| {
-                depc::network_hashrate_hps(
-                    economics.network_difficulty,
-                    economics.target_spacing_seconds,
-                )
-                .and_then(|network_hashrate| {
-                    depc::estimated_production_cost_usd_per_dom(
-                        network_hashrate,
-                        economics.next_block_reward_noms,
-                        economics.noms_per_dom,
-                        economics.target_spacing_seconds,
-                        depc::DEPC_COST_CENTRAL_USD_PER_KHS_DAY,
-                    )
-                })
+        let sync_context = self.sync_status_context();
+        let fee_usd_estimated = self.service.lock().ok().and_then(|service| {
+            let synchronized = sync_status_from_service(
+                &service,
+                SyncStatusContext {
+                    remote_source: false,
+                    ..sync_context
+                },
+            )
+            .synchronized;
+            let economics = service.embedded_mining_economics().ok()?;
+            network_mining_presentation(&economics, synchronized)
+                .estimated_cost_central_usd_per_dom
                 .map(|usd_per_dom| (fee_noms as f64 / economics.noms_per_dom as f64) * usd_per_dom)
-            });
+        });
         Ok(SwapFeeQuoteDto {
             amount_noms,
             from_asset: from_asset.to_owned(),
@@ -7059,7 +7090,7 @@ mod tests {
 
 #[cfg(test)]
 mod depc_tests {
-    use super::depc;
+    use super::{depc, network_mining_presentation, MiningEconomics};
 
     const REWARD_EPOCH_0_NOMS: u64 = 3_300_000_000;
     const REWARD_EPOCH_1_NOMS: u64 = 2_211_000_000;
@@ -7068,6 +7099,20 @@ mod depc_tests {
 
     fn relative_error(actual: f64, expected: f64) -> f64 {
         ((actual - expected) / expected).abs()
+    }
+
+    fn economics(observed_network_difficulty: Option<u128>) -> MiningEconomics {
+        MiningEconomics {
+            next_height: 25_001,
+            // A projected next target remains miner-only input. This value is
+            // deliberately the bad ~0.4 H/s regression vector and must never
+            // leak into network presentation.
+            network_difficulty: 49,
+            observed_network_difficulty,
+            next_block_reward_noms: REWARD_EPOCH_0_NOMS,
+            target_spacing_seconds: TARGET_SPACING,
+            noms_per_dom: NOMS_PER_DOM,
+        }
     }
 
     #[test]
@@ -7161,6 +7206,41 @@ mod depc_tests {
             depc::network_hashrate_hps(6_000_000, TARGET_SPACING),
             Some(50_000.0)
         );
+    }
+
+    #[test]
+    fn projected_difficulty_never_substitutes_for_missing_observed_headers() {
+        let presentation = network_mining_presentation(&economics(None), true);
+        assert_eq!(presentation.network_hashrate_hps, None);
+        assert_eq!(presentation.estimated_cost_central_usd_per_dom, None);
+    }
+
+    #[test]
+    fn unsynchronized_node_never_exposes_network_hashrate_or_cost() {
+        let presentation = network_mining_presentation(&economics(Some(6_000_000)), false);
+        assert_eq!(presentation.network_hashrate_hps, None);
+        assert_eq!(presentation.estimated_cost_low_usd_per_dom, None);
+        assert_eq!(presentation.estimated_cost_central_usd_per_dom, None);
+        assert_eq!(presentation.estimated_cost_high_usd_per_dom, None);
+    }
+
+    #[test]
+    fn synchronized_known_difficulty_exposes_expected_hashrate_and_depc_range() {
+        let presentation = network_mining_presentation(&economics(Some(6_000_000)), true);
+        let hashrate = presentation
+            .network_hashrate_hps
+            .expect("synchronized observation produces hashrate");
+        assert!(relative_error(hashrate, 6_000_000.0 / 120.0) < 1.0e-12);
+        let low = presentation
+            .estimated_cost_low_usd_per_dom
+            .expect("low estimate");
+        let central = presentation
+            .estimated_cost_central_usd_per_dom
+            .expect("central estimate");
+        let high = presentation
+            .estimated_cost_high_usd_per_dom
+            .expect("high estimate");
+        assert!(low < central && central < high);
     }
 }
 
