@@ -1223,6 +1223,12 @@ pub struct WalletState {
     /// once committed here, which is what makes every swap resumable.
     #[serde(default)]
     pub swap_sessions: Vec<SwapSessionRecord>,
+    /// Next external-leg derivation index to allocate. Monotonic, so an
+    /// index is never handed to two sessions even if one is abandoned.
+    /// Absent in states written before per-session indices existed, which
+    /// correctly resumes allocation at 0.
+    #[serde(default)]
+    pub next_swap_leg_index: u32,
     #[serde(with = "serde_bytes_32")]
     pub root_material: [u8; 32],
 }
@@ -1237,6 +1243,16 @@ pub struct MiningPreferences {
 
 /// Bounded number of durable swap sessions retained in encrypted state.
 pub const MAX_SWAP_SESSIONS: usize = 256;
+
+/// Consecutive empty indices a seed-only restoration scans before it may
+/// conclude nothing further was used — the BIP-44 gap-limit convention.
+/// The wallet file records the indices it allocated, so this bound only
+/// governs recovery from the recovery phrase alone.
+pub const SWAP_LEG_GAP_LIMIT: u32 = 20;
+
+/// Upper bound of the swap-leg derivation index. Bounded so a corrupt or
+/// hostile state cannot force an unbounded recovery scan (I14).
+pub const MAX_SWAP_LEG_INDEX: u32 = 100_000;
 
 /// Durable swap-session lifecycle.
 ///
@@ -1390,6 +1406,13 @@ pub struct SwapSessionRecord {
     pub fee_payment_asset: String,
     /// Ratified fee tier applied to this route.
     pub fee_bps: u64,
+    /// Derivation index of this session's external legs. Every session
+    /// gets its own index so repeated swaps do not reuse one address on
+    /// the transparent chains, where an observer clusters by address and
+    /// not by witness. Sessions written before per-session indices
+    /// existed decode as 0, which is exactly the index they used.
+    #[serde(default)]
+    pub leg_index: u32,
     pub state: SwapSessionState,
     /// Every transition with its timestamp, oldest first.
     #[serde(default)]
@@ -1445,6 +1468,7 @@ impl SwapSessionRecord {
             || !bounded(&self.fee_payment_asset, 32)
             || self.state_history.len() > 64
             || self.last_error.as_deref().is_some_and(|e| e.len() > 256)
+            || self.leg_index > MAX_SWAP_LEG_INDEX
         {
             return Err(DomainError::InvalidState);
         }
@@ -1521,6 +1545,7 @@ impl WalletState {
             node_configuration,
             mining_preferences: MiningPreferences::default(),
             swap_sessions: Vec::new(),
+            next_swap_leg_index: 0,
             root_material,
         }
     }
@@ -1570,7 +1595,9 @@ impl WalletState {
         }
         self.validate_scriptless_funding_reservations()?;
         self.validate_scriptless_payout_reservations()?;
-        if self.swap_sessions.len() > MAX_SWAP_SESSIONS {
+        if self.swap_sessions.len() > MAX_SWAP_SESSIONS
+            || self.next_swap_leg_index > MAX_SWAP_LEG_INDEX
+        {
             return Err(DomainError::InvalidState);
         }
         for session in &self.swap_sessions {
@@ -3653,6 +3680,7 @@ mod tests {
             minimum_output_base_units: 90_000,
             fee_payment_asset: "DOM".into(),
             fee_bps: 50,
+            leg_index: 0,
             state,
             state_history: Vec::new(),
             last_error: None,

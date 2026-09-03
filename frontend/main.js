@@ -518,6 +518,40 @@ const renderSwapFee = (quote) => {
   }
   swapFeeSummary().textContent = `Protocol fee ${quote.fee_percent}% (${legs}): ${quote.fee_noms} noms (${dom} DOM), ${paid}${usd}.`;
 };
+// The pickers are built from the curated registry, never from hard-coded
+// tickers: a bare "USDT" hides which network settles it, and that is how
+// funds reach a chain nobody can spend them from.
+let swapAssets = [];
+const swapAssetByCode = (code) => swapAssets.find((asset) => asset.code === code);
+const renderSwapReceivingLeg = () => {
+  const chosen = swapAssetByCode(byId("swap-to").value);
+  const note = byId("swap-receiving-leg");
+  if (!chosen) { note.hidden = true; return; }
+  note.textContent = chosen.is_dom
+    ? "You receive DOM into this wallet."
+    : `You receive ${chosen.ticker} on ${chosen.network}, into your ${chosen.receiving_leg} leg address. Paying it to any other network would put it beyond this wallet's reach.`;
+  note.hidden = false;
+};
+const populateSwapAssets = async () => {
+  const assets = await invoke("swap_asset_registry");
+  if (!Array.isArray(assets) || assets.length === 0) return;
+  swapAssets = assets;
+  for (const [id, preferred] of [["swap-from", "DOM"], ["swap-to", "USDT.ETH"], ["swap-fee-asset", "DOM"]]) {
+    const select = byId(id);
+    const previous = select.value;
+    select.replaceChildren(...assets.map((asset) => {
+      const option = document.createElement("option");
+      option.value = asset.code;
+      option.textContent = asset.label;
+      return option;
+    }));
+    const wanted = assets.some((asset) => asset.code === previous) ? previous : preferred;
+    if (assets.some((asset) => asset.code === wanted)) select.value = wanted;
+  }
+  renderSwapReceivingLeg();
+};
+byId("swap-to").addEventListener("change", renderSwapReceivingLeg);
+
 const previewSwapFee = async () => {
   const data = new FormData(byId("swap-intent-form"));
   const amount = integerNoms(data.get("amount"));
@@ -571,6 +605,9 @@ const renderSwapSessions = async (dto) => {
 };
 const refreshSwap = async () => {
   try {
+    await populateSwapAssets();
+  } catch { /* the pickers keep whatever the registry last supplied */ }
+  try {
     await renderSwapSessions(await invoke("swap_sessions_open"));
   } catch {
     markSwapDaemon(true);
@@ -588,6 +625,11 @@ byId("swap-addresses-refresh").addEventListener("click", async () => {
     byId("swap-evm-address").textContent = value.evm_address;
     byId("swap-sol-address").textContent = value.solana_address;
     byId("swap-xmr-address").textContent = value.monero_address;
+    // The index is part of the answer: these are the addresses the NEXT
+    // session will watch, and a later session will show different ones.
+    byId("swap-legs-index").textContent =
+      `Derivation index ${value.index}. Each swap takes a fresh index on Bitcoin, EVM and Solana so repeated swaps do not share one address; Monero stays on account 0 because its stealth addresses already do this.`;
+    byId("swap-legs-index").hidden = false;
   } catch (error) { show(redactedError(error), true); }
 });
 byId("swap-intent-form").addEventListener("submit", async (event) => {
@@ -645,18 +687,21 @@ byId("swap-export-keys").addEventListener("click", async () => {
     const keys = await run(() => invoke("swap_leg_keys_export", { acknowledged: true }));
     if (!keys) return;
     const output = byId("swap-export-output");
-    output.replaceChildren(...[
-      ["Warning", keys.warning],
-      [`Bitcoin ${keys.bitcoin_derivation_path}`, keys.bitcoin_address],
-      ["Bitcoin secret (hex)", keys.bitcoin_secret_hex],
-      [`EVM ${keys.evm_derivation_path}`, keys.evm_address],
-      ["EVM secret (hex)", keys.evm_secret_hex],
-      [`Solana ${keys.solana_derivation_path}`, keys.solana_address],
-      ["Solana secret (hex)", keys.solana_secret_hex],
-      [`Monero ${keys.monero_derivation_path}`, keys.monero_address],
-      ["Monero spend secret (hex)", keys.monero_spend_secret_hex],
-      ["Monero view secret (hex)", keys.monero_view_secret_hex],
-    ].map(([label, value]) => {
+    // Every index the wallet ever allocated, not just the live one: funds
+    // stranded on an earlier index have to remain reachable.
+    const rows = [["Warning", keys.warning]];
+    for (const set of keys.indices) {
+      rows.push([`Bitcoin ${set.bitcoin_derivation_path}`, set.bitcoin_address]);
+      rows.push([`Bitcoin secret (hex) · index ${set.index}`, set.bitcoin_secret_hex]);
+      rows.push([`EVM ${set.evm_derivation_path}`, set.evm_address]);
+      rows.push([`EVM secret (hex) · index ${set.index}`, set.evm_secret_hex]);
+      rows.push([`Solana ${set.solana_derivation_path}`, set.solana_address]);
+      rows.push([`Solana secret (hex) · index ${set.index}`, set.solana_secret_hex]);
+    }
+    rows.push([`Monero ${keys.monero_derivation_path}`, keys.monero_address]);
+    rows.push(["Monero spend secret (hex)", keys.monero_spend_secret_hex]);
+    rows.push(["Monero view secret (hex)", keys.monero_view_secret_hex]);
+    output.replaceChildren(...rows.map(([label, value]) => {
       const row = document.createElement("div");
       const name = document.createElement("span"); name.textContent = label;
       const code = document.createElement("code"); code.textContent = value;
@@ -666,11 +711,42 @@ byId("swap-export-keys").addEventListener("click", async () => {
     byId("swap-export-clear").hidden = false;
   } catch (error) { show(redactedError(error), true); }
 });
+// The seed-only recovery path: public addresses to check on each chain
+// when the wallet file is gone. No secret is involved, so it needs no
+// acknowledgment ceremony.
+byId("swap-scan-plan").addEventListener("click", async () => {
+  try {
+    const plan = await run(() => invoke("swap_leg_scan_plan"));
+    if (!plan) return;
+    const output = byId("swap-scan-output");
+    const rows = [[
+      "How to use this",
+      `${plan.note} Scanned through index ${plan.scan_through_index} (gap limit ${plan.gap_limit}).`,
+    ]];
+    for (const entry of plan.entries) {
+      const mark = entry.recorded ? "used" : "gap margin";
+      rows.push([`Index ${entry.index} · ${mark} · Bitcoin`, entry.bitcoin_address]);
+      rows.push([`Index ${entry.index} · ${mark} · EVM`, entry.evm_address]);
+      rows.push([`Index ${entry.index} · ${mark} · Solana`, entry.solana_address]);
+    }
+    rows.push(["Monero (account 0)", plan.monero_address]);
+    output.replaceChildren(...rows.map(([label, value]) => {
+      const row = document.createElement("div");
+      const name = document.createElement("span"); name.textContent = label;
+      const code = document.createElement("code"); code.textContent = value;
+      row.append(name, code); return row;
+    }));
+    output.hidden = false;
+  } catch (error) { show(redactedError(error), true); }
+});
 byId("swap-export-clear").addEventListener("click", () => {
   const output = byId("swap-export-output");
   output.replaceChildren();
   output.hidden = true;
   byId("swap-export-clear").hidden = true;
+  const scan = byId("swap-scan-output");
+  scan.replaceChildren();
+  scan.hidden = true;
 });
 byId("swap-identity-show").addEventListener("click", async () => {
   try {
