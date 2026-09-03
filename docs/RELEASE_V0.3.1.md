@@ -385,8 +385,10 @@ cargo run --locked -p dom-wallet-updater --example feed_tool -- \
 
 `latest.json` is not signed as a separate file. Its authenticated
 `dom_manifest.manifest_signature` is the detached signature over
-`dom-manifest-canonical.bin`, and it carries the three base64-encoded artifact
-signatures.
+`dom-manifest-canonical.bin`. Each `dom_manifest.artifacts[].signature` carries
+raw Minisign text for the DOM updater, while the corresponding
+`platforms.*.signature` carries the base64-encoded complete Minisign file
+required by Tauri.
 
 Verify the final identity before uploading:
 

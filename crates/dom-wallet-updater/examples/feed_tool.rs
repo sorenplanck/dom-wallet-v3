@@ -180,6 +180,20 @@ fn read_signature_file(artifact_path: &Path) -> Result<String, String> {
         .map_err(|error| format!("missing detached signature {signature_path:?}: {error}"))
 }
 
+/// Keep the two updater contracts explicit: Tauri consumes a base64-encoded
+/// Minisign file, while the DOM updater passes the raw Minisign text directly
+/// to `Signature::decode`.
+fn inject_artifact_signature(
+    platform_entry: &mut serde_json::Value,
+    artifact: &mut ArtifactDescriptor,
+    signature_text: String,
+) {
+    platform_entry["signature"] = serde_json::Value::String(
+        base64::engine::general_purpose::STANDARD.encode(signature_text.as_bytes()),
+    );
+    artifact.signature = signature_text;
+}
+
 fn finalize(directory: &Path) -> Result<(), String> {
     let draft = std::fs::read_to_string(directory.join(DRAFT_FILE))
         .map_err(|error| format!("missing {DRAFT_FILE}: {error}"))?;
@@ -191,11 +205,11 @@ fn finalize(directory: &Path) -> Result<(), String> {
     for (index, (platform_key, _, _, suffix)) in PLATFORMS.iter().enumerate() {
         let artifact_path = find_artifact(directory, suffix)?;
         let signature_text = read_signature_file(&artifact_path)?;
-        let signature_base64 =
-            base64::engine::general_purpose::STANDARD.encode(signature_text.as_bytes());
-        feed["platforms"][platform_key]["signature"] =
-            serde_json::Value::String(signature_base64.clone());
-        manifest.artifacts[index].signature = signature_base64;
+        inject_artifact_signature(
+            &mut feed["platforms"][platform_key],
+            &mut manifest.artifacts[index],
+            signature_text,
+        );
     }
     // The manifest signature covers the artifact signatures, so the canonical
     // bytes exist only after every artifact signature is injected. First pass:
@@ -264,25 +278,31 @@ fn verify(directory: &Path) -> Result<(), String> {
         let artifact = select_artifact(&manifest, target, architecture)
             .ok_or(format!("{platform_key}: no unique artifact"))?;
         let entry = &feed["platforms"][platform_key];
-        if entry["url"].as_str() != Some(artifact.url.as_str())
-            || entry["signature"].as_str() != Some(artifact.signature.as_str())
-        {
+        if entry["url"].as_str() != Some(artifact.url.as_str()) {
             return Err(format!(
-                "{platform_key}: platforms entry disagrees with dom_manifest"
+                "{platform_key}: platforms URL disagrees with dom_manifest"
             ));
         }
         let local = find_artifact(directory, suffix)?;
         let bytes =
             std::fs::read(&local).map_err(|error| format!("read {}: {error}", local.display()))?;
         validate_download(&bytes, artifact).map_err(describe(platform_key))?;
-        let signature_text = base64::engine::general_purpose::STANDARD
-            .decode(&artifact.signature)
+        let tauri_signature = entry["signature"]
+            .as_str()
+            .ok_or(format!("{platform_key}: Tauri signature is missing"))?;
+        let tauri_signature_text = base64::engine::general_purpose::STANDARD
+            .decode(tauri_signature)
             .ok()
             .and_then(|decoded| String::from_utf8(decoded).ok())
             .ok_or(format!(
-                "{platform_key}: artifact signature is not base64 text"
+                "{platform_key}: Tauri signature is not base64 text"
             ))?;
-        if !verifier.verify(&bytes, &signature_text) {
+        if tauri_signature_text != artifact.signature {
+            return Err(format!(
+                "{platform_key}: decoded Tauri signature disagrees with dom_manifest"
+            ));
+        }
+        if !verifier.verify(&bytes, &artifact.signature) {
             return Err(format!(
                 "{platform_key}: artifact Minisign signature INVALID"
             ));
@@ -302,4 +322,45 @@ fn verify(directory: &Path) -> Result<(), String> {
 
 fn describe(context: &str) -> impl Fn(UpdateError) -> String + '_ {
     move |error| format!("{context}: {error}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn artifact_signature_uses_tauri_base64_and_dom_raw_minisign_text() {
+        let signature_text = concat!(
+            "untrusted comment: signature from minisign secret key\n",
+            "RUTwnDDKlXoZdJ5ySx6oL0EcIRHpHMrDixBdwqPo9Fxk\n",
+            "trusted comment: timestamp:1\tfile:wallet\thashed\n",
+            "test-signature\n"
+        );
+        let mut platform_entry =
+            serde_json::json!({ "signature": "", "url": "https://example.com" });
+        let mut artifact = ArtifactDescriptor {
+            target: "linux".into(),
+            architecture: "x86_64".into(),
+            url: "https://github.com/sorenplanck/dom-wallet-v3/releases/download/test/wallet"
+                .parse()
+                .expect("test URL parses"),
+            sha256: "0".repeat(64),
+            size: 1,
+            signature: String::new(),
+        };
+
+        inject_artifact_signature(
+            &mut platform_entry,
+            &mut artifact,
+            signature_text.to_string(),
+        );
+
+        assert_eq!(artifact.signature, signature_text);
+        assert!(artifact.signature.starts_with("untrusted comment:"));
+        assert_ne!(platform_entry["signature"], signature_text);
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(platform_entry["signature"].as_str().expect("string"))
+            .expect("Tauri signature is base64");
+        assert_eq!(decoded, signature_text.as_bytes());
+    }
 }
