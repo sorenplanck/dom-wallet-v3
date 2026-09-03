@@ -69,6 +69,11 @@ test("Tauri resolves the frontend build from both supported CLI contexts", async
   assert.match(workspaceBuild, /\["\/d", "\/s", "\/c", "npm --prefix frontend run build"\]/);
   assert.match(workspaceBuild, /\["--prefix", "frontend", "run", "build"\]/);
   assert.equal(config.build.frontendDist, "../frontend/dist");
+  assert.equal(
+    config.app.security.freezePrototype ?? false,
+    false,
+    "prototype freezing is incompatible with the packaged QR and scanner dependencies",
+  );
   assert.deepEqual(config.bundle.icon, ["../frontend/assets/dom-coin.png", "icons/icon.ico"]);
   assert.equal(
     config.plugins.updater.pubkey,

@@ -13,6 +13,10 @@ const synchronizationAttemptLimit = Number.parseInt(
   process.env.PACKAGED_SYNC_ATTEMPTS ?? "120",
   10,
 );
+const bridgeAttemptLimit = Number.parseInt(
+  process.env.PACKAGED_BRIDGE_ATTEMPTS ?? "200",
+  10,
+);
 const requireBlockAdvance = process.env.PACKAGED_REQUIRE_BLOCK_ADVANCE === "1";
 const forceNetworkStatusFallback = process.env.PACKAGED_FORCE_NETWORK_STATUS_FALLBACK === "1";
 const forceUiNetworkStatusFallback = process.env.PACKAGED_FORCE_UI_NETWORK_STATUS_FALLBACK === "1";
@@ -20,6 +24,9 @@ const MAINNET_CHAIN_ID = "f9831fadabc8a4234beab35fbb6327e84581645f33e9f75ed2ea78
 const MAINNET_GENESIS_HASH = "182e10af28e7ec072f462e6044f580dc9dd8c866cb78dfc293bbfaee4e9325ce";
 if (!Number.isSafeInteger(synchronizationAttemptLimit) || synchronizationAttemptLimit < 1) {
   throw new Error("PACKAGED_SYNC_ATTEMPTS must be a positive integer");
+}
+if (!Number.isSafeInteger(bridgeAttemptLimit) || bridgeAttemptLimit < 1) {
+  throw new Error("PACKAGED_BRIDGE_ATTEMPTS must be a positive integer");
 }
 
 const port = 9515 + (process.pid % 1000);
@@ -100,11 +107,42 @@ try {
     const encoded = await request(`/session/${sessionId}/screenshot`);
     await writeFile(`${screenshotDirectory}/${name}.png`, Buffer.from(encoded, "base64"));
   };
-  for (let attempt = 0; attempt < 200; attempt += 1) {
+  let bridgeReady = false;
+  for (let attempt = 0; attempt < bridgeAttemptLimit; attempt += 1) {
     const ready = await execute("return document.readyState === 'complete' && document.documentElement.dataset.nativeBridge === 'READY'").catch(() => false);
-    if (ready) break;
-    if (attempt === 199) throw new Error("packaged bridge did not reach READY");
+    if (ready) {
+      bridgeReady = true;
+      break;
+    }
     await new Promise((done) => setTimeout(done, 100));
+  }
+  if (!bridgeReady) {
+    const diagnostics = await execute(`return {
+      documentReadyState: document.readyState,
+      bridgeState: document.documentElement.dataset.nativeBridge ?? null,
+      status: document.getElementById("status")?.textContent ?? null,
+      title: document.title,
+      internals: typeof window.__TAURI_INTERNALS__,
+      eventInternals: typeof window.__TAURI_EVENT_PLUGIN_INTERNALS__,
+      objectPrototypeFrozen: Object.isFrozen(Object.prototype)
+    }`).catch((error) => ({ diagnosticError: String(error) }));
+    const moduleDiagnostics = await execute(`
+      const source = [...document.scripts]
+        .find((script) => script.type === "module" && script.src)?.src;
+      if (!source) return { source: null, error: "module script not found" };
+      return import(source)
+        .then(() => ({ source, loaded: true }))
+        .catch((error) => ({
+          source,
+          loaded: false,
+          name: error?.name ?? null,
+          message: error?.message ?? String(error),
+          stack: error?.stack ?? null
+        }));
+    `).catch((error) => ({ diagnosticError: String(error) }));
+    throw new Error(
+      `packaged bridge did not reach READY: ${JSON.stringify(diagnostics)}; module=${JSON.stringify(moduleDiagnostics)}; driver=${driverOutput.slice(-4000)}`,
+    );
   }
 
   const runtime = await execute(`return {
@@ -135,7 +173,7 @@ try {
   const isCanonicalHash = (value) => typeof value === "string" && /^[0-9a-f]{64}$/i.test(value);
   const hasCoherentSyncProgress = (value) => {
     if (
-      value?.state !== "READY"
+      !["READY", "SYNCHRONIZING"].includes(value?.state)
       || value.last_error !== null
       || !Number.isSafeInteger(value.cursor_height)
       || !Number.isSafeInteger(value.canonical_height)
@@ -145,12 +183,15 @@ try {
       || !isCanonicalHash(value.canonical_hash)
     ) return false;
     if (value.synchronized) {
-      return value.cursor_height === value.canonical_height
+      return value.state === "READY"
+        && value.cursor_height === value.canonical_height
         && value.cursor_hash === value.canonical_hash;
     }
     // During IBD the canonical tip can advance faster than the wallet scan.
     // A positive, bounded cursor proves the self-healing worker is following.
-    return value.cursor_height > 0 && value.cursor_height < value.canonical_height;
+    return value.state === "SYNCHRONIZING"
+      && value.cursor_height > 0
+      && value.cursor_height < value.canonical_height;
   };
   let observedUiNetworkStatus;
   const readLiveNetworkStatus = async () => {

@@ -1,6 +1,6 @@
 # DOM Wallet V3 v0.3.3
 
-- Release date: 2026-09-02
+- Release date: 2026-09-03
 - Tag: `wallet-v0.3.3`
 - Source branch: `main-v0.4`
 - DOM Protocol revision: `6f8a947dee0e54c3421caa295755b1746c178137`

@@ -9,8 +9,7 @@
   },
   "app": {
     "security": {
-      "csp": "default-src 'self'; base-uri 'none'; connect-src 'self' ipc: http://ipc.localhost; font-src 'self'; form-action 'none'; frame-ancestors 'none'; img-src 'self' asset: http://asset.localhost data:; media-src 'self' blob:; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'",
-      "freezePrototype": true
+      "csp": "default-src 'self'; base-uri 'none'; connect-src 'self' ipc: http://ipc.localhost; font-src 'self'; form-action 'none'; frame-ancestors 'none'; img-src 'self' asset: http://asset.localhost data:; media-src 'self' blob:; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'"
     },
     "windows": [{ "label": "main", "title": "DOM Wallet V3", "width": 1100, "height": 760 }]
   },
