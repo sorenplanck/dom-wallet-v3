@@ -58,7 +58,7 @@ test("production protocol and secret boundaries are explicit", async () => {
     assert.equal(js.includes(`"${command}"`) || registry.includes(command), true);
   }
   assert.equal(js.includes("DOMSLATE4."), true);
-  assert.equal(js.includes("integerNoms"), true);
+  assert.equal(js.includes("nomsFromDom"), true);
   assert.equal(html.includes("recovery-confirm-password"), true);
   assert.equal(html.includes("endpoint_url"), false);
 });

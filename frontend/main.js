@@ -9,6 +9,7 @@ import {
   liveStatusProjection,
   miningPresentation,
   nodeStatusText,
+  nomsFromDom,
   remoteTipAlertPresentation,
   restoreReadinessPresentation,
   restoreScanPresentation,
@@ -42,6 +43,7 @@ let latestSynchronizationPresentation;
 let latestEmbeddedNodeStatus;
 let restoreScanTimer;
 let remoteTipAlertMessage;
+let latestSpendableBalance = null;
 const seenAutomaticCancellations = new Set();
 
 export const clearPasswords = (form) => form?.querySelectorAll('input[type="password"]').forEach((input) => { input.value = ""; });
@@ -68,11 +70,10 @@ const run = async (action) => {
   }
 };
 const redactJson = (target, value) => { target.textContent = JSON.stringify(value, null, 2); };
-const integerNoms = (value, optional = false) => {
-  if (optional && value === "") return null;
-  if (!/^[0-9]+$/.test(String(value))) throw new Error("Use an integer number of noms.");
+const integerHeight = (value) => {
+  if (!/^[0-9]+$/.test(String(value))) throw new Error("Use an integer block height.");
   const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed)) throw new Error("Amount exceeds the safe desktop boundary.");
+  if (!Number.isSafeInteger(parsed)) throw new Error("Use an integer block height.");
   return parsed;
 };
 const clearSecretForms = () => {
@@ -390,13 +391,17 @@ const refreshSummary = async () => {
     locked: "Locked",
     spendable: "Spendable",
   };
+  latestSpendableBalance = Number.isSafeInteger(summary.balance.spendable)
+    && summary.balance.spendable >= 0
+    ? summary.balance.spendable
+    : null;
   byId("balance-total").firstChild.textContent = `${formatDomFromNoms(summary.balance.total ?? 0).replace(/ DOM$/, "")} `;
   byId("balance-cards").replaceChildren(...Object.entries(balanceLabels).map(([key, label]) => {
     const value = summary.balance[key];
     const card = document.createElement("div");
     card.className = "card";
     card.textContent = Number.isSafeInteger(value) && value >= 0
-      ? `${label}: ${value} noms · ${formatDomFromNoms(value)}`
+      ? `${label}: ${formatDomFromNoms(value)}`
       : `${label}: unavailable`;
     return card;
   }));
@@ -525,7 +530,6 @@ const renderSwapFee = (quote) => {
     swapFeeSummary().textContent = `Protocol fee ${quote.fee_percent}% (${legs}): ${quote.fee_message} Fee payment currency: ${paymentLabel}.`;
     return;
   }
-  const dom = (quote.fee_noms / 100000000).toLocaleString("en-US", { maximumFractionDigits: 8 });
   const usd = quote.fee_usd_estimated != null
     ? ` (~US$ ${Number(quote.fee_usd_estimated).toPrecision(3)}, ${quote.depc_basket_version} estimate)`
     : "";
@@ -539,26 +543,13 @@ const renderSwapFee = (quote) => {
   } else {
     paid = `payable in ${paymentLabel}, fixed at the rate implied by the quote you accept`;
   }
-  swapFeeSummary().textContent = `Protocol fee ${quote.fee_percent}% (${legs}): ${quote.fee_noms} noms (${dom} DOM), ${paid}${usd}.`;
+  swapFeeSummary().textContent = `Protocol fee ${quote.fee_percent}% (${legs}): ${formatDomFromNoms(quote.fee_noms)}, ${paid}${usd}.`;
 };
 // The pickers are built from the curated registry, never from hard-coded
 // tickers: a bare "USDT" hides which network settles it, and that is how
 // funds reach a chain nobody can spend them from.
 let swapAssets = [];
 const swapAssetByCode = (code) => swapAssets.find((asset) => asset.code === code);
-const swapBaseUnitDisplayName = (asset) => ({
-  nom: "noms",
-  satoshi: "satoshis",
-  lamport: "lamports",
-  "micro-USDT": "micro-USDT",
-  piconero: "piconero",
-})[asset?.base_unit_name] ?? "base units";
-const renderSwapUnitPlaceholders = () => {
-  const from = swapAssetByCode(byId("swap-from").value);
-  const to = swapAssetByCode(byId("swap-to").value);
-  byId("swap-amount").placeholder = `Amount in ${swapBaseUnitDisplayName(from)}`;
-  byId("swap-minimum-output").placeholder = `Minimum received in ${swapBaseUnitDisplayName(to)}`;
-};
 const renderSwapReceivingLeg = () => {
   const chosen = swapAssetByCode(byId("swap-to").value);
   const note = byId("swap-receiving-leg");
@@ -584,18 +575,13 @@ const populateSwapAssets = async () => {
     const wanted = assets.some((asset) => asset.code === previous) ? previous : preferred;
     if (assets.some((asset) => asset.code === wanted)) select.value = wanted;
   }
-  renderSwapUnitPlaceholders();
   renderSwapReceivingLeg();
 };
-byId("swap-from").addEventListener("change", renderSwapUnitPlaceholders);
-byId("swap-to").addEventListener("change", () => {
-  renderSwapUnitPlaceholders();
-  renderSwapReceivingLeg();
-});
+byId("swap-to").addEventListener("change", renderSwapReceivingLeg);
 
 const previewSwapFee = async () => {
   const data = new FormData(byId("swap-intent-form"));
-  const amount = integerNoms(data.get("amount"));
+  const amount = nomsFromDom(data.get("amount"));
   const quote = await run(() => invoke("swap_fee_quote", { amount, fromAsset: byId("swap-from").value, toAsset: byId("swap-to").value, paymentAsset: byId("swap-fee-asset").value }));
   if (quote) renderSwapFee(quote);
 };
@@ -679,10 +665,10 @@ byId("swap-intent-form").addEventListener("submit", async (event) => {
   try {
     await previewSwapFee();
     const result = await run(() => invoke("swap_intent_create", {
-      amount: integerNoms(data.get("amount")),
+      amount: nomsFromDom(data.get("amount")),
       fromAsset: byId("swap-from").value,
       toAsset: byId("swap-to").value,
-      minimumOutput: integerNoms(data.get("minimum_output")),
+      minimumOutput: nomsFromDom(data.get("minimum_output")),
       feeAsset: byId("swap-fee-asset").value,
     }));
     if (!result) return;
@@ -982,13 +968,9 @@ byId("backup-import-form").addEventListener("submit", async (event) => {
   } finally { clearPasswords(form); }
 });
 
-// Display conversion only: 1 DOM = 100,000,000 noms (consensus COIN_UNIT).
-// Fee arithmetic itself stays in Core; the frontend only presents it.
-const NOMS_PER_DOM = 100000000;
-const domText = (noms) => `${noms} noms (${(noms / NOMS_PER_DOM).toLocaleString("en-US", { maximumFractionDigits: 8 })} DOM)`;
 const feeSummary = byId("send-fee-summary");
 const renderFeeSummary = (amountNoms, feeNoms) => {
-  feeSummary.textContent = `Amount ${domText(amountNoms)} · Network fee ${domText(feeNoms)} · Total ${domText(amountNoms + feeNoms)}`;
+  feeSummary.textContent = `Amount ${formatDomFromNoms(amountNoms)} · Network fee ${formatDomFromNoms(feeNoms)} · Total ${formatDomFromNoms(amountNoms + feeNoms)}`;
 };
 const output = byId("transaction-output");
 const slateId = byId("transaction-slate-id");
@@ -999,8 +981,8 @@ const requiredSlate = () => { const text = slateText.value.trim(); if (!text.sta
 byId("transaction-create").addEventListener("submit", async (event) => {
   event.preventDefault(); const data = new FormData(event.currentTarget);
   try {
-    const amount = integerNoms(data.get("amount"));
-    const requestedFee = integerNoms(data.get("requested_fee"), true);
+    const amount = nomsFromDom(data.get("amount"));
+    const requestedFee = data.get("requested_fee") === "" ? null : nomsFromDom(data.get("requested_fee"));
     let estimate;
     try {
       estimate = await run(() => invoke("transaction_fee_estimate", { amount, selectedInputCount: 1, changeOutput: true }));
@@ -1010,10 +992,16 @@ byId("transaction-create").addEventListener("submit", async (event) => {
       return;
     }
     const feeNoms = requestedFee ?? estimate.minimum_fee;
+    const totalNoms = amount + feeNoms;
+    if (!Number.isSafeInteger(totalNoms)) throw new Error("Amount exceeds the safe desktop boundary.");
     renderFeeSummary(amount, feeNoms);
-    if (!window.confirm(`Send ${domText(amount)} with a network fee of ${domText(feeNoms)}? Total ${domText(amount + feeNoms)}.`)) return;
+    const attention = latestSpendableBalance != null
+      && BigInt(totalNoms) * 10n > BigInt(latestSpendableBalance)
+      ? "ATTENTION: this spends more than 10% of your spendable balance. "
+      : "";
+    if (!window.confirm(`${attention}Send ${formatDomFromNoms(amount)} with a network fee of ${formatDomFromNoms(feeNoms)}? Total ${formatDomFromNoms(totalNoms)}.`)) return;
     const network = await run(() => invoke("node_network_status"));
-    const expiry = data.get("expires_at_height") === "" ? network.canonical_height + 1440 : integerNoms(data.get("expires_at_height"));
+    const expiry = data.get("expires_at_height") === "" ? network.canonical_height + 1440 : integerHeight(data.get("expires_at_height"));
     const result = await run(() => invoke("transaction_send_create", { amount, requestedFee, expiresAtHeight: expiry }));
     renderTransaction(result); show("Recoverable Slate v4 request created.");
   } catch (error) { show(redactedError(error), true); }
@@ -1021,7 +1009,7 @@ byId("transaction-create").addEventListener("submit", async (event) => {
 byId("transaction-estimate").addEventListener("click", async () => {
   const data = new FormData(byId("transaction-create"));
   try {
-    const amount = integerNoms(data.get("amount"));
+    const amount = nomsFromDom(data.get("amount"));
     const estimate = await run(() => invoke("transaction_fee_estimate", { amount, selectedInputCount: 1, changeOutput: true }));
     renderFeeSummary(amount, estimate.minimum_fee);
     renderTransaction(estimate);
@@ -1079,7 +1067,7 @@ const renderHistory = async () => {
     const node = document.createElement("article");
     node.className = "history-item";
     const title = document.createElement("strong");
-    title.textContent = `${transaction.state} · ${transaction.amount} noms`;
+    title.textContent = `${transaction.state} · ${formatDomFromNoms(transaction.amount)}`;
     const identifier = document.createElement("code");
     identifier.textContent = transaction.slate_id ?? transaction.id;
     const details = document.createElement("p");
