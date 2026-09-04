@@ -358,3 +358,12 @@ export function formatDomFromNoms(value) {
   const fraction = String(noms % unit).padStart(8, "0");
   return `${whole}.${fraction} DOM`;
 }
+
+export function nomsFromDom(text) {
+  const m = /^([0-9]+)(?:\.([0-9]{1,8}))?$/.exec(String(text).trim());
+  if (!m) throw new Error("Enter an amount in DOM with at most 8 decimal places.");
+  const noms = BigInt(m[1]) * 100000000n + BigInt((m[2] ?? "").padEnd(8, "0"));
+  if (noms <= 0n) throw new Error("The amount must be greater than zero.");
+  if (noms > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error("Amount exceeds the safe desktop boundary.");
+  return Number(noms);
+}

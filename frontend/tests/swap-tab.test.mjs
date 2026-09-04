@@ -178,19 +178,13 @@ test("assets are chosen as (ticker, network), never as a bare ticker", async () 
   );
 });
 
-test("swap amount units follow the selected source and destination assets", async () => {
+test("swap monetary inputs are denominated in DOM", async () => {
   const html = await source("index.html");
   const js = await source("main.js");
-  assert.equal(html.includes('placeholder="Amount in noms"'), false, "DOM units must not be hard-coded on a multi-asset input");
-  assert.equal(html.includes('id="swap-amount"'), true, "source amount needs a dynamic placeholder target");
-  assert.equal(html.includes('id="swap-minimum-output"'), true, "destination floor needs a dynamic placeholder target");
-  assert.equal(js.includes("asset?.base_unit_name"), true, "unit labels must come from the asset registry DTO");
-  assert.equal(js.includes('`Amount in ${swapBaseUnitDisplayName(from)}`'), true, "FROM must drive the source unit");
-  assert.equal(js.includes('`Minimum received in ${swapBaseUnitDisplayName(to)}`'), true, "TO must drive the destination unit");
-  assert.equal(js.includes('byId("swap-from").addEventListener("change", renderSwapUnitPlaceholders)'), true, "FROM changes must refresh units");
-  assert.equal(js.includes('byId("swap-to").addEventListener("change"'), true, "TO changes must refresh units");
-  assert.equal(js.includes('lamport: "lamports"'), true, "SOL must render in lamports");
-  assert.equal(js.includes('nom: "noms"'), true, "DOM must render in noms");
+  assert.equal(html.includes('placeholder="Amount in DOM"'), true, "source amount must be entered in DOM");
+  assert.equal(html.includes('placeholder="Your protection floor in DOM"'), true, "destination floor must be entered in DOM");
+  assert.equal(js.includes('amount: nomsFromDom(data.get("amount"))'), true, "source DOM amount must cross the boundary as noms");
+  assert.equal(js.includes('minimumOutput: nomsFromDom(data.get("minimum_output"))'), true, "minimum DOM output must cross the boundary as noms");
 });
 
 test("fee preview does not invent an absolute DOM fee for external input", async () => {
