@@ -46,6 +46,12 @@ signing key. The offline feed flow, per release:
    `releases/latest/download/` only resolve when a non-prerelease release
    exists.
 
+The final feed intentionally carries each artifact signature in two different
+encodings. `platforms.*.signature` is the base64 encoding of the complete
+Minisign file required by Tauri. `dom_manifest.artifacts[].signature` is the
+raw Minisign text consumed by the DOM updater. Never copy one representation
+into the other without converting it.
+
 Wallet V3 uses its embedded DOM Core through `WalletCoreApi` by default and can
 use the authenticated remote scan-only source for restore and synchronization.
 Transaction construction, submission and mining remain embedded-only. It
