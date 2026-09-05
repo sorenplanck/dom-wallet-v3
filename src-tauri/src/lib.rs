@@ -1285,18 +1285,19 @@ pub mod depc {
     /// High scenario: kWh 0.20, overhead 1.45/1.30, service life 3/4 years.
     pub const DEPC_COST_HIGH_USD_PER_KHS_DAY: f64 = 0.095_357_97;
 
-    /// Network hashrate implied by the expected per-block difficulty.
+    /// Network hash rate to present, in hashes per second.
     ///
-    /// The DOM difficulty is the expected number of hashes per block, so the
-    /// network produces `difficulty / spacing` hashes per second on average.
-    pub fn network_hashrate_hps(
-        network_difficulty: u128,
-        target_spacing_seconds: u64,
-    ) -> Option<f64> {
-        if network_difficulty == 0 || target_spacing_seconds == 0 {
-            return None;
-        }
-        let value = network_difficulty as f64 / target_spacing_seconds as f64;
+    /// This is a pass-through validation of the measurement the node already
+    /// made over its observation window, NOT a derivation. The previous
+    /// `difficulty / target_spacing` form carried two independent errors:
+    /// difficulty is normalised by `MAX_TARGET_BYTES = 2^240 - 1`, so it
+    /// understates the hash count by 2^16, and the target spacing is what the
+    /// chain aims for rather than the interval blocks actually arrived at.
+    ///
+    /// Fails closed: an absent, non-finite or non-positive measurement yields
+    /// `None`, never a fabricated number.
+    pub fn network_hashrate_hps(observed_network_hashrate_hps: Option<f64>) -> Option<f64> {
+        let value = observed_network_hashrate_hps?;
         (value.is_finite() && value > 0.0).then_some(value)
     }
 
@@ -1352,11 +1353,14 @@ fn network_mining_presentation(
     if !synchronized {
         return NetworkMiningPresentation::default();
     }
-    let Some(difficulty) = economics.observed_network_difficulty else {
+    // The observed difficulty window must be complete before anything is
+    // shown: a projected next target is miner-only input and must never stand
+    // in for an observation of the network.
+    if economics.observed_network_difficulty.is_none() {
         return NetworkMiningPresentation::default();
-    };
+    }
     let Some(network_hashrate_hps) =
-        depc::network_hashrate_hps(difficulty, economics.target_spacing_seconds)
+        depc::network_hashrate_hps(economics.observed_network_hashrate_hps)
     else {
         return NetworkMiningPresentation::default();
     };
@@ -7178,6 +7182,15 @@ mod depc_tests {
     }
 
     fn economics(observed_network_difficulty: Option<u128>) -> MiningEconomics {
+        // The measured hash rate is what gets presented; the observed
+        // difficulty only gates whether the window is complete.
+        economics_with_hashrate(observed_network_difficulty, Some(50_000.0))
+    }
+
+    fn economics_with_hashrate(
+        observed_network_difficulty: Option<u128>,
+        observed_network_hashrate_hps: Option<f64>,
+    ) -> MiningEconomics {
         MiningEconomics {
             next_height: 25_001,
             // A projected next target remains miner-only input. This value is
@@ -7185,6 +7198,7 @@ mod depc_tests {
             // leak into network presentation.
             network_difficulty: 49,
             observed_network_difficulty,
+            observed_network_hashrate_hps,
             next_block_reward_noms: REWARD_EPOCH_0_NOMS,
             target_spacing_seconds: TARGET_SPACING,
             noms_per_dom: NOMS_PER_DOM,
@@ -7252,8 +7266,11 @@ mod depc_tests {
 
     #[test]
     fn missing_or_zero_inputs_fail_closed() {
-        assert_eq!(depc::network_hashrate_hps(0, TARGET_SPACING), None);
-        assert_eq!(depc::network_hashrate_hps(6_000_000, 0), None);
+        assert_eq!(depc::network_hashrate_hps(None), None);
+        assert_eq!(depc::network_hashrate_hps(Some(0.0)), None);
+        assert_eq!(depc::network_hashrate_hps(Some(-1.0)), None);
+        assert_eq!(depc::network_hashrate_hps(Some(f64::NAN)), None);
+        assert_eq!(depc::network_hashrate_hps(Some(f64::INFINITY)), None);
         assert_eq!(
             depc::estimated_production_cost_usd_per_dom(
                 50_000.0,
@@ -7276,12 +7293,23 @@ mod depc_tests {
         );
     }
 
+    /// B5: the presented rate is the node's measurement, passed through — not
+    /// a figure derived here. This test previously asserted the derivation
+    /// `6_000_000 / 120 = 50_000`, which is the shape the fix removes: that
+    /// form understates the network by 2^16 (difficulty is normalised by
+    /// `MAX_TARGET_BYTES`) and divides by the spacing the chain aims for
+    /// rather than the one blocks actually arrived at.
     #[test]
-    fn network_hashrate_derives_exactly_from_the_expected_difficulty() {
-        assert_eq!(
-            depc::network_hashrate_hps(6_000_000, TARGET_SPACING),
-            Some(50_000.0)
-        );
+    fn network_hashrate_is_the_measurement_not_a_derivation() {
+        assert_eq!(depc::network_hashrate_hps(Some(50_000.0)), Some(50_000.0));
+
+        // The projected per-block difficulty must not reach the presentation
+        // by any path: with no measurement there is no rate to show, however
+        // complete the observed-difficulty window is.
+        let presentation =
+            network_mining_presentation(&economics_with_hashrate(Some(6_000_000), None), true);
+        assert_eq!(presentation.network_hashrate_hps, None);
+        assert_eq!(presentation.estimated_cost_central_usd_per_dom, None);
     }
 
     #[test]

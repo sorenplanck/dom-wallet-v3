@@ -278,7 +278,8 @@ impl EmbeddedCoreConfiguration {
 /// consensus crates. Nothing here recomputes consensus: the difficulty comes
 /// from the same `dom-pow` pair the wallet miner already uses, the subsidy
 /// comes from `dom_core::block_reward`, and the constants are imported.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+// `Eq` is not derivable once a float is carried: `f64` is only `PartialEq`.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MiningEconomics {
     /// Height of the next block candidate.
     pub next_height: u64,
@@ -288,12 +289,113 @@ pub struct MiningEconomics {
     /// Mean proof-of-work difficulty of the latest 30 canonical, already-mined
     /// blocks. Missing until the node has a complete observation window.
     pub observed_network_difficulty: Option<u128>,
+    /// Measured network hash rate, in hashes per second, over the latest 30
+    /// canonical blocks. Missing until the node has a complete window.
+    ///
+    /// This is the value to present. Difficulty cannot substitute for it: see
+    /// [`observed_network_hashrate_hps`].
+    pub observed_network_hashrate_hps: Option<f64>,
     /// Consensus block subsidy at the next height, in noms.
     pub next_block_reward_noms: u64,
     /// Consensus target block spacing, in seconds.
     pub target_spacing_seconds: u64,
     /// Consensus base unit: noms per DOM.
     pub noms_per_dom: u64,
+}
+
+/// A validated canonical header, reduced to what the observation windows read.
+type ObservedHeader = (
+    dom_core::BlockHeight,
+    dom_pow::CompactTarget,
+    dom_core::Timestamp,
+);
+
+/// Expected number of hashes needed to find a block at this target: `2^256 /
+/// (T + 1)`.
+///
+/// This is NOT the chain's difficulty. `target_to_difficulty` divides by
+/// `MAX_TARGET_BYTES`, which is `2^240 - 1`, so a difficulty of 1 already costs
+/// `2^256 / 2^240 = 65_536` hashes. Deriving a hash rate as `difficulty /
+/// seconds` therefore understates the network by a factor of 2^16. Worse, the
+/// numerator is not even constant: on mainnet, above the ASERT rescue height,
+/// `target_to_difficulty_for_network_height` normalises by a different value,
+/// so no single correction factor exists. Working from the target directly
+/// avoids the whole question.
+///
+/// Computed in `f64` rather than a 256-bit integer on purpose: this is a
+/// presentation figure, `f64` carries ~16 significant digits, and it has no
+/// overflow path — the 256-bit route ends in a `U256 -> u128` narrowing that
+/// aborts when the value does not fit.
+fn block_work(target: &[u8; 32]) -> f64 {
+    let mut value = 0.0_f64;
+    for byte in target {
+        value = value * 256.0 + f64::from(*byte);
+    }
+    if !(value.is_finite() && value > 0.0) {
+        // A zero target is not mineable; it contributes no measurable work.
+        return 0.0;
+    }
+    2.0_f64.powi(256) / (value + 1.0)
+}
+
+/// Measured network hash rate over the observation window, in hashes/second.
+///
+/// `H = (sum of per-block work) / (t_last - t_first)`, using only the
+/// timestamps and targets of headers the node has already validated.
+///
+/// Two things this deliberately does not do:
+///
+/// - It does not consult the local clock, and it does not project the next
+///   target through ASERT. A projection decays as soon as blocks stop arriving,
+///   so a quiet network reads as a collapsing hash rate when nothing has
+///   changed, and a node that is behind reads low simply for being behind.
+/// - It does not divide by the TARGET spacing. The target spacing is what the
+///   chain aims for; the measured span is what happened. Using 120 s while
+///   blocks actually arrive every ~64 s is close to a factor of two.
+///
+/// Work is summed over `window` blocks but the span covers the same `window`
+/// intervals, which needs `window + 1` headers: summing the work of all
+/// `window + 1` headers over `window` intervals would inflate the result by
+/// `(window + 1) / window`.
+///
+/// Returns `None` — never a fabricated number — when the window is incomplete,
+/// a header is missing, or the timestamps are not ordered (a reorg can leave
+/// `t_last < t_first`, and miners have latitude in the timestamps they claim).
+fn observed_network_hashrate_hps<F>(
+    canonical_height: u64,
+    window: u64,
+    mut header_at_height: F,
+) -> Option<f64>
+where
+    F: FnMut(u64) -> Option<ObservedHeader>,
+{
+    if window == 0 || canonical_height < window {
+        return None;
+    }
+    let first_height = canonical_height.checked_sub(window)?;
+
+    let (first_h, _, first_timestamp) = header_at_height(first_height)?;
+    if first_h.0 != first_height {
+        return None;
+    }
+
+    let mut work = 0.0_f64;
+    let mut last_timestamp = first_timestamp;
+    for height in (first_height + 1)..=canonical_height {
+        let (header_height, compact_target, timestamp) = header_at_height(height)?;
+        if header_height.0 != height {
+            return None;
+        }
+        work += block_work(&compact_target.to_target().ok()?);
+        last_timestamp = timestamp;
+    }
+
+    let span = i128::from(last_timestamp.0).checked_sub(i128::from(first_timestamp.0))?;
+    if span <= 0 {
+        return None;
+    }
+    let hps = work / span as f64;
+    (hps.is_finite() && hps > 0.0).then_some(hps)
 }
 
 fn observed_network_difficulty<F>(
@@ -726,18 +828,34 @@ impl EmbeddedCoreLifecycle {
         .map_err(|_| EmbeddedCoreAdapterError::Internal {
             code: "EXPECTED_DIFFICULTY",
         })?;
-        let observed_network_difficulty = node.chain.try_lock().ok().and_then(|chain| {
-            observed_network_difficulty(network_magic, canonical_height, |height| {
+        // One lock acquisition for both window reads: taking it twice can see
+        // two different tips, and `try_lock` failing on the second would report
+        // a hash rate with no matching difficulty.
+        let observed = node.chain.try_lock().ok().map(|chain| {
+            let header_at_height = |height: u64| {
                 let hash = chain.store.get_hash_at_height(height).ok()??;
                 let bytes = chain.store.get_block_header(&hash).ok()??;
                 let header = BlockHeader::from_bytes(&bytes).ok()?;
-                Some((header.height, header.target))
-            })
+                Some(header)
+            };
+            let difficulty =
+                observed_network_difficulty(network_magic, canonical_height, |height| {
+                    header_at_height(height).map(|header| (header.height, header.target))
+                });
+            let hashrate =
+                observed_network_hashrate_hps(canonical_height, OBSERVED_DIFFICULTY_WINDOW, |h| {
+                    header_at_height(h)
+                        .map(|header| (header.height, header.target, header.timestamp))
+                });
+            (difficulty, hashrate)
         });
+        let (observed_network_difficulty, observed_network_hashrate_hps) =
+            observed.unwrap_or((None, None));
         Ok(MiningEconomics {
             next_height,
             network_difficulty: projected_difficulty,
             observed_network_difficulty,
+            observed_network_hashrate_hps,
             next_block_reward_noms: dom_core::block_reward(dom_core::BlockHeight(next_height))
                 .noms(),
             target_spacing_seconds: dom_core::constants::TARGET_SPACING,
@@ -1481,6 +1599,207 @@ mod tests {
             "an incomplete chain must not be partially sampled"
         );
         assert_eq!(actual, None);
+    }
+
+    /// Headers at a fixed target, `spacing` seconds apart.
+    fn constant_rate_headers(
+        compact: dom_pow::CompactTarget,
+        spacing: u64,
+    ) -> impl Fn(u64) -> Option<ObservedHeader> {
+        move |height: u64| {
+            Some((
+                dom_core::BlockHeight(height),
+                compact,
+                dom_core::Timestamp(1_000_000 + height * spacing),
+            ))
+        }
+    }
+
+    /// B4: `H = work / elapsed`. With a constant target and constant spacing
+    /// the answer is exactly `per_block_work / spacing`.
+    #[test]
+    fn measured_hashrate_is_work_over_the_observed_timespan() {
+        let compact = dom_pow::CompactTarget(dom_pow::REGTEST_TARGET_COMPACT);
+        let target = compact.to_target().expect("valid target");
+        let per_block = block_work(&target);
+
+        for spacing in [30_u64, 64, 120] {
+            let actual = observed_network_hashrate_hps(
+                100,
+                OBSERVED_DIFFICULTY_WINDOW,
+                constant_rate_headers(compact, spacing),
+            )
+            .expect("complete window");
+            let expected = per_block / spacing as f64;
+            assert!(
+                ((actual - expected) / expected).abs() < 1.0e-12,
+                "spacing {spacing}: got {actual}, expected {expected}"
+            );
+        }
+    }
+
+    /// The rate must track the OBSERVED spacing. The old derivation divided by
+    /// the target spacing, so blocks arriving twice as fast reported the same
+    /// number — a factor-of-two error that never showed up.
+    #[test]
+    fn measured_hashrate_scales_with_the_real_block_rate() {
+        let compact = dom_pow::CompactTarget(dom_pow::REGTEST_TARGET_COMPACT);
+        let slow = observed_network_hashrate_hps(
+            100,
+            OBSERVED_DIFFICULTY_WINDOW,
+            constant_rate_headers(compact, 120),
+        )
+        .expect("complete window");
+        let fast = observed_network_hashrate_hps(
+            100,
+            OBSERVED_DIFFICULTY_WINDOW,
+            constant_rate_headers(compact, 60),
+        )
+        .expect("complete window");
+        assert!(
+            ((fast / slow) - 2.0).abs() < 1.0e-12,
+            "halving the block interval must double the measured hash rate, got {}",
+            fast / slow
+        );
+    }
+
+    /// B4: the work sum must cover `window` blocks over `window` intervals.
+    /// Summing all `window + 1` headers inflates the result by
+    /// `(window + 1) / window` — ~3.3% at a 30-block window.
+    #[test]
+    fn measured_hashrate_counts_intervals_not_headers() {
+        let compact = dom_pow::CompactTarget(dom_pow::REGTEST_TARGET_COMPACT);
+        let target = compact.to_target().expect("valid target");
+        let window = OBSERVED_DIFFICULTY_WINDOW;
+        let spacing = 120_u64;
+
+        let actual =
+            observed_network_hashrate_hps(100, window, constant_rate_headers(compact, spacing))
+                .expect("complete window");
+        let span = (window * spacing) as f64;
+        assert!(
+            ((actual - block_work(&target) * window as f64 / span) / actual).abs() < 1.0e-12,
+            "the sum must span exactly {window} blocks"
+        );
+
+        let inflated = block_work(&target) * (window + 1) as f64 / span;
+        assert!(
+            actual < inflated,
+            "counting {} headers instead of {window} blocks would inflate the result",
+            window + 1
+        );
+    }
+
+    /// R-B4.1: no panic path. The old suggestion narrowed a 256-bit work sum to
+    /// `u128`, which aborts when it does not fit.
+    #[test]
+    fn block_work_is_finite_across_the_target_range() {
+        assert_eq!(block_work(&[0u8; 32]), 0.0, "a zero target yields no work");
+
+        let easiest = block_work(&[0xff; 32]);
+        let hardest = block_work(&{
+            let mut t = [0u8; 32];
+            t[31] = 1;
+            t
+        });
+        assert!(easiest.is_finite() && easiest > 0.0);
+        assert!(hardest.is_finite() && hardest > 0.0);
+        assert!(
+            hardest > easiest,
+            "a harder (smaller) target must cost more work"
+        );
+    }
+
+    /// B4: work must come from the target, not from difficulty. Difficulty is
+    /// normalised by `MAX_TARGET_BYTES = 2^240 - 1`, so `difficulty` understates
+    /// the hash count by 2^16 — the largest of the three errors in the old
+    /// number.
+    #[test]
+    fn block_work_is_not_the_chain_difficulty() {
+        // A hard target on purpose. `target_to_difficulty` returns an integer,
+        // so the ratio it can express is quantised by 1/difficulty — and the
+        // regtest target is the easiest one there is, landing on a difficulty
+        // of exactly 1, where the true value 1.0000077 truncates and the ratio
+        // reads 2^16 x 1.0000077. That is the integer's resolution, not an
+        // error in the work formula. At 2^208 the difficulty is ~2^32 and the
+        // quantisation drops to ~2.3e-10, which is what lets the 2^16
+        // relationship be asserted at all.
+        let mut target = [0u8; 32];
+        target[5] = 1;
+        let difficulty = dom_pow::target_to_difficulty(&target) as f64;
+        let work = block_work(&target);
+
+        let ratio = work / difficulty;
+        assert!(
+            (ratio / 65_536.0 - 1.0).abs() < 1.0e-6,
+            "work must exceed difficulty by 2^16, got a ratio of {ratio}"
+        );
+    }
+
+    /// R-B4.2: a reorg or a miner's loose timestamp can leave the window with
+    /// non-increasing time. That must be `None`, never a negative or infinite
+    /// rate on screen.
+    #[test]
+    fn non_increasing_timestamps_produce_no_hashrate() {
+        let compact = dom_pow::CompactTarget(dom_pow::REGTEST_TARGET_COMPACT);
+
+        // Every header claims the same second.
+        let flat = observed_network_hashrate_hps(100, OBSERVED_DIFFICULTY_WINDOW, |height| {
+            Some((
+                dom_core::BlockHeight(height),
+                compact,
+                dom_core::Timestamp(1_000_000),
+            ))
+        });
+        assert_eq!(flat, None);
+
+        // Time runs backwards across the window.
+        let backwards = observed_network_hashrate_hps(100, OBSERVED_DIFFICULTY_WINDOW, |height| {
+            Some((
+                dom_core::BlockHeight(height),
+                compact,
+                dom_core::Timestamp(1_000_000_u64.saturating_sub(height)),
+            ))
+        });
+        assert_eq!(backwards, None);
+    }
+
+    /// An incomplete window must not be partially sampled, and a missing or
+    /// misindexed header must abort the whole measurement.
+    #[test]
+    fn measured_hashrate_requires_a_complete_header_window() {
+        let compact = dom_pow::CompactTarget(dom_pow::REGTEST_TARGET_COMPACT);
+
+        let mut reads = 0_u64;
+        let short = observed_network_hashrate_hps(29, 30, |_| {
+            reads += 1;
+            None
+        });
+        assert_eq!(reads, 0, "a short chain must not be sampled at all");
+        assert_eq!(short, None);
+
+        let missing = observed_network_hashrate_hps(100, OBSERVED_DIFFICULTY_WINDOW, |height| {
+            (height != 85).then(|| {
+                (
+                    dom_core::BlockHeight(height),
+                    compact,
+                    dom_core::Timestamp(1_000_000 + height * 120),
+                )
+            })
+        });
+        assert_eq!(missing, None, "a gap in the window must abort");
+
+        let misindexed = observed_network_hashrate_hps(100, OBSERVED_DIFFICULTY_WINDOW, |height| {
+            Some((
+                dom_core::BlockHeight(height + 1),
+                compact,
+                dom_core::Timestamp(1_000_000 + height * 120),
+            ))
+        });
+        assert_eq!(
+            misindexed, None,
+            "a header that is not at the requested height must abort"
+        );
     }
 
     #[test]
