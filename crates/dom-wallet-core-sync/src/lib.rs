@@ -13,11 +13,14 @@ use dom_wallet_core_api::{
     TransactionLocation, WalletCoreApi, WalletCoreError, WalletScanCursor, WALLET_SCAN_CURSOR_LEN,
     WALLET_SCAN_CURSOR_VERSION,
 };
-use std::{fmt, sync::Arc};
+use std::{fmt, sync::Arc, thread, time::Duration};
 use thiserror::Error;
 
 /// Conservative maximum number of blocks accepted in one Wallet-side batch.
 pub const MAX_CORE_SCAN_BATCH_BLOCKS: u64 = 1_024;
+
+const GENERATION_CONFLICT_MAX_ATTEMPTS: usize = 5;
+const GENERATION_CONFLICT_BACKOFF_MILLIS: u64 = 10;
 
 /// Wallet-owned chain identity copied from the frozen Core contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -280,6 +283,43 @@ pub trait CoreScanTransactionSink {
         batch: &CoreScanBatch,
         cursor: CoreCursorBytes,
     ) -> Result<(), Self::Error>;
+
+    /// Classify an opaque sink failure without exposing its storage text.
+    fn persistence_stage(_error: &Self::Error) -> ScanCommitStage {
+        ScanCommitStage::StorageCommit
+    }
+
+    /// Reload the active generation after an optimistic write conflict.
+    ///
+    /// `Ok(true)` means the batch may be reapplied to the refreshed state.
+    /// Other persistence failures remain terminal at this boundary.
+    fn recover_generation_conflict(&mut self, _error: &Self::Error) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+}
+
+/// Closed, non-sensitive stage labels for Wallet scan persistence failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanCommitStage {
+    Rewind,
+    RecoveryBatch,
+    KernelEvidence,
+    ExpiryCleanup,
+    CursorEncode,
+    StorageCommit,
+}
+
+impl fmt::Display for ScanCommitStage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Rewind => "REWIND",
+            Self::RecoveryBatch => "RECOVERY_BATCH",
+            Self::KernelEvidence => "KERNEL_EVIDENCE",
+            Self::ExpiryCleanup => "EXPIRY_CLEANUP",
+            Self::CursorEncode => "CURSOR_ENCODE",
+            Self::StorageCommit => "STORAGE_COMMIT",
+        })
+    }
 }
 
 /// Typed failures at the Wallet/Core identity and canonical-scan boundary.
@@ -316,8 +356,8 @@ pub enum CoreScanError {
     #[error("Core scan contract failed ({code})")]
     CoreContract { code: &'static str },
     /// Wallet persistence failed. No storage text crosses this boundary.
-    #[error("Wallet scan transaction failed")]
-    Persistence,
+    #[error("{stage}")]
+    Persistence { stage: ScanCommitStage },
 }
 
 impl CoreScanError {
@@ -484,8 +524,9 @@ impl CoreChainAdapter {
     ) -> Result<CoreReconcileResult, CoreScanError> {
         match sink
             .core_cursor_state()
-            .map_err(|_| CoreScanError::Persistence)?
-        {
+            .map_err(|_| CoreScanError::Persistence {
+                stage: ScanCommitStage::CursorEncode,
+            })? {
             PersistedCoreCursorState::Absent => {
                 let batch = self.scan_from_height(0, self.maximum_batch_blocks)?;
                 self.commit_normal(sink, batch)
@@ -514,7 +555,9 @@ impl CoreChainAdapter {
     ) -> Result<CoreReconcileResult, CoreScanError> {
         if !matches!(
             sink.core_cursor_state()
-                .map_err(|_| CoreScanError::Persistence)?,
+                .map_err(|_| CoreScanError::Persistence {
+                    stage: ScanCommitStage::CursorEncode,
+                })?,
             PersistedCoreCursorState::Absent
         ) {
             return self.reconcile_once(sink);
@@ -567,8 +610,9 @@ impl CoreChainAdapter {
             let result = self.reconcile_wallet_once(sink)?;
             let cursor = match sink
                 .core_cursor_state()
-                .map_err(|_| CoreScanError::Persistence)?
-            {
+                .map_err(|_| CoreScanError::Persistence {
+                    stage: ScanCommitStage::CursorEncode,
+                })? {
                 PersistedCoreCursorState::Valid(cursor) => cursor,
                 PersistedCoreCursorState::Absent => {
                     return Err(CoreScanError::InvalidScan {
@@ -605,8 +649,7 @@ impl CoreChainAdapter {
         let Some(cursor) = batch.commit_cursor else {
             return Ok(CoreReconcileResult::NoChanges);
         };
-        sink.commit_core_batch(&batch, cursor)
-            .map_err(|_| CoreScanError::Persistence)?;
+        self.commit_with_generation_retry(sink, |sink| sink.commit_core_batch(&batch, cursor))?;
         Ok(CoreReconcileResult::Committed(cursor))
     }
 
@@ -652,8 +695,9 @@ impl CoreChainAdapter {
                 });
             }
         };
-        sink.commit_core_reorg(safe_anchor, &batch, replacement)
-            .map_err(|_| CoreScanError::Persistence)?;
+        self.commit_with_generation_retry(sink, |sink| {
+            sink.commit_core_reorg(safe_anchor, &batch, replacement)
+        })?;
         Ok(CoreReconcileResult::ReorgCommitted {
             safe_anchor,
             cursor: replacement,
@@ -667,9 +711,11 @@ impl CoreChainAdapter {
     ) -> Result<CoreBlockReference, CoreScanError> {
         let lowest = invalid_height.saturating_sub(self.maximum_reorg_depth);
         for height in (lowest..invalid_height).rev() {
-            let local = sink
-                .committed_canonical_hash(height)
-                .map_err(|_| CoreScanError::Persistence)?;
+            let local =
+                sink.committed_canonical_hash(height)
+                    .map_err(|_| CoreScanError::Persistence {
+                        stage: ScanCommitStage::Rewind,
+                    })?;
             let core = self.canonical_hash_at_height(height)?;
             if let (Some(local_hash), Some(core_hash)) = (local, core) {
                 if local_hash == core_hash && core_hash != [0u8; 32] {
@@ -681,6 +727,39 @@ impl CoreChainAdapter {
             }
         }
         Err(CoreScanError::ReorgBeyondBound)
+    }
+
+    fn commit_with_generation_retry<S, F>(
+        &self,
+        sink: &mut S,
+        mut commit: F,
+    ) -> Result<(), CoreScanError>
+    where
+        S: CoreScanTransactionSink,
+        F: FnMut(&mut S) -> Result<(), S::Error>,
+    {
+        for attempt in 1..=GENERATION_CONFLICT_MAX_ATTEMPTS {
+            let error = match commit(sink) {
+                Ok(()) => return Ok(()),
+                Err(error) => error,
+            };
+            let stage = S::persistence_stage(&error);
+            let recovered = match sink.recover_generation_conflict(&error) {
+                Ok(recovered) => recovered,
+                Err(reload_error) => {
+                    return Err(CoreScanError::Persistence {
+                        stage: S::persistence_stage(&reload_error),
+                    })
+                }
+            };
+            if !recovered || attempt == GENERATION_CONFLICT_MAX_ATTEMPTS {
+                return Err(CoreScanError::Persistence { stage });
+            }
+            thread::sleep(Duration::from_millis(
+                GENERATION_CONFLICT_BACKOFF_MILLIS * attempt as u64,
+            ));
+        }
+        unreachable!("the bounded generation-conflict loop always returns")
     }
 
     fn check_limit(&self, limit: u64) -> Result<(), CoreScanError> {

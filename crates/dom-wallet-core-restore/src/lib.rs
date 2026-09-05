@@ -1260,7 +1260,7 @@ fn map_scan_error(error: CoreScanError) -> SeedRestoreError {
         CoreScanError::InvalidIdentity { .. }
         | CoreScanError::IdentityMismatch { .. }
         | CoreScanError::CursorIdentityMismatch => SeedRestoreError::ChainIdentityMismatch,
-        CoreScanError::Persistence => SeedRestoreError::Storage,
+        CoreScanError::Persistence { .. } => SeedRestoreError::Storage,
         CoreScanError::CoreNotReady => SeedRestoreError::CoreBusy,
         _ => SeedRestoreError::CanonicalScan,
     }

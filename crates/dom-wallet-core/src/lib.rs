@@ -36,7 +36,7 @@ use dom_wallet_core_submit::{
 };
 use dom_wallet_core_sync::{
     CoreBlockReference, CoreChainIdentity, CoreCursorBytes, CoreScanBatch, CoreScanTransactionSink,
-    PersistedCoreCursorState,
+    PersistedCoreCursorState, ScanCommitStage,
 };
 use dom_wallet_crypto::{KdfParameters, SecretBytes};
 use dom_wallet_domain::{
@@ -1361,6 +1361,7 @@ impl WalletService {
         self.state = ApplicationState::Synchronizing;
         let result = backend.reconcile_once(&mut sink);
         let recovery_error = sink.last_recovery_error.take();
+        let generation_conflict = sink.last_generation_conflict.take();
         self.backend = Some(backend);
         self.observed_tip_height = sink
             .observed_tip_height
@@ -1381,7 +1382,11 @@ impl WalletService {
             }
             Err(error) => {
                 self.finish_sync_failure(&error);
-                recovery_error.map_or_else(|| Err(error.into()), |error| Err(error.into()))
+                if let Some(current) = generation_conflict {
+                    Err(StorageError::ExpectedGenerationConflict { current }.into())
+                } else {
+                    recovery_error.map_or_else(|| Err(error.into()), |error| Err(error.into()))
+                }
             }
         }
     }
@@ -1430,6 +1435,7 @@ impl WalletService {
         self.state = ApplicationState::Synchronizing;
         let result = backend.reconcile_page(&mut sink);
         let recovery_error = sink.last_recovery_error.take();
+        let generation_conflict = sink.last_generation_conflict.take();
         self.backend = Some(backend);
         self.observed_tip_height = sink
             .observed_tip_height
@@ -1450,7 +1456,11 @@ impl WalletService {
             }
             Err(error) => {
                 self.finish_sync_failure(&error);
-                recovery_error.map_or_else(|| Err(error.into()), |error| Err(error.into()))
+                if let Some(current) = generation_conflict {
+                    Err(StorageError::ExpectedGenerationConflict { current }.into())
+                } else {
+                    recovery_error.map_or_else(|| Err(error.into()), |error| Err(error.into()))
+                }
             }
         }
     }
@@ -3695,6 +3705,22 @@ struct WalletRecoverySink {
     identity: CoreChainIdentity,
     observed_tip_height: Option<u64>,
     last_recovery_error: Option<SeedRestoreError>,
+    last_generation_conflict: Option<u64>,
+}
+
+#[derive(Debug)]
+struct WalletScanSinkError {
+    stage: ScanCommitStage,
+    source: CoreError,
+}
+
+impl WalletScanSinkError {
+    fn new(stage: ScanCommitStage, source: impl Into<CoreError>) -> Self {
+        Self {
+            stage,
+            source: source.into(),
+        }
+    }
 }
 
 impl WalletRecoverySink {
@@ -3715,6 +3741,7 @@ impl WalletRecoverySink {
             identity,
             observed_tip_height: None,
             last_recovery_error: None,
+            last_generation_conflict: None,
         }
     }
 
@@ -3723,10 +3750,11 @@ impl WalletRecoverySink {
         batch: &CoreScanBatch,
         cursor: CoreCursorBytes,
         reorg: Option<CoreBlockReference>,
-    ) -> Result<(), CoreError> {
+    ) -> Result<(), WalletScanSinkError> {
         let mut next = self.state.clone();
         if let Some(anchor) = reorg {
-            rewind_recovery_state(&mut next, anchor.height, batch.observed_tip.height)?;
+            rewind_recovery_state(&mut next, anchor.height, batch.observed_tip.height)
+                .map_err(|error| WalletScanSinkError::new(ScanCommitStage::Rewind, error))?;
         }
         if let Err(error) = apply_recovery_batch(
             &self.seed,
@@ -3739,7 +3767,10 @@ impl WalletRecoverySink {
             batch,
         ) {
             self.last_recovery_error = Some(error);
-            return Err(error.into());
+            return Err(WalletScanSinkError::new(
+                ScanCommitStage::RecoveryBatch,
+                error,
+            ));
         }
         // Kernel evidence inside the committed canonical blocks is what
         // proves a wallet transaction on-chain: it re-confirms records a
@@ -3753,16 +3784,21 @@ impl WalletRecoverySink {
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>();
-            next.apply_kernel_evidence(block.height, block.block_hash, &kernels)?;
+            next.apply_kernel_evidence(block.height, block.block_hash, &kernels)
+                .map_err(|error| {
+                    WalletScanSinkError::new(ScanCommitStage::KernelEvidence, error)
+                })?;
         }
         for transaction_id in
-            cancel_expired_unfinalized_reservations(&mut next, batch.observed_tip.height)?
+            cancel_expired_unfinalized_reservations(&mut next, batch.observed_tip.height)
+                .map_err(|error| WalletScanSinkError::new(ScanCommitStage::ExpiryCleanup, error))?
         {
             let transaction = next
                 .transactions
                 .iter()
                 .find(|transaction| transaction.id == transaction_id)
-                .ok_or(CoreError::TransactionNotFound)?;
+                .ok_or(CoreError::TransactionNotFound)
+                .map_err(|error| WalletScanSinkError::new(ScanCommitStage::ExpiryCleanup, error))?;
             tracing::info!(
                 %transaction_id,
                 slate_id = ?transaction.slate_id,
@@ -3777,33 +3813,47 @@ impl WalletRecoverySink {
         if next.seed_restore_status == Some(SeedRestoreStatus::InProgress) {
             let anchor_height = cursor
                 .decode()
-                .map_err(|_| CoreError::InvalidCoreCursor)?
+                .map_err(|_| {
+                    WalletScanSinkError::new(
+                        ScanCommitStage::CursorEncode,
+                        CoreError::InvalidCoreCursor,
+                    )
+                })?
                 .anchor_height;
             if anchor_height >= batch.observed_tip.height {
                 next.seed_restore_status = Some(SeedRestoreStatus::Complete);
                 next.sync_status = SyncStatus::Synced;
             }
         }
-        self.state = self.directory.commit(
-            self.state.generation,
-            next,
-            self.password.as_str(),
-            self.kdf,
-        )?;
+        self.state = self
+            .directory
+            .commit(
+                self.state.generation,
+                next,
+                self.password.as_str(),
+                self.kdf,
+            )
+            .map_err(|error| WalletScanSinkError::new(ScanCommitStage::StorageCommit, error))?;
+        self.last_generation_conflict = None;
         self.observed_tip_height = Some(batch.observed_tip.height);
         Ok(())
     }
 }
 
 impl CoreScanTransactionSink for WalletRecoverySink {
-    type Error = CoreError;
+    type Error = WalletScanSinkError;
 
     fn core_cursor_state(&self) -> Result<PersistedCoreCursorState, Self::Error> {
         match self.state.core_scan_cursor.as_deref() {
             None => Ok(PersistedCoreCursorState::Absent),
             Some(bytes) => CoreCursorBytes::parse(bytes, &self.identity)
                 .map(PersistedCoreCursorState::Valid)
-                .map_err(|_| CoreError::InvalidCoreCursor),
+                .map_err(|_| {
+                    WalletScanSinkError::new(
+                        ScanCommitStage::CursorEncode,
+                        CoreError::InvalidCoreCursor,
+                    )
+                }),
         }
     }
 
@@ -3831,6 +3881,27 @@ impl CoreScanTransactionSink for WalletRecoverySink {
         cursor: CoreCursorBytes,
     ) -> Result<(), Self::Error> {
         self.commit(batch, cursor, Some(safe_anchor))
+    }
+
+    fn persistence_stage(error: &Self::Error) -> ScanCommitStage {
+        error.stage
+    }
+
+    fn recover_generation_conflict(&mut self, error: &Self::Error) -> Result<bool, Self::Error> {
+        let CoreError::Storage(StorageError::ExpectedGenerationConflict { current }) =
+            &error.source
+        else {
+            self.last_generation_conflict = None;
+            return Ok(false);
+        };
+        self.last_generation_conflict = None;
+        let state = self
+            .directory
+            .load(self.password.as_str())
+            .map_err(|error| WalletScanSinkError::new(ScanCommitStage::StorageCommit, error))?;
+        self.state = state;
+        self.last_generation_conflict = Some(*current);
+        Ok(true)
     }
 }
 
@@ -4899,6 +4970,9 @@ impl CoreError {
             Self::TransactionNotFound => "TRANSACTION_NOT_FOUND",
             Self::InvalidCoreCursor => "CURSOR_INVALID",
             Self::Storage(StorageError::WriterActive) => "WALLET_WRITER_ACTIVE",
+            Self::Storage(StorageError::ExpectedGenerationConflict { .. }) => {
+                "WALLET_STORAGE_GENERATION_CONFLICT"
+            }
             Self::Storage(StorageError::InvalidPassword) => "INVALID_PASSWORD",
             Self::Storage(StorageError::AuthenticationDataCorrupt) => "WALLET_AUTH_DATA_CORRUPT",
             Self::Storage(StorageError::AuthenticatedPayloadCorrupt) => "WALLET_PAYLOAD_CORRUPT",
@@ -4916,31 +4990,171 @@ impl CoreError {
         }
     }
 
-    pub fn redacted_message(&self) -> String {
-        let description: &str = match self {
-            Self::Locked => "wallet is locked",
-            Self::IdentityMismatch => "embedded Core identity does not match wallet",
-            Self::InsufficientFunds => "insufficient spendable funds",
-            Self::FeeTooLow => "transaction fee is below the required Core policy floor",
-            Self::TransactionExpired => "transaction expiry is not above the canonical tip",
-            Self::TransactionLifetimeExceeded => "transaction lifetime exceeds the local maximum",
-            Self::NodeNotReady => "embedded Core is not ready",
-            Self::InvalidCoreCursor => "wallet cursor is invalid",
-            Self::InvalidSlateTransport => "Slate v4 transport is invalid",
-            Self::MissingPrivateContext => "private Slate context is unavailable",
-            Self::Storage(StorageError::WriterActive) => "wallet is already open by another writer",
-            Self::Storage(StorageError::InvalidPassword) => "wallet password is invalid",
+    pub fn redacted_description(&self) -> &'static str {
+        match self {
+            Self::WalletNotOpen => "Open a wallet before using this operation.",
+            Self::Locked => "Unlock the wallet before using this operation.",
+            Self::InvalidLifecycleState => {
+                "The wallet lifecycle does not permit this operation."
+            }
+            Self::InvalidPassword => "The local wallet password is invalid.",
+            Self::RandomnessUnavailable => "Secure randomness is temporarily unavailable.",
+            Self::RecoveryCeremonyRequired => {
+                "Confirm the recovery phrase before using wallet funds."
+            }
+            Self::RecoveryPhraseAlreadyConfirmed => {
+                "The recovery phrase has already been confirmed."
+            }
+            Self::RecoveryPhraseInvalid => "The recovery phrase is invalid.",
+            Self::RecoveryUnavailable => "This wallet is not eligible for mnemonic recovery.",
+            Self::InvalidBackupDestination => "Choose a valid backup destination.",
+            Self::EmbeddedCoreRequired => "Start the embedded node before using this operation.",
+            Self::NodeNotReady => "The embedded node is still starting.",
+            Self::IdentityMismatch => "The wallet and node belong to different chains.",
+            Self::AddressIdentityRequired => {
+                "Canonical wallet address identities are required for this operation."
+            }
+            Self::InvalidTransactionInput => "The transaction input is invalid.",
+            Self::TransactionExpired => {
+                "The transaction expiry is not above the canonical chain tip."
+            }
+            Self::TransactionLifetimeExceeded => {
+                "The transaction lifetime exceeds the wallet safety limit."
+            }
+            Self::InsufficientFunds => {
+                "The wallet does not have enough spendable funds for this payment."
+            }
+            Self::UnsupportedSpendingEvidence => {
+                "The selected outputs do not contain supported spending evidence."
+            }
+            Self::FeeTooLow => "The fee is below the embedded node policy minimum.",
+            Self::ArithmeticOverflow => "The requested values exceed the wallet amount range.",
+            Self::ReservationConflict => {
+                "One or more selected outputs are already reserved by another transaction."
+            }
+            Self::InvalidScriptlessFundingRequest => {
+                "The Scriptless funding reservation request is invalid."
+            }
+            Self::ScriptlessFundingSessionConflict => {
+                "The Scriptless funding session already has different frozen terms."
+            }
+            Self::ScriptlessFundingShapeMismatch => {
+                "The Scriptless funding components disagree with the frozen transaction shape."
+            }
+            Self::ScriptlessFundingReservationNotFound => {
+                "The Scriptless funding reservation was not found."
+            }
+            Self::ScriptlessFundingNotPrepared => {
+                "The Scriptless funding components are not durably prepared."
+            }
+            Self::ScriptlessFundingCannotExport => {
+                "The Scriptless funding components cannot be exported in their current state."
+            }
+            Self::ScriptlessFundingSigningNotAuthorized => {
+                "The Scriptless funding signing handoff is not authorized in this state."
+            }
+            Self::ScriptlessFundingContextMismatch => {
+                "The Scriptless funding public and encrypted contexts disagree."
+            }
+            Self::ScriptlessFundingCannotRelease => {
+                "The Scriptless funding reservation cannot be released after exposure or a chain change."
+            }
+            Self::ScriptlessSessionBindingRequired => {
+                "The authenticated Scriptless session binding is required before exposure."
+            }
+            Self::ScriptlessSessionBindingMismatch => {
+                "The Scriptless session-share capability disagrees with wallet state."
+            }
+            Self::ScriptlessTemplateBindingMismatch => {
+                "The Scriptless transaction template disagrees with wallet state."
+            }
+            Self::InvalidScriptlessPayoutRequest => {
+                "The Scriptless payout reservation request is invalid."
+            }
+            Self::ScriptlessPayoutSessionConflict => {
+                "The Scriptless payout role already has different frozen terms."
+            }
+            Self::ScriptlessPayoutReservationNotFound => {
+                "The Scriptless payout reservation was not found."
+            }
+            Self::ScriptlessPayoutNotPrepared => {
+                "The Scriptless payout components are not durably prepared."
+            }
+            Self::ScriptlessPayoutCannotExport => {
+                "The Scriptless payout components cannot be exported in their current state."
+            }
+            Self::ScriptlessPayoutContextMismatch => {
+                "The Scriptless payout public and encrypted contexts disagree."
+            }
+            Self::ScriptlessPayoutSigningNotAuthorized => {
+                "The Scriptless payout signing handoff is not authorized in this state."
+            }
+            Self::ScriptlessPayoutCannotRelease => {
+                "The Scriptless payout reservation cannot be released after exposure."
+            }
+            Self::InvalidSlateTransport => {
+                "The imported Slate v4 data is invalid or has been altered."
+            }
+            Self::SlateReplayConflict => "The imported Slate conflicts with durable wallet state.",
+            Self::InvalidTransactionTransition => {
+                "The transaction cannot enter the requested lifecycle state."
+            }
+            Self::MissingPrivateContext => {
+                "The private context required to continue this Slate is unavailable."
+            }
+            Self::ProtocolRejected => "DOM protocol validation rejected the transaction.",
+            Self::CoverPolicyRejected => {
+                "The ordinary-send cover policy rejected the current chain snapshot."
+            }
+            Self::FinalizedTransactionConflict => {
+                "Different finalized transaction bytes are already retained for this Slate."
+            }
+            Self::MixedOutputRegime => {
+                "The transaction mixes incompatible output recovery formats."
+            }
+            Self::CannotCancelTransaction => {
+                "The transaction cannot be cancelled after submission evidence."
+            }
+            Self::ConfirmationRequired => "Explicit confirmation is required.",
+            Self::TransactionNotFound => "The requested transaction was not found.",
+            Self::InvalidCoreCursor => "The wallet synchronization cursor is invalid.",
+            Self::Storage(StorageError::WriterActive) => {
+                "Close the other running wallet process before opening this wallet."
+            }
+            Self::Storage(StorageError::ExpectedGenerationConflict { .. }) => {
+                "Wallet state changed while synchronization was committing; retrying with the latest state."
+            }
+            Self::Storage(StorageError::InvalidPassword) => {
+                "The local wallet password is invalid."
+            }
             Self::Storage(StorageError::AuthenticationDataCorrupt) => {
-                "wallet authentication data is corrupt"
+                "The wallet authentication record is corrupt and cannot be trusted."
             }
             Self::Storage(StorageError::AuthenticatedPayloadCorrupt) => {
-                "authenticated wallet payload is corrupt"
+                "The authenticated wallet payload is corrupt and cannot be opened."
             }
-            Self::Storage(StorageError::InvalidMetadata) => "wallet metadata is corrupt",
-            Self::Storage(StorageError::NotFound) => "wallet was not found",
-            _ => "the requested wallet operation was rejected",
-        };
-        format!("{}:{description}", self.redacted_code())
+            Self::Storage(StorageError::InvalidMetadata) => {
+                "The wallet metadata is corrupt and cannot be opened."
+            }
+            Self::Storage(StorageError::NotFound) => "The managed wallet was not found.",
+            Self::Storage(_) => "Wallet storage could not complete the operation.",
+            Self::Domain(DomainError::SwapSessionNotFound) => {
+                "The requested swap session was not found."
+            }
+            Self::Domain(DomainError::InvalidSwapTransition) => {
+                "The swap session cannot enter the requested state."
+            }
+            Self::Domain(_) => "Wallet state validation rejected the requested change.",
+            Self::Backend(_) => "The node backend could not complete the requested operation.",
+            Self::Protocol(_) => "Wallet protocol validation rejected the requested operation.",
+            Self::Recovery(_) => "Wallet recovery material could not complete the operation.",
+            Self::Restore(_) => "The wallet restore operation could not be completed.",
+            Self::Submission(_) => "The transaction submission could not be completed.",
+        }
+    }
+
+    pub fn redacted_message(&self) -> String {
+        format!("{}:{}", self.redacted_code(), self.redacted_description())
     }
 }
 
@@ -5951,6 +6165,21 @@ mod tests {
     }
 
     #[test]
+    fn synchronization_failure_records_only_the_closed_commit_stage() {
+        let mut service = test_service();
+        service.record_sync_failure(&ProductionBackendError::Scan(
+            dom_wallet_core_sync::CoreScanError::Persistence {
+                stage: ScanCommitStage::StorageCommit,
+            },
+        ));
+
+        assert_eq!(
+            service.errors.synchronization.as_deref(),
+            Some("CURSOR_SYNCHRONIZATION_FAILED:STORAGE_COMMIT")
+        );
+    }
+
+    #[test]
     fn regression_a5_error_domains_do_not_contaminate_or_cross_clear() {
         let temp = tempfile::tempdir().unwrap();
         let mut service = test_service();
@@ -5983,8 +6212,15 @@ mod tests {
         assert_eq!(error.redacted_code(), "WALLET_WRITER_ACTIVE");
         assert_eq!(
             error.redacted_message(),
-            "WALLET_WRITER_ACTIVE:wallet is already open by another writer"
+            "WALLET_WRITER_ACTIVE:Close the other running wallet process before opening this wallet."
         );
+    }
+
+    #[test]
+    fn generation_conflict_has_a_distinct_redacted_error_code() {
+        let error = CoreError::Storage(StorageError::ExpectedGenerationConflict { current: 3 });
+        assert_eq!(error.redacted_code(), "WALLET_STORAGE_GENERATION_CONFLICT");
+        assert!(!error.redacted_description().contains('3'));
     }
 
     #[test]
