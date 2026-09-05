@@ -5252,6 +5252,7 @@ impl From<CommandError> for CommandErrorDto {
                     "WALLET_METADATA_CORRUPT"
                     | "WALLET_PAYLOAD_CORRUPT"
                     | "WALLET_WRITER_ACTIVE"
+                    | "WALLET_STORAGE_GENERATION_CONFLICT"
                     | "WALLET_NOT_FOUND"
                     | "WALLET_STORAGE_FAILED" => "STORAGE",
                     "INVALID_WALLET_STATE"
@@ -5316,29 +5317,11 @@ impl From<CoreError> for CommandError {
             },
             other => {
                 let code = other.redacted_code();
-                let (message, retryable) = match code {
-                    "WALLET_WRITER_ACTIVE" => (
-                        "Close the other running wallet process before opening this wallet.",
-                        true,
-                    ),
-                    "INVALID_PASSWORD" => ("The local wallet password is invalid.", false),
-                    "WALLET_AUTH_DATA_CORRUPT" => (
-                        "The wallet authentication record is corrupt and cannot be trusted.",
-                        false,
-                    ),
-                    "WALLET_METADATA_CORRUPT" => {
-                        ("The wallet metadata is corrupt and was not opened.", false)
-                    }
-                    "WALLET_PAYLOAD_CORRUPT" => (
-                        "The authenticated wallet payload is corrupt and was not opened.",
-                        false,
-                    ),
-                    "WALLET_NOT_FOUND" => ("The managed wallet was not found.", false),
-                    _ => (
-                        "The wallet rejected the requested operation. Review its typed error code.",
-                        false,
-                    ),
-                };
+                let message = other.redacted_description();
+                let retryable = matches!(
+                    code,
+                    "WALLET_WRITER_ACTIVE" | "WALLET_STORAGE_GENERATION_CONFLICT"
+                );
                 Self::Wallet {
                     code,
                     message,
@@ -6297,6 +6280,11 @@ mod tests {
                 message: "busy",
                 retryable: true,
             },
+            CommandError::Wallet {
+                code: "WALLET_STORAGE_GENERATION_CONFLICT",
+                message: "retrying",
+                retryable: true,
+            },
         ];
 
         for error in variants {
@@ -6316,10 +6304,40 @@ mod tests {
         assert!(!terminal_synchronization_error(
             &CommandError::RestoreNodeSynchronizing
         ));
+        assert!(!terminal_synchronization_error(&CommandError::from(
+            CoreError::Storage(
+                dom_wallet_storage::StorageError::ExpectedGenerationConflict { current: 7 }
+            )
+        )));
         // ...while a source that is not our chain must stop it immediately.
         assert!(terminal_synchronization_error(
             &CommandError::IdentityMismatch
         ));
+    }
+
+    #[test]
+    fn wallet_errors_have_actionable_messages_without_a_generic_code_prompt() {
+        let retired_prompt = ["Review its typed", " error code"].concat();
+        let errors = vec![
+            CoreError::RecoveryCeremonyRequired,
+            CoreError::TransactionLifetimeExceeded,
+            CoreError::TransactionExpired,
+            CoreError::ReservationConflict,
+            CoreError::Storage(dom_wallet_storage::StorageError::GenerationConflict),
+            CoreError::Storage(
+                dom_wallet_storage::StorageError::ExpectedGenerationConflict { current: 9 },
+            ),
+        ];
+
+        for error in errors {
+            let dto = CommandErrorDto::from(CommandError::from(error));
+            assert!(!dto.message.is_empty());
+            assert!(!dto.message.contains(&retired_prompt));
+            if dto.code == "WALLET_STORAGE_GENERATION_CONFLICT" {
+                assert!(dto.retryable);
+            }
+        }
+        assert!(!include_str!("lib.rs").contains(&retired_prompt));
     }
 
     #[test]

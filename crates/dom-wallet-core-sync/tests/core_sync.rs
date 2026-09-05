@@ -13,6 +13,7 @@ use dom_wallet_core_api::{
 use dom_wallet_core_sync::{
     CoreBlockReference, CoreChainAdapter, CoreChainIdentity, CoreCursorBytes, CoreReconcileResult,
     CoreScanBatch, CoreScanError, CoreScanTransactionSink, PersistedCoreCursorState,
+    ScanCommitStage,
 };
 use dom_wallet_embedded_core::{
     EmbeddedCoreConfiguration, EmbeddedCoreLifecycle, EmbeddedCoreNetwork,
@@ -518,10 +519,33 @@ struct MemorySink {
     fail_commit: bool,
     normal_commits: usize,
     reorg_commits: usize,
+    generation_conflicts_remaining: usize,
+    commit_attempts: usize,
+    generation_reloads: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemorySinkError {
+    Persistence,
+    GenerationConflict,
+}
+
+impl MemorySink {
+    fn prepare_commit(&mut self) -> Result<(), MemorySinkError> {
+        self.commit_attempts += 1;
+        if self.generation_conflicts_remaining > 0 {
+            self.generation_conflicts_remaining -= 1;
+            return Err(MemorySinkError::GenerationConflict);
+        }
+        if self.fail_commit {
+            return Err(MemorySinkError::Persistence);
+        }
+        Ok(())
+    }
 }
 
 impl CoreScanTransactionSink for MemorySink {
-    type Error = ();
+    type Error = MemorySinkError;
 
     fn core_cursor_state(&self) -> Result<PersistedCoreCursorState, Self::Error> {
         Ok(self.cursor.clone())
@@ -536,9 +560,7 @@ impl CoreScanTransactionSink for MemorySink {
         batch: &CoreScanBatch,
         cursor: CoreCursorBytes,
     ) -> Result<(), Self::Error> {
-        if self.fail_commit {
-            return Err(());
-        }
+        self.prepare_commit()?;
         for block in &batch.blocks {
             self.hashes.insert(block.height, block.block_hash);
         }
@@ -553,9 +575,7 @@ impl CoreScanTransactionSink for MemorySink {
         batch: &CoreScanBatch,
         cursor: CoreCursorBytes,
     ) -> Result<(), Self::Error> {
-        if self.fail_commit {
-            return Err(());
-        }
+        self.prepare_commit()?;
         self.hashes
             .retain(|height, _| *height <= safe_anchor.height);
         for block in &batch.blocks {
@@ -564,6 +584,14 @@ impl CoreScanTransactionSink for MemorySink {
         self.cursor = PersistedCoreCursorState::Valid(cursor);
         self.reorg_commits += 1;
         Ok(())
+    }
+
+    fn recover_generation_conflict(&mut self, error: &Self::Error) -> Result<bool, Self::Error> {
+        if *error != MemorySinkError::GenerationConflict {
+            return Ok(false);
+        }
+        self.generation_reloads += 1;
+        Ok(true)
     }
 }
 
@@ -967,10 +995,51 @@ fn interrupted_commit_does_not_publish_cursor() {
     };
     assert_eq!(
         core.adapter().reconcile_once(&mut sink),
-        Err(CoreScanError::Persistence)
+        Err(CoreScanError::Persistence {
+            stage: ScanCommitStage::StorageCommit,
+        })
     );
     assert_eq!(sink.cursor, PersistedCoreCursorState::Absent);
     assert!(sink.hashes.is_empty());
+}
+
+#[test]
+fn generation_conflicts_reload_and_reapply_until_the_cursor_commits() {
+    let core = FakeCore::new(4);
+    let mut sink = MemorySink {
+        generation_conflicts_remaining: 2,
+        ..MemorySink::default()
+    };
+
+    assert!(matches!(
+        core.adapter().reconcile_once(&mut sink),
+        Ok(CoreReconcileResult::Committed(_))
+    ));
+    let PersistedCoreCursorState::Valid(cursor) = sink.cursor else {
+        panic!("successful retry did not publish the cursor");
+    };
+    assert_eq!(cursor.decode().unwrap().anchor_height, 1);
+    assert_eq!(sink.commit_attempts, 3);
+    assert_eq!(sink.generation_reloads, 2);
+}
+
+#[test]
+fn exhausted_generation_conflicts_report_the_storage_commit_stage() {
+    let core = FakeCore::new(4);
+    let mut sink = MemorySink {
+        generation_conflicts_remaining: usize::MAX,
+        ..MemorySink::default()
+    };
+
+    assert_eq!(
+        core.adapter().reconcile_once(&mut sink),
+        Err(CoreScanError::Persistence {
+            stage: ScanCommitStage::StorageCommit,
+        })
+    );
+    assert_eq!(sink.cursor, PersistedCoreCursorState::Absent);
+    assert_eq!(sink.commit_attempts, 5);
+    assert_eq!(sink.generation_reloads, 5);
 }
 
 #[test]

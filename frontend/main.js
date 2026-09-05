@@ -47,9 +47,14 @@ let latestSpendableBalance = null;
 const seenAutomaticCancellations = new Set();
 
 export const clearPasswords = (form) => form?.querySelectorAll('input[type="password"]').forEach((input) => { input.value = ""; });
-export const redactedError = (error) => error?.message && !/password|mnemonic|seed|secret|key|token|credential|:\/\//i.test(error.message)
-  ? error.message
-  : error?.code ? `Operation rejected (${error.code}).` : "Operation rejected by the native wallet boundary.";
+export const redactedError = (error) => {
+  const safeMessage = error?.message
+    && !/password|mnemonic|seed|secret|key|token|credential|:\/\//i.test(error.message);
+  if (safeMessage) return error?.code ? `${error.message} (${error.code})` : error.message;
+  return error?.code
+    ? `Operation rejected (${error.code}).`
+    : "Operation rejected by the native wallet boundary.";
+};
 const show = (message, failed = false) => {
   status.textContent = message;
   toast.textContent = message;
