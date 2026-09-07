@@ -15,4 +15,5 @@ dom-slate.workspace = true
 dom-tx.workspace = true
 hex.workspace = true
 thiserror.workspace = true
+zeroize.workspace = true
 uuid.workspace = true

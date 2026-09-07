@@ -15,6 +15,7 @@ use dom_tx::slate::Slate;
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 pub const TRANSPORT_PREFIX: &str = "DOMSLATE1.";
 pub const QR_FRAME_PREFIX: &str = "DOMQR1.";
@@ -36,14 +37,14 @@ pub struct InputMaterial {
 pub struct ChangeMaterial {
     pub commitment: [u8; 33],
     pub value: u64,
-    pub blinding: [u8; 32],
+    pub blinding: Zeroizing<[u8; 32]>,
 }
 
 /// Private material returned only to encrypted wallet persistence.
 #[derive(Clone, Eq, PartialEq)]
 pub struct SenderSecrets {
-    pub excess_blinding: [u8; 32],
-    pub nonce: [u8; 32],
+    pub excess_blinding: Zeroizing<[u8; 32]>,
+    pub nonce: Zeroizing<[u8; 32]>,
 }
 
 impl std::fmt::Debug for SenderSecrets {
@@ -54,7 +55,7 @@ impl std::fmt::Debug for SenderSecrets {
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct RecipientSecrets {
-    pub output_blinding: [u8; 32],
+    pub output_blinding: Zeroizing<[u8; 32]>,
 }
 
 impl std::fmt::Debug for RecipientSecrets {
@@ -214,7 +215,7 @@ pub fn build_sender(
             .iter()
             .map(|input| SlateInput {
                 commitment: input.commitment,
-                blinding: input.blinding,
+                blinding: Zeroizing::new(input.blinding),
             })
             .collect::<Vec<_>>(),
         change_value,
