@@ -97,7 +97,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -108,7 +108,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -184,6 +184,18 @@ name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
+
+[[package]]
+name = "attohttpc"
+version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16e2cdb6d5ed835199484bb92bb8b3edd526effe995c61732580439c1a67e2e9"
+dependencies = [
+ "base64 0.22.1",
+ "http",
+ "log",
+ "url",
+]
 
 [[package]]
 name = "autocfg"
@@ -713,6 +725,16 @@ dependencies = [
 
 [[package]]
 name = "core-foundation"
+version = "0.9.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91e195e091a93c46f7102ec7818a2aa394e1e1771c3ab4825963fa03e45afb8f"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
+]
+
+[[package]]
+name = "core-foundation"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b2a6cd9ae233e7f62ba4e9353e81a88df7fc8a5987b8d445b4d90c879bd156f6"
@@ -734,7 +756,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "064badf302c3194842cf2c5d61f56cc88e54a759313879cdf03abdd27d0c3b97"
 dependencies = [
  "bitflags 2.13.0",
- "core-foundation",
+ "core-foundation 0.10.1",
  "core-graphics-types",
  "foreign-types",
  "libc",
@@ -747,7 +769,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d44a101f213f6c4cdc1853d4b78aef6db6bdfa3468798cc1d9912f4735013eb"
 dependencies = [
  "bitflags 2.13.0",
- "core-foundation",
+ "core-foundation 0.10.1",
  "libc",
 ]
 
@@ -1060,7 +1082,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1084,6 +1106,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "dlopen2"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09b4f5f101177ff01b8ec4ecc81eead416a8aa42819a2869311b3420fa114ffa"
+dependencies = [
+ "libc",
+ "once_cell",
+ "winapi",
 ]
 
 [[package]]
@@ -1112,11 +1145,14 @@ dependencies = [
 [[package]]
 name = "dom-adaptor"
 version = "0.2.0"
-source = "git+https://github.com/sorenplanck/dom-protocol?rev=6f8a947dee0e54c3421caa295755b1746c178137#6f8a947dee0e54c3421caa295755b1746c178137"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=28bfccab3b43e3d6949a65a0376f588d549f22e1#28bfccab3b43e3d6949a65a0376f588d549f22e1"
 dependencies = [
  "dom-consensus",
  "dom-core",
  "dom-crypto",
+ "dom-scriptless-bulletproof",
+ "dom-scriptless-consensus",
+ "dom-scriptless-primitives",
  "dom-serialization",
  "rand_core 0.6.4",
  "subtle",
@@ -1127,7 +1163,7 @@ dependencies = [
 [[package]]
 name = "dom-chain"
 version = "0.2.0"
-source = "git+https://github.com/sorenplanck/dom-protocol?rev=6f8a947dee0e54c3421caa295755b1746c178137#6f8a947dee0e54c3421caa295755b1746c178137"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=28bfccab3b43e3d6949a65a0376f588d549f22e1#28bfccab3b43e3d6949a65a0376f588d549f22e1"
 dependencies = [
  "blake2",
  "dom-consensus",
@@ -1147,18 +1183,19 @@ dependencies = [
 [[package]]
 name = "dom-config"
 version = "0.2.0"
-source = "git+https://github.com/sorenplanck/dom-protocol?rev=6f8a947dee0e54c3421caa295755b1746c178137#6f8a947dee0e54c3421caa295755b1746c178137"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=28bfccab3b43e3d6949a65a0376f588d549f22e1#28bfccab3b43e3d6949a65a0376f588d549f22e1"
 dependencies = [
  "dom-core",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]
 name = "dom-consensus"
 version = "0.2.0"
-source = "git+https://github.com/sorenplanck/dom-protocol?rev=6f8a947dee0e54c3421caa295755b1746c178137#6f8a947dee0e54c3421caa295755b1746c178137"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=28bfccab3b43e3d6949a65a0376f588d549f22e1#28bfccab3b43e3d6949a65a0376f588d549f22e1"
 dependencies = [
  "dom-core",
  "dom-crypto",
@@ -1172,7 +1209,7 @@ dependencies = [
 [[package]]
 name = "dom-core"
 version = "0.2.0"
-source = "git+https://github.com/sorenplanck/dom-protocol?rev=6f8a947dee0e54c3421caa295755b1746c178137#6f8a947dee0e54c3421caa295755b1746c178137"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=28bfccab3b43e3d6949a65a0376f588d549f22e1#28bfccab3b43e3d6949a65a0376f588d549f22e1"
 dependencies = [
  "hex",
  "subtle",
@@ -1183,7 +1220,7 @@ dependencies = [
 [[package]]
 name = "dom-crypto"
 version = "0.2.0"
-source = "git+https://github.com/sorenplanck/dom-protocol?rev=6f8a947dee0e54c3421caa295755b1746c178137#6f8a947dee0e54c3421caa295755b1746c178137"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=28bfccab3b43e3d6949a65a0376f588d549f22e1#28bfccab3b43e3d6949a65a0376f588d549f22e1"
 dependencies = [
  "blake2",
  "chacha20poly1305",
@@ -1205,7 +1242,7 @@ dependencies = [
 [[package]]
 name = "dom-mempool"
 version = "0.2.0"
-source = "git+https://github.com/sorenplanck/dom-protocol?rev=6f8a947dee0e54c3421caa295755b1746c178137#6f8a947dee0e54c3421caa295755b1746c178137"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=28bfccab3b43e3d6949a65a0376f588d549f22e1#28bfccab3b43e3d6949a65a0376f588d549f22e1"
 dependencies = [
  "dom-consensus",
  "dom-core",
@@ -1220,7 +1257,7 @@ dependencies = [
 [[package]]
 name = "dom-node"
 version = "0.2.0"
-source = "git+https://github.com/sorenplanck/dom-protocol?rev=6f8a947dee0e54c3421caa295755b1746c178137#6f8a947dee0e54c3421caa295755b1746c178137"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=28bfccab3b43e3d6949a65a0376f588d549f22e1#28bfccab3b43e3d6949a65a0376f588d549f22e1"
 dependencies = [
  "anyhow",
  "dom-chain",
@@ -1240,11 +1277,14 @@ dependencies = [
  "dom-wire",
  "futures",
  "hex",
+ "igd-next",
  "k256",
+ "natpmp",
  "primitive-types",
  "rand 0.8.6",
  "randomx-rs",
  "serde_json",
+ "socket2",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -1254,7 +1294,7 @@ dependencies = [
 [[package]]
 name = "dom-pmmr"
 version = "0.2.0"
-source = "git+https://github.com/sorenplanck/dom-protocol?rev=6f8a947dee0e54c3421caa295755b1746c178137#6f8a947dee0e54c3421caa295755b1746c178137"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=28bfccab3b43e3d6949a65a0376f588d549f22e1#28bfccab3b43e3d6949a65a0376f588d549f22e1"
 dependencies = [
  "dom-core",
  "dom-crypto",
@@ -1264,7 +1304,7 @@ dependencies = [
 [[package]]
 name = "dom-pow"
 version = "0.2.0"
-source = "git+https://github.com/sorenplanck/dom-protocol?rev=6f8a947dee0e54c3421caa295755b1746c178137#6f8a947dee0e54c3421caa295755b1746c178137"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=28bfccab3b43e3d6949a65a0376f588d549f22e1#28bfccab3b43e3d6949a65a0376f588d549f22e1"
 dependencies = [
  "blake2",
  "dom-core",
@@ -1278,7 +1318,7 @@ dependencies = [
 [[package]]
 name = "dom-rpc"
 version = "0.2.0"
-source = "git+https://github.com/sorenplanck/dom-protocol?rev=6f8a947dee0e54c3421caa295755b1746c178137#6f8a947dee0e54c3421caa295755b1746c178137"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=28bfccab3b43e3d6949a65a0376f588d549f22e1#28bfccab3b43e3d6949a65a0376f588d549f22e1"
 dependencies = [
  "axum",
  "dirs 5.0.1",
@@ -1286,7 +1326,6 @@ dependencies = [
  "dom-core",
  "dom-mempool",
  "dom-serialization",
- "dom-wallet-core-api",
  "governor",
  "hex",
  "rand 0.8.6",
@@ -1302,9 +1341,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "dom-scriptless-bulletproof"
+version = "0.2.0"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=28bfccab3b43e3d6949a65a0376f588d549f22e1#28bfccab3b43e3d6949a65a0376f588d549f22e1"
+dependencies = [
+ "dom-core",
+ "dom-crypto",
+ "dom-scriptless-primitives",
+ "grin_secp256k1zkp",
+ "k256",
+ "rand 0.8.6",
+ "secp256k1 0.28.2",
+ "secp256k1-zkp",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "dom-scriptless-consensus"
+version = "0.2.0"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=28bfccab3b43e3d6949a65a0376f588d549f22e1#28bfccab3b43e3d6949a65a0376f588d549f22e1"
+dependencies = [
+ "dom-consensus",
+ "dom-core",
+ "dom-crypto",
+]
+
+[[package]]
+name = "dom-scriptless-primitives"
+version = "0.2.0"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=28bfccab3b43e3d6949a65a0376f588d549f22e1#28bfccab3b43e3d6949a65a0376f588d549f22e1"
+dependencies = [
+ "dom-core",
+ "dom-crypto",
+ "k256",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
 name = "dom-serialization"
 version = "0.2.0"
-source = "git+https://github.com/sorenplanck/dom-protocol?rev=6f8a947dee0e54c3421caa295755b1746c178137#6f8a947dee0e54c3421caa295755b1746c178137"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=28bfccab3b43e3d6949a65a0376f588d549f22e1#28bfccab3b43e3d6949a65a0376f588d549f22e1"
 dependencies = [
  "dom-core",
  "thiserror 1.0.69",
@@ -1326,7 +1404,7 @@ dependencies = [
 [[package]]
 name = "dom-slate"
 version = "0.2.0"
-source = "git+https://github.com/sorenplanck/dom-protocol?rev=6f8a947dee0e54c3421caa295755b1746c178137#6f8a947dee0e54c3421caa295755b1746c178137"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=28bfccab3b43e3d6949a65a0376f588d549f22e1#28bfccab3b43e3d6949a65a0376f588d549f22e1"
 dependencies = [
  "dom-consensus",
  "dom-core",
@@ -1336,12 +1414,13 @@ dependencies = [
  "k256",
  "rand 0.8.6",
  "thiserror 1.0.69",
+ "zeroize",
 ]
 
 [[package]]
 name = "dom-store"
 version = "0.2.0"
-source = "git+https://github.com/sorenplanck/dom-protocol?rev=6f8a947dee0e54c3421caa295755b1746c178137#6f8a947dee0e54c3421caa295755b1746c178137"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=28bfccab3b43e3d6949a65a0376f588d549f22e1#28bfccab3b43e3d6949a65a0376f588d549f22e1"
 dependencies = [
  "blake2",
  "dom-consensus",
@@ -1357,7 +1436,7 @@ dependencies = [
 [[package]]
 name = "dom-tx"
 version = "0.2.0"
-source = "git+https://github.com/sorenplanck/dom-protocol?rev=6f8a947dee0e54c3421caa295755b1746c178137#6f8a947dee0e54c3421caa295755b1746c178137"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=28bfccab3b43e3d6949a65a0376f588d549f22e1#28bfccab3b43e3d6949a65a0376f588d549f22e1"
 dependencies = [
  "dom-consensus",
  "dom-core",
@@ -1369,7 +1448,7 @@ dependencies = [
 [[package]]
 name = "dom-wallet"
 version = "0.2.0"
-source = "git+https://github.com/sorenplanck/dom-protocol?rev=6f8a947dee0e54c3421caa295755b1746c178137#6f8a947dee0e54c3421caa295755b1746c178137"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=28bfccab3b43e3d6949a65a0376f588d549f22e1#28bfccab3b43e3d6949a65a0376f588d549f22e1"
 dependencies = [
  "argon2",
  "bip39",
@@ -1378,6 +1457,7 @@ dependencies = [
  "dom-consensus",
  "dom-core",
  "dom-crypto",
+ "dom-pow",
  "dom-serialization",
  "dom-slate",
  "dom-tx",
@@ -1457,7 +1537,7 @@ dependencies = [
 [[package]]
 name = "dom-wallet-core-api"
 version = "0.2.0"
-source = "git+https://github.com/sorenplanck/dom-protocol?rev=6f8a947dee0e54c3421caa295755b1746c178137#6f8a947dee0e54c3421caa295755b1746c178137"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=28bfccab3b43e3d6949a65a0376f588d549f22e1#28bfccab3b43e3d6949a65a0376f588d549f22e1"
 dependencies = [
  "dom-consensus",
  "dom-core",
@@ -1568,15 +1648,17 @@ dependencies = [
 [[package]]
 name = "dom-wallet-crypto"
 version = "0.2.0"
-source = "git+https://github.com/sorenplanck/dom-protocol?rev=6f8a947dee0e54c3421caa295755b1746c178137#6f8a947dee0e54c3421caa295755b1746c178137"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=28bfccab3b43e3d6949a65a0376f588d549f22e1#28bfccab3b43e3d6949a65a0376f588d549f22e1"
 dependencies = [
  "argon2",
  "chacha20poly1305",
  "hkdf",
  "rand 0.8.6",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror 1.0.69",
  "zeroize",
 ]
@@ -1628,7 +1710,7 @@ dependencies = [
 [[package]]
 name = "dom-wallet-keys"
 version = "0.2.0"
-source = "git+https://github.com/sorenplanck/dom-protocol?rev=6f8a947dee0e54c3421caa295755b1746c178137#6f8a947dee0e54c3421caa295755b1746c178137"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=28bfccab3b43e3d6949a65a0376f588d549f22e1#28bfccab3b43e3d6949a65a0376f588d549f22e1"
 dependencies = [
  "bip39",
  "hmac",
@@ -1710,7 +1792,7 @@ dependencies = [
 [[package]]
 name = "dom-wallet-recovery"
 version = "0.2.0"
-source = "git+https://github.com/sorenplanck/dom-protocol?rev=6f8a947dee0e54c3421caa295755b1746c178137#6f8a947dee0e54c3421caa295755b1746c178137"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=28bfccab3b43e3d6949a65a0376f588d549f22e1#28bfccab3b43e3d6949a65a0376f588d549f22e1"
 dependencies = [
  "dom-core",
  "dom-crypto",
@@ -1831,7 +1913,7 @@ dependencies = [
 [[package]]
 name = "dom-wire"
 version = "0.2.0"
-source = "git+https://github.com/sorenplanck/dom-protocol?rev=6f8a947dee0e54c3421caa295755b1746c178137#6f8a947dee0e54c3421caa295755b1746c178137"
+source = "git+https://github.com/sorenplanck/dom-protocol?rev=28bfccab3b43e3d6949a65a0376f588d549f22e1#28bfccab3b43e3d6949a65a0376f588d549f22e1"
 dependencies = [
  "blake2",
  "dom-config",
@@ -1994,7 +2076,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2589,6 +2671,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "h2"
+version = "0.4.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef8e5e5a340588f4452631496976cf8636d4a7ecf600239fdc27615d2530bc16"
+dependencies = [
+ "atomic-waker",
+ "bytes",
+ "fnv",
+ "futures-core",
+ "futures-sink",
+ "http",
+ "indexmap 2.14.0",
+ "slab",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2716,6 +2817,7 @@ dependencies = [
  "bytes",
  "futures-channel",
  "futures-core",
+ "h2",
  "http",
  "http-body",
  "httparse",
@@ -2907,6 +3009,26 @@ checksum = "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
+]
+
+[[package]]
+name = "igd-next"
+version = "0.17.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de7238d487a9aff61f81b5ab41c0a841532a115a398b5fa92a2fadd0885e2581"
+dependencies = [
+ "attohttpc",
+ "bytes",
+ "futures",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "log",
+ "rand 0.10.2",
+ "tokio",
+ "url",
+ "xmltree",
 ]
 
 [[package]]
@@ -3371,7 +3493,19 @@ dependencies = [
  "png 0.18.1",
  "serde",
  "thiserror 2.0.18",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "natpmp"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77366fa8ce34e2e1322dd97da65f11a62f451bd3daae8be6993c00800f61dd07"
+dependencies = [
+ "async-trait",
+ "cc",
+ "netdev",
+ "tokio",
 ]
 
 [[package]]
@@ -3396,6 +3530,71 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
 dependencies = [
  "jni-sys 0.3.1",
+]
+
+[[package]]
+name = "netdev"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f901362e84cd407be6f8cd9d3a46bccf09136b095792785401ea7d283c79b91d"
+dependencies = [
+ "dlopen2 0.5.0",
+ "ipnet",
+ "libc",
+ "netlink-packet-core",
+ "netlink-packet-route",
+ "netlink-sys",
+ "once_cell",
+ "system-configuration",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "netlink-packet-core"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72724faf704479d67b388da142b186f916188505e7e0b26719019c525882eda4"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "netlink-packet-utils",
+]
+
+[[package]]
+name = "netlink-packet-route"
+version = "0.17.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "053998cea5a306971f88580d0829e90f270f940befd7cf928da179d4187a5a66"
+dependencies = [
+ "anyhow",
+ "bitflags 1.3.2",
+ "byteorder",
+ "libc",
+ "netlink-packet-core",
+ "netlink-packet-utils",
+]
+
+[[package]]
+name = "netlink-packet-utils"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ede8a08c71ad5a95cdd0e4e52facd37190977039a4704eb82a283f713747d34"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "paste",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "netlink-sys"
+version = "0.8.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd6c30ed10fa69cc491d491b85cc971f6bdeb8e7367b7cde2ee6cc878d583fae"
+dependencies = [
+ "bytes",
+ "libc",
+ "log",
 ]
 
 [[package]]
@@ -3428,7 +3627,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3462,7 +3661,7 @@ version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
 dependencies = [
- "proc-macro-crate 3.5.0",
+ "proc-macro-crate 1.3.1",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -3806,6 +4005,12 @@ dependencies = [
  "rand_core 0.6.4",
  "subtle",
 ]
+
+[[package]]
+name = "paste"
+version = "1.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "pbkdf2"
@@ -4166,7 +4371,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4579,7 +4784,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4624,7 +4829,7 @@ version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "26d1e2536ce4f35f4846aa13bff16bd0ff40157cdb14cc056c7b14ba41233ba0"
 dependencies = [
- "core-foundation",
+ "core-foundation 0.10.1",
  "core-foundation-sys",
  "jni 0.22.4",
  "log",
@@ -4636,7 +4841,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4843,7 +5048,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b7f4bc775c73d9a02cde8bf7b2ec4c9d12743edf609006c7facc23998404cd1d"
 dependencies = [
  "bitflags 2.13.0",
- "core-foundation",
+ "core-foundation 0.10.1",
  "core-foundation-sys",
  "libc",
  "security-framework-sys",
@@ -5198,7 +5403,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5391,6 +5596,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "system-configuration"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c879d448e9d986b661742763247d3693ed13609438cf3d006f51f5368a5ba6b"
+dependencies = [
+ "bitflags 2.13.0",
+ "core-foundation 0.9.4",
+ "system-configuration-sys",
+]
+
+[[package]]
+name = "system-configuration-sys"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e1d1b10ced5ca923a1fcb8d03e96b8d3268065d724548c0211415ff6ac6bac4"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
+]
+
+[[package]]
 name = "system-deps"
 version = "6.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5411,11 +5637,11 @@ checksum = "d1c93047acf68669466a34690ac58cca7010bd1b201e1ec86f1fd0a75d3dd4a9"
 dependencies = [
  "bitflags 2.13.0",
  "block2",
- "core-foundation",
+ "core-foundation 0.10.1",
  "core-graphics",
  "crossbeam-channel",
  "dispatch2",
- "dlopen2",
+ "dlopen2 0.8.2",
  "dpi",
  "gdkwayland-sys",
  "gtk",
@@ -5740,10 +5966,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -6680,7 +6906,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -7275,6 +7501,21 @@ checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
 dependencies = [
  "libc",
  "rustix",
+]
+
+[[package]]
+name = "xml-rs"
+version = "0.8.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
+
+[[package]]
+name = "xmltree"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7d8a75eaf6557bb84a65ace8609883db44a29951042ada9b393151532e41fcb"
+dependencies = [
+ "xml-rs",
 ]
 
 [[package]]
