@@ -662,7 +662,7 @@ impl RecoverableOutputBuilder {
             .iter()
             .map(|input| SlateInput {
                 commitment: input.commitment,
-                blinding: input.blinding,
+                blinding: Zeroizing::new(input.blinding),
             })
             .collect();
         let mut sender = build_send_recoverable(
@@ -687,15 +687,11 @@ impl RecoverableOutputBuilder {
         // derivation to the canonical responder/finalizer.
         sender.slate.lock_height = lock_height;
         let private = SlatePrivateMaterial::Sender {
-            excess_blinding: Zeroizing::new(sender.excess_blinding),
-            nonce: Zeroizing::new(sender.nonce),
-            change: sender.change.map(|change| {
-                (
-                    change.commitment,
-                    change.value,
-                    Zeroizing::new(change.blinding),
-                )
-            }),
+            excess_blinding: sender.excess_blinding,
+            nonce: sender.nonce,
+            change: sender
+                .change
+                .map(|change| (change.commitment, change.value, change.blinding)),
         };
         RecoverableSlateMaterial::from_slate(sender.slate, private)
     }
@@ -728,7 +724,7 @@ impl RecoverableOutputBuilder {
         RecoverableSlateMaterial::from_slate(
             response.slate,
             SlatePrivateMaterial::Recipient {
-                output_blinding: Zeroizing::new(response.recipient_output_blinding),
+                output_blinding: response.recipient_output_blinding,
             },
         )
     }
