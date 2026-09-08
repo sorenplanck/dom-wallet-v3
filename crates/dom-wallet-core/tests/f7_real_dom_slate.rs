@@ -139,8 +139,12 @@ fn authenticated_post(client: &Client, base_url: &str, path: &str, body: Value) 
 }
 
 fn mempool_total(client: &Client, base_url: &str) -> u64 {
+    // `/mempool` exposes unconfirmed local state and is authenticated on the
+    // node by design (Dandelion++ origin privacy), unlike the public
+    // confirmed-chain routes.
     let response = client
         .get(format!("{base_url}/mempool"))
+        .bearer_auth(RPC_TOKEN)
         .send()
         .expect("query real DOM mempool");
     assert!(response.status().is_success());
