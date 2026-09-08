@@ -1345,6 +1345,13 @@ fn regression_known_phrase_mines_legacy_coinbase_then_v3_restore_has_balance() {
     };
 
     let temp = TempDir::new().unwrap();
+    // The hardened envelope requires the wallet file's parent to be exactly
+    // owner-only; the default TempDir mode follows the umask.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     drop(listener);
