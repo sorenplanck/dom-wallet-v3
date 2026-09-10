@@ -96,6 +96,13 @@ fn canonical_manifest_bytes(manifest: &WalletManifest) -> Vec<u8> {
     serde_json::to_vec(&unsigned).expect("manifest serializes")
 }
 
+/// GitHub normalizes spaces in uploaded release-asset names to dots.  The
+/// update feed must use that remote name, while the local filename remains
+/// untouched for hashing and detached Minisign signatures.
+fn github_release_asset_name(file_name: &str) -> String {
+    file_name.replace(' ', ".")
+}
+
 fn draft(directory: &Path, version: &str, wallet_revision: &str) -> Result<(), String> {
     if wallet_revision.len() != 40 || !wallet_revision.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
@@ -112,7 +119,8 @@ fn draft(directory: &Path, version: &str, wallet_revision: &str) -> Result<(), S
             .ok_or("artifact file name is not valid UTF-8")?;
         let bytes =
             std::fs::read(&path).map_err(|error| format!("read {}: {error}", path.display()))?;
-        let url: url::Url = format!("{REPOSITORY}/releases/download/{tag}/{file_name}")
+        let remote_file_name = github_release_asset_name(file_name);
+        let url: url::Url = format!("{REPOSITORY}/releases/download/{tag}/{remote_file_name}")
             .parse()
             .expect("release URL parses");
         println!("{platform_key}: {file_name} ({} bytes)", bytes.len());
@@ -367,8 +375,8 @@ mod tests {
     }
 
     #[test]
-    fn platform_urls_use_the_same_percent_encoded_representation_as_the_manifest() {
-        let url = format!("{REPOSITORY}/releases/download/wallet-v0.3.5/DOM Wallet V3.app.tar.gz")
+    fn platform_urls_use_github_normalized_asset_names() {
+        let url = format!("{REPOSITORY}/releases/download/wallet-v0.3.5/DOM.Wallet.V3.app.tar.gz")
             .parse::<url::Url>()
             .expect("release URL parses");
         let platform_entry = serde_json::json!({ "url": url.to_string() });
@@ -386,6 +394,7 @@ mod tests {
             Some(artifact.url.as_str()),
             "Tauri and DOM updater contracts must select the identical artifact URL"
         );
-        assert!(artifact.url.as_str().contains("%20"));
+        assert!(!artifact.url.as_str().contains("%20"));
+        assert!(artifact.url.as_str().ends_with("DOM.Wallet.V3.app.tar.gz"));
     }
 }
