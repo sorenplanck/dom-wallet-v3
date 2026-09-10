@@ -24,7 +24,6 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  CARGO_BUILD_JOBS: "1"
   RUST_TEST_THREADS: "1"
   RAYON_NUM_THREADS: "1"
   CARGO_INCREMENTAL: "0"
@@ -48,6 +47,10 @@ jobs:
         with:
           toolchain: stable
           components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1
+        with:
+          shared-key: release-validate
+          cache-on-failure: true
       - name: Install Linux validation dependencies
         run: sudo apt-get update && sudo apt-get install -y build-essential clang cmake libappindicator3-dev librsvg2-dev libssl-dev libwebkit2gtk-4.1-dev patchelf pkg-config rpm
       - name: Validate workflow syntax with pinned actionlint
@@ -99,10 +102,24 @@ jobs:
           cargo test --locked -p dom-wallet-production-backend -- --test-threads=1
           cargo test --locked -p dom-wallet-core-restore -- --test-threads=1
           cargo test --locked -p dom-wallet-tauri-shell --lib -- --test-threads=1
-      - name: Audit Rust dependency policy
+      - name: Audit Rust dependency policy with pinned prebuilt tools
+        shell: bash
         run: |
-          cargo install --locked cargo-audit --version 0.22.2
-          cargo install --locked cargo-deny --version 0.19.9
+          set -euo pipefail
+          audit_archive=cargo-audit-x86_64-unknown-linux-musl-v0.22.2.tgz
+          deny_archive=cargo-deny-0.19.9-x86_64-unknown-linux-musl.tar.gz
+          curl --fail --location --silent --show-error \
+            "https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.2/${audit_archive}" \
+            --output "/tmp/${audit_archive}"
+          curl --fail --location --silent --show-error \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.19.9/${deny_archive}" \
+            --output "/tmp/${deny_archive}"
+          echo "7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428  /tmp/${audit_archive}" | sha256sum --check
+          echo "f1f8eedc2a3ac297c540873f93785d4104b102c0079506b2a6b3221b7ec956af  /tmp/${deny_archive}" | sha256sum --check
+          mkdir -p /tmp/audit-tools
+          tar -xzf "/tmp/${audit_archive}" -C /tmp/audit-tools --strip-components=1
+          tar -xzf "/tmp/${deny_archive}" -C /tmp/audit-tools --strip-components=1
+          export PATH="/tmp/audit-tools:$PATH"
           cargo audit
           cargo deny check
       - name: Validate release workflow contract
@@ -144,6 +161,10 @@ jobs:
         with:
           toolchain: stable
           target: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1
+        with:
+          shared-key: release-package-${{ matrix.target }}
+          cache-on-failure: true
       - name: Install Linux bundle dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y build-essential clang cmake jq libappindicator3-dev librsvg2-dev libssl-dev libwebkit2gtk-4.1-dev patchelf pkg-config rpm webkit2gtk-driver xvfb
