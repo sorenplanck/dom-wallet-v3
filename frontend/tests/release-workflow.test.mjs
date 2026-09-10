@@ -22,6 +22,16 @@ test("release workflow provides pinned experimental dry-run packaging", async ()
     "cargo test --locked -p dom-wallet-updater",
     "cargo test --locked -p dom-wallet-storage",
   ]) assert.equal(workflow.includes(required), true, `missing ${required}`);
+  assert.equal(
+    workflow.includes(String.raw`replaceAll("\\", "/")`),
+    true,
+    "checksum manifests must normalize single Windows path separators",
+  );
+  assert.equal(
+    workflow.includes(String.raw`replaceAll("\\\\", "/")`),
+    false,
+    "checksum manifests must not leave single Windows path separators intact",
+  );
 
   const actionRefs = [...workflow.matchAll(/uses:\s+[^@\s]+@([^\s]+)/g)].map((match) => match[1]);
   assert.ok(actionRefs.length >= 8);
