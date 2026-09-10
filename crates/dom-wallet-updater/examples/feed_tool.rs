@@ -300,14 +300,10 @@ fn verify(directory: &Path) -> Result<(), String> {
         let tauri_signature = entry["signature"]
             .as_str()
             .ok_or(format!("{platform_key}: Tauri signature is missing"))?;
-        let tauri_signature_text = base64::engine::general_purpose::STANDARD
-            .decode(tauri_signature)
-            .ok()
-            .and_then(|decoded| String::from_utf8(decoded).ok())
-            .ok_or(format!(
-                "{platform_key}: Tauri signature is not base64 text"
-            ))?;
-        if tauri_signature_text != artifact.signature {
+        if !dom_wallet_updater::artifact_signature_matches_feed(
+            &artifact.signature,
+            tauri_signature,
+        ) {
             return Err(format!(
                 "{platform_key}: decoded Tauri signature disagrees with dom_manifest"
             ));

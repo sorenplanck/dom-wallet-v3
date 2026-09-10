@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+use base64::Engine as _;
 use futures_util::StreamExt;
 use minisign_verify::{PublicKey, Signature};
 use semver::{Version, VersionReq};
@@ -668,6 +669,25 @@ fn validate_artifact(
         return Err(UpdateError::ManifestInvalid);
     }
     Ok(())
+}
+
+/// Compare the `dom_manifest` artifact signature with the one Tauri read from
+/// the same feed.
+///
+/// The two updater contracts store the identical detached Minisign signature in
+/// different encodings: `dom_manifest` keeps the raw signature-file text so
+/// [`MinisignVerifier`] can decode it, while Tauri's `platforms` block requires
+/// it base64-encoded. A byte comparison therefore always disagrees and fails the
+/// cross-check closed on encoding alone, so normalize the feed side first.
+pub fn artifact_signature_matches_feed(dom_signature: &str, feed_signature: &str) -> bool {
+    if dom_signature == feed_signature {
+        return true;
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(feed_signature)
+        .ok()
+        .and_then(|decoded| String::from_utf8(decoded).ok())
+        .is_some_and(|decoded| decoded == dom_signature)
 }
 
 /// Verify size and digest in addition to the mandatory Minisign verification.
@@ -2225,6 +2245,25 @@ mod tests {
             load_valid_peer_manifest_cache(&path, &AcceptSignature, "chain", "genesis", 1, now()),
             Err(UpdateError::PeerManifestIdentityMismatch)
         );
+    }
+
+    #[test]
+    fn artifact_signature_matches_feed_across_the_two_updater_encodings() {
+        let raw = "untrusted comment: signature from minisign secret key\nRUTwnDDKlXoZdG+rnC0seqiAeHIG6tWp49t5ZW5xmBJxXqj+whrXMFBtcU1WTYrwuGpMiXGKg8NQs3se9djIjiZxWb0YJbTy5w8=\ntrusted comment: timestamp:1789063553\tfile:DOM Wallet V3_0.3.5_amd64.AppImage\thashed\nxjV8Xycsm64cA55i+p6h43rm5QruRVrhLfxLWUp+4j9a5jgYcqer2EV46S0wZl1vQlqYf8as+qZ6HY8OOPzIAQ==\n";
+        let tauri = base64::engine::general_purpose::STANDARD.encode(raw.as_bytes());
+        assert!(artifact_signature_matches_feed(raw, &tauri));
+        assert!(artifact_signature_matches_feed(raw, raw));
+    }
+
+    #[test]
+    fn artifact_signature_rejects_a_feed_signature_for_another_artifact() {
+        let raw = "untrusted comment: signature\nRUTwnDDKlXoZdA==\n";
+        let other = "untrusted comment: signature\nRUTwnDDKlXoZdB==\n";
+        let tauri = base64::engine::general_purpose::STANDARD.encode(other.as_bytes());
+        assert!(!artifact_signature_matches_feed(raw, &tauri));
+        assert!(!artifact_signature_matches_feed(raw, other));
+        assert!(!artifact_signature_matches_feed(raw, ""));
+        assert!(!artifact_signature_matches_feed(raw, "not base64 @@@"));
     }
 
     #[test]
