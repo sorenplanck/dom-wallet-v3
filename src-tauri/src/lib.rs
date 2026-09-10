@@ -5689,7 +5689,7 @@ mod tests {
     fn native_bridge_probe_is_static_redacted_and_versioned() {
         let status = native_bridge_status();
         assert_eq!(status.bridge, "ready");
-        assert_eq!(status.app_version, "0.3.4");
+        assert_eq!(status.app_version, "0.3.5");
         fn assert_serializable<T: serde::Serialize>(_: &T) {}
         assert_serializable(&status);
     }
@@ -5697,7 +5697,7 @@ mod tests {
     #[test]
     fn build_and_update_status_are_separate_redacted_channels() {
         let build = get_build_info();
-        assert_eq!(build.wallet_version, "0.3.4");
+        assert_eq!(build.wallet_version, "0.3.5");
         assert_eq!(build.embedded_node_revision, EMBEDDED_NODE_REVISION);
         assert_eq!(build.update_channel, "stable");
 
@@ -7139,9 +7139,22 @@ mod tests {
         let address = listener.local_addr().expect("local address");
         drop(listener);
         let app = DesktopApplication::default();
-        let node = app
+        let starting = app
             .embedded_node_start_mainnet(node_directory.path(), address)
             .expect("Mainnet node starts");
+        assert_eq!(starting.lifecycle, WalletReadinessDto::Starting);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+        let node = loop {
+            let status = app.embedded_node_status().expect("live node status");
+            if status.lifecycle != WalletReadinessDto::Starting {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "embedded Mainnet node did not finish starting within the acceptance window"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
         assert_eq!(node.network.as_deref(), Some("MAINNET"));
         assert_eq!(node.canonical_tip_height, Some(0));
         let destination = wallet_directory.path().join("wallet");
@@ -7182,6 +7195,8 @@ mod tests {
                 | CommandError::NoPeers
                 | CommandError::NodeNotReady)
         ));
+        app.synchronization_pause()
+            .expect("background synchronization pauses before shutdown");
         app.application_shutdown().expect("shutdown");
     }
 }

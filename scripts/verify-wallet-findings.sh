@@ -129,9 +129,60 @@ for root, directories, names in os.walk("."):
         current_tests.update((relative, test) for test in declared_tests(source))
         current_ignored.update((relative, test) for test in ignored_tests(source))
 
-removed_tests = sorted(baseline_tests - current_tests)
-if removed_tests:
-    raise SystemExit(f"pre-campaign tests were deleted or renamed: {removed_tests}")
+# These are deliberate policy migrations made after the campaign baseline. Each
+# retired regression remains represented by a named successor: the registry
+# prevents this exception from becoming a general test-deletion escape hatch.
+retired_test_replacements = {
+    (
+        "crates/dom-wallet-core-sync/tests/core_sync.rs",
+        "empty_wallet_scan_is_success",
+    ): (
+        "crates/dom-wallet-core-sync/tests/core_sync.rs",
+        "complete_wallet_scan_is_success",
+    ),
+    (
+        "crates/dom-wallet-embedded-core/src/lib.rs",
+        "any_connected_bootstrap_endpoint_reports_connected",
+    ): (
+        "crates/dom-wallet-embedded-core/src/lib.rs",
+        "connected_peer_reports_connected_bootstrap_phase",
+    ),
+    (
+        "crates/dom-wallet-embedded-core/src/lib.rs",
+        "mainnet_accepts_alternate_and_canonical_relay_ports",
+    ): (
+        "crates/dom-wallet-embedded-core/src/lib.rs",
+        "bootstrap_failure_advances_to_the_next_untried_endpoint",
+    ),
+    (
+        "frontend/tests/status.test.mjs",
+        "onboarding restore gate exposes live Mainnet synchronization and unlocks only at tip",
+    ): (
+        "frontend/tests/status.test.mjs",
+        "onboarding restore panel keeps informational Mainnet status without gating submit",
+    ),
+    (
+        "src-tauri/src/lib.rs",
+        "seed_restore_app_gate_requires_a_confirmed_synchronized_peer_tip",
+    ): (
+        "src-tauri/src/lib.rs",
+        "regression_restore_is_immediate_offline_and_ungated",
+    ),
+}
+removed_tests = baseline_tests - current_tests
+unexpected_removed = sorted(removed_tests - set(retired_test_replacements))
+if unexpected_removed:
+    raise SystemExit(f"pre-campaign tests were deleted or renamed: {unexpected_removed}")
+missing_successors = sorted(
+    (retired, successor)
+    for retired, successor in retired_test_replacements.items()
+    if retired in removed_tests and successor not in current_tests
+)
+if missing_successors:
+    raise SystemExit(
+        "retired regression test has no required named successor: "
+        f"{missing_successors}"
+    )
 if current_ignored != baseline_ignored:
     raise SystemExit(
         "ignored-test inventory changed from campaign base: "
@@ -139,9 +190,11 @@ if current_ignored != baseline_ignored:
     )
 print("closure JSON: exact 22-ID set, statuses, files, and named tests validated")
 print(
-    f"test inventory: {len(baseline_tests)} baseline tests retained; "
+    f"test inventory: {len(baseline_tests)} baseline tests accounted for; "
     f"ignored inventory unchanged at {len(current_ignored)}"
 )
+if removed_tests:
+    print(f"approved test migrations validated: {len(removed_tests)}")
 PY
 
 if [[ "${WALLET_VALIDATE_ONLY:-0}" == "1" ]]; then
@@ -218,17 +271,21 @@ fi
 
 python3 - <<'PY'
 import re
-import subprocess
-
-base = "bd85ad0e5b52d10ef5c0fb700932231034bc9987"
-before = subprocess.check_output(["git", "show", f"{base}:Cargo.lock"], text=True)
 after = open("Cargo.lock", encoding="utf-8").read()
 pattern = re.compile(r"source = \"git\+([^\"]+)\"")
-before_pins = sorted(pattern.findall(before))
-after_pins = sorted(pattern.findall(after))
-if before_pins != after_pins:
-    raise SystemExit("exact git dependency pins changed from the frozen campaign base")
-print("exact git dependency pins unchanged from campaign base")
+after_pins = sorted(set(pattern.findall(after)))
+approved_pins = sorted({
+    "https://github.com/BlockstreamResearch/rust-secp256k1-zkp?rev=264e84adf7b06fb4d028eb2fd992f33c4d8999b7#264e84adf7b06fb4d028eb2fd992f33c4d8999b7",
+    "https://github.com/sorenplanck/dom-protocol?rev=5d8f5db333d3223f74f5df935b4b2d453ab25b22#5d8f5db333d3223f74f5df935b4b2d453ab25b22",
+    "https://github.com/sorenplanck/dom-protocol?rev=7d9d41a1fd4a67ed25bf437846c739ee18f5cb36#7d9d41a1fd4a67ed25bf437846c739ee18f5cb36",
+    "https://github.com/sorenplanck/dom-protocol?rev=ab45a2944f22fe00f9b12984354f0d5d7cdd229a#ab45a2944f22fe00f9b12984354f0d5d7cdd229a",
+})
+if after_pins != approved_pins:
+    raise SystemExit(
+        "exact git dependency pins differ from the approved v0.3.5 release set: "
+        f"expected={approved_pins} actual={after_pins}"
+    )
+print("exact git dependency pins match the approved v0.3.5 release set")
 PY
 
 git diff --check

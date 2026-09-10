@@ -8,9 +8,9 @@ No independent security audit is claimed.
 
 ## Release identity
 
-- Wallet version: `0.3.4`
-- Recommended tag: `wallet-v0.3.4`
-- DOM Core revision: `6f8a947dee0e54c3421caa295755b1746c178137`
+- Wallet version: `0.3.5`
+- Recommended tag: `wallet-v0.3.5`
+- DOM Core and embedded node revision: `7d9d41a1fd4a67ed25bf437846c739ee18f5cb36`
 - Final genesis revision: `6a8a6475b36ad68bb760d61cf323126d95cd7416`
 - Mainnet chain ID: `f9831fadabc8a4234beab35fbb6327e84581645f33e9f75ed2ea78e8bcf1165b`
 
@@ -66,18 +66,18 @@ reservations, and preferences.
 ## Validation build
 
 Run the Actions workflow manually on the intended branch with
-`validation_only=false` and `release_version=0.3.4`. This builds unsigned Linux,
+`validation_only=false` and `release_version=0.3.5`. This builds unsigned Linux,
 Windows, and macOS artifacts and uploads checksums without creating or moving a
 tag and without creating a GitHub Release.
 
 ## Later release authorization
 
 After all local and CI gates pass and explicit authorization is given, verify
-that the clean release commit reports version `0.3.4`, then run:
+that the clean release commit reports version `0.3.5`, then run:
 
 ```bash
-git tag -a wallet-v0.3.4 -m "DOM Wallet V3 0.3.4 experimental"
-git push origin wallet-v0.3.4
+git tag -a wallet-v0.3.5 -m "DOM Wallet V3 0.3.5 experimental"
+git push origin wallet-v0.3.5
 ```
 
 Do not run these commands as part of validation. The tag workflow verifies

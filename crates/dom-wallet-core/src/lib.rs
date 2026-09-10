@@ -65,7 +65,7 @@ use std::sync::Arc;
 use std::{
     fmt,
     path::Path,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -76,6 +76,9 @@ use zeroize::Zeroizing;
 /// This does not expire a finalized transaction: its independently persisted
 /// bytes remain valid, and a kernel `lock_height` may legitimately be later.
 pub const MAX_TRANSACTION_LIFETIME_BLOCKS: u64 = 1_440;
+
+const RESCAN_TRANSIENT_SYNC_ATTEMPTS: u8 = 5;
+const RESCAN_TRANSIENT_SYNC_DELAY: Duration = Duration::from_millis(100);
 
 pub const MAINNET_CHAIN_ID_HEX: &str =
     "f9831fadabc8a4234beab35fbb6327e84581645f33e9f75ed2ea78e8bcf1165b";
@@ -1484,7 +1487,7 @@ impl WalletService {
         state.recovery_scanned_outputs = 0;
         state.legacy_proof_only_outputs = 0;
         self.commit(state)?;
-        self.synchronize()
+        retry_transient_rescan_synchronization(|| self.synchronize())
     }
 
     pub fn transaction_fee_estimate(
@@ -4906,6 +4909,26 @@ pub enum CoreError {
     Submission(#[from] dom_wallet_core_submit::WalletSubmissionError),
 }
 
+fn retry_transient_rescan_synchronization<T>(
+    mut synchronize: impl FnMut() -> Result<T, CoreError>,
+) -> Result<T, CoreError> {
+    for attempt in 1..=RESCAN_TRANSIENT_SYNC_ATTEMPTS {
+        match synchronize() {
+            Err(CoreError::NodeNotReady) if attempt < RESCAN_TRANSIENT_SYNC_ATTEMPTS => {
+                std::thread::sleep(RESCAN_TRANSIENT_SYNC_DELAY);
+            }
+            Err(CoreError::Backend(error))
+                if error.is_transient_sync_unavailability()
+                    && attempt < RESCAN_TRANSIENT_SYNC_ATTEMPTS =>
+            {
+                std::thread::sleep(RESCAN_TRANSIENT_SYNC_DELAY);
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the bounded rescan synchronization retry loop always returns")
+}
+
 impl CoreError {
     pub fn redacted_code(&self) -> &'static str {
         match self {
@@ -6162,6 +6185,30 @@ mod tests {
         assert_eq!(diagnostics.application_state, "READY");
         assert!(diagnostics.last_error.is_none());
         assert!(service.summary().is_ok());
+    }
+
+    #[test]
+    fn genesis_rescan_retries_only_transient_core_unavailability() {
+        let mut attempts = 0;
+        let result = retry_transient_rescan_synchronization(|| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(CoreError::NodeNotReady)
+            } else {
+                Ok("synchronized")
+            }
+        });
+
+        assert_eq!(result.unwrap(), "synchronized");
+        assert_eq!(attempts, 3);
+
+        let mut terminal_attempts = 0;
+        let terminal = retry_transient_rescan_synchronization::<()>(|| {
+            terminal_attempts += 1;
+            Err(CoreError::IdentityMismatch)
+        });
+        assert!(matches!(terminal, Err(CoreError::IdentityMismatch)));
+        assert_eq!(terminal_attempts, 1);
     }
 
     #[test]
