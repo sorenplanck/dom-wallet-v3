@@ -337,7 +337,10 @@ async fn check_wallet_update(
             .ok_or(UpdateError::ManifestInvalid)?;
     if manifest.version != update.version
         || artifact.url.as_str() != update.download_url.as_str()
-        || artifact.signature != update.signature
+        || !dom_wallet_updater::artifact_signature_matches_feed(
+            &artifact.signature,
+            &update.signature,
+        )
     {
         return Err(UpdateError::ManifestInvalid);
     }
