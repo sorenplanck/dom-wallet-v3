@@ -112,16 +112,18 @@ fn draft(directory: &Path, version: &str, wallet_revision: &str) -> Result<(), S
             .ok_or("artifact file name is not valid UTF-8")?;
         let bytes =
             std::fs::read(&path).map_err(|error| format!("read {}: {error}", path.display()))?;
-        let url = format!("{REPOSITORY}/releases/download/{tag}/{file_name}");
+        let url: url::Url = format!("{REPOSITORY}/releases/download/{tag}/{file_name}")
+            .parse()
+            .expect("release URL parses");
         println!("{platform_key}: {file_name} ({} bytes)", bytes.len());
         platforms.insert(
             platform_key.to_string(),
-            serde_json::json!({ "signature": "", "url": url }),
+            serde_json::json!({ "signature": "", "url": url.to_string() }),
         );
         artifacts.push(ArtifactDescriptor {
             target: target.into(),
             architecture: architecture.into(),
-            url: url.parse().expect("release URL parses"),
+            url,
             sha256: format!("{:x}", Sha256::digest(&bytes)),
             size: bytes.len() as u64,
             signature: String::new(),
@@ -362,5 +364,28 @@ mod tests {
             .decode(platform_entry["signature"].as_str().expect("string"))
             .expect("Tauri signature is base64");
         assert_eq!(decoded, signature_text.as_bytes());
+    }
+
+    #[test]
+    fn platform_urls_use_the_same_percent_encoded_representation_as_the_manifest() {
+        let url = format!("{REPOSITORY}/releases/download/wallet-v0.3.5/DOM Wallet V3.app.tar.gz")
+            .parse::<url::Url>()
+            .expect("release URL parses");
+        let platform_entry = serde_json::json!({ "url": url.to_string() });
+        let artifact = ArtifactDescriptor {
+            target: "macos".into(),
+            architecture: "aarch64".into(),
+            url,
+            sha256: "0".repeat(64),
+            size: 1,
+            signature: String::new(),
+        };
+
+        assert_eq!(
+            platform_entry["url"].as_str(),
+            Some(artifact.url.as_str()),
+            "Tauri and DOM updater contracts must select the identical artifact URL"
+        );
+        assert!(artifact.url.as_str().contains("%20"));
     }
 }
