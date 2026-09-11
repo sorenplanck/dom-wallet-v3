@@ -35,7 +35,11 @@ pub const NODE_UPDATE_ENDPOINT: &str =
 pub const PEER_UPDATE_ENDPOINT: &str =
     "https://github.com/sorenplanck/dom-wallet-v3/releases/latest/download/mainnet-peers.json";
 /// Pinned DOM Protocol revision compiled into this Wallet.
-pub const EMBEDDED_NODE_REVISION: &str = "6f8a947dee0e54c3421caa295755b1746c178137";
+///
+/// Must equal the `dom-node` revision the workspace `Cargo.lock` resolves;
+/// `embedded_node_revision_matches_the_cargo_lock_pin` enforces it so the
+/// published feed can never claim a node revision the binary does not carry.
+pub const EMBEDDED_NODE_REVISION: &str = "38dd70536f088a467f2b7175978c5a6ebb4e5bd4";
 /// First immutable DOM Protocol revision with authenticated build-info and shutdown.
 pub const MANAGED_NODE_CONTROL_REVISION: &str = "28ba3cefc9fbc913f126336482662528c68a7d8c";
 /// Stable update channel.
@@ -1548,6 +1552,41 @@ fn is_public_ipv6(ip: Ipv6Addr) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn embedded_node_revision_matches_the_cargo_lock_pin() {
+        // The constant travels into the signed update feed
+        // (dom_manifest.embedded_node_revision); if it drifts from the
+        // dom-node revision the workspace actually compiles, the feed lies
+        // about the shipped node. Compare against Cargo.lock directly.
+        let lock = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock"),
+        )
+        .expect("workspace Cargo.lock");
+        let mut package_name = String::new();
+        let mut lock_revision = None;
+        for line in lock.lines() {
+            let line = line.trim();
+            if let Some(value) = line.strip_prefix("name = \"") {
+                package_name = value.trim_end_matches('\"').to_owned();
+            }
+            if package_name == "dom-node"
+                && line.starts_with("source = \"")
+                && line.contains("github.com/sorenplanck/dom-protocol?rev=")
+            {
+                lock_revision = line
+                    .split("?rev=")
+                    .nth(1)
+                    .and_then(|rest| rest.split('#').next())
+                    .map(str::to_owned);
+            }
+        }
+        assert_eq!(
+            lock_revision.as_deref(),
+            Some(super::EMBEDDED_NODE_REVISION),
+            "EMBEDDED_NODE_REVISION diverges from the dom-node pin in Cargo.lock"
+        );
+    }
+
     use super::*;
     use std::io::Cursor;
     #[cfg(unix)]
