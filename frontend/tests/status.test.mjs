@@ -11,6 +11,7 @@ import {
   restoreReadinessPresentation,
   restoreScanPresentation,
   synchronizationPresentation,
+  reachabilityText,
 } from "../status.js";
 
 test("frontend source contains no durable browser storage access", async () => {
@@ -513,4 +514,45 @@ test("remote tip alert banners exist on the gate and in the application shell", 
   assert.equal(html.includes('id="gate-remote-tip-alert"'), true);
   assert.equal(js.includes("remoteTipAlertPresentation"), true);
   assert.equal(js.includes("remoteTipAlertMessage"), true);
+});
+
+test("reachability distinguishes degraded mesh listener from chosen private mode", () => {
+  const base = {
+    connected_inbound: 0, connected_outbound: 3, total_connected_peers: 3,
+    portmap_status: "none", advertised_port: 0, p2p_listen_port: 33369,
+  };
+  const degraded = reachabilityText({
+    ...base, accepting_inbound: false, inbound_preference_enabled: true,
+  });
+  assert.equal(degraded[0], "Could not open the network listener \u00b7 outbound connections only");
+  const privateMode = reachabilityText({
+    ...base, accepting_inbound: false, inbound_preference_enabled: false,
+  });
+  assert.equal(privateMode[0], "Inbound connections disabled");
+  assert.notEqual(degraded[0], privateMode[0]);
+});
+
+test("any inbound peer proves reachability regardless of portmap status", () => {
+  const peers = {
+    connected_inbound: 2, connected_outbound: 5, total_connected_peers: 7,
+    portmap_status: "none", advertised_port: 0, p2p_listen_port: 33369,
+    accepting_inbound: true, inbound_preference_enabled: true,
+  };
+  const [pill] = reachabilityText(peers);
+  assert.equal(pill, "Reachable from the network \u00b7 port 33369");
+  const mapped = reachabilityText({ ...peers, portmap_status: "upnp", advertised_port: 40001 });
+  assert.equal(mapped[0], "Reachable from the network \u00b7 port 40001");
+});
+
+test("mesh listener without inbound peers reports the portmap outcome", () => {
+  const base = {
+    connected_inbound: 0, connected_outbound: 4, total_connected_peers: 4,
+    p2p_listen_port: 33369, accepting_inbound: true, inbound_preference_enabled: true,
+  };
+  assert.equal(reachabilityText({ ...base, portmap_status: "upnp", advertised_port: 40001 })[0],
+    "Port open on the router \u00b7 waiting for connections");
+  assert.equal(reachabilityText({ ...base, portmap_status: "cgnat_detected", advertised_port: 0 })[0],
+    "Your provider uses CGNAT \u00b7 outbound connections only");
+  assert.equal(reachabilityText({ ...base, portmap_status: "none", advertised_port: 0 })[0],
+    "Router did not open the port automatically");
 });

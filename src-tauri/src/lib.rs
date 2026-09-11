@@ -57,6 +57,11 @@ pub struct DesktopApplication {
     node_start_error: Arc<Mutex<Option<&'static str>>>,
     last_successful_node_status_at: AtomicU64,
     last_peer_connected_unix_seconds: AtomicU64,
+    /// W6/W8: whether the LAST mainnet start asked for the mesh listener
+    /// (0.0.0.0). Together with the core's `accepting_inbound` this lets the
+    /// UI distinguish user-chosen private mode from a mesh listener that
+    /// degraded to the loopback leaf.
+    mesh_listener_requested: AtomicBool,
     synchronization_paused: AtomicBool,
     synchronization: Mutex<SynchronizationRuntime>,
     mining: Mutex<MiningRuntime>,
@@ -448,6 +453,7 @@ impl Default for DesktopApplication {
             node_start_error: Arc::new(Mutex::new(None)),
             last_successful_node_status_at: AtomicU64::new(0),
             last_peer_connected_unix_seconds: AtomicU64::new(0),
+            mesh_listener_requested: AtomicBool::new(false),
             synchronization_paused: AtomicBool::new(false),
             synchronization: Mutex::new(SynchronizationRuntime::default()),
             mining: Mutex::new(MiningRuntime::default()),
@@ -607,6 +613,11 @@ pub struct NodePeerStatusDto {
     pub advertised_port: u16,
     pub p2p_listen_port: u16,
     pub accepting_inbound: bool,
+    /// Whether the persisted preference asked for inbound connections on the
+    /// last node start. `true` with `accepting_inbound == false` means the
+    /// mesh listener degraded to the loopback leaf, which the UI must show
+    /// differently from user-chosen private mode.
+    pub inbound_preference_enabled: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2393,6 +2404,10 @@ impl DesktopApplication {
                 "automatic local node listener is invalid".into(),
             ));
         }
+        self.mesh_listener_requested.store(
+            listen_address.ip() == std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            Ordering::Release,
+        );
         let mut runtime = self
             .node_start
             .lock()
@@ -2488,10 +2503,16 @@ impl DesktopApplication {
                             // the port candidates. Store-level failures
                             // (DOM_NODE_INIT, LMDB_*) happen before any bind
                             // and would fail identically on every port.
+                            // STARTUP_TIMEOUT is deliberately NOT walked: a
+                            // slow machine hitting the 20s startup budget is
+                            // not a port problem, and walking every candidate
+                            // would cost minutes before the leaf fallback.
+                            // DOM_NODE_RUN walks only when the port really is
+                            // occupied right now; any other run failure
+                            // propagates unchanged.
                             let rendered = format!("{error:?}");
-                            let listener_failure = rendered.contains("DOM_NODE_RUN")
-                                || rendered.contains("STARTUP_TIMEOUT");
-                            if listener_failure {
+                            let port_is_taken = !p2p_port_is_free(listen_address.port());
+                            if rendered.contains("DOM_NODE_RUN") && port_is_taken {
                                 if let Some(next) = listen_fallbacks.pop_front() {
                                     listen_address = next;
                                     continue;
@@ -2730,6 +2751,7 @@ impl DesktopApplication {
             advertised_port: status.advertised_port,
             p2p_listen_port: status.p2p_listen_port,
             accepting_inbound: status.accepting_inbound,
+            inbound_preference_enabled: self.mesh_listener_requested.load(Ordering::Acquire),
         })
     }
 

@@ -9,6 +9,7 @@ import {
   liveStatusProjection,
   miningPresentation,
   nodeStatusText,
+  reachabilityText,
   nomsFromDom,
   remoteTipAlertPresentation,
   restoreReadinessPresentation,
@@ -428,23 +429,6 @@ const refreshSummary = async () => {
   byId("settings-peer-count").textContent = liveStatus.connectedPeers ?? "—";
   byId("settings-bootstrap").textContent = liveStatus.bootstrapPhase ?? "UNAVAILABLE";
   byId("settings-heights").textContent = `${liveStatus.cursorHeight ?? "—"} / ${liveStatus.canonicalHeight ?? "—"}`;
-};
-const reachabilityText = (peers) => {
-  if (!peers) return ["\u2014", "\u2014"];
-  if (!peers.accepting_inbound) {
-    return ["Inbound connections disabled", "Private mode: this wallet only dials out, like v0.3.5."];
-  }
-  const detail = `Listening on port ${peers.p2p_listen_port} \u00b7 announced port ${peers.advertised_port || "\u2014"} \u00b7 inbound peers ${peers.connected_inbound}`;
-  if ((peers.portmap_status === "upnp" || peers.portmap_status === "natpmp") && peers.connected_inbound > 0) {
-    return [`Reachable from the network \u00b7 port ${peers.advertised_port}`, detail];
-  }
-  if (peers.portmap_status === "upnp" || peers.portmap_status === "natpmp") {
-    return ["Port open on the router \u00b7 waiting for connections", detail];
-  }
-  if (peers.portmap_status === "cgnat_detected") {
-    return ["Your provider uses CGNAT \u00b7 outbound connections only", detail];
-  }
-  return ["Router did not open the port automatically", detail];
 };
 const refreshReachability = async () => {
   try {
