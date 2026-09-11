@@ -1,0 +1,60 @@
+name: republish-feed
+
+# Replaces the latest.json asset of an already-published release with the
+# byte-identical-signatures form that wallets 0.3.4/0.3.5 accept (see
+# docs/RELEASING.md). The job refuses to upload unless the recovery file
+# carries exactly the published, signed dom_manifest and each platforms
+# signature is exactly the base64-decoding of the published one — so it can
+# only re-encode the existing release, never alter what was signed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag whose latest.json is republished"
+        required: true
+        default: "wallet-v0.3.6"
+
+permissions:
+  contents: write
+
+jobs:
+  republish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate recovery feed against the published asset
+        env:
+          TAG: ${{ github.event.inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern latest.json --output published.json
+          python3 - "$TAG" <<'EOF'
+          import base64, json, sys
+          tag = sys.argv[1]
+          published = json.load(open("published.json"))
+          fixed = json.load(open(f"release-recovery/{tag}/latest.json"))
+          assert fixed["dom_manifest"] == published["dom_manifest"], "dom_manifest differs"
+          for key in ("version", "notes", "pub_date"):
+              assert fixed[key] == published[key], f"{key} differs"
+          assert set(fixed["platforms"]) == set(published["platforms"]), "platform set differs"
+          for name, entry in published["platforms"].items():
+              assert fixed["platforms"][name]["url"] == entry["url"], f"{name}: url differs"
+              raw = fixed["platforms"][name]["signature"]
+              old = entry["signature"]
+              decoded = old if old == raw else base64.b64decode(old).decode()
+              assert decoded == raw, f"{name}: signature is not a pure re-encoding"
+              assert raw.startswith("untrusted comment:"), f"{name}: not raw Minisign text"
+          print("recovery feed is a pure re-encoding of the published, signed feed")
+          EOF
+      - name: Replace the release asset
+        env:
+          TAG: ${{ github.event.inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" "release-recovery/$TAG/latest.json" --repo "$GITHUB_REPOSITORY" --clobber
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern latest.json --output verify.json
+          cmp verify.json "release-recovery/$TAG/latest.json"
+          echo "latest.json replaced and verified for $TAG"
