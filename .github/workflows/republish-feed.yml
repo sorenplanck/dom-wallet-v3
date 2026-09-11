@@ -14,10 +14,6 @@ on:
         description: "Release tag whose latest.json is republished"
         required: true
         default: "wallet-v0.3.6"
-  push:
-    branches: [feat/wallet-mode]
-    paths: ["release-recovery/**", ".github/workflows/republish-feed.yml"]
-
 env:
   FEED_TAG: ${{ github.event.inputs.tag || 'wallet-v0.3.6' }}
 
