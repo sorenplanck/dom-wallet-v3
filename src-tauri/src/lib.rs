@@ -159,6 +159,8 @@ macro_rules! wallet_command_registry {
             embedded_node_start,
             embedded_node_stop,
             embedded_node_status,
+            inbound_connections_status,
+            inbound_connections_set,
             experimental_sidecar_status,
             experimental_sidecar_enable,
             experimental_sidecar_disable,
@@ -597,6 +599,14 @@ pub struct NodePeerStatusDto {
     pub canonical_height: u64,
     pub highest_known_peer_height: Option<u64>,
     pub peer_addresses: Vec<String>,
+    /// W8 — reachability: port-mapping outcome (`none` / `upnp` / `natpmp` /
+    /// `cgnat_detected`), the port announced in the node's `Hello`
+    /// (0 = unreachable), the local listen port, and whether this node
+    /// accepts connections from the network at all.
+    pub portmap_status: String,
+    pub advertised_port: u16,
+    pub p2p_listen_port: u16,
+    pub accepting_inbound: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2378,7 +2388,7 @@ impl DesktopApplication {
                 return Ok(status);
             }
         }
-        if !listen_address.ip().is_loopback() || listen_address.port() == 0 {
+        if !mainnet_listener_shape_is_valid(listen_address) {
             return Err(CommandError::InvalidInput(
                 "automatic local node listener is invalid".into(),
             ));
@@ -2396,6 +2406,19 @@ impl DesktopApplication {
         self.node_start_cancelled.store(false, Ordering::Release);
         self.node_starting.store(true, Ordering::Release);
         let data_directory = data_directory.as_ref().to_path_buf();
+        // R-W2.1 / §1.4: if the chosen mesh port is stolen between the free
+        // check and the node's own bind, the start walks the remaining
+        // candidates and, as the last resort, degrades to the v0.3.5
+        // loopback leaf instead of failing the boot.
+        let mut listen_fallbacks: VecDeque<SocketAddr> =
+            if listen_address.ip() == std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED) {
+                remaining_mesh_listen_addresses(&data_directory, listen_address.port()).into()
+            } else {
+                VecDeque::new()
+            };
+        let mut leaf_fallback_available =
+            listen_address.ip() == std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+        let mut listen_address = listen_address;
         let service = Arc::clone(&self.service);
         let starting = Arc::clone(&self.node_starting);
         let cancelled = Arc::clone(&self.node_start_cancelled);
@@ -2427,7 +2450,14 @@ impl DesktopApplication {
                                 wallet.attach_backend(backend).map(|_| ()).map_err(|_| ())
                             });
                             match attached {
-                                Ok(()) => started_mirror.store(true, Ordering::Release),
+                                Ok(()) => {
+                                    if listen_address.ip()
+                                        == std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+                                    {
+                                        persist_p2p_port(&data_directory, listen_address.port());
+                                    }
+                                    started_mirror.store(true, Ordering::Release)
+                                }
                                 Err(()) => {
                                     // Either cancelled or rejected (identity /
                                     // lifecycle); shut the fresh node down so
@@ -2453,6 +2483,27 @@ impl DesktopApplication {
                             continue;
                         }
                         Err(error) => {
+                            // A failed bind surfaces as DOM_NODE_RUN (the node
+                            // task exits) or STARTUP_TIMEOUT; only those walk
+                            // the port candidates. Store-level failures
+                            // (DOM_NODE_INIT, LMDB_*) happen before any bind
+                            // and would fail identically on every port.
+                            let rendered = format!("{error:?}");
+                            let listener_failure = rendered.contains("DOM_NODE_RUN")
+                                || rendered.contains("STARTUP_TIMEOUT");
+                            if listener_failure {
+                                if let Some(next) = listen_fallbacks.pop_front() {
+                                    listen_address = next;
+                                    continue;
+                                }
+                                if leaf_fallback_available {
+                                    leaf_fallback_available = false;
+                                    if let Some(leaf) = loopback_leaf_listen_address() {
+                                        listen_address = leaf;
+                                        continue;
+                                    }
+                                }
+                            }
                             if let Ok(mut slot) = error_slot.lock() {
                                 *slot = Some(node_start_error_code(&error));
                             }
@@ -2675,6 +2726,10 @@ impl DesktopApplication {
             highest_known_peer_height: (status.connected_total > 0)
                 .then_some(status.highest_known_peer_height),
             peer_addresses: status.peer_addresses,
+            portmap_status: status.portmap_status.into(),
+            advertised_port: status.advertised_port,
+            p2p_listen_port: status.p2p_listen_port,
+            accepting_inbound: status.accepting_inbound,
         })
     }
 
@@ -4681,6 +4736,91 @@ fn persist_map_size(directory: Option<&Path>, map_size: usize) {
 }
 
 /// Redacted, typed code for a failed background node start.
+/// W2 — stable, persisted P2P port for the mesh listener.
+///
+/// The preferred port is the canonical Mainnet P2P port; if it is taken
+/// (for example by a standalone dom-node on the same machine) a small
+/// deterministic range follows, and only then an ephemeral port. The chosen
+/// port is persisted beside the node data and reused on the next start, so
+/// the address the hubs confirm by dial-back survives restarts.
+pub const MAINNET_P2P_FALLBACK_PORTS: std::ops::RangeInclusive<u16> = 33_370..=33_379;
+const P2P_PORT_FILE_NAME: &str = "p2p_port";
+
+pub fn read_persisted_p2p_port(node_directory: &Path) -> Option<u16> {
+    // R-W2.2: a corrupt or unreadable file is ignored, never fatal.
+    let text = std::fs::read_to_string(node_directory.join(P2P_PORT_FILE_NAME)).ok()?;
+    let port = text.trim().parse::<u16>().ok()?;
+    (port != 0).then_some(port)
+}
+
+/// Best effort by design: a read-only disk must not block the boot (§1.4).
+pub fn persist_p2p_port(node_directory: &Path, port: u16) {
+    if std::fs::create_dir_all(node_directory).is_ok() {
+        let _ = std::fs::write(node_directory.join(P2P_PORT_FILE_NAME), format!("{port}\n"));
+    }
+}
+
+fn p2p_port_is_free(port: u16) -> bool {
+    std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).is_ok()
+}
+
+/// Ordered, deduplicated candidate ports: persisted choice first, then the
+/// canonical port, then the deterministic fallback range.
+pub fn p2p_port_candidates(node_directory: &Path) -> Vec<u16> {
+    let mut seen = BTreeSet::new();
+    read_persisted_p2p_port(node_directory)
+        .into_iter()
+        .chain(std::iter::once(MAINNET_P2P_PORT))
+        .chain(MAINNET_P2P_FALLBACK_PORTS)
+        .filter(|port| seen.insert(*port))
+        .collect()
+}
+
+/// Choose and persist the mesh listen address (`0.0.0.0:<port>`).
+pub fn choose_mesh_listen_address(node_directory: &Path) -> SocketAddr {
+    for port in p2p_port_candidates(node_directory) {
+        if p2p_port_is_free(port) {
+            persist_p2p_port(node_directory, port);
+            return SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port));
+        }
+    }
+    // Every deterministic candidate is taken: ask the system for one.
+    let port = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+        .and_then(|listener| listener.local_addr())
+        .map(|address| address.port())
+        .unwrap_or(MAINNET_P2P_PORT);
+    persist_p2p_port(node_directory, port);
+    SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port))
+}
+
+/// Learn a concrete loopback address for the private-mode / last-resort
+/// leaf listener (the v0.3.5 shape).
+pub fn loopback_leaf_listen_address() -> Option<SocketAddr> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+    listener.local_addr().ok()
+}
+
+/// R-W2.1: the walk a failed mesh start performs — the remaining candidate
+/// ports after the one that failed, each as `0.0.0.0:<port>`. The final
+/// loopback fallback is appended at runtime because its port only exists
+/// once bound.
+pub fn remaining_mesh_listen_addresses(node_directory: &Path, failed_port: u16) -> Vec<SocketAddr> {
+    p2p_port_candidates(node_directory)
+        .into_iter()
+        .filter(|port| *port != failed_port)
+        .map(|port| SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port)))
+        .collect()
+}
+
+/// W3: the Mainnet listener is either `0.0.0.0` (mesh mode, the default
+/// since v0.4.0) or loopback (private mode, the v0.3.5 shape). Port 0 stays
+/// rejected — the announced address must be concrete.
+pub fn mainnet_listener_shape_is_valid(listen_address: SocketAddr) -> bool {
+    let shape = listen_address.ip() == std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+        || listen_address.ip().is_loopback();
+    shape && listen_address.port() != 0
+}
+
 fn node_start_error_code<E: std::fmt::Debug>(error: &E) -> &'static str {
     let rendered = format!("{error:?}");
     if rendered.contains(LMDB_MAP_FULL_ERROR_CODE) {
@@ -5564,6 +5704,139 @@ impl From<SeedRestoreError> for CommandError {
 
 #[cfg(test)]
 mod tests {
+    // ---- W2: stable, persisted P2P port ----------------------------------
+
+    #[test]
+    fn first_start_prefers_mainnet_p2p_port_when_free() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let candidates = p2p_port_candidates(directory.path());
+        assert_eq!(candidates.first(), Some(&MAINNET_P2P_PORT));
+        assert_eq!(
+            candidates.len(),
+            1 + MAINNET_P2P_FALLBACK_PORTS.count(),
+            "canonical port plus the deterministic fallback range"
+        );
+    }
+
+    #[test]
+    fn persisted_port_is_reused_on_next_start() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        persist_p2p_port(directory.path(), 33_377);
+        assert_eq!(read_persisted_p2p_port(directory.path()), Some(33_377));
+        let candidates = p2p_port_candidates(directory.path());
+        assert_eq!(candidates.first(), Some(&33_377));
+        // Deduplicated: 33377 appears once even though it is in the range.
+        assert_eq!(candidates.iter().filter(|port| **port == 33_377).count(), 1);
+    }
+
+    #[test]
+    fn occupied_persisted_port_falls_back_and_overwrites() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        // Occupy an ephemeral port and persist it as the preference.
+        let blocker = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+            .expect("blocking listener");
+        let blocked_port = blocker.local_addr().expect("blocker address").port();
+        persist_p2p_port(directory.path(), blocked_port);
+        let chosen = choose_mesh_listen_address(directory.path());
+        assert!(chosen.ip().is_unspecified());
+        assert_ne!(chosen.port(), blocked_port, "occupied port must be skipped");
+        assert_ne!(chosen.port(), 0);
+        // R-W2 step 5: the persisted value is overwritten with the new choice.
+        assert_eq!(
+            read_persisted_p2p_port(directory.path()),
+            Some(chosen.port())
+        );
+        drop(blocker);
+    }
+
+    #[test]
+    fn corrupt_port_file_is_ignored_not_fatal() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        std::fs::write(directory.path().join("p2p_port"), b"not a port\xff\xfe")
+            .expect("write corrupt file");
+        assert_eq!(read_persisted_p2p_port(directory.path()), None);
+        let chosen = choose_mesh_listen_address(directory.path());
+        assert!(chosen.ip().is_unspecified());
+        assert_ne!(chosen.port(), 0);
+        // Zero is not a port either.
+        persist_p2p_port(directory.path(), 33_371);
+        std::fs::write(directory.path().join("p2p_port"), b"0").expect("write zero");
+        assert_eq!(read_persisted_p2p_port(directory.path()), None);
+    }
+
+    #[test]
+    fn bind_race_eaddrinuse_tries_next_candidate_without_aborting_boot() {
+        // The worker walks `remaining_mesh_listen_addresses` and finally the
+        // loopback leaf; the walk after a failed bind must cover every other
+        // candidate exactly once and never contain the failed port.
+        let directory = tempfile::tempdir().expect("temp dir");
+        let failed = MAINNET_P2P_PORT;
+        let walk = remaining_mesh_listen_addresses(directory.path(), failed);
+        assert_eq!(walk.len(), MAINNET_P2P_FALLBACK_PORTS.count());
+        assert!(walk.iter().all(|address| address.port() != failed));
+        assert!(walk.iter().all(|address| address.ip().is_unspecified()));
+        let leaf = loopback_leaf_listen_address().expect("loopback leaf");
+        assert!(leaf.ip().is_loopback());
+        assert_ne!(leaf.port(), 0);
+    }
+
+    #[test]
+    fn start_mainnet_command_accepts_unspecified_listener() {
+        // The positive shape (0.0.0.0:<port>) passes the command's gate; the
+        // full start is exercised by the live acceptance test. Shapes that
+        // must never reach the node are rejected before any worker spawns.
+        assert!(mainnet_listener_shape_is_valid(
+            "0.0.0.0:33369".parse().unwrap()
+        ));
+        assert!(mainnet_listener_shape_is_valid(
+            "127.0.0.1:3414".parse().unwrap()
+        ));
+        assert!(!mainnet_listener_shape_is_valid(
+            "0.0.0.0:0".parse().unwrap()
+        ));
+        assert!(!mainnet_listener_shape_is_valid(
+            "192.168.0.10:33369".parse().unwrap()
+        ));
+        assert!(!mainnet_listener_shape_is_valid(
+            "[::]:33369".parse().unwrap()
+        ));
+        let app = DesktopApplication::default();
+        assert!(matches!(
+            app.embedded_node_start_mainnet("/tmp/not-used", "192.168.0.10:33369".parse().unwrap()),
+            Err(CommandError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            app.embedded_node_start_mainnet("/tmp/not-used", "0.0.0.0:0".parse().unwrap()),
+            Err(CommandError::InvalidInput(_))
+        ));
+    }
+
+    // ---- W5: the wallet must not disable the portmap or override the
+    // advertised port -------------------------------------------------------
+
+    #[test]
+    fn wallet_does_not_disable_portmap_or_override_advertised_port() {
+        // Assembled at runtime so this test file itself never matches.
+        let portmap_variable = format!("DOM_{}", "PORTMAP");
+        let advertised_variable = format!("DOM_{}", "ADVERTISED_PORT");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        for source in [
+            "src-tauri/src/main.rs",
+            "src-tauri/src/lib.rs",
+            "crates/dom-wallet-embedded-core/src/lib.rs",
+        ] {
+            let contents = std::fs::read_to_string(root.join(source)).expect(source);
+            let occurrences = contents.matches(&portmap_variable).count()
+                + contents.matches(&advertised_variable).count();
+            assert_eq!(
+                occurrences, 0,
+                "{source} must not touch {portmap_variable}/{advertised_variable}"
+            );
+        }
+        assert!(std::env::var(portmap_variable).is_err());
+        assert!(std::env::var(advertised_variable).is_err());
+    }
+
     use super::*;
 
     #[test]
@@ -5689,7 +5962,7 @@ mod tests {
     fn native_bridge_probe_is_static_redacted_and_versioned() {
         let status = native_bridge_status();
         assert_eq!(status.bridge, "ready");
-        assert_eq!(status.app_version, "0.3.5");
+        assert_eq!(status.app_version, "0.4.0");
         fn assert_serializable<T: serde::Serialize>(_: &T) {}
         assert_serializable(&status);
     }
@@ -5697,7 +5970,7 @@ mod tests {
     #[test]
     fn build_and_update_status_are_separate_redacted_channels() {
         let build = get_build_info();
-        assert_eq!(build.wallet_version, "0.3.5");
+        assert_eq!(build.wallet_version, "0.4.0");
         assert_eq!(build.embedded_node_revision, EMBEDDED_NODE_REVISION);
         assert_eq!(build.update_channel, "stable");
 

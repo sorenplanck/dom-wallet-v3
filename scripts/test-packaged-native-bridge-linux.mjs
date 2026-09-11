@@ -161,7 +161,7 @@ try {
 
   const probe = await execute("return window.__TAURI_INTERNALS__.invoke('native_bridge_status')");
   assert.equal(probe.bridge, "ready");
-  assert.equal(probe.app_version, "0.3.5");
+  assert.equal(probe.app_version, "0.4.0");
   assert.ok(Array.isArray(probe.command_names));
   assert.ok(probe.command_names.includes("native_bridge_status"));
 

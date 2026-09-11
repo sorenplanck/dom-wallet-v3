@@ -54,6 +54,15 @@ pub const MAINNET_DNS_SEEDS: [&str; 3] = [
 /// Canonical Mainnet P2P port.
 pub const MAINNET_P2P_PORT: u16 = 33_369;
 
+/// Last-resort Mainnet bootstrap endpoints, used only after every DNS seed
+/// has failed at least once (W9).
+///
+/// These mirror the private `MAINNET_SEED_IPS` in `dom-wire/src/dns_seed.rs`
+/// at the pinned protocol revision (38dd705); the wallet owns DNS discovery
+/// (`disable_dns_seeds = true`), so Core's own IP fallback is never reached
+/// and this duplicate is the only route in when DNS is down.
+pub const MAINNET_FALLBACK_SEED_IPS: [&str; 2] = ["66.42.127.141:33369", "64.177.121.62:33369"];
+
 /// Outbound peers the embedded Mainnet node keeps connected.
 ///
 /// This was 1, and a single peer is a single point of truth: the wallet
@@ -66,10 +75,17 @@ pub const MAINNET_P2P_PORT: u16 = 33_369;
 /// `max_in_flight_attempts` ceiling — asking for more would be silently capped.
 pub const MAINNET_OUTBOUND_PEER_TARGET: usize = 8;
 
-/// Inbound slots on Mainnet. The wallet is a leaf client that dials out and
-/// never advertises itself, so this stays small; it does not limit the outbound
-/// connections that carry synchronization.
-pub const MAINNET_INBOUND_PEER_LIMIT: usize = 4;
+/// Inbound slots on Mainnet.
+///
+/// Since v0.4.0 the wallet listens on all interfaces and advertises itself
+/// (UPnP/NAT-PMP), so reachable wallets connect to each other instead of
+/// leaning on the two hubs alone. Each node keeps up to
+/// [`MAINNET_OUTBOUND_PEER_TARGET`] outbound connections; with only 4 inbound
+/// slots two or three reachable wallets would exhaust each other and the mesh
+/// could not close, while Core's Mainnet default (125) is too heavy for a
+/// household machine. 16 is a starting point to be tuned with production
+/// reachability data, not a measurement.
+pub const MAINNET_INBOUND_PEER_LIMIT: usize = 16;
 
 /// LMDB map-exhaustion sentinel emitted by the protocol store layer
 /// (`dom-store`). The embedded adapter surfaces this exact code so the
@@ -211,15 +227,21 @@ impl EmbeddedCoreConfiguration {
             });
         }
         if self.network == EmbeddedCoreNetwork::Mainnet
-            && (!self.p2p_listen_address.ip().is_loopback()
+            && (!(self.p2p_listen_address.ip() == IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+                || self.p2p_listen_address.ip().is_loopback())
                 || self.seed_peers.contains(&self.p2p_listen_address)
                 || self
                     .seed_peers
                     .iter()
                     .any(|peer| !is_public_routable_peer(*peer)))
         {
+            // The Mainnet listener is either 0.0.0.0 (mesh mode, the v0.4.0
+            // default) or loopback (private mode). IPv6 and specific
+            // interface addresses stay rejected: the hubs have no IPv6 to
+            // dial back to, and a v6-only bind fallback could silently lose
+            // IPv4 reachability.
             return Err(EmbeddedCoreAdapterError::InvalidConfiguration {
-                code: "UNSAFE_MAINNET_LISTENER_OR_SELF_PEER",
+                code: "INVALID_MAINNET_LISTENER",
             });
         }
         Ok(())
@@ -441,6 +463,16 @@ pub struct EmbeddedPeerStatus {
     pub canonical_height: u64,
     pub highest_known_peer_height: u64,
     pub seed_resolution_states: Vec<&'static str>,
+    /// Port-mapping outcome reported by the embedded node (W8): one of
+    /// `none`, `upnp`, `natpmp`, `cgnat_detected`.
+    pub portmap_status: &'static str,
+    /// Port the node announces in its `Hello` (0 = not reachable).
+    pub advertised_port: u16,
+    /// Local P2P listen port the wallet configured.
+    pub p2p_listen_port: u16,
+    /// Whether this node accepts connections from the network (mesh mode);
+    /// `false` in private mode, where the listener stays on loopback.
+    pub accepting_inbound: bool,
 }
 
 impl fmt::Debug for EmbeddedCoreConfiguration {
@@ -769,6 +801,10 @@ impl EmbeddedCoreLifecycle {
                     .collect()
             })
             .unwrap_or_default();
+        let portmap_status =
+            portmap_status_label(node.metrics.portmap_status_code.load(Ordering::Relaxed));
+        let advertised_port =
+            u16::try_from(node.metrics.advertised_port.load(Ordering::Relaxed)).unwrap_or(0);
         Ok(EmbeddedPeerStatus {
             connected_inbound,
             connected_outbound,
@@ -788,6 +824,10 @@ impl EmbeddedCoreLifecycle {
                     _ => "PENDING",
                 })
                 .collect(),
+            portmap_status,
+            advertised_port,
+            p2p_listen_port: self.configuration.p2p_listen_address.port(),
+            accepting_inbound: listener_accepts_inbound(&self.configuration),
         })
     }
 
@@ -984,6 +1024,30 @@ impl BootstrapFallbackSequence {
     }
 }
 
+/// Render the node's `dom_portmap_status` one-hot code (W8). The four codes
+/// are the fixed set the core's metrics renderer uses; anything unknown is
+/// reported as `none` rather than invented.
+fn portmap_status_label(code: u64) -> &'static str {
+    match code {
+        1 => "upnp",
+        2 => "natpmp",
+        3 => "cgnat_detected",
+        _ => "none",
+    }
+}
+
+/// Mesh mode listens on the IPv4 unspecified address; private mode keeps the
+/// v0.3.5 loopback listener and accepts nothing from the network (W6).
+fn listener_accepts_inbound(configuration: &EmbeddedCoreConfiguration) -> bool {
+    configuration.p2p_listen_address.ip() == IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+}
+
+/// All DNS seeds have failed at least once and none is currently resolved:
+/// the staged fallback may descend to the hub IPs (W9).
+fn all_dns_seeds_failing(failures: &[u8; MAINNET_DNS_SEEDS.len()]) -> bool {
+    failures.iter().all(|count| *count > 0)
+}
+
 fn bootstrap_phase(connected_peers: u64) -> &'static str {
     if connected_peers > 0 {
         "CONNECTED"
@@ -1143,8 +1207,10 @@ async fn run_wallet_dns_discovery(
     const INITIAL_BACKOFF: Duration = Duration::from_secs(5);
     const MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
     const SUCCESS_REFRESH: Duration = Duration::from_secs(30 * 60);
+    const IP_FALLBACK_RETRY: Duration = Duration::from_secs(5 * 60);
     let mut failures = [0u8; MAINNET_DNS_SEEDS.len()];
     let mut next_attempt = [Instant::now(); MAINNET_DNS_SEEDS.len()];
+    let mut ip_fallback_next_attempt = Instant::now();
     let mut bootstrap = BootstrapFallbackSequence::new(bootstrap_peers);
     let mut observed_connected = HashSet::new();
     let mut last_connected_count = usize::MAX;
@@ -1259,6 +1325,30 @@ async fn run_wallet_dns_discovery(
                 .unwrap_or(MAX_BACKOFF)
                 .min(MAX_BACKOFF);
             next_attempt[index] = Instant::now() + delay;
+        }
+        // W9 — last rung of the staged fallback: only after every DNS seed
+        // has failed do the pinned hub IPs enter the PEX candidate set. The
+        // wallet owns DNS discovery (Core's resolver and its own IP fallback
+        // are disabled), so without this a full DNS outage leaves no way in.
+        if all_dns_seeds_failing(&failures) && Instant::now() >= ip_fallback_next_attempt {
+            let fallback_addresses = MAINNET_FALLBACK_SEED_IPS
+                .iter()
+                .filter_map(|endpoint| endpoint.parse::<SocketAddr>().ok())
+                .filter(|address| *address != local_address)
+                .filter(|address| is_public_routable_peer(*address))
+                .map(|address| address.to_string())
+                .collect::<Vec<_>>();
+            if !fallback_addresses.is_empty() {
+                if let Ok(mut pex) = node.pex.try_lock() {
+                    pex.seed_from_config(&fallback_addresses);
+                    tracing::warn!(
+                        event = "wallet_bootstrap_ip_fallback_activated",
+                        endpoints = fallback_addresses.len(),
+                        "every Mainnet DNS seed failed; seeding pinned hub IPs"
+                    );
+                }
+            }
+            ip_fallback_next_attempt = Instant::now() + IP_FALLBACK_RETRY;
         }
         tokio::select! {
             _ = shutdown.wait() => return,
@@ -1378,17 +1468,210 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_configuration_rejects_public_listener_and_self_bootstrap() {
+    fn mainnet_accepts_unspecified_ipv4_listener() {
         let directory = TempDir::new().expect("temporary directory");
-        let public = EmbeddedCoreConfiguration::mainnet(
+        let mesh = EmbeddedCoreConfiguration::mainnet(
             directory.path(),
             "0.0.0.0:33369".parse().expect("address"),
         );
-        assert!(public.validate().is_err());
+        mesh.validate()
+            .expect("the v0.4.0 mesh listener must validate");
+    }
+
+    #[test]
+    fn mainnet_rejects_zero_port() {
+        let directory = TempDir::new().expect("temporary directory");
+        let zero = EmbeddedCoreConfiguration::mainnet(
+            directory.path(),
+            "0.0.0.0:0".parse().expect("address"),
+        );
+        assert!(matches!(
+            zero.validate(),
+            Err(EmbeddedCoreAdapterError::InvalidConfiguration {
+                code: "ZERO_P2P_PORT"
+            })
+        ));
+    }
+
+    #[test]
+    fn mainnet_rejects_specific_interface_and_ipv6_listeners() {
+        let directory = TempDir::new().expect("temporary directory");
+        // `[::1]` stays accepted: any loopback keeps the v0.3.5 private-mode
+        // surface. `[::]` stays rejected — no IPv6 mesh this release (W10).
+        let ipv6_private = EmbeddedCoreConfiguration::mainnet(
+            directory.path(),
+            "[::1]:33369".parse().expect("address"),
+        );
+        ipv6_private
+            .validate()
+            .expect("loopback of either family remains a valid private listener");
+        for value in ["192.168.0.10:33369", "8.8.8.8:33369", "[::]:33369"] {
+            let configuration = EmbeddedCoreConfiguration::mainnet(
+                directory.path(),
+                value.parse().expect("test socket address"),
+            );
+            assert!(
+                matches!(
+                    configuration.validate(),
+                    Err(EmbeddedCoreAdapterError::InvalidConfiguration {
+                        code: "INVALID_MAINNET_LISTENER"
+                    })
+                ),
+                "accepted listener {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn mainnet_still_rejects_seed_equal_to_listener() {
+        let directory = TempDir::new().expect("temporary directory");
         let address = "127.0.0.1:34341".parse().expect("static test address");
         let self_peer = EmbeddedCoreConfiguration::mainnet(directory.path(), address)
             .with_seed_peers(vec![address]);
         assert!(self_peer.validate().is_err());
+        let mesh_address = "0.0.0.0:33369".parse().expect("address");
+        let mesh_self = EmbeddedCoreConfiguration::mainnet(directory.path(), mesh_address)
+            .with_seed_peers(vec![mesh_address]);
+        assert!(mesh_self.validate().is_err());
+    }
+
+    #[test]
+    fn node_config_listens_on_all_interfaces_by_default() {
+        let directory = TempDir::new().expect("temporary directory");
+        let configuration = EmbeddedCoreConfiguration::mainnet(
+            directory.path(),
+            "0.0.0.0:33369".parse().expect("address"),
+        );
+        let node = configuration.node_config();
+        assert_eq!(node.p2p_listen_addr, "0.0.0.0:33369");
+        assert!(listener_accepts_inbound(&configuration));
+    }
+
+    #[test]
+    fn private_mode_restores_loopback_listener() {
+        let directory = TempDir::new().expect("temporary directory");
+        let configuration = EmbeddedCoreConfiguration::mainnet(
+            directory.path(),
+            "127.0.0.1:34341".parse().expect("address"),
+        );
+        configuration
+            .validate()
+            .expect("private mode keeps the v0.3.5 loopback listener");
+        assert_eq!(
+            configuration.node_config().p2p_listen_addr,
+            "127.0.0.1:34341"
+        );
+        assert!(!listener_accepts_inbound(&configuration));
+    }
+
+    #[test]
+    fn rpc_and_metrics_listeners_remain_disabled() {
+        let directory = TempDir::new().expect("temporary directory");
+        let node = EmbeddedCoreConfiguration::mainnet(
+            directory.path(),
+            "0.0.0.0:33369".parse().expect("address"),
+        )
+        .node_config();
+        assert!(node.rpc_listen_addr.is_none());
+        assert!(node.rpc_bearer_token.is_none());
+        assert!(node.metrics_listen_addr.is_none());
+    }
+
+    #[test]
+    fn mainnet_inbound_limit_is_raised() {
+        assert_eq!(MAINNET_INBOUND_PEER_LIMIT, 16);
+        let directory = TempDir::new().expect("temporary directory");
+        let node = EmbeddedCoreConfiguration::mainnet(
+            directory.path(),
+            "0.0.0.0:33369".parse().expect("address"),
+        )
+        .node_config();
+        assert_eq!(node.max_inbound, MAINNET_INBOUND_PEER_LIMIT);
+    }
+
+    #[test]
+    fn bootstrap_falls_back_to_hub_ips_after_all_dns_seeds_fail() {
+        // The rung only opens when EVERY seed has failed at least once.
+        assert!(!all_dns_seeds_failing(&[0, 0, 0]));
+        assert!(!all_dns_seeds_failing(&[3, 0, 1]));
+        assert!(all_dns_seeds_failing(&[1, 1, 1]));
+        // The pinned endpoints mirror dom-wire's MAINNET_SEED_IPS at 38dd705
+        // and must stay publicly routable so the PEX filter admits them.
+        assert_eq!(
+            MAINNET_FALLBACK_SEED_IPS,
+            ["66.42.127.141:33369", "64.177.121.62:33369"]
+        );
+        for endpoint in MAINNET_FALLBACK_SEED_IPS {
+            let address: SocketAddr = endpoint.parse().expect("hub endpoint parses");
+            assert!(is_public_routable_peer(address), "unroutable {endpoint}");
+            assert_eq!(address.port(), MAINNET_P2P_PORT);
+        }
+    }
+
+    #[test]
+    fn no_duplicate_dom_protocol_revisions() {
+        // R-W1.1: a split pin compiles two copies of dom-node/dom-wire and
+        // types stop matching. The interop crates (5d8f5db) and dom-sidecar
+        // (ab45a29) are pinned separately on purpose and stay untouched; the
+        // invariant is that no package name resolves to more than one
+        // revision, and that the node set sits on the single W1 pin.
+        const NODE_PIN: &str = "38dd70536f088a467f2b7175978c5a6ebb4e5bd4";
+        let lock = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock"),
+        )
+        .expect("workspace Cargo.lock");
+        let mut by_name: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        let mut name = String::new();
+        for line in lock.lines() {
+            let line = line.trim();
+            if let Some(value) = line.strip_prefix("name = \"") {
+                name = value.trim_end_matches('\"').to_owned();
+            }
+            if line.starts_with("source = \"")
+                && line.contains("github.com/sorenplanck/dom-protocol?rev=")
+            {
+                let revision = line
+                    .split("?rev=")
+                    .nth(1)
+                    .and_then(|rest| rest.split('#').next())
+                    .expect("revision in source line")
+                    .to_owned();
+                by_name.entry(name.clone()).or_default().insert(revision);
+            }
+        }
+        for (package, revisions) in &by_name {
+            assert_eq!(
+                revisions.len(),
+                1,
+                "{package} resolves to more than one dom-protocol revision: {revisions:?}"
+            );
+        }
+        for package in [
+            "dom-core",
+            "dom-crypto",
+            "dom-consensus",
+            "dom-serialization",
+            "dom-tx",
+            "dom-slate",
+            "dom-config",
+            "dom-chain",
+            "dom-node",
+            "dom-pow",
+            "dom-wire",
+        ] {
+            let revisions = by_name
+                .get(package)
+                .unwrap_or_else(|| panic!("{package} missing from Cargo.lock"));
+            assert!(
+                revisions.contains(NODE_PIN),
+                "{package} is not on the W1 pin: {revisions:?}"
+            );
+        }
+        assert_eq!(
+            by_name.get("dom-node").map(std::collections::BTreeSet::len),
+            Some(1)
+        );
     }
 
     #[test]
@@ -1868,6 +2151,104 @@ mod tests {
             lifecycle.wallet_api(),
             Err(EmbeddedCoreAdapterError::NotRunning)
         ));
+    }
+
+    #[test]
+    fn peer_status_exposes_portmap_state_and_advertised_port() {
+        // Label mapping is the fixed four-label set of dom_portmap_status.
+        assert_eq!(portmap_status_label(0), "none");
+        assert_eq!(portmap_status_label(1), "upnp");
+        assert_eq!(portmap_status_label(2), "natpmp");
+        assert_eq!(portmap_status_label(3), "cgnat_detected");
+        assert_eq!(portmap_status_label(99), "none");
+
+        let directory = TempDir::new().expect("temporary directory");
+        let configuration = regtest_configuration(directory.path());
+        let listen_port = configuration.p2p_listen_address.port();
+        let mut lifecycle = EmbeddedCoreLifecycle::new(configuration);
+        lifecycle.start().expect("start embedded Core");
+        let status = lifecycle.peer_status().expect("peer status");
+        assert!(
+            ["none", "upnp", "natpmp", "cgnat_detected"].contains(&status.portmap_status),
+            "unexpected portmap status {}",
+            status.portmap_status
+        );
+        assert_eq!(status.p2p_listen_port, listen_port);
+        assert!(
+            !status.accepting_inbound,
+            "a loopback listener never reports itself as accepting inbound"
+        );
+        lifecycle.request_shutdown().expect("request shutdown");
+        lifecycle.wait_for_shutdown().expect("wait for shutdown");
+    }
+
+    /// T-W1: with the W1 pin (38dd705) the prologue fallback also reaches
+    /// INBOUND connections. Dial the embedded node's listener as an external
+    /// peer pinned to one prologue version and require the Noise handshake to
+    /// complete for both supported versions.
+    fn inbound_handshake_completes_with_prologue_version(version: u32) {
+        let directory = TempDir::new().expect("temporary directory");
+        let configuration = regtest_configuration(directory.path());
+        let listen_address = configuration.p2p_listen_address;
+        let mut lifecycle = EmbeddedCoreLifecycle::new(configuration);
+        lifecycle.start().expect("start embedded Core");
+
+        let magic = Network::Regtest.magic();
+        let genesis =
+            dom_core::startup_genesis_hash_for_network_magic(magic).expect("regtest genesis hash");
+        let chain_id = *dom_consensus::derive_chain_id(magic, &genesis).as_bytes();
+        let (private_key, _public_key) = dom_wire::handshake::generate_static_keypair();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let transport = runtime.block_on(async {
+            // The listener comes up asynchronously with the node, and a
+            // failed prologue cannot be retried on the same TCP connection:
+            // the responder leads with its preferred version, reads the
+            // abort as evidence and demotes its per-IP version memory, so a
+            // peer pinned to the older prologue succeeds on a RECONNECT.
+            // That reconnect walk is exactly how dom-node dials (see
+            // SUPPORTED_PROLOGUE_VERSIONS), so the test performs it too.
+            let mut last_error: Option<String> = None;
+            for _ in 0..50 {
+                match tokio::net::TcpStream::connect(listen_address).await {
+                    Ok(mut stream) => {
+                        match dom_wire::handshake::perform_handshake_initiator_versioned(
+                            &mut stream,
+                            &private_key,
+                            version,
+                            magic,
+                            &chain_id,
+                        )
+                        .await
+                        {
+                            Ok(_) => return Ok(()),
+                            Err(error) => last_error = Some(format!("{error:?}")),
+                        }
+                    }
+                    Err(error) => last_error = Some(format!("{error:?}")),
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(last_error.unwrap_or_else(|| "no attempt completed".into()))
+        });
+        lifecycle.request_shutdown().expect("request shutdown");
+        lifecycle.wait_for_shutdown().expect("wait for shutdown");
+        transport.unwrap_or_else(|error| {
+            panic!("inbound handshake with prologue v{version} failed: {error}")
+        });
+    }
+
+    #[test]
+    fn embedded_node_accepts_inbound_handshake_from_v3_prologue_peer() {
+        inbound_handshake_completes_with_prologue_version(3);
+    }
+
+    #[test]
+    fn embedded_node_accepts_inbound_handshake_from_v2_prologue_peer() {
+        inbound_handshake_completes_with_prologue_version(2);
     }
 
     #[test]

@@ -429,10 +429,43 @@ const refreshSummary = async () => {
   byId("settings-bootstrap").textContent = liveStatus.bootstrapPhase ?? "UNAVAILABLE";
   byId("settings-heights").textContent = `${liveStatus.cursorHeight ?? "—"} / ${liveStatus.canonicalHeight ?? "—"}`;
 };
+const reachabilityText = (peers) => {
+  if (!peers) return ["\u2014", "\u2014"];
+  if (!peers.accepting_inbound) {
+    return ["Inbound connections disabled", "Private mode: this wallet only dials out, like v0.3.5."];
+  }
+  const detail = `Listening on port ${peers.p2p_listen_port} \u00b7 announced port ${peers.advertised_port || "\u2014"} \u00b7 inbound peers ${peers.connected_inbound}`;
+  if ((peers.portmap_status === "upnp" || peers.portmap_status === "natpmp") && peers.connected_inbound > 0) {
+    return [`Reachable from the network \u00b7 port ${peers.advertised_port}`, detail];
+  }
+  if (peers.portmap_status === "upnp" || peers.portmap_status === "natpmp") {
+    return ["Port open on the router \u00b7 waiting for connections", detail];
+  }
+  if (peers.portmap_status === "cgnat_detected") {
+    return ["Your provider uses CGNAT \u00b7 outbound connections only", detail];
+  }
+  return ["Router did not open the port automatically", detail];
+};
+const refreshReachability = async () => {
+  try {
+    const peers = await invoke("node_peer_status");
+    const [pill, detail] = reachabilityText(peers);
+    byId("node-reachability").textContent = pill;
+    byId("node-reachability-detail").textContent = detail;
+  } catch {
+    byId("node-reachability").textContent = "\u2014";
+    byId("node-reachability-detail").textContent = "Reachability is reported once the embedded node is running.";
+  }
+  try {
+    const preference = await invoke("inbound_connections_status");
+    byId("inbound-connections").checked = preference.enabled;
+  } catch { /* preference stays at its default rendering */ }
+};
 const refreshNode = async () => {
   const value = await invoke("embedded_node_status");
   latestEmbeddedNodeStatus = value;
   byId("node-status").textContent = nodeStatusText(value);
+  await refreshReachability();
   return value;
 };
 const refreshUpdates = async () => {
@@ -949,6 +982,15 @@ byId("backup-export-form").addEventListener("submit", async (event) => {
   try { const result = await run(() => invoke("wallet_backup_export", { destination: data.get("destination"), backupPassword: data.get("backup_password") })); show(`Encrypted backup created: ${result.destination_name}.`); }
   catch (error) { show(redactedError(error), true); } finally { clearPasswords(form); }
 });
+byId("inbound-connections").addEventListener("change", (event) => run(async () => {
+  const status = await invoke("inbound_connections_set", { enabled: event.target.checked });
+  byId("inbound-connections").checked = status.enabled;
+  if (status.restart_required) {
+    show(status.enabled
+      ? "Inbound connections enabled. Restart the embedded node (or the wallet) to start accepting peers."
+      : "Private mode enabled. Restart the embedded node (or the wallet) to stop accepting peers.");
+  }
+}).catch((error) => show(redactedError(error), true)));
 byId("backup-import-form").addEventListener("submit", async (event) => {
   event.preventDefault(); const form = event.currentTarget; const data = new FormData(form);
   if (!window.confirm("Close the current wallet and import this backup into a new folder?")) {
