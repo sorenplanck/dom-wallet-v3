@@ -2184,9 +2184,16 @@ mod tests {
 
     /// T-W1: with the W1 pin (38dd705) the prologue fallback also reaches
     /// INBOUND connections. Dial the embedded node's listener as an external
-    /// peer pinned to one prologue version and require the Noise handshake to
-    /// complete for both supported versions.
-    fn inbound_handshake_completes_with_prologue_version(version: u32) {
+    /// peer pinned to one prologue version and require the Noise handshake
+    /// to complete within `permitted_attempts` handshakes: v3 (the
+    /// responder's preferred version) must complete on the FIRST attempt;
+    /// v2 within TWO, because a failed prologue cannot be retried on the
+    /// same TCP connection - the responder reads the abort as evidence,
+    /// demotes its per-IP version memory, and serves v2 on the reconnect.
+    /// Waiting for the listener is a separate phase using bare TCP
+    /// connects, which the responder deliberately does not count as
+    /// evidence, so the probe cannot consume the fallback budget.
+    fn inbound_handshake_completes_with_prologue_version(version: u32, permitted_attempts: u32) {
         let directory = TempDir::new().expect("temporary directory");
         let configuration = regtest_configuration(directory.path());
         let listen_address = configuration.p2p_listen_address;
@@ -2203,52 +2210,70 @@ mod tests {
             .enable_all()
             .build()
             .expect("test runtime");
-        let transport = runtime.block_on(async {
-            // The listener comes up asynchronously with the node, and a
-            // failed prologue cannot be retried on the same TCP connection:
-            // the responder leads with its preferred version, reads the
-            // abort as evidence and demotes its per-IP version memory, so a
-            // peer pinned to the older prologue succeeds on a RECONNECT.
-            // That reconnect walk is exactly how dom-node dials (see
-            // SUPPORTED_PROLOGUE_VERSIONS), so the test performs it too.
-            let mut last_error: Option<String> = None;
-            for _ in 0..50 {
-                match tokio::net::TcpStream::connect(listen_address).await {
-                    Ok(mut stream) => {
-                        match dom_wire::handshake::perform_handshake_initiator_versioned(
-                            &mut stream,
-                            &private_key,
-                            version,
-                            magic,
-                            &chain_id,
-                        )
-                        .await
-                        {
-                            Ok(_) => return Ok(()),
-                            Err(error) => last_error = Some(format!("{error:?}")),
-                        }
-                    }
-                    Err(error) => last_error = Some(format!("{error:?}")),
+        let used_attempts = runtime.block_on(async {
+            // Phase 1 - listener readiness only: the node binds
+            // asynchronously, so wait until a bare TCP connect is accepted
+            // and close it without writing a byte.
+            let mut listener_ready = false;
+            for _ in 0..100 {
+                if let Ok(probe) = tokio::net::TcpStream::connect(listen_address).await {
+                    drop(probe);
+                    listener_ready = true;
+                    break;
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            Err(last_error.unwrap_or_else(|| "no attempt completed".into()))
+            assert!(listener_ready, "embedded node listener never accepted");
+
+            // Phase 2 - counted handshake attempts, one fresh connection
+            // each. The pause between attempts only gives the responder
+            // time to observe the previous close; it never adds attempts.
+            let mut last_error = String::new();
+            for attempt in 1..=permitted_attempts {
+                let mut stream = tokio::net::TcpStream::connect(listen_address)
+                    .await
+                    .expect("listener stopped accepting between attempts");
+                match dom_wire::handshake::perform_handshake_initiator_versioned(
+                    &mut stream,
+                    &private_key,
+                    version,
+                    magic,
+                    &chain_id,
+                )
+                .await
+                {
+                    Ok(_) => return Ok(attempt),
+                    Err(error) => last_error = format!("{error:?}"),
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(last_error)
         });
         lifecycle.request_shutdown().expect("request shutdown");
         lifecycle.wait_for_shutdown().expect("wait for shutdown");
-        transport.unwrap_or_else(|error| {
-            panic!("inbound handshake with prologue v{version} failed: {error}")
+        let used = used_attempts.unwrap_or_else(|error| {
+            panic!(
+                "inbound handshake with prologue v{version} failed within \
+                 {permitted_attempts} attempts: {error}"
+            )
         });
+        assert!(
+            used <= permitted_attempts,
+            "prologue v{version} needed {used} attempts (budget {permitted_attempts})"
+        );
     }
 
     #[test]
     fn embedded_node_accepts_inbound_handshake_from_v3_prologue_peer() {
-        inbound_handshake_completes_with_prologue_version(3);
+        // The responder leads with v3: first handshake must complete.
+        inbound_handshake_completes_with_prologue_version(3, 1);
     }
 
     #[test]
     fn embedded_node_accepts_inbound_handshake_from_v2_prologue_peer() {
-        inbound_handshake_completes_with_prologue_version(2);
+        // One failed v3-led exchange demotes the per-IP version memory;
+        // the reconnect must complete, so two handshakes at most.
+        inbound_handshake_completes_with_prologue_version(2, 2);
     }
 
     #[test]
