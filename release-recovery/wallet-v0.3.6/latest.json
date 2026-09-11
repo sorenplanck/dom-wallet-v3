@@ -1,0 +1,64 @@
+{
+  "dom_manifest": {
+    "artifacts": [
+      {
+        "architecture": "x86_64",
+        "sha256": "ccbca30fe09d0f21118a2a0fe40e77f7aa1e548a3cf2a9ce9dd020039fdb9481",
+        "signature": "untrusted comment: signature from minisign secret key\nRUTwnDDKlXoZdFU9XC+UnIJbJBMMsF4qhEoqEIIMdSfmI6v1kkeLjmoaWD07dHhgr8/ry01K8ZSjZi7d73DnMggYuRIeWAMypgQ=\ntrusted comment: timestamp:1789131596\tfile:DOM Wallet V3_0.3.6_amd64.AppImage\thashed\n5hYxGEbVV1zB3tCxtdIe+WuvelhbEcbz49L2o6IDJCzaMnhyfI/OA/y0yHfAFiRrlYUGVLCzsmJ0ZJ1S6n1lCQ==\n",
+        "size": 90552824,
+        "target": "linux",
+        "url": "https://github.com/sorenplanck/dom-wallet-v3/releases/download/wallet-v0.3.6/DOM.Wallet.V3_0.3.6_amd64.AppImage"
+      },
+      {
+        "architecture": "x86_64",
+        "sha256": "057307cf2fa003745759033d50e7b616fce5e26c9c72c595a35bbdc110289ef9",
+        "signature": "untrusted comment: signature from minisign secret key\nRUTwnDDKlXoZdNryPj3G+hiKCdm+I7pZFJp38CxalObI4GyN6iXZ5Os9FO+1fOOnNYwdNsF6JSArQ91gdh1sqdC9HwAlBPbHxgk=\ntrusted comment: timestamp:1789131612\tfile:DOM Wallet V3_0.3.6_x64-setup.exe\thashed\nC3DP/ctAnvELYm28GNQCvfq8CBV2miG/iWvlY7wM+qXv4+O8kbMZBz6TBifLcq6J3oemfBMTgroJrt3MBa5yCQ==\n",
+        "size": 7882499,
+        "target": "windows",
+        "url": "https://github.com/sorenplanck/dom-wallet-v3/releases/download/wallet-v0.3.6/DOM.Wallet.V3_0.3.6_x64-setup.exe"
+      },
+      {
+        "architecture": "aarch64",
+        "sha256": "ac04abd226d399cc3f1c4802157dad7d8c3b5e6a580e64a2ba21b7e9226ad818",
+        "signature": "untrusted comment: signature from minisign secret key\nRUTwnDDKlXoZdFfzzccTsTPANGuGQLubZ9bDjZLc8Ed7XgPUM4YTqjud1hG5LPerUnpMliw94k97he/LSNOSgOgr5IVl6L9Dzww=\ntrusted comment: timestamp:1789131634\tfile:DOM Wallet V3.app.tar.gz\thashed\nm5dmj9us1i0PT7a2Q6cPpeKCdJ+Slqhazz4SLLoV76Tj7VRQXvnwZR5WiCl0tHtvz9RgHweHKFP85Jdmm03cCg==\n",
+        "size": 12230165,
+        "target": "macos",
+        "url": "https://github.com/sorenplanck/dom-wallet-v3/releases/download/wallet-v0.3.6/DOM.Wallet.V3.app.tar.gz"
+      }
+    ],
+    "channel": "stable",
+    "critical_update": false,
+    "draft": false,
+    "embedded_node_revision": "38dd70536f088a467f2b7175978c5a6ebb4e5bd4",
+    "embedded_node_version": "0.2.0",
+    "expires_at": "2026-10-11T12:58:08Z",
+    "manifest_signature": "untrusted comment: signature from minisign secret key\nRUTwnDDKlXoZdKKKM7hgRoLEurQRdwOZ4+Cig9FDUhqgo9aIvv1hw3M7acliVtVcWU4340MI/wWZhxT+/8mvbqynmnQlp3SVZAU=\ntrusted comment: timestamp:1789131826\tfile:dom-manifest-canonical.bin\thashed\nSZY1TqV3oi3O9ULf2vl4K8h2hHslLrbR7ZuOo+FkCT30XAjhJT0wtnrTjTWrixMKVQ+A1wjGfgkVW3xXoEb2CA==\n",
+    "minimum_supported_version": "0.2.0",
+    "minimum_wallet_schema": 2,
+    "network": "mainnet",
+    "prerelease": false,
+    "published_at": "2026-09-11T12:58:08Z",
+    "release_notes": "DOM Wallet V3 0.3.6 stable release.",
+    "release_url": "https://github.com/sorenplanck/dom-wallet-v3/releases/tag/wallet-v0.3.6",
+    "schema_version": 1,
+    "version": "0.3.6",
+    "wallet_revision": "ff571db59f6d3989600f667af5e3131bbff7f712"
+  },
+  "notes": "DOM Wallet V3 0.3.6 stable release.",
+  "platforms": {
+    "darwin-aarch64": {
+      "signature": "untrusted comment: signature from minisign secret key\nRUTwnDDKlXoZdFfzzccTsTPANGuGQLubZ9bDjZLc8Ed7XgPUM4YTqjud1hG5LPerUnpMliw94k97he/LSNOSgOgr5IVl6L9Dzww=\ntrusted comment: timestamp:1789131634\tfile:DOM Wallet V3.app.tar.gz\thashed\nm5dmj9us1i0PT7a2Q6cPpeKCdJ+Slqhazz4SLLoV76Tj7VRQXvnwZR5WiCl0tHtvz9RgHweHKFP85Jdmm03cCg==\n",
+      "url": "https://github.com/sorenplanck/dom-wallet-v3/releases/download/wallet-v0.3.6/DOM.Wallet.V3.app.tar.gz"
+    },
+    "linux-x86_64": {
+      "signature": "untrusted comment: signature from minisign secret key\nRUTwnDDKlXoZdFU9XC+UnIJbJBMMsF4qhEoqEIIMdSfmI6v1kkeLjmoaWD07dHhgr8/ry01K8ZSjZi7d73DnMggYuRIeWAMypgQ=\ntrusted comment: timestamp:1789131596\tfile:DOM Wallet V3_0.3.6_amd64.AppImage\thashed\n5hYxGEbVV1zB3tCxtdIe+WuvelhbEcbz49L2o6IDJCzaMnhyfI/OA/y0yHfAFiRrlYUGVLCzsmJ0ZJ1S6n1lCQ==\n",
+      "url": "https://github.com/sorenplanck/dom-wallet-v3/releases/download/wallet-v0.3.6/DOM.Wallet.V3_0.3.6_amd64.AppImage"
+    },
+    "windows-x86_64": {
+      "signature": "untrusted comment: signature from minisign secret key\nRUTwnDDKlXoZdNryPj3G+hiKCdm+I7pZFJp38CxalObI4GyN6iXZ5Os9FO+1fOOnNYwdNsF6JSArQ91gdh1sqdC9HwAlBPbHxgk=\ntrusted comment: timestamp:1789131612\tfile:DOM Wallet V3_0.3.6_x64-setup.exe\thashed\nC3DP/ctAnvELYm28GNQCvfq8CBV2miG/iWvlY7wM+qXv4+O8kbMZBz6TBifLcq6J3oemfBMTgroJrt3MBa5yCQ==\n",
+      "url": "https://github.com/sorenplanck/dom-wallet-v3/releases/download/wallet-v0.3.6/DOM.Wallet.V3_0.3.6_x64-setup.exe"
+    }
+  },
+  "pub_date": "2026-09-11T12:58:08Z",
+  "version": "0.3.6"
+}
