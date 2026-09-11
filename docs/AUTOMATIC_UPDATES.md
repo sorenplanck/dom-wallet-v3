@@ -170,11 +170,12 @@ control-plane revision that provides:
 - graceful shutdown through `DomNode::request_shutdown()` and ordered task drain.
 
 The embedded Wallet core and embedded node are pinned to
-`7d9d41a1fd4a67ed25bf437846c739ee18f5cb36`, a descendant of that control-plane
+`38dd70536f088a467f2b7175978c5a6ebb4e5bd4`, a descendant of that control-plane
 baseline which retains the reviewed ASERT rescue and equal-height
-fork-divergence fixes, adds the v0.4 transport and shared-custody work, and
-mirrors the negotiated P2P prologue version in the Hello payload so deployed
-v2 and v3 peers remain interoperable. The
+fork-divergence fixes, adds the v0.4 transport and shared-custody work,
+mirrors the negotiated P2P prologue version in the Hello payload, and extends
+the prologue fallback to inbound connections and DNS-named seeds so deployed
+v2 and v3 peers remain interoperable in both directions. The
 managed sidecar dependency is separately pinned to
 `ab45a2944f22fe00f9b12984354f0d5d7cdd229a`, whose authenticated
 `/build-info` and `/network-info` responses provide the complete compatibility

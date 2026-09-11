@@ -881,9 +881,19 @@ Compare the result with the checksum published in the corresponding GitHub Relea
 
 The authoritative per-version record — artifacts, checksums, and release notes from `wallet-v0.1.0` through `wallet-v0.3.5` — is the repository's GitHub Releases page.
 
+### wallet-v0.4.0 (in preparation)
+
+Mesh release from the `main-v0.4` line. The wallet accepts inbound
+connections from the DOM network by default (UPnP/NAT-PMP, stable persisted
+P2P port, private-mode opt-out, reachability shown on the Node status
+screen), falls back to the pinned hub IPs when every DNS seed fails, and
+embeds DOM Protocol revision `38dd705`, whose delta over `7d9d41a` is
+exclusively P2P: the prologue fallback now also reaches inbound connections
+and DNS-named seeds.
+
 ### wallet-v0.3.5
 
-Latest release from the `main-v0.4` line. It accepts user-facing payment values in DOM while preserving exact integer noms internally, retries optimistic storage generation conflicts without freezing synchronization, preserves raw Minisign artifact signatures in the DOM updater feed, and embeds DOM Protocol revision `7d9d41a` with the v2/v3 P2P Hello compatibility hotfix.
+Release from the `main-v0.4` line. It accepts user-facing payment values in DOM while preserving exact integer noms internally, retries optimistic storage generation conflicts without freezing synchronization, preserves raw Minisign artifact signatures in the DOM updater feed, and embeds DOM Protocol revision `7d9d41a` with the v2/v3 P2P Hello compatibility hotfix.
 
 ### wallet-v0.3.4
 
