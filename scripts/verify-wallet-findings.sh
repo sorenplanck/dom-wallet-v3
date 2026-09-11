@@ -168,6 +168,18 @@ retired_test_replacements = {
         "src-tauri/src/lib.rs",
         "regression_restore_is_immediate_offline_and_ungated",
     ),
+    # v0.4.0 (mesh): the 0.0.0.0 listener became the Mainnet default, so the
+    # combined rejection test split; the surviving self-bootstrap semantics
+    # live in mainnet_still_rejects_seed_equal_to_listener, alongside
+    # mainnet_accepts_unspecified_ipv4_listener and
+    # mainnet_rejects_specific_interface_and_ipv6_listeners.
+    (
+        "crates/dom-wallet-embedded-core/src/lib.rs",
+        "mainnet_configuration_rejects_public_listener_and_self_bootstrap",
+    ): (
+        "crates/dom-wallet-embedded-core/src/lib.rs",
+        "mainnet_still_rejects_seed_equal_to_listener",
+    ),
 }
 removed_tests = baseline_tests - current_tests
 unexpected_removed = sorted(removed_tests - set(retired_test_replacements))
@@ -277,15 +289,15 @@ after_pins = sorted(set(pattern.findall(after)))
 approved_pins = sorted({
     "https://github.com/BlockstreamResearch/rust-secp256k1-zkp?rev=264e84adf7b06fb4d028eb2fd992f33c4d8999b7#264e84adf7b06fb4d028eb2fd992f33c4d8999b7",
     "https://github.com/sorenplanck/dom-protocol?rev=5d8f5db333d3223f74f5df935b4b2d453ab25b22#5d8f5db333d3223f74f5df935b4b2d453ab25b22",
-    "https://github.com/sorenplanck/dom-protocol?rev=7d9d41a1fd4a67ed25bf437846c739ee18f5cb36#7d9d41a1fd4a67ed25bf437846c739ee18f5cb36",
+    "https://github.com/sorenplanck/dom-protocol?rev=38dd70536f088a467f2b7175978c5a6ebb4e5bd4#38dd70536f088a467f2b7175978c5a6ebb4e5bd4",
     "https://github.com/sorenplanck/dom-protocol?rev=ab45a2944f22fe00f9b12984354f0d5d7cdd229a#ab45a2944f22fe00f9b12984354f0d5d7cdd229a",
 })
 if after_pins != approved_pins:
     raise SystemExit(
-        "exact git dependency pins differ from the approved v0.3.5 release set: "
+        "exact git dependency pins differ from the approved v0.4.0 release set: "
         f"expected={approved_pins} actual={after_pins}"
     )
-print("exact git dependency pins match the approved v0.3.5 release set")
+print("exact git dependency pins match the approved v0.4.0 release set")
 PY
 
 git diff --check
