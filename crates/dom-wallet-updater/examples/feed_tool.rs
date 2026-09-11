@@ -15,7 +15,6 @@
 //! cargo run -p dom-wallet-updater --example feed_tool -- verify <artifacts-dir>
 //! ```
 
-use base64::Engine as _;
 use dom_wallet_updater::{
     select_artifact, validate_download, validate_wallet_manifest, verify_wallet_manifest_signature,
     ArtifactDescriptor, MinisignVerifier, SignatureVerifier, UpdateError, WalletDecision,
@@ -190,17 +189,20 @@ fn read_signature_file(artifact_path: &Path) -> Result<String, String> {
         .map_err(|error| format!("missing detached signature {signature_path:?}: {error}"))
 }
 
-/// Keep the two updater contracts explicit: Tauri consumes a base64-encoded
-/// Minisign file, while the DOM updater passes the raw Minisign text directly
-/// to `Signature::decode`.
+/// Publish the identical raw Minisign text in both feed positions. Wallets
+/// 0.3.4 and 0.3.5 compare `dom_manifest.artifacts[].signature` against
+/// `platforms.*.signature` byte-for-byte before accepting an update, so the
+/// two fields must match exactly for installed wallets to upgrade at all.
+/// The Tauri plugin never verifies this string in our flow (the DOM updater
+/// downloads and Minisign-verifies the artifact itself, and `Update::install`
+/// performs no signature check), so the plugin's base64 convention is not
+/// required — and 0.3.6+ wallets accept either encoding.
 fn inject_artifact_signature(
     platform_entry: &mut serde_json::Value,
     artifact: &mut ArtifactDescriptor,
     signature_text: String,
 ) {
-    platform_entry["signature"] = serde_json::Value::String(
-        base64::engine::general_purpose::STANDARD.encode(signature_text.as_bytes()),
-    );
+    platform_entry["signature"] = serde_json::Value::String(signature_text.clone());
     artifact.signature = signature_text;
 }
 
@@ -335,7 +337,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn artifact_signature_uses_tauri_base64_and_dom_raw_minisign_text() {
+    fn artifact_signature_is_identical_raw_minisign_text_in_both_positions() {
         let signature_text = concat!(
             "untrusted comment: signature from minisign secret key\n",
             "RUTwnDDKlXoZdJ5ySx6oL0EcIRHpHMrDixBdwqPo9Fxk\n",
@@ -363,11 +365,12 @@ mod tests {
 
         assert_eq!(artifact.signature, signature_text);
         assert!(artifact.signature.starts_with("untrusted comment:"));
-        assert_ne!(platform_entry["signature"], signature_text);
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(platform_entry["signature"].as_str().expect("string"))
-            .expect("Tauri signature is base64");
-        assert_eq!(decoded, signature_text.as_bytes());
+        // 0.3.4/0.3.5 wallets require the two positions to be byte-identical.
+        assert_eq!(platform_entry["signature"], signature_text);
+        assert!(dom_wallet_updater::artifact_signature_matches_feed(
+            &artifact.signature,
+            platform_entry["signature"].as_str().expect("string"),
+        ));
     }
 
     #[test]

@@ -46,11 +46,19 @@ signing key. The offline feed flow, per release:
    `releases/latest/download/` only resolve when a non-prerelease release
    exists.
 
-The final feed intentionally carries each artifact signature in two different
-encodings. `platforms.*.signature` is the base64 encoding of the complete
-Minisign file required by Tauri. `dom_manifest.artifacts[].signature` is the
-raw Minisign text consumed by the DOM updater. Never copy one representation
-into the other without converting it.
+The final feed carries the identical raw Minisign text in both signature
+positions: `platforms.*.signature` and `dom_manifest.artifacts[].signature`
+must match byte for byte. Wallets 0.3.4 and 0.3.5 reject the whole feed with
+`UPDATE_MANIFEST_INVALID` when the two fields differ (they compare the strings
+without decoding), so a feed that base64-encodes the `platforms` copy — the
+Tauri plugin convention, used by feeds up to and including the original
+0.3.6 upload — is unappliable for every installed wallet older than 0.3.6.
+The raw text is safe on the Tauri side because the DOM updater downloads and
+Minisign-verifies each artifact itself and `Update::install` performs no
+signature check of its own. If a published feed ever hits this rejection,
+recovery needs no re-signing: base64-decode each `platforms.*.signature` in
+`latest.json` back to the raw Minisign text and replace the release asset —
+`dom_manifest` and its `manifest_signature` stay untouched.
 
 Wallet V3 uses its embedded DOM Core through `WalletCoreApi` by default and can
 use the authenticated remote scan-only source for restore and synchronization.
