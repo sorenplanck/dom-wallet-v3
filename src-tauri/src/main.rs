@@ -107,6 +107,69 @@ fn automatic_update_preference_path(handle: &tauri::AppHandle) -> Result<PathBuf
         .map_err(|_| UpdateError::StateIo)
 }
 
+/// W6 — "Accept connections from the DOM network". Enabled by default: an
+/// absent or unreadable preference means enabled, so wallets migrating from
+/// v0.3.5 (which have no file) join the mesh without any action (R-W6.1).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct InboundConnectionsPreference {
+    schema_version: u32,
+    enabled: bool,
+}
+
+fn inbound_connections_preference_path(handle: &tauri::AppHandle) -> Result<PathBuf, UpdateError> {
+    handle
+        .path()
+        .app_config_dir()
+        .map(|directory| directory.join("inbound-connections-preference.json"))
+        .map_err(|_| UpdateError::StateIo)
+}
+
+fn load_inbound_connections_preference(path: &Path) -> bool {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<InboundConnectionsPreference>(&bytes).ok())
+        .filter(|preference| preference.schema_version == 1)
+        .map(|preference| preference.enabled)
+        .unwrap_or(true)
+}
+
+fn persist_inbound_connections_preference(path: &Path, enabled: bool) -> Result<(), UpdateError> {
+    let parent = path.parent().ok_or(UpdateError::StateIo)?;
+    fs::create_dir_all(parent).map_err(|_| UpdateError::StateIo)?;
+    let temporary = parent.join(format!(
+        ".inbound-connections-preference-{}.tmp",
+        uuid::Uuid::new_v4()
+    ));
+    let bytes = serde_json::to_vec(&InboundConnectionsPreference {
+        schema_version: 1,
+        enabled,
+    })
+    .map_err(|_| UpdateError::StateIo)?;
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut output = options.open(&temporary).map_err(|_| UpdateError::StateIo)?;
+    let result = (|| {
+        output.write_all(&bytes).map_err(|_| UpdateError::StateIo)?;
+        output.sync_all().map_err(|_| UpdateError::StateIo)?;
+        fs::rename(&temporary, path).map_err(|_| UpdateError::StateIo)?;
+        #[cfg(unix)]
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| UpdateError::StateIo)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
 fn initialize_file_logging(app: &tauri::App) {
     let file = app.path().app_log_dir().ok().and_then(|directory| {
         fs::create_dir_all(&directory).ok()?;
@@ -152,24 +215,79 @@ fn ensure_mainnet_node(
         })?
         .join("mainnet")
         .join("node");
-    let listener =
-        TcpListener::bind("127.0.0.1:0").map_err(|_| dom_wallet_tauri_shell::CommandErrorDto {
-            code: "LOCAL_LISTENER_UNAVAILABLE".into(),
-            category: "NODE".into(),
-            message: "A private local node listener could not be reserved.".into(),
-            retryable: true,
-        })?;
-    let address = listener
-        .local_addr()
-        .map_err(|_| dom_wallet_tauri_shell::CommandErrorDto {
-            code: "LOCAL_LISTENER_UNAVAILABLE".into(),
-            category: "NODE".into(),
-            message: "A private local node listener could not be reserved.".into(),
-            retryable: true,
-        })?;
-    drop(listener);
+    let accept_inbound = inbound_connections_preference_path(handle)
+        .map(|path| load_inbound_connections_preference(&path))
+        .unwrap_or(true);
+    let address = if accept_inbound {
+        // W2/W3: a stable, persisted port on all interfaces so the address
+        // the hubs confirm by dial-back survives restarts.
+        dom_wallet_tauri_shell::choose_mesh_listen_address(&data_directory)
+    } else {
+        // W6 private mode: the v0.3.5 loopback leaf shape.
+        dom_wallet_tauri_shell::loopback_leaf_listen_address().ok_or(
+            dom_wallet_tauri_shell::CommandErrorDto {
+                code: "LOCAL_LISTENER_UNAVAILABLE".into(),
+                category: "NODE".into(),
+                message: "A private local node listener could not be reserved.".into(),
+                retryable: true,
+            },
+        )?
+    };
     app.embedded_node_start_mainnet(data_directory, address)
         .map_err(Into::into)
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+struct InboundConnectionsStatusDto {
+    enabled: bool,
+    restart_required: bool,
+}
+
+#[tauri::command]
+fn inbound_connections_status(
+    handle: tauri::AppHandle,
+) -> Result<InboundConnectionsStatusDto, dom_wallet_tauri_shell::CommandErrorDto> {
+    let path = inbound_connections_preference_path(&handle).map_err(|_| {
+        dom_wallet_tauri_shell::CommandErrorDto {
+            code: "INBOUND_PREFERENCE_IO".into(),
+            category: "NODE".into(),
+            message: "The inbound connections preference could not be read.".into(),
+            retryable: true,
+        }
+    })?;
+    Ok(InboundConnectionsStatusDto {
+        enabled: load_inbound_connections_preference(&path),
+        restart_required: false,
+    })
+}
+
+#[tauri::command]
+fn inbound_connections_set(
+    handle: tauri::AppHandle,
+    enabled: bool,
+) -> Result<InboundConnectionsStatusDto, dom_wallet_tauri_shell::CommandErrorDto> {
+    let path = inbound_connections_preference_path(&handle).map_err(|_| {
+        dom_wallet_tauri_shell::CommandErrorDto {
+            code: "INBOUND_PREFERENCE_IO".into(),
+            category: "NODE".into(),
+            message: "The inbound connections preference could not be persisted.".into(),
+            retryable: true,
+        }
+    })?;
+    persist_inbound_connections_preference(&path, enabled).map_err(|_| {
+        dom_wallet_tauri_shell::CommandErrorDto {
+            code: "INBOUND_PREFERENCE_IO".into(),
+            category: "NODE".into(),
+            message: "The inbound connections preference could not be persisted.".into(),
+            retryable: true,
+        }
+    })?;
+    // The listener shape only changes when the embedded node restarts; the
+    // UI surfaces that instead of silently rebinding under the wallet.
+    Ok(InboundConnectionsStatusDto {
+        enabled,
+        restart_required: true,
+    })
 }
 
 #[tauri::command]

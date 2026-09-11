@@ -367,3 +367,35 @@ export function nomsFromDom(text) {
   if (noms > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error("Amount exceeds the safe desktop boundary.");
   return Number(noms);
 }
+
+/// W8 — reachability presentation for the Node status screen.
+///
+/// Three distinct non-mesh states: user-chosen private mode
+/// (preference off), a mesh listener that degraded to the loopback leaf
+/// (preference on, listener not accepting), and the normal mesh states.
+/// Any inbound peer proves reachability regardless of what the port
+/// mapper reported (public IP, manual port-forward, hairpin).
+export function reachabilityText(peers) {
+  if (!peers) return ["\u2014", "\u2014"];
+  if (!peers.accepting_inbound) {
+    if (peers.inbound_preference_enabled) {
+      return [
+        "Could not open the network listener \u00b7 outbound connections only",
+        "The preferred P2P ports were unavailable, so the wallet fell back to a private local listener. Synchronization continues normally; restart the node to try again.",
+      ];
+    }
+    return ["Inbound connections disabled", "Private mode: this wallet only dials out, like v0.3.5."];
+  }
+  const reachablePort = peers.advertised_port || peers.p2p_listen_port;
+  const detail = `Listening on port ${peers.p2p_listen_port} \u00b7 announced port ${peers.advertised_port || "\u2014"} \u00b7 inbound peers ${peers.connected_inbound}`;
+  if (peers.connected_inbound > 0) {
+    return [`Reachable from the network \u00b7 port ${reachablePort}`, detail];
+  }
+  if (peers.portmap_status === "upnp" || peers.portmap_status === "natpmp") {
+    return ["Port open on the router \u00b7 waiting for connections", detail];
+  }
+  if (peers.portmap_status === "cgnat_detected") {
+    return ["Your provider uses CGNAT \u00b7 outbound connections only", detail];
+  }
+  return ["Router did not open the port automatically", detail];
+}

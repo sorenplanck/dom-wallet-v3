@@ -21,7 +21,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.5"
+version = "0.4.0"
 edition = "2021"
 authors = ["Soren Planck <sorenplanck@tutamail.com>"]
 repository = "https://github.com/sorenplanck/dom-wallet-v3"
@@ -67,21 +67,22 @@ tauri-plugin-updater = "=2.10.1"
 # sole authority for slate construction, transaction serialization, proof and
 # signature validation.  These are deliberately revision pinned rather than
 # copied into this wallet workspace.
-dom-core = { git = "https://github.com/sorenplanck/dom-protocol", rev = "7d9d41a1fd4a67ed25bf437846c739ee18f5cb36" }
-dom-crypto = { git = "https://github.com/sorenplanck/dom-protocol", rev = "7d9d41a1fd4a67ed25bf437846c739ee18f5cb36" }
-dom-consensus = { git = "https://github.com/sorenplanck/dom-protocol", rev = "7d9d41a1fd4a67ed25bf437846c739ee18f5cb36" }
-dom-serialization = { git = "https://github.com/sorenplanck/dom-protocol", rev = "7d9d41a1fd4a67ed25bf437846c739ee18f5cb36" }
-dom-tx = { git = "https://github.com/sorenplanck/dom-protocol", rev = "7d9d41a1fd4a67ed25bf437846c739ee18f5cb36" }
-dom-slate = { git = "https://github.com/sorenplanck/dom-protocol", rev = "7d9d41a1fd4a67ed25bf437846c739ee18f5cb36" }
-dom-config = { git = "https://github.com/sorenplanck/dom-protocol", rev = "7d9d41a1fd4a67ed25bf437846c739ee18f5cb36" }
-dom-chain = { git = "https://github.com/sorenplanck/dom-protocol", rev = "7d9d41a1fd4a67ed25bf437846c739ee18f5cb36" }
-dom-node = { git = "https://github.com/sorenplanck/dom-protocol", rev = "7d9d41a1fd4a67ed25bf437846c739ee18f5cb36" }
-dom-pow = { git = "https://github.com/sorenplanck/dom-protocol", rev = "7d9d41a1fd4a67ed25bf437846c739ee18f5cb36" }
-dom-wallet = { git = "https://github.com/sorenplanck/dom-protocol", rev = "7d9d41a1fd4a67ed25bf437846c739ee18f5cb36" }
-dom-wallet-core-api = { git = "https://github.com/sorenplanck/dom-protocol", rev = "7d9d41a1fd4a67ed25bf437846c739ee18f5cb36" }
-dom-wallet-keys = { git = "https://github.com/sorenplanck/dom-protocol", rev = "7d9d41a1fd4a67ed25bf437846c739ee18f5cb36" }
-dom-wallet-recovery = { git = "https://github.com/sorenplanck/dom-protocol", rev = "7d9d41a1fd4a67ed25bf437846c739ee18f5cb36" }
-dom-adaptor = { git = "https://github.com/sorenplanck/dom-protocol", rev = "7d9d41a1fd4a67ed25bf437846c739ee18f5cb36" }
+dom-core = { git = "https://github.com/sorenplanck/dom-protocol", rev = "38dd70536f088a467f2b7175978c5a6ebb4e5bd4" }
+dom-crypto = { git = "https://github.com/sorenplanck/dom-protocol", rev = "38dd70536f088a467f2b7175978c5a6ebb4e5bd4" }
+dom-consensus = { git = "https://github.com/sorenplanck/dom-protocol", rev = "38dd70536f088a467f2b7175978c5a6ebb4e5bd4" }
+dom-serialization = { git = "https://github.com/sorenplanck/dom-protocol", rev = "38dd70536f088a467f2b7175978c5a6ebb4e5bd4" }
+dom-tx = { git = "https://github.com/sorenplanck/dom-protocol", rev = "38dd70536f088a467f2b7175978c5a6ebb4e5bd4" }
+dom-slate = { git = "https://github.com/sorenplanck/dom-protocol", rev = "38dd70536f088a467f2b7175978c5a6ebb4e5bd4" }
+dom-config = { git = "https://github.com/sorenplanck/dom-protocol", rev = "38dd70536f088a467f2b7175978c5a6ebb4e5bd4" }
+dom-chain = { git = "https://github.com/sorenplanck/dom-protocol", rev = "38dd70536f088a467f2b7175978c5a6ebb4e5bd4" }
+dom-node = { git = "https://github.com/sorenplanck/dom-protocol", rev = "38dd70536f088a467f2b7175978c5a6ebb4e5bd4" }
+dom-pow = { git = "https://github.com/sorenplanck/dom-protocol", rev = "38dd70536f088a467f2b7175978c5a6ebb4e5bd4" }
+dom-wallet = { git = "https://github.com/sorenplanck/dom-protocol", rev = "38dd70536f088a467f2b7175978c5a6ebb4e5bd4" }
+dom-wallet-core-api = { git = "https://github.com/sorenplanck/dom-protocol", rev = "38dd70536f088a467f2b7175978c5a6ebb4e5bd4" }
+dom-wallet-keys = { git = "https://github.com/sorenplanck/dom-protocol", rev = "38dd70536f088a467f2b7175978c5a6ebb4e5bd4" }
+dom-wallet-recovery = { git = "https://github.com/sorenplanck/dom-protocol", rev = "38dd70536f088a467f2b7175978c5a6ebb4e5bd4" }
+dom-adaptor = { git = "https://github.com/sorenplanck/dom-protocol", rev = "38dd70536f088a467f2b7175978c5a6ebb4e5bd4" }
+dom-wire = { git = "https://github.com/sorenplanck/dom-protocol", rev = "38dd70536f088a467f2b7175978c5a6ebb4e5bd4" }
 
 # Sidecar release authentication and atomic pointer handling are deliberately
 # consumed from their reviewed protocol commit. This does not move the wallet's

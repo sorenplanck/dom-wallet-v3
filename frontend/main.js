@@ -9,6 +9,7 @@ import {
   liveStatusProjection,
   miningPresentation,
   nodeStatusText,
+  reachabilityText,
   nomsFromDom,
   remoteTipAlertPresentation,
   restoreReadinessPresentation,
@@ -429,10 +430,26 @@ const refreshSummary = async () => {
   byId("settings-bootstrap").textContent = liveStatus.bootstrapPhase ?? "UNAVAILABLE";
   byId("settings-heights").textContent = `${liveStatus.cursorHeight ?? "—"} / ${liveStatus.canonicalHeight ?? "—"}`;
 };
+const refreshReachability = async () => {
+  try {
+    const peers = await invoke("node_peer_status");
+    const [pill, detail] = reachabilityText(peers);
+    byId("node-reachability").textContent = pill;
+    byId("node-reachability-detail").textContent = detail;
+  } catch {
+    byId("node-reachability").textContent = "\u2014";
+    byId("node-reachability-detail").textContent = "Reachability is reported once the embedded node is running.";
+  }
+  try {
+    const preference = await invoke("inbound_connections_status");
+    byId("inbound-connections").checked = preference.enabled;
+  } catch { /* preference stays at its default rendering */ }
+};
 const refreshNode = async () => {
   const value = await invoke("embedded_node_status");
   latestEmbeddedNodeStatus = value;
   byId("node-status").textContent = nodeStatusText(value);
+  await refreshReachability();
   return value;
 };
 const refreshUpdates = async () => {
@@ -949,6 +966,15 @@ byId("backup-export-form").addEventListener("submit", async (event) => {
   try { const result = await run(() => invoke("wallet_backup_export", { destination: data.get("destination"), backupPassword: data.get("backup_password") })); show(`Encrypted backup created: ${result.destination_name}.`); }
   catch (error) { show(redactedError(error), true); } finally { clearPasswords(form); }
 });
+byId("inbound-connections").addEventListener("change", (event) => run(async () => {
+  const status = await invoke("inbound_connections_set", { enabled: event.target.checked });
+  byId("inbound-connections").checked = status.enabled;
+  if (status.restart_required) {
+    show(status.enabled
+      ? "Inbound connections enabled. Restart the embedded node (or the wallet) to start accepting peers."
+      : "Private mode enabled. Restart the embedded node (or the wallet) to stop accepting peers.");
+  }
+}).catch((error) => show(redactedError(error), true)));
 byId("backup-import-form").addEventListener("submit", async (event) => {
   event.preventDefault(); const form = event.currentTarget; const data = new FormData(form);
   if (!window.confirm("Close the current wallet and import this backup into a new folder?")) {
