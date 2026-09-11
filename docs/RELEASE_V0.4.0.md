@@ -100,9 +100,13 @@ wallet then behaves exactly like v0.3.5.
   different home networks, one behind CGNAT); pass V1-V7 and V10 of the mesh
   spec - reachable status in the UI, hub dial-back confirmed, two wallets
   connected to each other, stable port across three restarts, CGNAT detected
-  cleanly, private mode verified, firewall behavior recorded; then watch the
-  hubs for 24 hours (equal `dom_best_known_peer_height`, no peer drops)
-  before publishing `latest.json`.
+  cleanly, private mode verified, firewall behavior recorded. On a REACHABLE
+  wallet, additionally check its peer list for its own public IP and its logs
+  for reconnection loops to itself (the core has no Noise-identity
+  self-connection guard - see docs/issues-draft/): any such instability is a
+  RELEASE BLOCKER until the core is fixed. Then watch the hubs for 24 hours
+  (equal `dom_best_known_peer_height`, no peer drops) before publishing
+  `latest.json`.
 - Rollback path: there is no remote kill switch. If v0.4.0 misbehaves after
   publication, ship a v0.4.1 with the listener reverted to loopback;
   meanwhile users can enable private mode to restore the previous behavior.
