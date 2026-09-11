@@ -302,14 +302,7 @@ fn verify(directory: &Path) -> Result<(), String> {
         let tauri_signature = entry["signature"]
             .as_str()
             .ok_or(format!("{platform_key}: Tauri signature is missing"))?;
-        if !dom_wallet_updater::artifact_signature_matches_feed(
-            &artifact.signature,
-            tauri_signature,
-        ) {
-            return Err(format!(
-                "{platform_key}: decoded Tauri signature disagrees with dom_manifest"
-            ));
-        }
+        check_signatures_publishable(platform_key, &artifact.signature, tauri_signature)?;
         if !verifier.verify(&bytes, &artifact.signature) {
             return Err(format!(
                 "{platform_key}: artifact Minisign signature INVALID"
@@ -324,6 +317,31 @@ fn verify(directory: &Path) -> Result<(), String> {
         println!("feed fully verified against the pinned release key");
     } else {
         println!("feed verified against the REHEARSAL key only — not publishable");
+    }
+    Ok(())
+}
+
+/// Wallets 0.3.4 and 0.3.5 reject the whole feed unless
+/// `platforms.*.signature` and `dom_manifest.artifacts[].signature` are
+/// byte-identical raw Minisign text, so `verify` fails any feed that would
+/// strand them — including the base64 `platforms` encoding every feed used
+/// up to the original 0.3.6 upload, which older `verify` builds accepted.
+fn check_signatures_publishable(
+    platform_key: &str,
+    dom_signature: &str,
+    tauri_signature: &str,
+) -> Result<(), String> {
+    if !dom_signature.starts_with("untrusted comment:") {
+        return Err(format!(
+            "{platform_key}: dom_manifest signature is not raw Minisign text"
+        ));
+    }
+    if dom_signature != tauri_signature {
+        return Err(format!(
+            "{platform_key}: platforms signature is not byte-identical to dom_manifest \
+             (base64-encoded?); wallets 0.3.4/0.3.5 would reject this feed with \
+             UPDATE_MANIFEST_INVALID — re-run finalize with this feed_tool"
+        ));
     }
     Ok(())
 }
@@ -371,6 +389,30 @@ mod tests {
             &artifact.signature,
             platform_entry["signature"].as_str().expect("string"),
         ));
+        check_signatures_publishable(
+            "linux-x86_64",
+            &artifact.signature,
+            platform_entry["signature"].as_str().expect("string"),
+        )
+        .expect("finalize output is publishable");
+    }
+
+    #[test]
+    fn verify_rejects_the_legacy_base64_platforms_encoding() {
+        let raw = concat!(
+            "untrusted comment: signature from minisign secret key\n",
+            "RUTwnDDKlXoZdJ5ySx6oL0EcIRHpHMrDixBdwqPo9Fxk\n",
+            "trusted comment: timestamp:1\tfile:wallet\thashed\n",
+            "test-signature\n"
+        );
+        use base64::Engine as _;
+        let legacy = base64::engine::general_purpose::STANDARD.encode(raw.as_bytes());
+        let error = check_signatures_publishable("windows-x86_64", raw, &legacy)
+            .expect_err("legacy encoding must fail the publish gate");
+        assert!(error.contains("UPDATE_MANIFEST_INVALID"));
+        assert!(check_signatures_publishable("windows-x86_64", raw, raw).is_ok());
+        check_signatures_publishable("windows-x86_64", &legacy, &legacy)
+            .expect_err("dom_manifest must carry raw Minisign text");
     }
 
     #[test]

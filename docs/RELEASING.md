@@ -55,7 +55,11 @@ Tauri plugin convention, used by feeds up to and including the original
 0.3.6 upload — is unappliable for every installed wallet older than 0.3.6.
 The raw text is safe on the Tauri side because the DOM updater downloads and
 Minisign-verifies each artifact itself and `Update::install` performs no
-signature check of its own. If a published feed ever hits this rejection,
+signature check of its own. `feed_tool verify` — the mandatory pre-publish
+gate — fails any feed whose two signature positions are not byte-identical
+raw Minisign text, so this regression cannot pass the gate again; always run
+the `feed_tool` from the revision being released or newer, never an older
+checkout. If a published feed ever hits this rejection,
 recovery needs no re-signing: base64-decode each `platforms.*.signature` in
 `latest.json` back to the raw Minisign text and replace the release asset —
 `dom_manifest` and its `manifest_signature` stay untouched.
