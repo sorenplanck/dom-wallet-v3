@@ -9,10 +9,13 @@
 ; P2P port can move (W2: 33369 preferred, 33370-33379 fallback, then
 ; ephemeral).
 ;
-; A per-user installation without elevation cannot create machine firewall
-; rules; `netsh` then fails and the `| 0` below swallows the error, so the
-; standard Windows dialog appears once instead. That degraded path is
-; documented in docs/RELEASE_V0.4.0.md.
+; The bundle's effective installMode is currentUser (Tauri's default; the
+; wallet does not override it), so the DEFAULT installation runs without
+; elevation: `netsh` fails there, the exit code is popped and ignored, the
+; installation continues, and Windows shows its standard firewall dialog
+; once on first listen. An elevated installation creates the rule, which
+; applies to ALL network profiles (no profile= filter), and the elevated
+; uninstaller removes it. Documented in docs/RELEASE_V0.4.0.md.
 
 !macro NSIS_HOOK_POSTINSTALL
   nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="DOM Wallet P2P"'

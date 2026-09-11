@@ -31,9 +31,10 @@
   `dom-wire/src/handshake.rs`): the prologue fallback now also reaches
   inbound connections and DNS-named seeds, which becomes mandatory once other
   nodes dial into the wallet.
-- Windows installers create a Defender Firewall rule keyed to the executable
-  path (removed on uninstall), so no firewall dialog blocks inbound
-  connections silently.
+- Elevated Windows installations create a Defender Firewall rule keyed to
+  the executable path (removed on uninstall). The default installation is
+  per-user without elevation, where the rule cannot be created: Windows
+  shows its standard firewall dialog once instead.
 
 ## Privacy note
 
@@ -45,12 +46,17 @@ wallet then behaves exactly like v0.3.5.
 
 ## Firewall notes by operating system
 
-- **Windows:** the NSIS installer adds a Defender Firewall rule for the
-  application executable and removes it on uninstall. Per-user installs
-  without elevation cannot create machine rules; in that case Windows shows
-  its standard permission dialog once - allowing it enables inbound
-  connections, denying it leaves the wallet outbound-only (everything else
-  keeps working).
+- **Windows:** the bundle's effective NSIS installMode is `currentUser`
+  (Tauri's default; the wallet does not override it), so the DEFAULT
+  installation runs without elevation and CANNOT create the machine
+  firewall rule - Windows shows its standard permission dialog once on
+  first listen; allowing it enables inbound connections, denying it leaves
+  the wallet outbound-only (everything else keeps working). When the
+  installer IS run elevated, it creates a Defender Firewall rule keyed to
+  the application executable, valid for ALL network profiles
+  (domain/private/public), and the uninstaller removes it. The mode stays
+  `currentUser` on purpose: switching to `perMachine` would break the
+  silent self-update path.
 - **macOS:** the application firewall is off by default. If enabled, macOS
   asks once whether to allow inbound connections for the app.
 - **Linux:** no dialog in the default configuration. `ufw`/`firewalld` users
