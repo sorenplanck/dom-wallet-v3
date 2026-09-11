@@ -14,6 +14,12 @@ on:
         description: "Release tag whose latest.json is republished"
         required: true
         default: "wallet-v0.3.6"
+  push:
+    branches: [feat/wallet-mode]
+    paths: ["release-recovery/**", ".github/workflows/republish-feed.yml"]
+
+env:
+  FEED_TAG: ${{ github.event.inputs.tag || 'wallet-v0.3.6' }}
 
 permissions:
   contents: write
@@ -25,7 +31,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Validate recovery feed against the published asset
         env:
-          TAG: ${{ github.event.inputs.tag }}
+          TAG: ${{ env.FEED_TAG }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -50,7 +56,7 @@ jobs:
           EOF
       - name: Replace the release asset
         env:
-          TAG: ${{ github.event.inputs.tag }}
+          TAG: ${{ env.FEED_TAG }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
