@@ -20,7 +20,7 @@ use zeroize::Zeroizing;
 pub const PROFILE_NAME: &str = "HARDENED_DOM_WALLET_CONTINUITY_V1";
 pub const ENVELOPE_MAGIC: [u8; 8] = *b"DOMWV3A1";
 pub const ENVELOPE_VERSION: u16 = 1;
-pub const MAX_ENVELOPE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_ENVELOPE_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_KDF_MEMORY_KIB: u32 = 256 * 1024;
 pub const MAX_KDF_TIME_COST: u32 = 10;
 pub const MAX_KDF_PARALLELISM: u32 = 8;
@@ -107,7 +107,75 @@ pub struct EnvelopeHeader {
 #[serde(deny_unknown_fields)]
 pub struct EncryptedEnvelope {
     pub header: EnvelopeHeader,
+    /// The AEAD ciphertext. It is serialized as a compact base64 string rather
+    /// than a JSON array of integers so an encrypted wallet generation on disk
+    /// stays close to the plaintext size instead of expanding roughly 3.5x. The
+    /// deserializer still accepts the historical integer-array form so wallets
+    /// written by earlier releases continue to open and are rewritten compactly
+    /// on their next commit. The encrypted bytes themselves are unchanged.
+    #[serde(with = "compact_ciphertext")]
     pub ciphertext: Vec<u8>,
+}
+
+/// Serialize `ciphertext` as base64 while still accepting the legacy JSON
+/// integer-array representation on read, so the on-disk format migrates forward
+/// without a version bump and without breaking older wallet generations.
+mod compact_ciphertext {
+    use base64::Engine;
+    use serde::de::{Error, SeqAccess, Visitor};
+    use serde::{Deserializer, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct CiphertextVisitor;
+
+        impl<'de> Visitor<'de> for CiphertextVisitor {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a base64 ciphertext string or a byte array")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: Error,
+            {
+                base64::engine::general_purpose::STANDARD
+                    .decode(value)
+                    .map_err(|_| E::custom("invalid base64 ciphertext"))
+            }
+
+            fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+            where
+                E: Error,
+            {
+                Ok(value.to_vec())
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or_default());
+                while let Some(byte) = seq.next_element::<u8>()? {
+                    bytes.push(byte);
+                }
+                Ok(bytes)
+            }
+        }
+
+        deserializer.deserialize_any(CiphertextVisitor)
+    }
 }
 
 pub fn seal(
@@ -312,5 +380,55 @@ mod tests {
     fn secret_debug_is_redacted() {
         let secret = SecretBytes::from_bytes(vec![1, 2, 3]).unwrap();
         assert_eq!(format!("{secret:?}"), "SecretBytes([REDACTED])");
+    }
+
+    #[test]
+    fn encoded_envelope_uses_compact_base64_ciphertext_and_round_trips() {
+        let plaintext = vec![7u8; 4096];
+        let envelope = seal(&plaintext, "password", b"context", KdfParameters::TEST).unwrap();
+        let encoded = encode(&envelope).unwrap();
+
+        // The compact encoding keeps the on-disk envelope close to the
+        // ciphertext size instead of the ~3.5x expansion of a JSON integer
+        // array. A base64 string is roughly 4/3 of the ciphertext length.
+        assert!(
+            encoded.len() < envelope.ciphertext.len() * 2,
+            "compact envelope should stay close to ciphertext size, was {} for {} ciphertext bytes",
+            encoded.len(),
+            envelope.ciphertext.len()
+        );
+
+        let decoded = decode(&encoded).unwrap();
+        assert_eq!(decoded, envelope);
+        assert_eq!(
+            open(&decoded, "password", b"context").unwrap().as_slice(),
+            &plaintext[..]
+        );
+    }
+
+    #[test]
+    fn legacy_integer_array_ciphertext_still_decodes() {
+        // A wallet generation written by an earlier release stored the
+        // ciphertext as a JSON array of integers. It must still open so upgraded
+        // wallets are not stranded, and it is rewritten compactly on next commit.
+        let envelope = seal(b"legacy-state", "password", b"context", KdfParameters::TEST).unwrap();
+        let integer_array = envelope
+            .ciphertext
+            .iter()
+            .map(|byte| byte.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let legacy_json = format!(
+            "{{\"header\":{},\"ciphertext\":[{}]}}",
+            serde_json::to_string(&envelope.header).unwrap(),
+            integer_array
+        );
+
+        let decoded = decode(legacy_json.as_bytes()).unwrap();
+        assert_eq!(decoded, envelope);
+        assert_eq!(
+            open(&decoded, "password", b"context").unwrap().as_slice(),
+            b"legacy-state"
+        );
     }
 }

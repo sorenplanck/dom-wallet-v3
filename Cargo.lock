@@ -1669,6 +1669,7 @@ name = "dom-wallet-crypto"
 version = "0.3.6"
 dependencies = [
  "argon2",
+ "base64 0.22.1",
  "chacha20poly1305",
  "hkdf",
  "rand 0.8.6",
@@ -1827,6 +1828,7 @@ dependencies = [
 name = "dom-wallet-storage"
 version = "0.3.6"
 dependencies = [
+ "base64 0.22.1",
  "dom-wallet-crypto 0.3.6",
  "dom-wallet-domain",
  "fs2",

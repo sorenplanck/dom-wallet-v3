@@ -16,5 +16,6 @@ uuid.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+base64.workspace = true
 libc = "0.2"
 tempfile.workspace = true

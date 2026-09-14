@@ -22,8 +22,9 @@ use dom_wallet_core_api::{
 use dom_wallet_core_recovery::{CanonicalWalletSeed, RecoverableOutputBuilder};
 use dom_wallet_core_restore::{
     abort_restore_stage, apply_recovery_batch, discover_restore_stages, offline_restore_state,
-    rewind_recovery_state, RestoredSpendSource, SeedRestoreCompletion, SeedRestoreError,
-    SeedRestoreProgress, SeedRestoreService, SeedRestoreWarning, RECOVERY_CANONICAL_WINDOW_BLOCKS,
+    prune_spent_recovered_outputs_below_window, rewind_recovery_state, RestoredSpendSource,
+    SeedRestoreCompletion, SeedRestoreError, SeedRestoreProgress, SeedRestoreService,
+    SeedRestoreWarning, RECOVERY_CANONICAL_WINDOW_BLOCKS,
 };
 use dom_wallet_core_sync::{
     CoreBlockReference, CoreChainAdapter, CoreChainIdentity, CoreCoinbaseMetadata, CoreCursorBytes,
@@ -32,8 +33,9 @@ use dom_wallet_core_sync::{
 };
 use dom_wallet_crypto::KdfParameters;
 use dom_wallet_domain::{
-    Network, NetworkIdentity, OutputState, RecoveryCanonicalBlock, RecoveryOutputClass,
-    SeedRestoreStatus, SyncStatus as WalletSyncStatus, WalletState,
+    Network, NetworkIdentity, OutputRecord, OutputState, RecoveredOutputDomain,
+    RecoveredOutputMetadata, RecoveryCanonicalBlock, RecoveryOutputClass, SeedRestoreStatus,
+    SyncStatus as WalletSyncStatus, WalletState,
 };
 use dom_wallet_storage::{default_node_configuration, WalletDirectory};
 use std::{
@@ -1590,6 +1592,137 @@ fn regression_reorg_window_prunes_blocks_and_keeps_durable_counters() {
         reloaded.recovery_canonical_blocks.len() as u64,
         RECOVERY_CANONICAL_WINDOW_BLOCKS
     );
+}
+
+#[test]
+fn regression_spent_outputs_below_reorg_window_are_pruned_but_live_balance_survives() {
+    let seed = CanonicalWalletSeed::from_entropy(&[0x33; 32]).unwrap();
+    let core = identity();
+    let domain_identity = NetworkIdentity {
+        network: Network::PrivateTestnet,
+        chain_id: core.chain_id,
+        genesis_id: core.genesis_hash,
+    };
+    let mut state = offline_restore_state(&seed, domain_identity);
+
+    // A contiguous rolling window of canonical anchors ending well above the
+    // window depth, so the window floor sits far above height zero.
+    let top = RECOVERY_CANONICAL_WINDOW_BLOCKS + 5_000;
+    let first = top - (RECOVERY_CANONICAL_WINDOW_BLOCKS - 1);
+    for height in first..=top {
+        state
+            .recovery_canonical_blocks
+            .push(RecoveryCanonicalBlock {
+                height,
+                block_hash: window_hash(height, 0x10),
+                previous_block_hash: window_hash(height - 1, 0x10),
+                output_count: 0,
+                legacy_proof_only_outputs: 0,
+            });
+    }
+    // Whole-history durable counters cover more than the retained window and
+    // must never be rewound by pruning.
+    state.recovery_scanned_blocks = top + 1;
+    state.recovery_scanned_outputs = 40_000;
+    state.legacy_proof_only_outputs = 3;
+
+    let push_output = |state: &mut WalletState, tag: u8, value: u64, output_state: OutputState| {
+        let id = uuid::Uuid::new_v4();
+        state.outputs.push(OutputRecord {
+            id,
+            account_id: state.default_account.id,
+            commitment: None,
+            value,
+            state: output_state,
+            discovered_height: first.saturating_sub(200),
+            reserved_by: None,
+        });
+        state.remember_output_blinding(id, [tag; 32]);
+        state
+            .recovered_output_metadata
+            .push(RecoveredOutputMetadata {
+                output_id: id,
+                recovery_account: 0,
+                derivation_index: u64::from(tag),
+                domain: RecoveredOutputDomain::Coinbase,
+                is_coinbase: true,
+                block_hash: window_hash(first.saturating_sub(200), 0x10),
+                output_position: 0,
+            });
+        id
+    };
+
+    // Spent far below the window floor: unreachable by any reorg, dead weight.
+    let expired = push_output(
+        &mut state,
+        0xA1,
+        100,
+        OutputState::Spent {
+            spent_height: first - 10,
+        },
+    );
+    // Spent exactly at the floor is still inside the retained window.
+    let boundary = push_output(
+        &mut state,
+        0xA2,
+        200,
+        OutputState::Spent {
+            spent_height: first,
+        },
+    );
+    // Spent inside the window: a reorg could still reverse it, so it stays.
+    let recent_spend = push_output(
+        &mut state,
+        0xA3,
+        300,
+        OutputState::Spent {
+            spent_height: first + 100,
+        },
+    );
+    // An old but unspent output is live balance and is always retained.
+    let live = push_output(&mut state, 0xA4, 400, OutputState::Confirmed);
+
+    state.validate().unwrap();
+    let balance_before = state.balance();
+
+    prune_spent_recovered_outputs_below_window(&mut state);
+
+    // Only the expired spend, and its private material, are gone.
+    assert!(!state.outputs.iter().any(|output| output.id == expired));
+    assert!(state.output_blinding(expired).is_none());
+    assert!(!state
+        .recovered_output_metadata
+        .iter()
+        .any(|metadata| metadata.output_id == expired));
+    for retained in [boundary, recent_spend, live] {
+        assert!(state.outputs.iter().any(|output| output.id == retained));
+        assert!(state.output_blinding(retained).is_some());
+        assert!(state
+            .recovered_output_metadata
+            .iter()
+            .any(|metadata| metadata.output_id == retained));
+    }
+
+    // Balance is unchanged (spent outputs never contributed) and durable
+    // whole-history counters are untouched.
+    assert_eq!(state.balance(), balance_before);
+    assert_eq!(state.recovery_scanned_blocks, top + 1);
+    assert_eq!(state.recovery_scanned_outputs, 40_000);
+    assert_eq!(state.legacy_proof_only_outputs, 3);
+    state.validate().unwrap();
+
+    // The pruned state still round-trips through encrypted storage.
+    let temp = TempDir::new().unwrap();
+    let directory = WalletDirectory::create(
+        temp.path().join("prune"),
+        &state,
+        &password(),
+        KdfParameters::TEST,
+    )
+    .unwrap();
+    let reloaded = directory.load(&password()).unwrap();
+    assert_eq!(reloaded.outputs.len(), 3);
+    assert_eq!(reloaded.balance(), balance_before);
 }
 
 #[test]

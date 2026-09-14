@@ -25,10 +25,19 @@ const AUTHENTICATION_FILE: &str = "authentication.envelope";
 const AUTHENTICATION_PLAINTEXT: &[u8] = b"DOM-WALLET-V3-PASSWORD-CHECK-V1";
 const RESCAN_PLAN_FILE: &str = "rescan-plan.envelope";
 const WRITER_LOCK_FILE: &str = ".wallet.lock";
-const MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
+// The encrypted wallet generation grows with the number of recovered outputs a
+// seed owns. A long-lived mining-reward recovery wallet can accumulate tens of
+// thousands of coinbase records, so this defensive ceiling must clear a
+// realistic recovered set rather than freeze the cursor mid-sync. It matches
+// `dom_wallet_crypto::MAX_ENVELOPE_BYTES`; both were raised from 16 MiB together
+// with the compact base64 envelope encoding.
+const MAX_STATE_BYTES: usize = 64 * 1024 * 1024;
 pub const BACKUP_MAGIC: [u8; 8] = *b"DOMWBK01";
 pub const BACKUP_FORMAT_VERSION: u16 = 1;
-pub const MAX_BACKUP_BYTES: usize = 20 * 1024 * 1024;
+// A backup container wraps the full encrypted state, so its ceiling must stay
+// above the state ceiling (plus container overhead); otherwise a large recovery
+// wallet could commit but never export or import a backup.
+pub const MAX_BACKUP_BYTES: usize = 80 * 1024 * 1024;
 pub const RETAIN_SUPERSEDED_GENERATIONS: usize = 1;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1770,5 +1779,100 @@ mod tests {
         )
         .is_err());
         assert!(!temp.path().join("damaged").exists());
+    }
+
+    #[test]
+    fn wallets_written_in_the_legacy_integer_array_envelope_format_still_open() {
+        use base64::Engine;
+
+        // main-v0.4 stored the envelope ciphertext as a JSON array of integers.
+        // New code must open those wallets unchanged (the upgrade path) by
+        // decoding the legacy representation; it is rewritten compactly on the
+        // next commit. Here we create a wallet, rewrite every on-disk envelope
+        // back into the integer-array form main-v0.4 produced, and reopen it.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("legacy");
+        let state = WalletState::new(identity(), [6; 32], default_node_configuration(identity()));
+        let wallet =
+            WalletDirectory::create(&root, &state, "correct", KdfParameters::TEST).unwrap();
+
+        for path in [
+            root.join(AUTHENTICATION_FILE),
+            root.join(GENERATIONS_DIR)
+                .join(generation_name(0))
+                .join(STATE_FILE),
+        ] {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            let raw = base64::engine::general_purpose::STANDARD
+                .decode(value["ciphertext"].as_str().unwrap())
+                .unwrap();
+            value["ciphertext"] =
+                serde_json::Value::Array(raw.into_iter().map(serde_json::Value::from).collect());
+            fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        }
+
+        // The existing handle re-reads from disk, and a fresh open must work too.
+        assert_eq!(wallet.load("correct").unwrap().wallet_id, state.wallet_id);
+        assert!(matches!(
+            wallet.load("wrong"),
+            Err(StorageError::InvalidPassword)
+        ));
+        drop(wallet);
+        let reopened = WalletDirectory::open(&root)
+            .unwrap()
+            .load("correct")
+            .unwrap();
+        assert_eq!(reopened.wallet_id, state.wallet_id);
+    }
+
+    #[test]
+    fn large_recovered_output_set_commits_above_the_legacy_sixteen_mib_ceiling() {
+        // A mining-reward recovery wallet records one output per owned coinbase.
+        // Enough of them push the encrypted generation past the historical
+        // 16 MiB ceiling that used to freeze the scan cursor at STORAGE_COMMIT.
+        // With the compact base64 envelope and the raised bound it round-trips.
+        let temp = tempfile::tempdir().unwrap();
+        let mut state =
+            WalletState::new(identity(), [6; 32], default_node_configuration(identity()));
+        let account = state.default_account.id;
+        let outputs = 90_000usize;
+        state.outputs = (0..outputs)
+            .map(|index| OutputRecord {
+                id: Uuid::new_v4(),
+                account_id: account,
+                commitment: None,
+                value: index as u64,
+                state: OutputState::Confirmed,
+                discovered_height: index as u64,
+                reserved_by: None,
+            })
+            .collect();
+        state.validate().unwrap();
+
+        let wallet = WalletDirectory::create(
+            temp.path().join("large"),
+            &state,
+            "correct",
+            KdfParameters::TEST,
+        )
+        .unwrap();
+
+        let state_file = temp
+            .path()
+            .join("large")
+            .join(GENERATIONS_DIR)
+            .join(generation_name(0))
+            .join(STATE_FILE);
+        let encoded_len = fs::metadata(&state_file).unwrap().len();
+        assert!(
+            encoded_len > 16 * 1024 * 1024,
+            "regression fixture must exceed the legacy 16 MiB ceiling, was {encoded_len}"
+        );
+        assert!(encoded_len <= MAX_STATE_BYTES as u64);
+
+        let reloaded = wallet.load("correct").unwrap();
+        assert_eq!(reloaded.outputs.len(), outputs);
+        assert_eq!(reloaded.balance(), state.balance());
     }
 }

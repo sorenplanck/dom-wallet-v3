@@ -45,7 +45,9 @@ pub const DEFAULT_RESTORE_REORG_DEPTH: u64 = 1_024;
 /// `recovery_canonical_blocks` is pruned to the most recent
 /// `RECOVERY_CANONICAL_WINDOW_BLOCKS` scanned heights so encrypted state stays
 /// bounded on long chains (the full list previously grew without limit toward
-/// the 16 MiB storage ceiling). The window must be at least as deep as every
+/// the encrypted-state storage ceiling). Spent output records are bounded the
+/// same way by `prune_spent_recovered_outputs_below_window`. The window must be
+/// at least as deep as every
 /// configured reorg search bound — `DEFAULT_RESTORE_REORG_DEPTH` here and the
 /// production backend reorg depth, both 1_024 — because `find_safe_anchor`
 /// walks at most `reorg_depth` heights below the invalidated cursor anchor and
@@ -664,6 +666,7 @@ pub fn apply_recovery_batch(
         .recovery_canonical_blocks
         .sort_by_key(|block| block.height);
     prune_recovery_canonical_window(state);
+    prune_spent_recovered_outputs_below_window(state);
     refresh_maturity(state, batch.observed_tip.height, identity.coinbase_maturity)?;
     // Whole-history rescans temporarily remove wallet-local output records.
     // Rebind any rediscovered Scriptless funding input and claim/refund payout
@@ -765,6 +768,51 @@ pub fn prune_recovery_canonical_window(state: &mut WalletState) {
             .recovery_canonical_blocks
             .retain(|block| block.height >= minimum);
     }
+}
+
+/// Drop recovered outputs whose spend is older than the retained reorg window,
+/// together with their private blindings and recovered metadata.
+///
+/// `recovery_canonical_blocks` is already bounded to a rolling window, but the
+/// output, blinding, and metadata records are not, so a long-lived wallet that
+/// spends many recovered coinbases would otherwise grow encrypted state without
+/// bound toward the storage ceiling and eventually freeze the scan cursor at
+/// `STORAGE_COMMIT`. A spend that occurred below the window floor can never be
+/// reversed: the reorg ancestor search is bounded well inside the window
+/// (`DEFAULT_RESTORE_REORG_DEPTH` < `RECOVERY_CANONICAL_WINDOW_BLOCKS`), so the
+/// spent record is dead weight. Unspent outputs are the live balance and are
+/// always retained regardless of age; durable whole-history counters and
+/// non-reuse floors are untouched.
+pub fn prune_spent_recovered_outputs_below_window(state: &mut WalletState) {
+    let Some(last) = state.recovery_canonical_blocks.last() else {
+        return;
+    };
+    let floor = last
+        .height
+        .saturating_sub(RECOVERY_CANONICAL_WINDOW_BLOCKS.saturating_sub(1));
+    if floor == 0 {
+        return;
+    }
+    let mut pruned = BTreeSet::new();
+    state.outputs.retain(|output| {
+        let expired_spend = matches!(
+            output.state,
+            OutputState::Spent { spent_height } if spent_height < floor
+        );
+        if expired_spend {
+            pruned.insert(output.id);
+        }
+        !expired_spend
+    });
+    if pruned.is_empty() {
+        return;
+    }
+    state
+        .private_output_blindings
+        .retain(|secret| !pruned.contains(&secret.output_id));
+    state
+        .recovered_output_metadata
+        .retain(|metadata| !pruned.contains(&metadata.output_id));
 }
 
 fn merge_restored_output(
