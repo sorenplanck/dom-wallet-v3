@@ -5226,9 +5226,12 @@ fn submission_result(transaction: TransactionSummary) -> SubmissionResultDto {
             Some(false),
         ),
         "IN_MEMPOOL" => (SubmissionOutcomeDto::AlreadyKnown, false, true, None),
-        "RETRANSMIT_REQUIRED" | "RECONCILIATION_REQUIRED" => {
-            (SubmissionOutcomeDto::TemporaryFailure, true, false, None)
-        }
+        "RETRANSMIT_REQUIRED" => (SubmissionOutcomeDto::TemporaryFailure, true, false, None),
+        // Not retryable: `submit_transaction` only accepts a retry from
+        // `Finalized`, `Submitting` or `RetransmitRequired`, so advertising a
+        // retry here sent the user at a button the core rejects. Reconciliation
+        // is the way out of this state, not resubmission.
+        "RECONCILIATION_REQUIRED" => (SubmissionOutcomeDto::TemporaryFailure, false, false, None),
         "CONFIRMED" => (SubmissionOutcomeDto::Confirmed, false, true, None),
         "REORGED" => (SubmissionOutcomeDto::Reorged, true, false, None),
         "CANCELLED" => (SubmissionOutcomeDto::Cancelled, false, false, None),

@@ -1469,6 +1469,29 @@ impl WalletService {
     }
 
     pub fn rescan_from_genesis(&mut self) -> Result<WalletSummary, CoreError> {
+        // A genesis rescan removes every output discovered above height zero and
+        // recreates the rediscovered ones under fresh identifiers. A transaction
+        // intent stores only `reserved_output_ids`, never the input commitments,
+        // so its reservations cannot be rebound afterwards: the inputs would
+        // silently come back unreserved and spendable while a finalized
+        // transaction the counterparty can still broadcast keeps claiming them.
+        // Fail closed instead of creating a local double spend.
+        if self
+            .unlocked
+            .as_ref()
+            .ok_or(CoreError::Locked)?
+            .transactions
+            .iter()
+            .any(|transaction| {
+                !transaction.reserved_output_ids.is_empty()
+                    && !matches!(
+                        transaction.lifecycle,
+                        TransactionLifecycle::Cancelled | TransactionLifecycle::Confirmed { .. }
+                    )
+            })
+        {
+            return Err(CoreError::RescanBlockedByReservedInputs);
+        }
         let identity = self
             .backend
             .as_ref()
@@ -3494,16 +3517,28 @@ impl WalletService {
             .checked_add(1)
             .ok_or(CoreError::ArithmeticOverflow)?;
         self.commit(state)?;
-        let outcome = if retry {
-            self.backend
-                .as_ref()
-                .ok_or(CoreError::EmbeddedCoreRequired)?
-                .rebroadcast(WalletTransactionIdentifier::TransactionHash(hash))?
-        } else {
-            self.backend
-                .as_ref()
-                .ok_or(CoreError::EmbeddedCoreRequired)?
-                .submit(&submission)?
+        // A retry must resend the transaction itself, not just its identifier.
+        // `rebroadcast` only names a transaction the node is expected to already
+        // hold, but `RetransmitRequired` is produced precisely by
+        // `NodeNotReady`, `TemporaryFailure` and `InternalFailure` — the cases
+        // where the node never received the bytes. Asking it to rebroadcast
+        // something it does not have could never succeed, so the finalized
+        // transaction stayed off the network forever while its inputs remained
+        // reserved. The wallet holds the exact verified bytes, and resubmitting
+        // a transaction the node already knows is answered with `AlreadyKnown`,
+        // so submitting is strictly more capable than rebroadcasting here.
+        let backend = self
+            .backend
+            .as_ref()
+            .ok_or(CoreError::EmbeddedCoreRequired)?;
+        let outcome = match backend.submit(&submission) {
+            Ok(outcome) => outcome,
+            // Keep the identifier-only path as a fallback so a backend that
+            // rejects a resubmission outright can still nudge its mempool.
+            Err(error) if retry => backend
+                .rebroadcast(WalletTransactionIdentifier::TransactionHash(hash))
+                .map_err(|_| error)?,
+            Err(error) => return Err(error.into()),
         };
         let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
         let index = find_transaction_index(&state, slate_id, TransactionRole::Sender)?;
@@ -4960,6 +4995,8 @@ pub enum CoreError {
     MixedOutputRegime,
     #[error("transaction cannot be cancelled after submission evidence")]
     CannotCancelTransaction,
+    #[error("a genesis rescan would discard live input reservations")]
+    RescanBlockedByReservedInputs,
     #[error("explicit confirmation is required")]
     ConfirmationRequired,
     #[error("transaction not found")]
@@ -5062,6 +5099,7 @@ impl CoreError {
             Self::FinalizedTransactionConflict => "FINALIZED_TRANSACTION_CONFLICT",
             Self::MixedOutputRegime => "MIXED_OUTPUT_REGIME",
             Self::CannotCancelTransaction => "TRANSACTION_CANNOT_CANCEL",
+            Self::RescanBlockedByReservedInputs => "RESCAN_BLOCKED_RESERVED_INPUTS",
             Self::ConfirmationRequired => "CONFIRMATION_REQUIRED",
             Self::TransactionNotFound => "TRANSACTION_NOT_FOUND",
             Self::InvalidCoreCursor => "CURSOR_INVALID",
@@ -5218,6 +5256,9 @@ impl CoreError {
             }
             Self::CannotCancelTransaction => {
                 "The transaction cannot be cancelled after submission evidence."
+            }
+            Self::RescanBlockedByReservedInputs => {
+                "Settle or cancel the pending payments before rescanning from genesis."
             }
             Self::ConfirmationRequired => "Explicit confirmation is required.",
             Self::TransactionNotFound => "The requested transaction was not found.",
@@ -5815,6 +5856,30 @@ mod tests {
                 .reserved_by,
             None
         );
+    }
+
+    #[test]
+    fn a_genesis_rescan_refuses_to_discard_live_input_reservations() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut service, _transaction_id, slate_id, _output_id) =
+            unlocked_service_with(&temp, |_, _| {});
+
+        // The reserved send is still in flight: the rescan would drop the
+        // output record and rebuild it unreserved, so it must be refused. The
+        // guard runs before the backend is consulted, so this is not an
+        // EmbeddedCoreRequired failure in disguise.
+        assert!(matches!(
+            service.rescan_from_genesis(),
+            Err(CoreError::RescanBlockedByReservedInputs)
+        ));
+
+        // Once the payment is cancelled the reservation is gone and the rescan
+        // is allowed to proceed to the backend as usual.
+        service.slate_cancel(slate_id, true).unwrap();
+        assert!(matches!(
+            service.rescan_from_genesis(),
+            Err(CoreError::EmbeddedCoreRequired)
+        ));
     }
 
     #[test]
