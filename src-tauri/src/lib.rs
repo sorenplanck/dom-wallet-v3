@@ -827,6 +827,40 @@ fn terminal_synchronization_error(error: &CommandError) -> bool {
     }
 }
 
+/// Consecutive failures after which a retriable synchronization error stops
+/// being silent.
+///
+/// Conditions such as a state that no longer fits the storage ceiling, a
+/// reorganization deeper than the configured bound, or an unreadable persisted
+/// cursor are retriable by classification but are not actually repaired by
+/// waiting. Retrying forever is still the right behaviour — the worker must not
+/// die — but the user and support need to see *why* the cursor stopped moving
+/// instead of a screen that claims synchronization is merely "preparing".
+const SYNC_STALL_REPORT_AFTER_FAILURES: u32 = 3;
+
+/// Stable, machine-readable code for a synchronization failure.
+///
+/// The worker previously collapsed every non-recovery error into
+/// `SYNC_WORK_FAILED`, which erased the difference between a locked wallet, a
+/// foreign chain and a storage commit that cannot complete.
+fn synchronization_error_code(error: &CommandError) -> String {
+    match error {
+        CommandError::RecoveryRequired => "SYNC_RECOVERY_REQUIRED".into(),
+        CommandError::IdentityMismatch => "SYNC_IDENTITY_MISMATCH".into(),
+        CommandError::SynchronizationPaused => "SYNC_PAUSED".into(),
+        CommandError::NodeNotReady | CommandError::RestoreNodeSynchronizing => {
+            "SYNC_NODE_NOT_READY".into()
+        }
+        CommandError::NoPeers => "SYNC_NO_PEERS".into(),
+        CommandError::CursorInitializationFailed => "SYNC_CURSOR_INITIALIZATION_FAILED".into(),
+        CommandError::ActivityBusy => "SYNC_ACTIVITY_BUSY".into(),
+        CommandError::Unavailable => "SYNC_SERVICE_UNAVAILABLE".into(),
+        CommandError::WorkerPanicked => "SYNC_WORKER_PANIC".into(),
+        CommandError::Wallet { code, .. } => format!("SYNC_{code}"),
+        _ => "SYNC_WORK_FAILED".into(),
+    }
+}
+
 fn synchronization_retry_backoff(consecutive_failures: u32) -> std::time::Duration {
     let shift = consecutive_failures.min(5);
     let base = SYNC_RETRY_INITIAL_BACKOFF_MILLIS
@@ -839,20 +873,28 @@ fn synchronization_retry_backoff(consecutive_failures: u32) -> std::time::Durati
     std::time::Duration::from_millis(base.saturating_add(jitter))
 }
 
-fn run_synchronization_follow_loop<Synchronize, Wait>(
+fn run_synchronization_follow_loop<Synchronize, Wait, Report>(
     stop: &AtomicBool,
     mut synchronize_once: Synchronize,
     mut wait: Wait,
+    mut report_stall: Report,
 ) -> Result<(), CommandError>
 where
     Synchronize: FnMut() -> Result<bool, CommandError>,
     Wait: FnMut(std::time::Duration),
+    Report: FnMut(Option<String>),
 {
     let mut consecutive_failures = 0_u32;
+    let mut stall_reported = false;
     while !stop.load(Ordering::Acquire) {
         let delay = match synchronize_once() {
             Ok(synchronized) => {
                 consecutive_failures = 0;
+                if stall_reported {
+                    // The condition cleared on its own: stop advertising it.
+                    report_stall(None);
+                    stall_reported = false;
+                }
                 std::time::Duration::from_millis(if synchronized {
                     SYNC_FOLLOW_POLL_MILLIS
                 } else {
@@ -860,9 +902,15 @@ where
                 })
             }
             Err(error) if terminal_synchronization_error(&error) => return Err(error),
-            Err(_) => {
+            Err(error) => {
                 let delay = synchronization_retry_backoff(consecutive_failures);
                 consecutive_failures = consecutive_failures.saturating_add(1);
+                // Keep retrying, but stop being silent about a condition that
+                // repeated retries are plainly not repairing.
+                if consecutive_failures >= SYNC_STALL_REPORT_AFTER_FAILURES {
+                    report_stall(Some(synchronization_error_code(&error)));
+                    stall_reported = true;
+                }
                 delay
             }
         };
@@ -2776,7 +2824,7 @@ impl DesktopApplication {
         self.reap_finished_sync_worker()?;
         match self.service.try_lock() {
             Ok(service) => {
-                let status = sync_status_from_service(&service, self.sync_status_context());
+                let mut status = sync_status_from_service(&service, self.sync_status_context());
                 let summary_available = service.summary().is_ok();
                 drop(service);
                 if summary_available && !status.seed_restore_in_progress {
@@ -2785,6 +2833,18 @@ impl DesktopApplication {
                     self.seed_restore_started.store(false, Ordering::Release);
                 }
                 if let Ok(runtime) = self.synchronization.lock() {
+                    // Several synchronization failures never reach the durable
+                    // `errors.synchronization` field: `synchronize_live` returns
+                    // some of them before recording anything, and a retriable
+                    // condition that never clears records nothing at all. The
+                    // worker's own code is the only evidence in those cases, so
+                    // surface it instead of reporting "no error" while the
+                    // cursor sits still.
+                    if status.last_error.is_none() {
+                        if let Ok(code) = runtime.error_code.lock() {
+                            status.last_error = code.clone();
+                        }
+                    }
                     if let Ok(mut cached) = runtime.cached_status.lock() {
                         *cached = Some(status.clone());
                     }
@@ -3384,6 +3444,7 @@ impl DesktopApplication {
         let stop = Arc::clone(&runtime.stop);
         let state = Arc::clone(&runtime.state);
         let error_code = Arc::clone(&runtime.error_code);
+        let stall_error_code = Arc::clone(&runtime.error_code);
         let cached = Arc::clone(&runtime.cached_status);
         let activities = Arc::clone(&self.activities);
         let chain_source = Arc::clone(&self.chain_source);
@@ -3442,6 +3503,11 @@ impl DesktopApplication {
                             result.map(|_| synchronized)
                         },
                         std::thread::park_timeout,
+                        |code| {
+                            if let Ok(mut slot) = stall_error_code.lock() {
+                                *slot = code;
+                            }
+                        },
                     )
                 }));
                 match worker_result {
@@ -3453,10 +3519,7 @@ impl DesktopApplication {
                     Ok(Err(error)) => {
                         state.store(SYNC_ERROR, Ordering::Release);
                         if let Ok(mut slot) = error_code.lock() {
-                            *slot = Some(match error {
-                                CommandError::RecoveryRequired => "SYNC_RECOVERY_REQUIRED".into(),
-                                _ => "SYNC_WORK_FAILED".into(),
-                            });
+                            *slot = Some(synchronization_error_code(&error));
                         }
                     }
                     Err(_) => {
@@ -6508,6 +6571,7 @@ mod tests {
                     stop.store(true, Ordering::Release);
                 }
             },
+            |_| {},
         );
 
         assert!(result.is_ok());
@@ -6534,10 +6598,88 @@ mod tests {
             &stop,
             || Err(CommandError::IdentityMismatch),
             |_| waits.set(waits.get() + 1),
+            |_| {},
         );
 
         assert!(matches!(result, Err(CommandError::IdentityMismatch)));
         assert_eq!(waits.get(), 0);
+    }
+
+    /// A retriable condition that never clears — a state that no longer fits the
+    /// storage ceiling, a reorganization beyond the configured bound, an
+    /// unreadable persisted cursor — used to retry forever in complete silence:
+    /// the cursor stopped moving and the UI kept claiming synchronization was
+    /// merely preparing. The worker must keep retrying, but it must also say
+    /// what is wrong.
+    #[test]
+    fn a_persistently_failing_retriable_error_stops_being_silent() {
+        let stop = AtomicBool::new(false);
+        let calls = std::cell::Cell::new(0_u32);
+        let reported = std::cell::RefCell::new(Vec::new());
+
+        let result = run_synchronization_follow_loop(
+            &stop,
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() >= 8 {
+                    stop.store(true, Ordering::Release);
+                }
+                Err(CommandError::Wallet {
+                    code: "EMBEDDED_NODE_OPERATION_FAILED",
+                    message: "storage commit failed",
+                    retryable: true,
+                })
+            },
+            |_| {},
+            |code| reported.borrow_mut().push(code),
+        );
+
+        assert!(
+            result.is_ok(),
+            "a retriable failure must never kill the worker"
+        );
+        let reported = reported.borrow();
+        assert!(
+            !reported.is_empty(),
+            "a repeated retriable failure must be reported instead of staying invisible"
+        );
+        assert!(
+            reported
+                .iter()
+                .all(|code| code.as_deref() == Some("SYNC_EMBEDDED_NODE_OPERATION_FAILED")),
+            "the reported code must be stable and specific, got {reported:?}"
+        );
+        // Nothing is reported before the threshold, so a single hiccup stays quiet.
+        assert!(reported.len() < calls.get() as usize);
+    }
+
+    #[test]
+    fn a_recovered_synchronization_clears_the_reported_stall() {
+        let stop = AtomicBool::new(false);
+        let calls = std::cell::Cell::new(0_u32);
+        let reported = std::cell::RefCell::new(Vec::new());
+
+        let result = run_synchronization_follow_loop(
+            &stop,
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() >= 6 {
+                    stop.store(true, Ordering::Release);
+                    return Ok(true);
+                }
+                Err(CommandError::NodeNotReady)
+            },
+            |_| {},
+            |code| reported.borrow_mut().push(code),
+        );
+
+        assert!(result.is_ok());
+        let reported = reported.borrow();
+        assert_eq!(
+            reported.last(),
+            Some(&None),
+            "recovering must retract the reported stall, got {reported:?}"
+        );
     }
 
     /// The follow loop's terminal/transient split must stay identical to the

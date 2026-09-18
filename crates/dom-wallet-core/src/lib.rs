@@ -5074,6 +5074,14 @@ impl CoreError {
             Self::Storage(StorageError::AuthenticatedPayloadCorrupt) => "WALLET_PAYLOAD_CORRUPT",
             Self::Storage(StorageError::InvalidMetadata) => "WALLET_METADATA_CORRUPT",
             Self::Storage(StorageError::NotFound) => "WALLET_NOT_FOUND",
+            // A wallet that outgrew the encrypted-state ceiling is the exact
+            // condition that froze the scan cursor. Collapsing it into the
+            // generic storage code left the user and support with an opaque
+            // string and no idea what to do.
+            Self::Storage(StorageError::FileSizeOutOfBounds)
+            | Self::Storage(StorageError::Crypto(
+                dom_wallet_crypto::CryptoError::EnvelopeTooLarge,
+            )) => "WALLET_STATE_TOO_LARGE",
             Self::Storage(_) => "WALLET_STORAGE_FAILED",
             Self::Domain(DomainError::SwapSessionNotFound) => "SWAP_SESSION_NOT_FOUND",
             Self::Domain(DomainError::InvalidSwapTransition) => "SWAP_TRANSITION_INVALID",
@@ -5233,6 +5241,10 @@ impl CoreError {
                 "The wallet metadata is corrupt and cannot be opened."
             }
             Self::Storage(StorageError::NotFound) => "The managed wallet was not found.",
+            Self::Storage(StorageError::FileSizeOutOfBounds)
+            | Self::Storage(StorageError::Crypto(dom_wallet_crypto::CryptoError::EnvelopeTooLarge)) => {
+                "The encrypted wallet state no longer fits its storage ceiling."
+            }
             Self::Storage(_) => "Wallet storage could not complete the operation.",
             Self::Domain(DomainError::SwapSessionNotFound) => {
                 "The requested swap session was not found."

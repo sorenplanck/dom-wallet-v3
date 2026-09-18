@@ -34,10 +34,19 @@ const WRITER_LOCK_FILE: &str = ".wallet.lock";
 const MAX_STATE_BYTES: usize = 64 * 1024 * 1024;
 pub const BACKUP_MAGIC: [u8; 8] = *b"DOMWBK01";
 pub const BACKUP_FORMAT_VERSION: u16 = 1;
+/// Largest plaintext that can actually round-trip through a generation.
+///
+/// `MAX_STATE_BYTES` bounds the *encoded* envelope, and the envelope carries
+/// its ciphertext as base64, which expands by 4/3. The real plaintext ceiling
+/// is therefore three quarters of it — bounding plaintext by `MAX_STATE_BYTES`
+/// directly would accept payloads that later fail on the encoded write.
+pub const MAX_STATE_PLAINTEXT_BYTES: usize = MAX_STATE_BYTES / 4 * 3;
 // A backup container wraps the full encrypted state, so its ceiling must stay
-// above the state ceiling (plus container overhead); otherwise a large recovery
-// wallet could commit but never export or import a backup.
+// above what that state can be once sealed and encoded (plus container
+// overhead); otherwise a wallet that commits fine could never be exported.
 pub const MAX_BACKUP_BYTES: usize = 80 * 1024 * 1024;
+// Any plaintext the wallet can commit must also fit a backup container.
+const _: () = assert!(MAX_BACKUP_BYTES >= MAX_STATE_PLAINTEXT_BYTES / 3 * 4 + 1024 * 1024);
 pub const RETAIN_SUPERSEDED_GENERATIONS: usize = 1;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -481,7 +490,7 @@ impl WalletDirectory {
             rescan_plan: &plan,
         };
         let plaintext = serialize_secret(&payload)?;
-        if plaintext.is_empty() || plaintext.len() > MAX_STATE_BYTES {
+        if plaintext.is_empty() || plaintext.len() > MAX_STATE_PLAINTEXT_BYTES {
             return Err(StorageError::FileSizeOutOfBounds);
         }
         let context = backup_context(created_unix_seconds, state.wallet_id, &state.identity);
