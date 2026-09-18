@@ -947,6 +947,17 @@ pub struct BalanceProjection {
     pub pending_outgoing: u64,
     pub locked: u64,
     pub spendable: u64,
+    /// Confirmed value held by an in-flight payment's input reservation.
+    ///
+    /// `locked` is the protocol's `OutputState::Locked`, which nothing in this
+    /// wallet ever produces, so the "Locked" card sat at zero forever while
+    /// reservations - the thing that actually ties up a user's money - had no
+    /// figure at all. `confirmed` counts this value and `spendable` does not,
+    /// so without it the gap between the two was unexplained.
+    ///
+    /// `serde(default)` so a payload written before this field still loads.
+    #[serde(default)]
+    pub reserved: u64,
     pub total: u64,
 }
 
@@ -2314,7 +2325,32 @@ impl WalletState {
     }
 
     pub fn balance(&self) -> BalanceProjection {
-        BalanceProjection::from_outputs(&self.outputs)
+        let mut balance = BalanceProjection::from_outputs(&self.outputs);
+        // `from_outputs` can only see output records, so it counts every
+        // `Confirmed` output as spendable. Coin selection is stricter: it also
+        // requires the output to be unreserved, to carry a commitment and to
+        // have a retained blinding. The headline "spendable" figure therefore
+        // promised money the send flow would refuse, and the user got
+        // `INSUFFICIENT_FUNDS` on a wallet that said the funds were there.
+        // Only the state knows about blindings, so the correction belongs here.
+        balance.spendable = self
+            .outputs
+            .iter()
+            .filter(|output| {
+                matches!(output.state, OutputState::Confirmed)
+                    && output.reserved_by.is_none()
+                    && output.commitment.is_some()
+                    && self.output_blinding(output.id).is_some()
+            })
+            .fold(0u64, |sum, output| sum.saturating_add(output.value));
+        balance.reserved = self
+            .outputs
+            .iter()
+            .filter(|output| {
+                matches!(output.state, OutputState::Confirmed) && output.reserved_by.is_some()
+            })
+            .fold(0u64, |sum, output| sum.saturating_add(output.value));
+        balance
     }
 
     /// The sole ownership classifier. There is no approved DOM derivation and
@@ -2343,6 +2379,53 @@ impl WalletState {
             return true;
         }
         false
+    }
+
+    /// Settles a *recipient* record once the output it is waiting for has been
+    /// confirmed on chain at `height`.
+    ///
+    /// A received payment is only ever confirmed by the sender's kernel, and
+    /// `apply_kernel_evidence` matches on `kernel_excess` - which a recipient
+    /// record is born without (the recipient never sees the finalized bytes,
+    /// and the one method that would fill it in is not reachable from the
+    /// interface). The record therefore sat at `ResponsePrepared` forever even
+    /// though the money had arrived and the scanner had adopted the output.
+    ///
+    /// The output's own confirmation is evidence enough: the scanner only
+    /// confirms an output it found in a canonical block, so an output
+    /// confirmed at `height` means the transaction that created it is in the
+    /// block at `height`. Nothing here confirms an output - it reads output
+    /// state the scanner already established.
+    pub fn settle_recipient_records_confirmed_at(
+        &mut self,
+        height: u64,
+        block_hash: [u8; 32],
+    ) -> Result<(), DomainError> {
+        let settled = self
+            .transactions
+            .iter()
+            .enumerate()
+            .filter(|(_, transaction)| {
+                matches!(
+                    transaction.lifecycle,
+                    TransactionLifecycle::ResponsePrepared
+                        | TransactionLifecycle::ResponseExported
+                )
+            })
+            .filter_map(|(index, transaction)| {
+                let output_id = transaction.recipient_output_id?;
+                let output = self.outputs.iter().find(|output| output.id == output_id)?;
+                (output.state == OutputState::Confirmed && output.discovered_height == height)
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        for index in settled {
+            self.transactions[index].transition(
+                TransactionLifecycle::Confirmed { height, block_hash },
+                TransactionTransitionEvidence::ConfirmationEvidence,
+            )?;
+        }
+        Ok(())
     }
 
     /// Applies public block-output evidence only to already persisted local
@@ -3339,6 +3422,128 @@ mod tests {
             state.transactions[0].lifecycle,
             TransactionLifecycle::ReconciliationRequired
         );
+    }
+
+    #[test]
+    fn regression_m29_spendable_matches_what_coin_selection_will_actually_take() {
+        // `spendable` used to be "sum of every Confirmed output", while coin
+        // selection also demands unreserved + commitment + retained blinding.
+        // The card promised funds the send flow then refused.
+        let mut state = WalletState::new(identity(), [7; 32], configuration());
+        let account_id = state.default_account.id;
+        let mut push = |commitment: Option<[u8; 33]>, value: u64, reserved: Option<Uuid>| {
+            let id = Uuid::new_v4();
+            state.outputs.push(OutputRecord {
+                id,
+                account_id,
+                commitment,
+                value,
+                state: OutputState::Confirmed,
+                discovered_height: 5,
+                reserved_by: reserved,
+            });
+            id
+        };
+
+        let usable = push(Some([1; 33]), 1_000, None);
+        let reserved = push(Some([2; 33]), 2_000, Some(Uuid::new_v4()));
+        let no_commitment = push(None, 4_000, None);
+        let no_blinding = push(Some([3; 33]), 8_000, None);
+
+        state.remember_output_blinding(usable, [9; 32]);
+        state.remember_output_blinding(reserved, [9; 32]);
+        state.remember_output_blinding(no_commitment, [9; 32]);
+        let _ = no_blinding;
+
+        let balance = state.balance();
+        // `confirmed` still reports everything the chain confirmed ...
+        assert_eq!(balance.confirmed, 15_000);
+        // ... but only the one output selection can take is spendable.
+        assert_eq!(balance.spendable, 1_000);
+        // B7: the reservation is now a figure of its own, instead of showing
+        // up as an unexplained gap between `confirmed` and `spendable`.
+        assert_eq!(balance.reserved, 2_000);
+        // `locked` remains what it always was: a protocol state this wallet
+        // never produces.
+        assert_eq!(balance.locked, 0);
+    }
+
+    #[test]
+    fn regression_a15_recipient_record_settles_from_its_confirmed_output() {
+        // The recipient never learns the sender's kernel, so its record is
+        // born with an empty `kernel_excess` and `apply_kernel_evidence` can
+        // never match it. The record used to sit at `ResponsePrepared` for
+        // good, even though the scanner had already adopted and confirmed the
+        // output - the money arrived and the History never said so.
+        let mut state = WalletState::new(identity(), [7; 32], configuration());
+        let output_id = Uuid::new_v4();
+        state.outputs.push(OutputRecord {
+            id: output_id,
+            account_id: state.default_account.id,
+            commitment: Some([5; 33]),
+            value: 600_000,
+            state: OutputState::Confirmed,
+            discovered_height: 12,
+            reserved_by: None,
+        });
+        state.transactions.push(LocalTransactionIntent {
+            id: Uuid::new_v4(),
+            created_at_height: 0,
+            created_at_unix_seconds: 0,
+            cancellation_reason: None,
+            cancelled_at_height: None,
+            kernel_excess: Vec::new(),
+            lifecycle: TransactionLifecycle::ResponsePrepared,
+            submitted: false,
+            exposure: BroadcastExposure::NeverBroadcast,
+            slate_id: Some(Uuid::new_v4()),
+            role: Some(TransactionRole::Recipient),
+            amount: 600_000,
+            fee: 50_000,
+            reserved_output_ids: Vec::new(),
+            request_bytes: Vec::new(),
+            response_bytes: Vec::new(),
+            finalized_transaction_bytes: Vec::new(),
+            transaction_hash: None,
+            attempt_count: 0,
+            private_context: None,
+            recipient_output_id: Some(output_id),
+            change_output_id: None,
+            expires_at_height: 0,
+        });
+
+        // A different block settles nothing: the output was not confirmed there.
+        state
+            .settle_recipient_records_confirmed_at(11, [1; 32])
+            .unwrap();
+        assert_eq!(
+            state.transactions[0].lifecycle,
+            TransactionLifecycle::ResponsePrepared
+        );
+
+        state
+            .settle_recipient_records_confirmed_at(12, [7; 32])
+            .unwrap();
+        assert_eq!(
+            state.transactions[0].lifecycle,
+            TransactionLifecycle::Confirmed {
+                height: 12,
+                block_hash: [7; 32]
+            }
+        );
+
+        // Idempotent: rescanning the same block must not transition again.
+        state
+            .settle_recipient_records_confirmed_at(12, [7; 32])
+            .unwrap();
+        assert_eq!(
+            state.transactions[0].lifecycle,
+            TransactionLifecycle::Confirmed {
+                height: 12,
+                block_hash: [7; 32]
+            }
+        );
+        assert!(state.validate().is_ok());
     }
 
     #[test]

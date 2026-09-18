@@ -532,10 +532,18 @@ impl CoreChainAdapter {
                 self.commit_normal(sink, batch)
             }
             PersistedCoreCursorState::Valid(cursor) => match self.validate_cursor(cursor) {
-                Ok(_) => {
-                    let batch = self.scan_next(cursor, self.maximum_batch_blocks)?;
-                    self.commit_normal(sink, batch)
-                }
+                Ok(_) => match self.scan_next(cursor, self.maximum_batch_blocks) {
+                    Ok(batch) => self.commit_normal(sink, batch),
+                    // A reorg can land between `validate_cursor` and
+                    // `scan_next`, and `validate_and_map` then detects it from
+                    // the anchor mismatch. Only the `validate_cursor` arm below
+                    // used to be routed to `reconcile_reorg`, so this one
+                    // escaped as a plain scan failure: the wallet reported a
+                    // broken synchronization and stopped, instead of rewinding
+                    // and carrying on. Same cursor, same recovery.
+                    Err(CoreScanError::ReorgDetected) => self.reconcile_reorg(sink, cursor),
+                    Err(error) => Err(error),
+                },
                 Err(CoreScanError::ReorgDetected) => self.reconcile_reorg(sink, cursor),
                 Err(error) => Err(error),
             },
@@ -596,6 +604,12 @@ impl CoreChainAdapter {
                 commit_cursor: Some(cursor),
             }
         } else {
+            // Height 1, not 0, on purpose. The mainnet genesis body is an
+            // identity record rather than a block: it carries no wallet-visible
+            // outputs, inputs, fees or kernels, and the node projects it as an
+            // empty scan (`dom-node/src/wallet_scan.rs`). Scanning it would
+            // find nothing, so a "rescan from genesis" that starts at 1 misses
+            // no money.
             self.scan_from_height(1, self.maximum_batch_blocks)?
         };
         self.commit_normal(sink, batch)

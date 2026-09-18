@@ -479,6 +479,12 @@ fn run_worker(
             let hash = if work.deterministic_dev_mode {
                 fast_pow_hash(&work.seed_hash, &preimage)
             } else {
+                // Unreachable by construction, and the only `expect` left on
+                // a production path in this repository. `seed_changed` is
+                // computed with `is_none_or`, so a `None` vm forces either a
+                // successful `MinerVm` creation or a `continue` before the
+                // round body is entered; there is no path that reaches here
+                // with `vm` unset.
                 match vm
                     .as_ref()
                     .expect("RandomX VM initialized")

@@ -708,6 +708,17 @@ impl WalletDirectory {
         create_private_directory(&temporary_dir)?;
         let result = (|| {
             let plaintext = serialize_secret(state)?;
+            // Every persisted state passes through here, so this is the one
+            // place the round-trip ceiling has to hold. Without it the
+            // oversize case was only caught by `encode` - after a full Argon2
+            // derivation and a seal of the whole state - and surfaced as an
+            // opaque crypto error. It also makes export and import symmetric
+            // by construction: `export_backup` bounds its payload by the same
+            // constant, so a backup this build can write is a backup it can
+            // restore.
+            if plaintext.len() > MAX_STATE_PLAINTEXT_BYTES {
+                return Err(StorageError::FileSizeOutOfBounds);
+            }
             let context = state_context(state.wallet_id, &state.identity, state.generation);
             let envelope =
                 seal(&plaintext, password, &context, kdf).map_err(StorageError::Crypto)?;

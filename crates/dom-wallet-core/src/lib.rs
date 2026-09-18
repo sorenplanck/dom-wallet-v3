@@ -3617,7 +3617,11 @@ impl WalletService {
                     )?;
                     self.commit(state)?;
                 }
-                return Err(CoreError::CannotCancelTransaction);
+                // Not `CannotCancelTransaction`: this arm commits a lifecycle
+                // change before refusing, so the caller's copy of the
+                // transaction is stale and the interface has to reload. The
+                // distinct code is what tells it to.
+                return Err(CoreError::ReconciliationRequired);
             }
         }
         if (matches!(
@@ -3770,7 +3774,12 @@ impl WalletService {
         if self.state == ApplicationState::Closed {
             Ok(())
         } else {
-            Err(CoreError::InvalidLifecycleState)
+            // Not the generic lifecycle error: this arm has exactly one cause -
+            // a wallet is already open - and exactly one remedy. Reporting
+            // "the wallet lifecycle does not permit this operation" left the
+            // user staring at a create form with no idea that the fix was to
+            // close the wallet they already had open.
+            Err(CoreError::WalletAlreadyOpen)
         }
     }
 }
@@ -3877,6 +3886,14 @@ impl WalletRecoverySink {
                 .into_iter()
                 .collect::<Vec<_>>();
             next.apply_kernel_evidence(block.height, block.block_hash, &kernels)
+                .map_err(|error| {
+                    WalletScanSinkError::new(ScanCommitStage::KernelEvidence, error)
+                })?;
+            // A received payment carries no kernel this wallet knows about, so
+            // the loop above can never settle the recipient side. The output
+            // the recovery batch just confirmed in this very block is the
+            // evidence that does.
+            next.settle_recipient_records_confirmed_at(block.height, block.block_hash)
                 .map_err(|error| {
                     WalletScanSinkError::new(ScanCommitStage::KernelEvidence, error)
                 })?;
@@ -5018,8 +5035,16 @@ pub enum CoreError {
     FinalizedTransactionConflict,
     #[error("mixed recoverable and proof-only output regime")]
     MixedOutputRegime,
+    #[error("another wallet is already open")]
+    WalletAlreadyOpen,
     #[error("transaction cannot be cancelled after submission evidence")]
     CannotCancelTransaction,
+    /// Cancellation was denied *and* the transaction was moved to
+    /// `ReconciliationRequired` as a side effect. It is distinct from
+    /// `CannotCancelTransaction` because the caller's view of the transaction
+    /// is now stale: the record on disk changed even though the call failed.
+    #[error("submission evidence is inconclusive; reconcile before cancelling")]
+    ReconciliationRequired,
     #[error("a genesis rescan would discard live input reservations")]
     RescanBlockedByReservedInputs,
     #[error("explicit confirmation is required")]
@@ -5123,7 +5148,9 @@ impl CoreError {
             Self::CoverPolicyRejected => "COVER_POLICY_REJECTED",
             Self::FinalizedTransactionConflict => "FINALIZED_TRANSACTION_CONFLICT",
             Self::MixedOutputRegime => "MIXED_OUTPUT_REGIME",
+            Self::WalletAlreadyOpen => "WALLET_ALREADY_OPEN",
             Self::CannotCancelTransaction => "TRANSACTION_CANNOT_CANCEL",
+            Self::ReconciliationRequired => "TRANSACTION_RECONCILIATION_REQUIRED",
             Self::RescanBlockedByReservedInputs => "RESCAN_BLOCKED_RESERVED_INPUTS",
             Self::ConfirmationRequired => "CONFIRMATION_REQUIRED",
             Self::TransactionNotFound => "TRANSACTION_NOT_FOUND",
@@ -5167,6 +5194,9 @@ impl CoreError {
             Self::Locked => "Unlock the wallet before using this operation.",
             Self::InvalidLifecycleState => {
                 "The wallet lifecycle does not permit this operation."
+            }
+            Self::WalletAlreadyOpen => {
+                "A wallet is already open. Close it first, then create or open another one."
             }
             Self::InvalidPassword => "The local wallet password is invalid.",
             Self::RandomnessUnavailable => "Secure randomness is temporarily unavailable.",
@@ -5285,6 +5315,10 @@ impl CoreError {
             }
             Self::CannotCancelTransaction => {
                 "The transaction cannot be cancelled after submission evidence."
+            }
+            Self::ReconciliationRequired => {
+                "Whether this payment reached the network is unknown, so it cannot be \
+                 cancelled. Reconcile it against the node, or retry the submission."
             }
             Self::RescanBlockedByReservedInputs => {
                 "Settle or cancel the pending payments before rescanning from genesis."
