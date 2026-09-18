@@ -13,6 +13,20 @@ export function synchronizationPresentation(network, peers, synchronization) {
     ? Math.min(100, Math.floor((localHeight * 100) / peerHeight))
     : 0;
 
+  // A paused worker never advances the cursor, and nothing in the interface
+  // read `paused`: the balance simply stopped updating with no explanation,
+  // including through a whole restore. It outranks the node states below
+  // because no node condition can make progress while it holds.
+  if (synchronization?.paused === true) {
+    return {
+      badgeState: "PAUSED",
+      message: `Synchronization is paused at local height ${localHeight}. Resume it to continue.`,
+      localHeight,
+      peerHeight,
+      progress,
+    };
+  }
+
   if (lifecycle === "FAILED" || lifecycle === "STALE" || lifecycle === "STOPPED"
     || lifecycle === "STARTING") {
     return {

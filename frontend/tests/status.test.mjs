@@ -35,6 +35,19 @@ test("dashboard refreshes live IBD progress every fifteen seconds", async () => 
   assert.equal(source.includes('ready: false'), true);
 });
 
+test("a paused synchronization is reported instead of looking merely idle", () => {
+  // Nothing read `paused`, so pausing silently froze the cursor: the balance
+  // just stopped updating and no screen said why.
+  const result = synchronizationPresentation(
+    { canonical_height: 1_008, lifecycle: "READY" },
+    { highest_known_peer_height: 1_008, total_connected_peers: 3 },
+    { synchronized: false, cursor_height: 500, last_error: null, paused: true },
+  );
+  assert.equal(result.badgeState, "PAUSED");
+  assert.match(result.message, /paused/i);
+  assert.match(result.message, /[Rr]esume/);
+});
+
 test("dashboard badge cannot report READY while a peer is ahead", () => {
   const result = synchronizationPresentation(
     { canonical_height: 1_008 },

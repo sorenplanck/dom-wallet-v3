@@ -273,10 +273,42 @@ byId("recovery-abandon").addEventListener("click", () => { clearPhrase(); show("
 
 byId("create-form").addEventListener("submit", async (event) => {
   event.preventDefault(); const form = event.currentTarget; const data = new FormData(form);
+  const name = data.get("name");
+  const password = data.get("password");
   try {
-    const created = await run(() => invoke("wallet_create_recoverable", { name: data.get("name"), password: data.get("password") }));
+    const created = await run(() => invoke("wallet_create_recoverable", { name, password }));
     clearPasswords(form); beginPhrase(created.mnemonic); created.mnemonic = ""; show("Write down and confirm the recovery phrase.");
-  } catch (error) { clearPasswords(form); show(redactedError(error), true); }
+  } catch (error) {
+    // An interrupted creation leaves a staging directory that permanently
+    // blocks this wallet name. The resume and abort commands exist for exactly
+    // this, but nothing in the UI ever reached them, so the user was stuck with
+    // an opaque storage error and no way out. Offer both here.
+    if (error?.code === "WALLET_CREATION_INCOMPLETE") {
+      const resume = window.confirm(
+        `A previous creation of "${name}" was interrupted.\n\n`
+        + "OK: resume it and show the recovery phrase again.\n"
+        + "Cancel: discard the incomplete wallet so the name can be reused.",
+      );
+      try {
+        if (resume) {
+          const created = await run(() => invoke("wallet_create_resume", { name, password }));
+          clearPasswords(form);
+          beginPhrase(created.mnemonic);
+          created.mnemonic = "";
+          show("Interrupted creation resumed. Write down and confirm the recovery phrase.");
+        } else {
+          await run(() => invoke("wallet_create_abort", { name, password }));
+          clearPasswords(form);
+          show("Incomplete wallet discarded. The name is available again.");
+        }
+      } catch (recoveryError) {
+        clearPasswords(form);
+        show(redactedError(recoveryError), true);
+      }
+      return;
+    }
+    clearPasswords(form); show(redactedError(error), true);
+  }
 });
 byId("restore-form").addEventListener("submit", async (event) => {
   event.preventDefault(); const form = event.currentTarget; const data = new FormData(form);

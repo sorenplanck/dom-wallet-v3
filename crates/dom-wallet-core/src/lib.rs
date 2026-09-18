@@ -5141,6 +5141,10 @@ impl CoreError {
             // condition that froze the scan cursor. Collapsing it into the
             // generic storage code left the user and support with an opaque
             // string and no idea what to do.
+            // An interrupted creation leaves a staging directory that blocks
+            // the wallet name. Collapsing it into the generic storage code hid
+            // the one condition the resume/abort commands exist to repair.
+            Self::Storage(StorageError::IncompleteGeneration) => "WALLET_CREATION_INCOMPLETE",
             Self::Storage(StorageError::FileSizeOutOfBounds)
             | Self::Storage(StorageError::Crypto(
                 dom_wallet_crypto::CryptoError::EnvelopeTooLarge,
