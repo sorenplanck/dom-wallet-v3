@@ -519,7 +519,12 @@ impl RestoreSink<'_> {
         let expected_generation = state.generation;
         let result = (|| {
             if let Some(anchor) = reorg_anchor {
-                rewind_recovery_state(&mut state, anchor.height, batch.observed_tip.height)?;
+                rewind_recovery_state(
+                    &mut state,
+                    anchor.height,
+                    batch.observed_tip.height,
+                    self.identity.coinbase_maturity,
+                )?;
             }
             apply_recovery_batch(self.seed, self.chain, self.identity, &mut state, batch)?;
             state.core_scan_cursor = Some(cursor.as_bytes().to_vec());
@@ -948,6 +953,13 @@ fn refresh_maturity(
         if matches!(output.state, OutputState::Spent { .. }) {
             continue;
         }
+        // An output reserved by an in-flight transaction keeps its
+        // `PendingOutgoing` state. Recomputing maturity here would advertise it
+        // as confirmed and spendable while coin selection still refuses it,
+        // inflating the displayed balance and hiding the money in transit.
+        if output.reserved_by.is_some() {
+            continue;
+        }
         let Some(metadata) = state
             .recovered_output_metadata
             .iter()
@@ -982,6 +994,7 @@ pub fn rewind_recovery_state(
     state: &mut WalletState,
     safe_height: u64,
     tip_height: u64,
+    coinbase_maturity: u64,
 ) -> Result<(), SeedRestoreError> {
     let removed_ids = state
         .outputs
@@ -1026,7 +1039,7 @@ pub fn rewind_recovery_state(
             output.state = OutputState::Confirmed;
         }
     }
-    refresh_maturity(state, tip_height, 0)?;
+    refresh_maturity(state, tip_height, coinbase_maturity)?;
     state
         .rollback_confirmations_after_height(safe_height)
         .map_err(|_| SeedRestoreError::MalformedRecovery)

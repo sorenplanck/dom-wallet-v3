@@ -1469,15 +1469,14 @@ impl WalletService {
     }
 
     pub fn rescan_from_genesis(&mut self) -> Result<WalletSummary, CoreError> {
-        let tip = self
+        let identity = self
             .backend
             .as_ref()
             .ok_or(CoreError::EmbeddedCoreRequired)?
-            .current_identity()?
-            .current_tip
-            .height;
+            .current_identity()?;
+        let tip = identity.current_tip.height;
         let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
-        rewind_recovery_state(&mut state, 0, tip)?;
+        rewind_recovery_state(&mut state, 0, tip, identity.coinbase_maturity)?;
         state.core_scan_cursor = None;
         state.recovery_canonical_blocks.clear();
         // A genesis rescan restarts the whole-history totals. This also clears
@@ -3520,11 +3519,29 @@ impl WalletService {
         confirm_exported: bool,
     ) -> Result<TransactionSummary, CoreError> {
         let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
-        let index = state
-            .transactions
-            .iter()
-            .position(|transaction| transaction.slate_id == Some(slate_id))
-            .ok_or(CoreError::TransactionNotFound)?;
+        // Prefer the sender record: it is the one that holds the input
+        // reservations, and "cancel this payment" always means the sending
+        // side. A recipient-only record stays cancellable through the
+        // fallback, but a sender record is never shadowed by a recipient one
+        // that happens to share the slate id.
+        let index = match find_transaction_index(&state, slate_id, TransactionRole::Sender) {
+            Ok(index) => index,
+            Err(_) => state
+                .transactions
+                .iter()
+                .position(|transaction| transaction.slate_id == Some(slate_id))
+                .ok_or(CoreError::TransactionNotFound)?,
+        };
+        // Cancelling an already cancelled transaction is idempotent. Re-running
+        // the release would hand back inputs that another transaction may have
+        // reserved in the meantime, which is a local double spend.
+        if matches!(
+            state.transactions[index].lifecycle,
+            TransactionLifecycle::Cancelled
+        ) {
+            let id = state.transactions[index].id;
+            return self.transaction_summary(id);
+        }
         match cancellation_decision(state.transactions[index].exposure) {
             CancellationDecision::ReleaseNeverBroadcastReservations => {}
             CancellationDecision::DenyPossiblyBroadcast => {
@@ -3553,15 +3570,22 @@ impl WalletService {
         {
             return Err(CoreError::ConfirmationRequired);
         }
+        let transaction_id = state.transactions[index].id;
         let reserved = state.transactions[index].reserved_output_ids.clone();
         for output in &mut state.outputs {
-            if reserved.contains(&output.id) {
+            // Release only the inputs this transaction still owns. Without the
+            // ownership check a stale reservation list would free an input that
+            // a later transaction reserved, allowing it to be spent twice. This
+            // mirrors the automatic expiry path.
+            if reserved.contains(&output.id) && output.reserved_by == Some(transaction_id) {
                 output.reserved_by = None;
                 if matches!(output.state, OutputState::PendingOutgoing) {
                     output.state = OutputState::Confirmed;
                 }
             }
         }
+        state.transactions[index].reserved_output_ids.clear();
+        release_cancelled_local_outputs(&mut state, index);
         state.transactions[index].transition(
             TransactionLifecycle::Cancelled,
             TransactionTransitionEvidence::Cancellation,
@@ -3756,8 +3780,13 @@ impl WalletRecoverySink {
     ) -> Result<(), WalletScanSinkError> {
         let mut next = self.state.clone();
         if let Some(anchor) = reorg {
-            rewind_recovery_state(&mut next, anchor.height, batch.observed_tip.height)
-                .map_err(|error| WalletScanSinkError::new(ScanCommitStage::Rewind, error))?;
+            rewind_recovery_state(
+                &mut next,
+                anchor.height,
+                batch.observed_tip.height,
+                self.identity.coinbase_maturity,
+            )
+            .map_err(|error| WalletScanSinkError::new(ScanCommitStage::Rewind, error))?;
         }
         if let Err(error) = apply_recovery_batch(
             &self.seed,
@@ -4672,6 +4701,48 @@ fn transaction_summary_from(transaction: &LocalTransactionIntent) -> Transaction
     }
 }
 
+/// Drop the locally created outputs of a cancelled transaction.
+///
+/// A send records its change output, and a receive records its payout output,
+/// as `PendingIncoming` with `discovered_height == 0` before either can exist
+/// on chain. Once the transaction is cancelled they can never materialise, so
+/// leaving them behind inflates `total` and `pending_incoming` permanently: a
+/// genesis rescan does not remove them either, because the rewind only drops
+/// outputs discovered *above* the safe height and these carry height zero.
+///
+/// An output the scanner has already adopted (`discovered_height != 0`) is
+/// canonical evidence and is always kept.
+fn release_cancelled_local_outputs(state: &mut WalletState, index: usize) {
+    fn drop_if_purely_local(state: &mut WalletState, output_id: Uuid) -> bool {
+        let purely_local = state
+            .outputs
+            .iter()
+            .any(|output| output.id == output_id && output.discovered_height == 0);
+        if !purely_local {
+            return false;
+        }
+        state.outputs.retain(|output| output.id != output_id);
+        state
+            .private_output_blindings
+            .retain(|secret| secret.output_id != output_id);
+        state
+            .recovered_output_metadata
+            .retain(|metadata| metadata.output_id != output_id);
+        true
+    }
+
+    if let Some(output_id) = state.transactions[index].change_output_id {
+        if drop_if_purely_local(state, output_id) {
+            state.transactions[index].change_output_id = None;
+        }
+    }
+    if let Some(output_id) = state.transactions[index].recipient_output_id {
+        if drop_if_purely_local(state, output_id) {
+            state.transactions[index].recipient_output_id = None;
+        }
+    }
+}
+
 fn cancel_expired_unfinalized_reservations(
     state: &mut WalletState,
     canonical_tip_height: u64,
@@ -4714,6 +4785,8 @@ fn cancel_expired_unfinalized_reservations(
                 }
             }
         }
+        state.transactions[index].reserved_output_ids.clear();
+        release_cancelled_local_outputs(state, index);
         state.transactions[index].transition(
             TransactionLifecycle::Cancelled,
             TransactionTransitionEvidence::Cancellation,
@@ -5359,7 +5432,7 @@ mod tests {
         // This is the same state rewind used by `rescan_from_genesis`; the
         // CANCELLED intent is a durable tombstone and cannot reserve again.
         let mut rescanned = state.clone();
-        rewind_recovery_state(&mut rescanned, 1, 20).unwrap();
+        rewind_recovery_state(&mut rescanned, 1, 20, 0).unwrap();
         assert_eq!(
             rescanned.transactions[0].lifecycle,
             TransactionLifecycle::Cancelled
@@ -5522,6 +5595,290 @@ mod tests {
         assert_eq!(state.balance().spendable, 33_000_000_000);
     }
 
+    fn unlocked_service_with(
+        temp: &tempfile::TempDir,
+        seed: impl FnOnce(&mut WalletState, Uuid),
+    ) -> (WalletService, Uuid, Uuid, Uuid) {
+        let password = "password-1";
+        let mut service = test_service();
+        service
+            .create_recoverable(temp.path().join("wallet"), password, backup_identity())
+            .unwrap();
+        service.recovery_phrase_confirmed(password).unwrap();
+        service.unlock(password).unwrap();
+        let (mut seeded, transaction_id, slate_id, output_id) = reserved_sender_state(false);
+        let mut state = service.unlocked.as_ref().unwrap().clone();
+        let account_id = state.default_account.id;
+        for output in &mut seeded.outputs {
+            output.account_id = account_id;
+        }
+        state.outputs.append(&mut seeded.outputs);
+        state
+            .private_output_blindings
+            .append(&mut seeded.private_output_blindings);
+        state.transactions.append(&mut seeded.transactions);
+        seed(&mut state, account_id);
+        service.commit(state).unwrap();
+        (service, transaction_id, slate_id, output_id)
+    }
+
+    #[test]
+    fn repeated_manual_cancel_never_releases_an_input_reserved_by_another_transaction() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut service, _transaction_id, slate_id, output_id) =
+            unlocked_service_with(&temp, |_, _| {});
+
+        // The first cancellation legitimately releases the reserved input.
+        service.slate_cancel(slate_id, true).unwrap();
+        let mut state = service.unlocked.as_ref().unwrap().clone();
+        assert_eq!(
+            state
+                .outputs
+                .iter()
+                .find(|output| output.id == output_id)
+                .unwrap()
+                .reserved_by,
+            None
+        );
+
+        // A later transaction legitimately reserves that very same input.
+        let successor = Uuid::new_v4();
+        let mut successor_intent = state.transactions[0].clone();
+        successor_intent.id = successor;
+        successor_intent.slate_id = Some(Uuid::new_v4());
+        successor_intent.lifecycle = TransactionLifecycle::InputsReserved;
+        successor_intent.cancellation_reason = None;
+        successor_intent.reserved_output_ids = vec![output_id];
+        successor_intent.change_output_id = None;
+        state.transactions.push(successor_intent);
+        let output = state
+            .outputs
+            .iter_mut()
+            .find(|output| output.id == output_id)
+            .unwrap();
+        output.reserved_by = Some(successor);
+        output.state = OutputState::PendingOutgoing;
+        service.commit(state).unwrap();
+
+        // Re-running the cancellation must not hand the successor's input back:
+        // doing so would let the same UTXO be spent twice.
+        service.slate_cancel(slate_id, true).unwrap();
+        let state = service.unlocked.as_ref().unwrap();
+        let output = state
+            .outputs
+            .iter()
+            .find(|output| output.id == output_id)
+            .unwrap();
+        assert_eq!(
+            output.reserved_by,
+            Some(successor),
+            "an input reserved by another transaction was released"
+        );
+        assert_eq!(output.state, OutputState::PendingOutgoing);
+        assert_eq!(state.balance().spendable, 0);
+    }
+
+    #[test]
+    fn cancelling_drops_the_local_change_output_so_the_balance_does_not_inflate() {
+        let temp = tempfile::tempdir().unwrap();
+        let change_output_id = Uuid::new_v4();
+        let (mut service, _transaction_id, slate_id, _output_id) =
+            unlocked_service_with(&temp, |state, account_id| {
+                state.outputs.push(OutputRecord {
+                    id: change_output_id,
+                    account_id,
+                    commitment: Some([3; 33]),
+                    value: 5_000_000_000,
+                    state: OutputState::PendingIncoming,
+                    discovered_height: 0,
+                    reserved_by: None,
+                });
+                state.remember_output_blinding(change_output_id, [4; 32]);
+                state.transactions[0].change_output_id = Some(change_output_id);
+            });
+
+        assert_eq!(
+            service
+                .unlocked
+                .as_ref()
+                .unwrap()
+                .balance()
+                .pending_incoming,
+            5_000_000_000
+        );
+
+        service.slate_cancel(slate_id, true).unwrap();
+
+        let state = service.unlocked.as_ref().unwrap();
+        assert!(
+            !state
+                .outputs
+                .iter()
+                .any(|output| output.id == change_output_id),
+            "the change output of a cancelled send must not survive"
+        );
+        assert!(state.output_blinding(change_output_id).is_none());
+        assert_eq!(state.balance().pending_incoming, 0);
+        assert_eq!(state.transactions[0].change_output_id, None);
+    }
+
+    #[test]
+    fn cancelling_keeps_a_change_output_the_scanner_already_confirmed() {
+        let temp = tempfile::tempdir().unwrap();
+        let change_output_id = Uuid::new_v4();
+        let (mut service, _transaction_id, slate_id, _output_id) =
+            unlocked_service_with(&temp, |state, account_id| {
+                state.outputs.push(OutputRecord {
+                    id: change_output_id,
+                    account_id,
+                    commitment: Some([3; 33]),
+                    value: 5_000_000_000,
+                    // Adopted by the canonical scan: this is real money.
+                    state: OutputState::Confirmed,
+                    discovered_height: 42,
+                    reserved_by: None,
+                });
+                state.remember_output_blinding(change_output_id, [4; 32]);
+                state.transactions[0].change_output_id = Some(change_output_id);
+            });
+
+        service.slate_cancel(slate_id, true).unwrap();
+
+        let state = service.unlocked.as_ref().unwrap();
+        assert!(
+            state
+                .outputs
+                .iter()
+                .any(|output| output.id == change_output_id),
+            "an output already seen on chain must never be dropped by a cancellation"
+        );
+        assert_eq!(
+            state.transactions[0].change_output_id,
+            Some(change_output_id)
+        );
+    }
+
+    #[test]
+    fn manual_cancel_targets_the_sender_record_even_when_a_recipient_shares_the_slate_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let recipient_id = Uuid::new_v4();
+        let (mut service, transaction_id, slate_id, output_id) =
+            unlocked_service_with(&temp, |state, _| {
+                // A recipient record carrying the same slate id, inserted first
+                // so a naive positional lookup would find it instead.
+                let mut recipient = state.transactions[0].clone();
+                recipient.id = recipient_id;
+                recipient.role = Some(TransactionRole::Recipient);
+                recipient.lifecycle = TransactionLifecycle::RequestImported;
+                recipient.reserved_output_ids = Vec::new();
+                recipient.change_output_id = None;
+                state.transactions.insert(0, recipient);
+            });
+
+        let cancelled = service.slate_cancel(slate_id, true).unwrap();
+        assert_eq!(
+            cancelled.id, transaction_id,
+            "the sender record must be cancelled"
+        );
+
+        let state = service.unlocked.as_ref().unwrap();
+        let sender = state
+            .transactions
+            .iter()
+            .find(|transaction| transaction.id == transaction_id)
+            .unwrap();
+        let recipient = state
+            .transactions
+            .iter()
+            .find(|transaction| transaction.id == recipient_id)
+            .unwrap();
+        assert_eq!(sender.lifecycle, TransactionLifecycle::Cancelled);
+        assert_eq!(recipient.lifecycle, TransactionLifecycle::RequestImported);
+        assert_eq!(
+            state
+                .outputs
+                .iter()
+                .find(|output| output.id == output_id)
+                .unwrap()
+                .reserved_by,
+            None
+        );
+    }
+
+    #[test]
+    fn rewind_preserves_reservations_and_honours_the_real_coinbase_maturity() {
+        use dom_wallet_domain::{RecoveredOutputDomain, RecoveredOutputMetadata};
+
+        let (mut state, transaction_id, _slate_id, output_id) = reserved_sender_state(false);
+        // Recovery metadata is what makes `refresh_maturity` consider an output
+        // at all, so the reserved input needs it for this to be a real test.
+        state
+            .recovered_output_metadata
+            .push(RecoveredOutputMetadata {
+                output_id,
+                recovery_account: 0,
+                derivation_index: 1,
+                domain: RecoveredOutputDomain::Received,
+                is_coinbase: false,
+                block_hash: [5; 32],
+                output_position: 0,
+            });
+        let coinbase_id = Uuid::new_v4();
+        state.outputs.push(OutputRecord {
+            id: coinbase_id,
+            account_id: state.default_account.id,
+            commitment: Some([4; 33]),
+            value: 9_000,
+            state: OutputState::Immature {
+                required_height: 1 + 1_440,
+            },
+            discovered_height: 1,
+            reserved_by: None,
+        });
+        state.remember_output_blinding(coinbase_id, [6; 32]);
+        state
+            .recovered_output_metadata
+            .push(RecoveredOutputMetadata {
+                output_id: coinbase_id,
+                recovery_account: 0,
+                derivation_index: 2,
+                domain: RecoveredOutputDomain::Coinbase,
+                is_coinbase: true,
+                block_hash: [5; 32],
+                output_position: 1,
+            });
+        state.validate().unwrap();
+
+        rewind_recovery_state(&mut state, 10, 10, 1_440).unwrap();
+
+        let reserved = state
+            .outputs
+            .iter()
+            .find(|output| output.id == output_id)
+            .unwrap();
+        assert_eq!(
+            reserved.state,
+            OutputState::PendingOutgoing,
+            "an input reserved by an in-flight send must not be reset to Confirmed"
+        );
+        assert_eq!(reserved.reserved_by, Some(transaction_id));
+
+        let coinbase = state
+            .outputs
+            .iter()
+            .find(|output| output.id == coinbase_id)
+            .unwrap();
+        assert_eq!(
+            coinbase.state,
+            OutputState::Immature {
+                required_height: 1 + 1_440
+            },
+            "a hardcoded maturity of zero would have made this coinbase spendable"
+        );
+        assert_eq!(state.balance().spendable, 0);
+        state.validate().unwrap();
+    }
+
     #[test]
     fn one_block_reorg_restores_exact_finalized_reservation_without_duplication() {
         let (mut state, transaction_id, _, output_id) = reserved_sender_state(true);
@@ -5533,7 +5890,7 @@ mod tests {
         state.outputs[0].state = OutputState::Spent { spent_height: 11 };
         state.outputs[0].reserved_by = None;
 
-        rewind_recovery_state(&mut state, 10, 10).unwrap();
+        rewind_recovery_state(&mut state, 10, 10, 0).unwrap();
         assert_eq!(
             state.transactions[0].lifecycle,
             TransactionLifecycle::Reorged
@@ -5545,7 +5902,7 @@ mod tests {
         assert_eq!(state.balance().pending_outgoing, 33_000_000_000);
         assert_eq!(state.balance().spendable, 0);
 
-        rewind_recovery_state(&mut state, 10, 10).unwrap();
+        rewind_recovery_state(&mut state, 10, 10, 0).unwrap();
         assert_eq!(state.outputs.len(), 1);
         assert_eq!(state.outputs[0].reserved_by, Some(transaction_id));
         assert!(state.mark_known_output_spent(&[9; 33], 11));
@@ -5628,7 +5985,7 @@ mod tests {
         state.non_reuse_floor = 1;
         state.validate().unwrap();
 
-        rewind_recovery_state(&mut state, 0, 10).unwrap();
+        rewind_recovery_state(&mut state, 0, 10, 0).unwrap();
         assert!(state.outputs.iter().all(|output| output.id != input_id));
         let change = state
             .outputs
@@ -5755,7 +6112,7 @@ mod tests {
         state.non_reuse_floor = 1;
         state.validate().unwrap();
 
-        rewind_recovery_state(&mut state, 10, 10).unwrap();
+        rewind_recovery_state(&mut state, 10, 10, 0).unwrap();
         let restored = state
             .outputs
             .iter()
@@ -5779,7 +6136,7 @@ mod tests {
             .output_bytes
             .is_empty());
 
-        rewind_recovery_state(&mut state, 10, 10).unwrap();
+        rewind_recovery_state(&mut state, 10, 10, 0).unwrap();
         assert_eq!(
             state
                 .outputs
