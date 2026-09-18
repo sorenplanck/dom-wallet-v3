@@ -583,3 +583,46 @@ test("mesh listener without inbound peers reports the portmap outcome", () => {
   assert.equal(reachabilityText({ ...base, portmap_status: "none", advertised_port: 0 })[0],
     "Router did not open the port automatically");
 });
+
+test("regression_m13_restore_panel_does_not_fake_peer_discovery_while_node_is_down", () => {
+  // Closing a wallet stops the embedded node. The panel used to fall through
+  // to the zero-peer branch and announce "Discovering Mainnet peers", i.e. it
+  // claimed progress at exactly the moment nothing was running.
+  const stopped = restoreReadinessPresentation({
+    network: "MAINNET",
+    lifecycle: "STOPPED",
+    ready: false,
+    canonical_tip_height: 5_241,
+    highest_known_peer_height: 0,
+    connected_peers: 0,
+  });
+  assert.equal(stopped.badge, "STOPPED");
+  assert.doesNotMatch(stopped.message, /Discovering/);
+  // Restore stays available in every node state - only the wording is fixed.
+  assert.equal(stopped.submitEnabled, true);
+
+  const failed = restoreReadinessPresentation({
+    network: "MAINNET",
+    lifecycle: "FAILED",
+    ready: false,
+    status_message: "Embedded node exited with code 1",
+    canonical_tip_height: 0,
+    highest_known_peer_height: 0,
+    connected_peers: 0,
+  });
+  assert.equal(failed.badge, "FAILED");
+  assert.equal(failed.message, "Embedded node exited with code 1");
+  assert.equal(failed.submitEnabled, true);
+
+  const starting = restoreReadinessPresentation({
+    network: "MAINNET",
+    lifecycle: "STARTING",
+    ready: false,
+    canonical_tip_height: 0,
+    highest_known_peer_height: 0,
+    connected_peers: 0,
+  });
+  assert.equal(starting.badge, "STARTING");
+  assert.doesNotMatch(starting.message, /Discovering/);
+  assert.equal(starting.submitEnabled, true);
+});

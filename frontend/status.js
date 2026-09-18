@@ -131,6 +131,34 @@ export function restoreReadinessPresentation(node) {
       progress: 100,
     };
   }
+  // A node that is stopped, failed or still starting has zero connected peers,
+  // so it used to fall through to "Discovering Mainnet peers" - the panel
+  // claimed progress at exactly the moment the node was not running at all
+  // (closing a wallet stops it, for instance). Report what is actually
+  // happening instead of inventing peer discovery.
+  //
+  // submitEnabled stays true: restore is always available and scans in the
+  // background while the node comes up (see index.html and
+  // regression_restore_submit_is_enabled_in_every_node_state). This branch
+  // only corrects what the panel *says*, never what it allows.
+  const lifecycle = node?.lifecycle;
+  if (lifecycle === "STOPPED" || lifecycle === "FAILED" || lifecycle === "STARTING") {
+    const message = lifecycle === "STARTING"
+      ? "The Mainnet node is starting. Restore will scan as soon as it is up."
+      : lifecycle === "STOPPED"
+        ? "The Mainnet node is stopped. Restore will scan once it is running again."
+        : node?.status_message
+          ?? "The Mainnet node failed. Restore will scan once it recovers.";
+    return {
+      submitEnabled: true,
+      badge: lifecycle,
+      message,
+      localHeight,
+      peerHeight: null,
+      connectedPeers,
+      progress: 0,
+    };
+  }
   if (connectedPeers === 0) {
     return {
       submitEnabled: true,
