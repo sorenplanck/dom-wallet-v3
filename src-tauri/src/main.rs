@@ -176,6 +176,20 @@ fn mark_install_started(handle: &tauri::AppHandle, target_version: &str) {
     }
 }
 
+/// Whether an install that was handed to the platform installer actually took
+/// effect, given the version now running.
+///
+/// `None` means it did. Split out from `reconcile_pending_install` so the
+/// decision is testable without an `AppHandle`: the decision is the part that
+/// has to be right, and it used to not exist at all.
+fn pending_install_outcome(running: &str, pending: &PendingInstall) -> Option<&'static str> {
+    if running == pending.target_version {
+        None
+    } else {
+        Some("UPDATE_INSTALL_DID_NOT_APPLY")
+    }
+}
+
 /// Account for an install recorded before the last restart.
 ///
 /// Three outcomes, and all three used to look identical from the interface:
@@ -193,20 +207,21 @@ fn reconcile_pending_install(handle: &tauri::AppHandle) {
         return;
     };
     let running = get_build_info().wallet_version;
-    if running == pending.target_version {
-        tracing::info!(version = running, "Update installed successfully");
-        state.last_error = None;
-    } else {
-        tracing::error!(
-            running,
-            target = %pending.target_version,
-            previous = %pending.previous_version,
-            "Update did not take effect; the previous version is still running"
-        );
-        handle
-            .state::<UpdateControl>()
-            .record_wallet_failure("UPDATE_INSTALL_DID_NOT_APPLY");
-        state.last_error = Some("UPDATE_INSTALL_DID_NOT_APPLY".into());
+    match pending_install_outcome(running, &pending) {
+        None => {
+            tracing::info!(version = running, "Update installed successfully");
+            state.last_error = None;
+        }
+        Some(code) => {
+            tracing::error!(
+                running,
+                target = %pending.target_version,
+                previous = %pending.previous_version,
+                "Update did not take effect; the previous version is still running"
+            );
+            handle.state::<UpdateControl>().record_wallet_failure(code);
+            state.last_error = Some(code.into());
+        }
     }
     // Cleared either way: this install has now been accounted for, and
     // leaving it would re-report the same outcome on every later start.
@@ -1769,6 +1784,66 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pending(target: &str) -> PendingInstall {
+        PendingInstall {
+            previous_version: "0.3.6".into(),
+            target_version: target.into(),
+            started_unix_seconds: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn regression_a18_an_install_that_did_not_apply_is_reported_instead_of_silent() {
+        // The running version is the target: the install took effect and there
+        // is nothing to report.
+        assert_eq!(pending_install_outcome("0.4.0", &pending("0.4.0")), None);
+
+        // Still on the previous version. This used to be indistinguishable
+        // from an install that never happened: the wallet restarted on the old
+        // binary, the state reset to Idle and nothing ever explained why.
+        assert_eq!(
+            pending_install_outcome("0.3.6", &pending("0.4.0")),
+            Some("UPDATE_INSTALL_DID_NOT_APPLY")
+        );
+
+        // Some third version is running. Report rather than assume success -
+        // whatever happened, it was not the install that was asked for.
+        assert_eq!(
+            pending_install_outcome("0.3.9", &pending("0.4.0")),
+            Some("UPDATE_INSTALL_DID_NOT_APPLY")
+        );
+    }
+
+    #[test]
+    fn regression_a18_pending_install_survives_the_restart_it_has_to_survive() {
+        // The record is written before control passes to the platform
+        // installer and read back by a process that did not write it, so the
+        // on-disk round trip is the whole mechanism.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("update-state.json");
+
+        let written = PersistedUpdateState {
+            schema_version: 1,
+            last_check_unix_seconds: Some(1_700_000_000),
+            next_check_unix_seconds: Some(1_700_003_600),
+            last_error: None,
+            pending_install: Some(pending("0.4.0")),
+        };
+        persist_update_state(&path, &written).unwrap();
+        assert_eq!(load_update_state(&path), Some(written));
+
+        // A state written before this field existed still loads, with no
+        // pending install rather than a parse failure.
+        std::fs::write(
+            &path,
+            br#"{"schema_version":1,"last_check_unix_seconds":7,"next_check_unix_seconds":null,"last_error":null}"#,
+        )
+        .unwrap();
+        let legacy = load_update_state(&path).expect("legacy update state must still load");
+        assert_eq!(legacy.last_check_unix_seconds, Some(7));
+        assert_eq!(legacy.pending_install, None);
+    }
 
     #[test]
     fn packaged_entrypoint_constructs_the_registered_builder() {
