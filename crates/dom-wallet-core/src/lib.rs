@@ -3142,6 +3142,23 @@ impl WalletService {
         &mut self,
         slate_id: Uuid,
     ) -> Result<TransactionSummary, CoreError> {
+        // Preparing a response twice used to burn a second derivation index,
+        // push a second `PendingIncoming` output that can never confirm (the
+        // first one is orphaned and inflates the balance forever), and replace
+        // `response_bytes`. If the sender had already imported the first
+        // response, finalization then failed with a binding mismatch and the
+        // payment died with the sender's inputs still reserved. The response is
+        // already durable, so return it instead of rebuilding it.
+        {
+            let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
+            let index = find_transaction_index(state, slate_id, TransactionRole::Recipient)?;
+            if state.transactions[index].recipient_output_id.is_some()
+                && !state.transactions[index].response_bytes.is_empty()
+            {
+                let id = state.transactions[index].id;
+                return self.transaction_summary(id);
+            }
+        }
         let identity = self
             .backend
             .as_ref()
@@ -5863,6 +5880,106 @@ mod tests {
                 .unwrap()
                 .reserved_by,
             None
+        );
+    }
+
+    #[test]
+    fn preparing_a_recipient_response_twice_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let recipient_output = Uuid::new_v4();
+        let (mut service, _transaction_id, slate_id, _output_id) =
+            unlocked_service_with(&temp, |state, account_id| {
+                // A recipient holds no input reservation: release the fixture's.
+                for output in &mut state.outputs {
+                    output.reserved_by = None;
+                    output.state = OutputState::Confirmed;
+                }
+                // The payout output the first response already created.
+                state.outputs.push(OutputRecord {
+                    id: recipient_output,
+                    account_id,
+                    commitment: Some([7; 33]),
+                    value: 1_000_000_000,
+                    state: OutputState::PendingIncoming,
+                    discovered_height: 0,
+                    reserved_by: None,
+                });
+                state.remember_output_blinding(recipient_output, [8; 32]);
+                // A recipient record that already produced its response.
+                let transaction = &mut state.transactions[0];
+                transaction.role = Some(TransactionRole::Recipient);
+                transaction.lifecycle = TransactionLifecycle::ResponsePrepared;
+                transaction.reserved_output_ids = Vec::new();
+                transaction.recipient_output_id = Some(recipient_output);
+                transaction.response_bytes = vec![9; 32];
+            });
+
+        let before = service.unlocked.as_ref().unwrap().clone();
+        let summary = service.slate_response_create(slate_id).unwrap();
+        assert_eq!(summary.state, "RESPONSE_PREPARED");
+
+        let after = service.unlocked.as_ref().unwrap();
+        assert_eq!(
+            after.transactions[0].recipient_output_id,
+            Some(recipient_output),
+            "the existing recipient output must be kept"
+        );
+        assert_eq!(
+            after.transactions[0].response_bytes, before.transactions[0].response_bytes,
+            "the durable response must not be rebuilt under the sender's feet"
+        );
+        assert_eq!(
+            after.recovery_allocation_floors, before.recovery_allocation_floors,
+            "no extra derivation index may be burned"
+        );
+        assert_eq!(after.outputs.len(), before.outputs.len());
+    }
+
+    #[test]
+    fn an_in_flight_send_is_not_counted_twice_in_the_total_balance() {
+        let (mut state, _transaction_id, _slate_id, output_id) = reserved_sender_state(false);
+        let input_value = state
+            .outputs
+            .iter()
+            .find(|output| output.id == output_id)
+            .unwrap()
+            .value;
+
+        // The change carved out of that same input, not yet seen on chain.
+        let change_id = Uuid::new_v4();
+        state.outputs.push(OutputRecord {
+            id: change_id,
+            account_id: state.default_account.id,
+            commitment: Some([2; 33]),
+            value: input_value - 1_000_000_000,
+            state: OutputState::PendingIncoming,
+            discovered_height: 0,
+            reserved_by: None,
+        });
+        state.remember_output_blinding(change_id, [3; 32]);
+
+        let balance = state.balance();
+        assert_eq!(
+            balance.total, input_value,
+            "the change is carved out of an input already counted; total must not double count it"
+        );
+        assert_eq!(balance.pending_outgoing, input_value);
+        assert_eq!(
+            balance.pending_incoming,
+            input_value - 1_000_000_000,
+            "the change still has to be visible as money on its way"
+        );
+
+        // Once the scan adopts the change it becomes independent value again.
+        state
+            .outputs
+            .iter_mut()
+            .find(|output| output.id == change_id)
+            .unwrap()
+            .discovered_height = 12;
+        assert_eq!(
+            state.balance().total,
+            input_value + (input_value - 1_000_000_000)
         );
     }
 

@@ -965,7 +965,20 @@ impl BalanceProjection {
                     balance.immature = balance.immature.saturating_add(output.value)
                 }
                 OutputState::PendingIncoming => {
-                    balance.total = balance.total.saturating_add(output.value);
+                    // A locally created output that the canonical scan has not
+                    // adopted yet (`discovered_height == 0`) is not independent
+                    // value. For a sender it is the change carved out of an
+                    // input that is *already* counted as `pending_outgoing`, so
+                    // adding it to `total` counted the same money twice: a 10
+                    // DOM wallet sending 1 DOM reported 18.99. For a receiver it
+                    // is money that is not owned until the transaction
+                    // confirms. It still appears in `pending_incoming`, which is
+                    // what tells the user it is on its way; it just stops
+                    // inflating the headline figure. Once the scanner adopts it
+                    // the output leaves this state and counts normally.
+                    if output.discovered_height != 0 {
+                        balance.total = balance.total.saturating_add(output.value);
+                    }
                     balance.pending_incoming = balance.pending_incoming.saturating_add(output.value)
                 }
                 OutputState::PendingOutgoing => {
