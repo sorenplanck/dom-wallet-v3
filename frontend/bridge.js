@@ -25,7 +25,16 @@ export function createNativeBridge(invokeImpl = tauriInvoke) {
     state = BridgeState.INITIALIZING;
     probe = invokeImpl("native_bridge_status")
       .then((result) => {
-        if (result?.bridge !== "ready" || typeof result?.app_version !== "string") {
+        // `command_names` is part of the contract every caller relies on:
+        // `invoke` refuses any command missing from it. Validating it only at
+        // call time surfaced a broken handshake as a misleading "Unsupported
+        // desktop command." per command, instead of one clear bridge failure.
+        if (
+          result?.bridge !== "ready"
+          || typeof result?.app_version !== "string"
+          || !Array.isArray(result?.command_names)
+          || result.command_names.length === 0
+        ) {
           throw new Error("Invalid native bridge response.");
         }
         state = BridgeState.READY;

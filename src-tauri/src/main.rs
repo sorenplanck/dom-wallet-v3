@@ -403,6 +403,11 @@ async fn perform_update_cycle(
 ) -> dom_wallet_tauri_shell::UpdateStatusDto {
     let updater_state = handle.state::<UpdateControl>();
     if !updater_state.begin_check(unix_seconds()) {
+        // Returning the untouched snapshot made the click a complete no-op: the
+        // hourly automatic cycle, a 20s network check or a download of up to
+        // 15 minutes all hold this latch, and during that window Check,
+        // Download and Apply changed absolutely nothing on screen. Say so.
+        updater_state.record_wallet_failure("UPDATE_CONCURRENT_CHECK");
         return updater_state.snapshot();
     }
     let Some(public_key) = UPDATE_PUBLIC_KEY.filter(|key| !key.trim().is_empty()) else {
@@ -965,18 +970,25 @@ fn chain_source_get(
 }
 #[tauri::command]
 fn chain_source_set(
+    handle: tauri::AppHandle,
     app: tauri::State<'_, DesktopApplication>,
     source: String,
     base_url: Option<String>,
     bearer_token: Option<String>,
 ) -> Result<dom_wallet_tauri_shell::ChainSourceStatusDto, dom_wallet_tauri_shell::CommandErrorDto> {
     let bearer_token = bearer_token.map(Zeroizing::new);
-    app.chain_source_set(
+    let status = app.chain_source_set(
         source.as_str(),
         base_url.as_deref(),
         bearer_token.as_ref().map(|token| token.as_str()),
-    )
-    .map_err(Into::into)
+    )?;
+    // Switching sources retires the previous backend. When the new source is
+    // the embedded node, nothing used to bring it back: the sync worker just
+    // retried `NodeNotReady` forever while the UI reported "Chain source
+    // saved". The cursor stopped advancing until the user hit "Start node" or
+    // restarted the app. Start it here, where the app handle is available.
+    let _ = ensure_mainnet_node_if_embedded(&handle, &app);
+    Ok(status)
 }
 #[tauri::command]
 fn wallet_sync_status(

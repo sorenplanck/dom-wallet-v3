@@ -1538,4 +1538,31 @@ mod compatibility_tests {
             "the same test phrase must produce the same 64-byte BIP-39 secret"
         );
     }
+
+    /// A phrase pasted from another wallet can arrive separated by non-ASCII
+    /// whitespace. `split_whitespace` splits on the Unicode `White_Space`
+    /// property — which covers U+3000 IDEOGRAPHIC SPACE and U+00A0 NO-BREAK
+    /// SPACE — so the word count agrees with the real parser and such a phrase
+    /// is never rejected as "1 word". This is pinned because "count before
+    /// normalizing" reads like a bug and could be 'fixed' into one.
+    #[test]
+    fn unusual_unicode_whitespace_does_not_break_the_word_count() {
+        let canonical = CanonicalWalletSeed::from_entropy(&[0x2a; 32]).unwrap();
+        let phrase = canonical.mnemonic_text();
+        let words = phrase.split(' ').collect::<Vec<_>>();
+        assert_eq!(words.len(), super::CANONICAL_PHRASE_WORDS);
+
+        for separator in ['\u{3000}', '\u{00A0}', '\t'] {
+            let exotic = words.join(&separator.to_string());
+            assert_eq!(
+                exotic.split_whitespace().count(),
+                super::CANONICAL_PHRASE_WORDS,
+                "separator {separator:?} must still yield 24 words"
+            );
+            assert!(
+                CanonicalWalletSeed::diagnose_phrase(&exotic).is_ok(),
+                "separator {separator:?} must not be diagnosed as malformed"
+            );
+        }
+    }
 }
