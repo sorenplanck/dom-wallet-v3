@@ -320,6 +320,20 @@ impl UpdateControl {
         }
     }
 
+    /// The status lock, recovered from poisoning.
+    ///
+    /// `status` is plain presentation data and every mutator below overwrites
+    /// the fields it owns outright, so a guard left poisoned by a panicking
+    /// thread carries no torn invariant worth protecting. Refusing it did real
+    /// damage: each mutator was written as `if let Ok(..)`, so one poisoning
+    /// turned *every* later transition into a silent no-op and the updater
+    /// froze on whatever state it happened to be showing, forever.
+    fn status(&self) -> std::sync::MutexGuard<'_, UpdateStatusDto> {
+        self.status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub fn snapshot(&self) -> UpdateStatusDto {
         self.status
             .lock()
@@ -342,9 +356,26 @@ impl UpdateControl {
     }
 
     pub fn set_automatic_updates(&self, enabled: bool) {
-        if let Ok(mut status) = self.status.lock() {
-            status.automatic_updates = enabled;
-        }
+        let mut status = self.status();
+        status.automatic_updates = enabled;
+    }
+
+    /// Restore the durable part of a previous session's status.
+    ///
+    /// Only timestamps and the last error come back. The lifecycle state is
+    /// deliberately not restored: `ReadyToApply` would claim a staged artifact
+    /// this call cannot verify still exists, so a fresh process always starts
+    /// from `Idle` and lets the next check establish the truth.
+    pub fn restore_persisted(
+        &self,
+        last_check_unix_seconds: Option<u64>,
+        next_check_unix_seconds: Option<u64>,
+        last_error: Option<String>,
+    ) {
+        let mut status = self.status();
+        status.wallet.last_check_unix_seconds = last_check_unix_seconds;
+        status.wallet.next_check_unix_seconds = next_check_unix_seconds;
+        status.wallet.sanitized_error = last_error;
     }
 
     pub fn begin_check(&self, now: u64) -> bool {
@@ -355,20 +386,19 @@ impl UpdateControl {
         {
             return false;
         }
-        if let Ok(mut status) = self.status.lock() {
-            status.wallet.state = WalletUpdaterState::Checking;
-            status.wallet.last_check_unix_seconds = Some(now);
-            status.wallet.next_check_unix_seconds = Some(now + UPDATE_INTERVAL_SECONDS);
-            status.wallet.sanitized_error = None;
-        }
+        let mut status = self.status();
+        status.wallet.state = WalletUpdaterState::Checking;
+        status.wallet.last_check_unix_seconds = Some(now);
+        status.wallet.next_check_unix_seconds = Some(now + UPDATE_INTERVAL_SECONDS);
+        status.wallet.sanitized_error = None;
         true
     }
 
     pub fn finish_check_without_key(&self) {
-        if let Ok(mut status) = self.status.lock() {
-            status.wallet.state = WalletUpdaterState::Failed;
-            status.wallet.sanitized_error = Some("UPDATE_SIGNATURE_KEY_UNAVAILABLE".into());
-        }
+        let mut status = self.status();
+        status.wallet.state = WalletUpdaterState::Failed;
+        status.wallet.sanitized_error = Some("UPDATE_SIGNATURE_KEY_UNAVAILABLE".into());
+        drop(status);
         self.check_in_progress.store(false, Ordering::Release);
     }
 
@@ -377,34 +407,33 @@ impl UpdateControl {
         wallet_available: Option<String>,
         wallet_error: Option<&'static str>,
     ) {
-        if let Ok(mut status) = self.status.lock() {
-            status.wallet.available_version = wallet_available;
-            status.wallet.state = if status.wallet.available_version.is_some() {
-                WalletUpdaterState::WalletUpdateAvailable
-            } else if wallet_error.is_some() {
-                WalletUpdaterState::Failed
-            } else {
-                WalletUpdaterState::UpToDate
-            };
-            status.wallet.sanitized_error = wallet_error.map(str::to_owned);
-        }
+        let mut status = self.status();
+        status.wallet.available_version = wallet_available;
+        status.wallet.state = if status.wallet.available_version.is_some() {
+            WalletUpdaterState::WalletUpdateAvailable
+        } else if wallet_error.is_some() {
+            WalletUpdaterState::Failed
+        } else {
+            WalletUpdaterState::UpToDate
+        };
+        status.wallet.sanitized_error = wallet_error.map(str::to_owned);
+        drop(status);
         self.check_in_progress.store(false, Ordering::Release);
     }
 
     pub fn set_wallet_download_state(&self, state: WalletUpdaterState, progress: Option<u8>) {
-        if let Ok(mut status) = self.status.lock() {
-            status.wallet.state = state;
-            status.wallet.progress_percent = progress;
-        }
+        let mut status = self.status();
+        status.wallet.state = state;
+        status.wallet.progress_percent = progress;
     }
 
     pub fn finish_verified_download(&self, version: String) {
-        if let Ok(mut status) = self.status.lock() {
-            status.wallet.available_version = Some(version);
-            status.wallet.state = WalletUpdaterState::ReadyToApply;
-            status.wallet.progress_percent = Some(100);
-            status.wallet.sanitized_error = None;
-        }
+        let mut status = self.status();
+        status.wallet.available_version = Some(version);
+        status.wallet.state = WalletUpdaterState::ReadyToApply;
+        status.wallet.progress_percent = Some(100);
+        status.wallet.sanitized_error = None;
+        drop(status);
         self.check_in_progress.store(false, Ordering::Release);
     }
 
@@ -415,10 +444,9 @@ impl UpdateControl {
     /// actually holds it, letting a second update cycle run concurrently
     /// against the same staging path.
     pub fn record_wallet_failure(&self, error: &'static str) {
-        if let Ok(mut status) = self.status.lock() {
-            status.wallet.state = WalletUpdaterState::Failed;
-            status.wallet.sanitized_error = Some(error.into());
-        }
+        let mut status = self.status();
+        status.wallet.state = WalletUpdaterState::Failed;
+        status.wallet.sanitized_error = Some(error.into());
     }
 
     /// Record a failure and end the check this call's `begin_check` started.
@@ -428,11 +456,11 @@ impl UpdateControl {
     }
 
     pub fn defer_wallet_install(&self, version: String) {
-        if let Ok(mut status) = self.status.lock() {
-            status.wallet.available_version = Some(version);
-            status.wallet.state = WalletUpdaterState::WaitingForSafePoint;
-            status.wallet.sanitized_error = Some("UPDATE_BUSY_CRITICAL_OPERATION".into());
-        }
+        let mut status = self.status();
+        status.wallet.available_version = Some(version);
+        status.wallet.state = WalletUpdaterState::WaitingForSafePoint;
+        status.wallet.sanitized_error = Some("UPDATE_BUSY_CRITICAL_OPERATION".into());
+        drop(status);
         self.check_in_progress.store(false, Ordering::Release);
     }
 }
@@ -3407,10 +3435,22 @@ impl DesktopApplication {
             return Ok(());
         }
         let result = (|| {
-            let _activity = self.activities.try_begin(ActivityKind::Shutdown)?;
+            // Stop the workers *before* taking the exclusive lease, not after.
+            // `Shutdown` requires `active.is_empty()`, and the synchronization
+            // worker holds a `Synchronization` lease for the whole of every
+            // scan page - so with the lease taken first, any exit landing
+            // mid-page was refused outright. The caller at `RunEvent::Exit`
+            // discarded that error, and the application quit with the node,
+            // the sidecar and the wallet never closed down.
+            //
+            // Neither stop needs the lease: each one signals its worker
+            // through its own mutex and joins it. Once they are joined the
+            // leases they held are released, and `Shutdown` can be acquired
+            // for the teardown that does need exclusivity.
             self.cancel_node_start_worker();
             self.stop_mining_worker()?;
             self.stop_synchronization_worker()?;
+            let _activity = self.activities.try_begin(ActivityKind::Shutdown)?;
             self.sidecar
                 .lock()
                 .map_err(|_| CommandError::Unavailable)?
@@ -5530,8 +5570,10 @@ impl From<CommandError> for CommandErrorDto {
                     | "WALLET_NOT_FOUND"
                     | "WALLET_STORAGE_FAILED" => "STORAGE",
                     "INVALID_WALLET_STATE"
+                    | "WALLET_ALREADY_OPEN"
                     | "TRANSACTION_STATE_INVALID"
-                    | "TRANSACTION_CANNOT_CANCEL" => "LIFECYCLE",
+                    | "TRANSACTION_CANNOT_CANCEL"
+                    | "TRANSACTION_RECONCILIATION_REQUIRED" => "LIFECYCLE",
                     "EMBEDDED_NODE_OPERATION_FAILED" | "EMBEDDED_NODE_REQUIRED" => "NODE",
                     "TRANSACTION_SUBMISSION_FAILED" => "SUBMISSION",
                     _ => "WALLET",

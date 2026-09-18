@@ -25,8 +25,16 @@ use zeroize::Zeroizing;
 
 /// Pinned primary DOM release signing key (Minisign key ID 74197A95CA309CF0).
 /// The backup key 1BD5CDF20DACC151 stays offline until an explicit rotation
-/// release; the Tauri updater plugin accepts a single key, so pinning the
-/// backup here would create a verification path that can never succeed.
+/// release.
+///
+/// This constant is the only key that gates an install. The Tauri updater
+/// plugin is also configured with it (`plugin_pubkey` below), but that is
+/// belt and braces: this code downloads the artifact itself and calls
+/// `Update::install` directly, so the plugin's own verification never runs.
+/// What actually decides is [`MinisignVerifier`], built from this constant in
+/// `verify_staged_artifact`, and it holds exactly one `PublicKey`. So a
+/// rotation means replacing this value and shipping a release signed by the
+/// new key - not adding a second key here, which nothing would read.
 const UPDATE_PUBLIC_KEY: Option<&str> =
     Some("RWTwnDDKlXoZdG3obVRiLPfVRHr17E0Fj2GN8IZ2rBkipRZvIIW6PLJ3");
 
@@ -52,6 +60,87 @@ fn unix_seconds() -> u64 {
 struct AutomaticUpdatePreference {
     schema_version: u32,
     enabled: bool,
+}
+
+/// The part of the updater's status that has to outlive the process.
+///
+/// `UpdateControl` is built fresh on every launch, so "Last check" read
+/// "Never" after each restart no matter how recently a check had run, the
+/// hourly schedule restarted from zero, and a failed check or install left no
+/// trace at all once the application was closed. Only facts are stored:
+/// nothing here re-asserts that an artifact is staged or ready to apply,
+/// because that depends on files this record cannot vouch for.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedUpdateState {
+    schema_version: u32,
+    last_check_unix_seconds: Option<u64>,
+    next_check_unix_seconds: Option<u64>,
+    last_error: Option<String>,
+}
+
+fn update_state_path(handle: &tauri::AppHandle) -> Result<PathBuf, UpdateError> {
+    handle
+        .path()
+        .app_config_dir()
+        .map(|directory| directory.join("update-state.json"))
+        .map_err(|_| UpdateError::StateIo)
+}
+
+fn load_update_state(path: &Path) -> Option<PersistedUpdateState> {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<PersistedUpdateState>(&bytes).ok())
+        .filter(|state| state.schema_version == 1)
+}
+
+fn persist_update_state(path: &Path, state: &PersistedUpdateState) -> Result<(), UpdateError> {
+    let parent = path.parent().ok_or(UpdateError::StateIo)?;
+    fs::create_dir_all(parent).map_err(|_| UpdateError::StateIo)?;
+    let temporary = parent.join(format!(".update-state-{}.tmp", uuid::Uuid::new_v4()));
+    let bytes = serde_json::to_vec(state).map_err(|_| UpdateError::StateIo)?;
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut output = options.open(&temporary).map_err(|_| UpdateError::StateIo)?;
+    let result = (|| {
+        output.write_all(&bytes).map_err(|_| UpdateError::StateIo)?;
+        output.sync_all().map_err(|_| UpdateError::StateIo)?;
+        fs::rename(&temporary, path).map_err(|_| UpdateError::StateIo)?;
+        #[cfg(unix)]
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| UpdateError::StateIo)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// Write the durable part of the current status out, best effort.
+///
+/// Called after every terminal step of an update cycle. A failure to persist
+/// must never fail the cycle itself, so the result is logged, not propagated.
+fn save_update_state(handle: &tauri::AppHandle) {
+    let snapshot = handle.state::<UpdateControl>().snapshot();
+    let Ok(path) = update_state_path(handle) else {
+        return;
+    };
+    let state = PersistedUpdateState {
+        schema_version: 1,
+        last_check_unix_seconds: snapshot.wallet.last_check_unix_seconds,
+        next_check_unix_seconds: snapshot.wallet.next_check_unix_seconds,
+        last_error: snapshot.wallet.sanitized_error.clone(),
+    };
+    if persist_update_state(&path, &state).is_err() {
+        tracing::warn!("Could not persist updater state; it will reset on restart");
+    }
 }
 
 fn load_automatic_update_preference(path: &Path) -> bool {
@@ -419,6 +508,11 @@ async fn perform_update_cycle(
         tracing::warn!(code = %error, "signed update check failed");
         updater_state.fail_wallet_check(error_code(error));
     }
+    // Every terminal outcome of the cycle passes through here, success and
+    // failure alike, so this is the one place the durable part has to be
+    // written. `apply` never reaches it - it restarts the process - which is
+    // why an install failure records itself before restarting.
+    save_update_state(&handle);
     updater_state.snapshot()
 }
 
@@ -551,7 +645,6 @@ async fn check_wallet_update(
     application
         .prepare_for_update(&lease)
         .map_err(|_| UpdateError::WalletPersistFailed)?;
-    let _ = fs::remove_file(&staging_path);
     // `bytes` is exactly what `verify_staged_artifact` returned above: size,
     // SHA-256 and minisign all checked, and held in memory since, so there is no
     // window for the file on disk to be swapped underneath us.
@@ -561,8 +654,18 @@ async fn check_wallet_update(
         // all, so the user clicked "Apply", the app restarted on the old
         // version, and nothing ever explained why.
         state.record_wallet_failure("UPDATE_INSTALL_FAILED");
+        // This path restarts instead of returning, so it persists its own
+        // failure: otherwise the restart erased every trace of it.
+        save_update_state(handle);
+        // Deliberately keep the staged artifact: it used to be deleted just
+        // before this call, so a half-finished install left the user with no
+        // verified artifact and no way forward but a full re-download. The
+        // stage is not trusted by being kept - every apply re-runs
+        // `verify_staged_artifact` over it from scratch.
         handle.restart();
     }
+    // Only now is the artifact no longer needed.
+    let _ = fs::remove_file(&staging_path);
     state.set_wallet_download_state(WalletUpdaterState::Restarting, Some(100));
     handle.restart();
 }
@@ -1018,7 +1121,11 @@ fn wallet_sync_resume(
 fn wallet_sync_retry(
     app: tauri::State<'_, DesktopApplication>,
 ) -> Result<dom_wallet_tauri_shell::WalletSyncStatusDto, dom_wallet_tauri_shell::CommandErrorDto> {
-    app.synchronization_resume_live().map_err(Into::into)
+    // `start_live`, not `resume_live`, matching `synchronization_retry`. This
+    // used to resume, which clears the pause flag: pressing Retry silently
+    // undid a pause the user had asked for. Retrying a failure and resuming a
+    // pause are different intents, and Resume is the button for the second.
+    app.synchronization_start_live().map_err(Into::into)
 }
 #[tauri::command]
 fn wallet_rescan(
@@ -1445,6 +1552,18 @@ fn application_builder() -> tauri::Builder<tauri::Wry> {
                 app.state::<UpdateControl>()
                     .set_automatic_updates(load_automatic_update_preference(&path));
             }
+            // "Last check: Never" after every restart, and a failed check or
+            // install that left no trace once the window closed.
+            if let Some(persisted) = update_state_path(app.handle())
+                .ok()
+                .and_then(|path| load_update_state(&path))
+            {
+                app.state::<UpdateControl>().restore_persisted(
+                    persisted.last_check_unix_seconds,
+                    persisted.next_check_unix_seconds,
+                    persisted.last_error,
+                );
+            }
             // Bind the persistent app-config directory before anything can read
             // the chain source, so a saved REMOTE selection (and the embedded
             // node map size) survives the restart instead of silently
@@ -1538,7 +1657,11 @@ fn main() {
             });
         }
         tauri::RunEvent::Exit | tauri::RunEvent::ExitRequested { .. } => {
-            let _ = handle.state::<DesktopApplication>().application_shutdown();
+            // A refused shutdown used to vanish here, so the application quit
+            // with the node and the wallet still open and nothing said why.
+            if let Err(error) = handle.state::<DesktopApplication>().application_shutdown() {
+                tracing::error!(%error, "Shutdown did not complete cleanly on exit");
+            }
         }
         _ => {}
     });
