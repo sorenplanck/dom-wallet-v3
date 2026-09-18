@@ -194,6 +194,29 @@ fn initialize_file_logging(app: &tauri::App) {
     }
 }
 
+/// Start the embedded node only when it is the configured chain source.
+///
+/// `setup` and the offline restore already honoured the user's choice, but
+/// wallet creation, creation resume, backup import and opening a wallet called
+/// `ensure_mainnet_node` unconditionally. Someone who had selected "Remote
+/// node" still got a full local node started — disk, CPU and a P2P listener —
+/// every time they opened or created a wallet, contradicting the explicit
+/// setting. A remote source is scan-only, so those commands simply proceed
+/// without a local node.
+fn ensure_mainnet_node_if_embedded(
+    handle: &tauri::AppHandle,
+    app: &DesktopApplication,
+) -> Result<(), dom_wallet_tauri_shell::CommandErrorDto> {
+    let embedded = app
+        .chain_source_get()
+        .map(|source| source.source == "EMBEDDED")
+        .unwrap_or(true);
+    if embedded {
+        ensure_mainnet_node(handle, app)?;
+    }
+    Ok(())
+}
+
 fn ensure_mainnet_node(
     handle: &tauri::AppHandle,
     app: &DesktopApplication,
@@ -612,7 +635,7 @@ fn wallet_create_recoverable(
 ) -> Result<dom_wallet_tauri_shell::RecoveryCreateDto, dom_wallet_tauri_shell::CommandErrorDto> {
     let password = Zeroizing::new(password);
     let path = managed_wallet_path(&handle, &name)?;
-    ensure_mainnet_node(&handle, &app)?;
+    ensure_mainnet_node_if_embedded(&handle, &app)?;
     app.wallet_create_recoverable(path, password.as_str())
         .map_err(Into::into)
 }
@@ -626,7 +649,7 @@ fn wallet_create_resume(
 ) -> Result<dom_wallet_tauri_shell::RecoveryCreateDto, dom_wallet_tauri_shell::CommandErrorDto> {
     let password = Zeroizing::new(password);
     let path = managed_wallet_path(&handle, &name)?;
-    ensure_mainnet_node(&handle, &app)?;
+    ensure_mainnet_node_if_embedded(&handle, &app)?;
     app.wallet_create_resume(path, password.as_str())
         .map_err(Into::into)
 }
@@ -711,7 +734,7 @@ fn wallet_backup_import(
     let backup_password = Zeroizing::new(backup_password);
     let password = Zeroizing::new(password);
     let destination = managed_wallet_path(&handle, &name)?;
-    ensure_mainnet_node(&handle, &app)?;
+    ensure_mainnet_node_if_embedded(&handle, &app)?;
     app.wallet_backup_import(
         destination,
         backup_path,
@@ -746,7 +769,7 @@ fn wallet_open_named(
     name: String,
 ) -> Result<dom_wallet_core::WalletSummary, dom_wallet_tauri_shell::CommandErrorDto> {
     let root = managed_wallets_root(&handle)?;
-    ensure_mainnet_node(&handle, &app)?;
+    ensure_mainnet_node_if_embedded(&handle, &app)?;
     app.wallet_open_managed(&root, &name).map_err(Into::into)
 }
 #[tauri::command]
@@ -1426,14 +1449,35 @@ fn application_builder() -> tauri::Builder<tauri::Wry> {
                 let application = app.state::<DesktopApplication>();
                 let _ = ensure_mainnet_node(&handle, &application);
             }
-            let runtime_root = app
+            // The managed sidecar is an experimental feature with no path from
+            // the UI: none of the `experimental_sidecar_*` commands is invoked
+            // by the frontend. Aborting `setup` when its runtime directory
+            // cannot be prepared took the whole wallet down — and `main` turns
+            // that into a bare `exit(1)` with no log and no dialog, so a
+            // corrupt or unreadable `runtime/managed-sidecar` made the wallet
+            // impossible to open with no explanation whatsoever. Degrade
+            // instead: log it and leave the sidecar unconfigured.
+            match app
                 .path()
-                .app_local_data_dir()?
-                .join("runtime")
-                .join("managed-sidecar");
-            app.state::<DesktopApplication>()
-                .configure_sidecar_runtime(runtime_root)
-                .map_err(|error| std::io::Error::other(error.to_string()))?;
+                .app_local_data_dir()
+                .map(|root| root.join("runtime").join("managed-sidecar"))
+            {
+                Ok(runtime_root) => {
+                    if let Err(error) = app
+                        .state::<DesktopApplication>()
+                        .configure_sidecar_runtime(runtime_root)
+                    {
+                        tracing::warn!(
+                            %error,
+                            "managed sidecar runtime unavailable; continuing without it"
+                        );
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    %error,
+                    "no local data directory for the managed sidecar; continuing without it"
+                ),
+            }
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let jitter = unix_seconds() % (MAX_INITIAL_JITTER_SECONDS + 1);
@@ -1453,8 +1497,16 @@ fn application_builder() -> tauri::Builder<tauri::Wry> {
 }
 
 fn main() {
-    let Ok(app) = application_builder().build(tauri::generate_context!()) else {
-        std::process::exit(1);
+    let app = match application_builder().build(tauri::generate_context!()) {
+        Ok(app) => app,
+        Err(error) => {
+            // A bare exit(1) left no trace at all. The file logger is already
+            // installed by `setup`, but a build failure can happen before that,
+            // so report on stderr too.
+            tracing::error!(%error, "wallet application failed to start");
+            eprintln!("DOM Wallet failed to start: {error}");
+            std::process::exit(1);
+        }
     };
     app.run(|handle, event| match event {
         tauri::RunEvent::Resumed => {

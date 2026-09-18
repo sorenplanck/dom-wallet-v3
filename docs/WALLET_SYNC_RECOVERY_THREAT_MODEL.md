@@ -7,13 +7,16 @@
 **Reference implementation:** the functional wallet built and tested on
 2026-07-29, not yet published: branch `redesign/restore-remote-scan`, with the
 legacy deterministic coinbase compatibility fix in
-`b1f04ac713ff8770b0ece73e9fedc595cd7936c5`. At the time of writing, the DOM
-protocol crates are pinned to
-`387b744474d2414f9d2d0e542bc654096ce2f8ed`.
+`b1f04ac713ff8770b0ece73e9fedc595cd7936c5`. The DOM protocol crates are pinned
+in `Cargo.toml` to `38dd70536f088a467f2b7175978c5a6ebb4e5bd4` (the revision
+`387b744474d2414f9d2d0e542bc654096ce2f8ed` quoted here previously is no longer
+the one the workspace builds against). `dom-sidecar` is pinned separately to
+`ab45a2944f22fe00f9b12984354f0d5d7cdd229a`, and the swap crates to
+`5d8f5db333d3223f74f5df935b4b2d453ab25b22`.
 
 > This document describes behavior implemented in the current code. It is not
 > a future specification, a release note, or an independent security audit.
-> The local `wallet-v0.3.0` tag still points to `7d43910`; therefore, the legacy
+> The `wallet-v0.3.0` tag points to `5d828f5`; therefore, the legacy
 > deterministic coinbase compatibility fix in `b1f04ac` must be included in
 > the revision that is actually published.
 

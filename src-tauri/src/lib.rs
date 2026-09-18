@@ -5638,6 +5638,10 @@ pub fn resolve_wallet_directory(wallets_root: &Path, name: &str) -> Result<PathB
     Ok(wallets_root.join(name))
 }
 
+fn phrase_problem_error(problem: PhraseProblem) -> CommandError {
+    CommandError::RecoveryPhrase(problem)
+}
+
 /// Whether a restore destination is genuinely taken.
 ///
 /// A bare `path.exists()` was reported as a phantom `RESTORE_DESTINATION_EXISTS`
@@ -5652,10 +5656,6 @@ pub fn resolve_wallet_directory(wallets_root: &Path, name: &str) -> Result<PathB
 ///   wallet data even if the emptiness check raced;
 /// - anything else (a real wallet, foreign files, a file, a symlink) →
 ///   occupied. Restore never overwrites content it did not create.
-fn phrase_problem_error(problem: PhraseProblem) -> CommandError {
-    CommandError::RecoveryPhrase(problem)
-}
-
 fn restore_destination_is_occupied(path: &Path) -> Result<bool, CommandError> {
     let Ok(metadata) = path.symlink_metadata() else {
         // No entry at all (or an unreadable parent): nothing is in the way.
