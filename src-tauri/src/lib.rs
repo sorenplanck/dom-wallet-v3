@@ -212,6 +212,7 @@ macro_rules! wallet_command_registry {
             diagnostics_redacted,
             application_shutdown,
             transaction_fee_estimate,
+            transaction_funding_preflight,
             wallet_address_validate,
             transaction_send_create,
             slate_request_export,
@@ -2762,7 +2763,13 @@ impl DesktopApplication {
     }
 
     pub fn node_network_status(&self) -> Result<NodeNetworkStatusDto, CommandError> {
-        let status = self.embedded_node_status()?;
+        // Read-only: use the inner query directly. Taking a second
+        // `NodeLifecycle` lease made this fail with `ACTIVITY_COORDINATOR_BUSY`
+        // whenever the UI polled it alongside `embedded_node_status` — which it
+        // does, in the same `Promise.allSettled` — and the dashboard then
+        // reported a node failure that had not happened.
+        let _activity = self.activities.try_begin(ActivityKind::NodeLifecycle).ok();
+        let status = self.embedded_node_status_inner()?;
         Ok(NodeNetworkStatusDto {
             network: status.network.ok_or(CommandError::Unavailable)?,
             chain_id: status.chain_id.ok_or(CommandError::Unavailable)?,
@@ -3620,6 +3627,23 @@ impl DesktopApplication {
             return Err(CommandError::WorkerPanicked);
         }
         Ok(())
+    }
+
+    /// Real funding preflight: selects actual spendable outputs and prices the
+    /// transaction with the input count it will really use.
+    ///
+    /// The UI used to price every send with a hardcoded `selected_input_count:
+    /// 1`, so the total shown in the confirmation dialog understated the fee
+    /// whenever coin selection needed more than one input — and a
+    /// `requested_fee` derived from it was rejected with `FEE_TOO_LOW`.
+    pub fn transaction_funding_preflight(
+        &self,
+        amount: u64,
+    ) -> Result<dom_wallet_core::FundingPreflight, CommandError> {
+        self.ensure_running()?;
+        self.lock_service()?
+            .preflight_funding(amount)
+            .map_err(CommandError::from)
     }
 
     pub fn transaction_fee_estimate(

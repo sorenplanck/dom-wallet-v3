@@ -378,17 +378,26 @@ const refreshSummary = async () => {
   if (summaryResult.status !== "fulfilled") throw summaryResult.reason;
   const summary = summaryResult.value;
   if (nodeResult.status === "fulfilled") latestEmbeddedNodeStatus = nodeResult.value;
+  // A failed status poll is not evidence that the node failed. Contention on
+  // the activity coordinator (another status poll, a start, a restore) answers
+  // ACTIVITY_COORDINATOR_BUSY, and fabricating a STALE lifecycle from it told
+  // the user the node had died when nothing was wrong. Keep the last known
+  // status for transient contention and only degrade on a real failure.
+  const nodeStatusContended = nodeResult.status !== "fulfilled"
+    && nodeResult.reason?.code === "ACTIVITY_COORDINATOR_BUSY";
   const node = nodeResult.status === "fulfilled"
     ? nodeResult.value
-    : latestEmbeddedNodeStatus
-      ? {
-          ...latestEmbeddedNodeStatus,
-          lifecycle: "STALE",
-          ready: false,
-          status_message: "Node status is stale; retry the embedded node.",
-          error_code: "NODE_STATUS_STALE",
-        }
-      : undefined;
+    : nodeStatusContended
+      ? latestEmbeddedNodeStatus
+      : latestEmbeddedNodeStatus
+        ? {
+            ...latestEmbeddedNodeStatus,
+            lifecycle: "STALE",
+            ready: false,
+            status_message: "Node status is stale; retry the embedded node.",
+            error_code: "NODE_STATUS_STALE",
+          }
+        : undefined;
   const network = networkResult.status === "fulfilled" ? networkResult.value : undefined;
   const peers = peersResult.status === "fulfilled" ? peersResult.value : undefined;
   const synchronization = synchronizationResult.status === "fulfilled"
@@ -1040,13 +1049,23 @@ byId("transaction-create").addEventListener("submit", async (event) => {
     const requestedFee = data.get("requested_fee") === "" ? null : nomsFromDom(data.get("requested_fee"));
     let estimate;
     try {
-      estimate = await run(() => invoke("transaction_fee_estimate", { amount, selectedInputCount: 1, changeOutput: true }));
+      // Price with the inputs coin selection will really use. A hardcoded
+      // count of 1 understated the fee whenever more than one input was
+      // needed, so the confirmation dialog showed a total lower than what was
+      // actually charged - and a requested_fee derived from it was rejected
+      // with FEE_TOO_LOW.
+      estimate = await run(() => invoke("transaction_funding_preflight", { amount }));
     } catch (error) {
       feeSummary.textContent = "The network fee is unavailable; the payment was not created.";
       show(`Network fee unavailable: ${redactedError(error)}`, true);
       return;
     }
-    const feeNoms = requestedFee ?? estimate.minimum_fee;
+    if (estimate.fundable === false) {
+      feeSummary.textContent = "The spendable balance does not cover this payment and its fee.";
+      show("Insufficient spendable balance for this amount plus its network fee.", true);
+      return;
+    }
+    const feeNoms = requestedFee ?? estimate.estimated_fee;
     const totalNoms = amount + feeNoms;
     if (!Number.isSafeInteger(totalNoms)) throw new Error("Amount exceeds the safe desktop boundary.");
     renderFeeSummary(amount, feeNoms);
@@ -1065,8 +1084,8 @@ byId("transaction-estimate").addEventListener("click", async () => {
   const data = new FormData(byId("transaction-create"));
   try {
     const amount = nomsFromDom(data.get("amount"));
-    const estimate = await run(() => invoke("transaction_fee_estimate", { amount, selectedInputCount: 1, changeOutput: true }));
-    renderFeeSummary(amount, estimate.minimum_fee);
+    const estimate = await run(() => invoke("transaction_funding_preflight", { amount }));
+    renderFeeSummary(amount, estimate.estimated_fee);
     renderTransaction(estimate);
   } catch (error) {
     feeSummary.textContent = "The network fee is unavailable.";

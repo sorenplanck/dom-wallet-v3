@@ -1118,6 +1118,14 @@ fn transaction_fee_estimate(
         .map_err(Into::into)
 }
 #[tauri::command]
+fn transaction_funding_preflight(
+    app: tauri::State<'_, DesktopApplication>,
+    amount: u64,
+) -> Result<dom_wallet_core::FundingPreflight, dom_wallet_tauri_shell::CommandErrorDto> {
+    app.transaction_funding_preflight(amount)
+        .map_err(Into::into)
+}
+#[tauri::command]
 fn wallet_address_validate(
     app: tauri::State<'_, DesktopApplication>,
     address: String,

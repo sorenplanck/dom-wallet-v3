@@ -37,10 +37,13 @@ test("mining screen shows the DEPC range with a fail-closed placeholder", async 
 test("send flow presents the Core fee projection and fails closed without it", async () => {
   const [html, js] = await Promise.all([source("index.html"), source("main.js")]);
   assert.equal(html.includes('id="send-fee-summary"'), true, "missing fee summary element");
-  assert.equal(js.includes('invoke("transaction_fee_estimate"'), true, "send flow must request the Core projection");
+  // The projection must come from Core. `transaction_funding_preflight` is
+  // that projection priced with the inputs coin selection will really use,
+  // instead of a hardcoded count of one.
+  assert.equal(js.includes('invoke("transaction_funding_preflight"'), true, "send flow must request the Core projection");
   assert.equal(js.includes("Network fee unavailable"), true, "missing projection must surface a reason");
   assert.equal(js.includes("the payment was not created"), true, "missing projection must abort the payment");
-  assert.equal(js.includes("estimate.minimum_fee"), true, "the displayed fee must come from the Core projection");
+  assert.equal(js.includes("estimate.estimated_fee"), true, "the displayed fee must come from the Core projection");
   // Presentation only: the frontend must not recompute fee policy.
   for (const forbidden of ["fee_rate", "weight *", "* weight", "minimum_relay", "minimum_mempool"]) {
     assert.equal(js.includes(forbidden), false, `fee-policy arithmetic leaked into the frontend: ${forbidden}`);
