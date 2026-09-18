@@ -407,11 +407,22 @@ impl UpdateControl {
         self.check_in_progress.store(false, Ordering::Release);
     }
 
-    pub fn fail_wallet_check(&self, error: &'static str) {
+    /// Record a failure without touching the in-progress latch.
+    ///
+    /// Use this from paths that never called [`Self::begin_check`]. Releasing a
+    /// latch this call never acquired would clear the guard of whichever cycle
+    /// actually holds it, letting a second update cycle run concurrently
+    /// against the same staging path.
+    pub fn record_wallet_failure(&self, error: &'static str) {
         if let Ok(mut status) = self.status.lock() {
             status.wallet.state = WalletUpdaterState::Failed;
             status.wallet.sanitized_error = Some(error.into());
         }
+    }
+
+    /// Record a failure and end the check this call's `begin_check` started.
+    pub fn fail_wallet_check(&self, error: &'static str) {
+        self.record_wallet_failure(error);
         self.check_in_progress.store(false, Ordering::Release);
     }
 

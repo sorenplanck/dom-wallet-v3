@@ -116,6 +116,7 @@ document.querySelectorAll("[data-screen]").forEach((button) => button.addEventLi
 }));
 document.querySelectorAll("[data-gate-panel]").forEach((button) => button.addEventListener("click", () => {
   clearSecretForms();
+  stopRestoreScanPolling();
   const panel = button.dataset.gatePanel;
   document.querySelectorAll(".gate-panel").forEach((node) => { node.hidden = node.id !== panel; });
   if (panel === "restore-form") {
@@ -141,7 +142,7 @@ const refreshWalletList = async () => {
   byId("open-wallet-empty").hidden = names.length > 0;
   return names;
 };
-const enterApp = () => { byId("gate").classList.add("hidden"); byId("app").classList.remove("hidden"); selectScreen("dashboard"); };
+const enterApp = () => { stopRestoreScanPolling(); byId("gate").classList.add("hidden"); byId("app").classList.remove("hidden"); selectScreen("dashboard"); };
 const enterGate = () => { byId("app").classList.add("hidden"); byId("gate").classList.remove("hidden"); clearSecretForms(); };
 
 const renderOnboardingNode = (node) => {
@@ -961,8 +962,21 @@ byId("updates-download").addEventListener("click", () => run(async () => {
 }).catch((error) => show(redactedError(error), true)));
 byId("updates-apply").addEventListener("click", () => {
   if (!window.confirm("Apply the already downloaded and verified Wallet update, close the wallet, and restart now?")) return;
-  run(() => invoke("apply_update_now", { confirmed: true }))
-    .catch((error) => show(redactedError(error), true));
+  // apply_update_now never returns Err, so the .catch here could not report a
+  // failed install: a missing stage, an invalid signature, a busy lease or a
+  // refused confirmation all left the screen completely unchanged. Inspect the
+  // returned status the same way the check and download handlers do.
+  run(async () => {
+    const updates = await invoke("apply_update_now", { confirmed: true });
+    await refreshUpdates();
+    const error = updates?.wallet?.sanitized_error;
+    show(
+      error
+        ? `Update install failed closed (${error}).`
+        : "Signed Wallet update applied. The wallet is restarting.",
+      Boolean(error),
+    );
+  }).catch((error) => show(redactedError(error), true));
 });
 byId("automatic-updates").addEventListener("change", (event) => run(async () => {
   await invoke("automatic_updates_set", { enabled: event.target.checked });
@@ -1231,7 +1245,26 @@ nativeBridge.initialize()
     refreshChainSource().catch(() => { /* configuration is loaded on demand in the panel */ });
     return Promise.all([invoke("application_status"), refreshOnboardingNode()]);
   })
-  .then(([result]) => show(`Application state: ${result.state}.`))
+  .then(async ([result]) => {
+    show(`Application state: ${result.state}.`);
+    // Nothing used to look for an existing wallet at startup, so the primary
+    // "Unlock wallet" call-to-action always failed with INVALID_WALLET_STATE:
+    // a wallet has to be *opened* before it can be unlocked, and the user had
+    // to discover that on their own. Open the single managed wallet so unlock
+    // works directly, and steer to the picker when the choice is ambiguous.
+    if (result.state !== "CLOSED") return;
+    const names = await invoke("wallet_list").catch(() => []);
+    if (names.length === 1) {
+      await invoke("wallet_open_named", { name: names[0] }).catch(() => {});
+      return;
+    }
+    if (names.length > 1) {
+      await refreshWalletList().catch(() => {});
+      document.querySelectorAll(".gate-panel").forEach((node) => {
+        node.hidden = node.id !== "open-form";
+      });
+    }
+  })
   .catch((error) => {
     document.documentElement.dataset.nativeBridge = nativeBridge.state;
     show(redactedError(error), true);

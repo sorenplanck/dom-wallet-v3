@@ -351,7 +351,7 @@ async fn apply_update_now(
     if !confirmed {
         handle
             .state::<UpdateControl>()
-            .fail_wallet_check("UPDATE_APPLY_CONFIRMATION_REQUIRED");
+            .record_wallet_failure("UPDATE_APPLY_CONFIRMATION_REQUIRED");
         return handle.state::<UpdateControl>().snapshot();
     }
     perform_update_cycle(handle, UpdateAction::Apply).await
@@ -529,6 +529,10 @@ async fn check_wallet_update(
     // window for the file on disk to be swapped underneath us.
     if update.install(bytes).is_err() {
         tracing::error!("Wallet installer failed; restarting the current signed version");
+        // Record before restarting: without this the failure left no trace at
+        // all, so the user clicked "Apply", the app restarted on the old
+        // version, and nothing ever explained why.
+        state.record_wallet_failure("UPDATE_INSTALL_FAILED");
         handle.restart();
     }
     state.set_wallet_download_state(WalletUpdaterState::Restarting, Some(100));
