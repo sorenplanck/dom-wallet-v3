@@ -2408,8 +2408,7 @@ impl WalletState {
             .filter(|(_, transaction)| {
                 matches!(
                     transaction.lifecycle,
-                    TransactionLifecycle::ResponsePrepared
-                        | TransactionLifecycle::ResponseExported
+                    TransactionLifecycle::ResponsePrepared | TransactionLifecycle::ResponseExported
                 )
             })
             .filter_map(|(index, transaction)| {
