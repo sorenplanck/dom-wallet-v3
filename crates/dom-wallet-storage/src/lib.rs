@@ -34,13 +34,26 @@ const WRITER_LOCK_FILE: &str = ".wallet.lock";
 const MAX_STATE_BYTES: usize = 64 * 1024 * 1024;
 pub const BACKUP_MAGIC: [u8; 8] = *b"DOMWBK01";
 pub const BACKUP_FORMAT_VERSION: u16 = 1;
+/// Everything in an encoded envelope that is not base64 of the plaintext: the
+/// 16-byte AEAD tag, and the JSON header carrying magic, version, profile, KDF
+/// parameters, salt and nonce, plus the punctuation around them. It comes to a
+/// few hundred bytes; 64 KiB is deliberately far more, because being wrong in
+/// this direction only costs ceiling and being wrong in the other direction
+/// costs a wallet that cannot commit.
+const ENVELOPE_OVERHEAD_ALLOWANCE: usize = 64 * 1024;
 /// Largest plaintext that can actually round-trip through a generation.
 ///
 /// `MAX_STATE_BYTES` bounds the *encoded* envelope, and the envelope carries
-/// its ciphertext as base64, which expands by 4/3. The real plaintext ceiling
-/// is therefore three quarters of it — bounding plaintext by `MAX_STATE_BYTES`
-/// directly would accept payloads that later fail on the encoded write.
-pub const MAX_STATE_PLAINTEXT_BYTES: usize = MAX_STATE_BYTES / 4 * 3;
+/// its ciphertext as base64, which expands by 4/3. Three quarters of
+/// `MAX_STATE_BYTES` is therefore close, but not correct: a payload of exactly
+/// that size still fails `encode`, because the tag and the header push the
+/// encoded form past the ceiling. Subtract the overhead before dividing.
+///
+/// `state_plaintext_ceiling_actually_round_trips` proves this bound by sealing
+/// and encoding a payload of exactly this size, rather than trusting the
+/// arithmetic - the arithmetic is what got it wrong the first time.
+pub const MAX_STATE_PLAINTEXT_BYTES: usize =
+    (MAX_STATE_BYTES - ENVELOPE_OVERHEAD_ALLOWANCE) / 4 * 3;
 // A backup container wraps the full encrypted state, so its ceiling must stay
 // above what that state can be once sealed and encoded (plus container
 // overhead); otherwise a wallet that commits fine could never be exported.
@@ -1101,6 +1114,49 @@ mod tests {
         WalletState,
     };
     use uuid::Uuid;
+
+    /// The ceiling `write_generation` enforces must be one a generation can
+    /// actually be written at.
+    ///
+    /// It was first derived as `MAX_STATE_BYTES / 4 * 3`, reasoning only about
+    /// base64's 4/3 expansion. That is wrong by the AEAD tag plus the JSON
+    /// header, so a payload of exactly the advertised size still failed
+    /// `encode` - the guard did not prevent the failure, it only moved it
+    /// earlier. Seal and encode at exactly the bound and require success,
+    /// so the constant is checked against the real encoder rather than
+    /// against the arithmetic that was wrong.
+    #[test]
+    fn state_plaintext_ceiling_actually_round_trips() {
+        let payload = vec![0x5au8; MAX_STATE_PLAINTEXT_BYTES];
+        let envelope = seal(
+            &payload,
+            "correct horse battery staple",
+            b"ceiling-round-trip",
+            KdfParameters::TEST,
+        )
+        .expect("seal at the advertised plaintext ceiling");
+        let encoded = encode(&envelope).expect("encode at the advertised plaintext ceiling");
+        assert!(
+            encoded.len() <= MAX_STATE_BYTES,
+            "encoded {} exceeds MAX_STATE_BYTES {}",
+            encoded.len(),
+            MAX_STATE_BYTES
+        );
+        // And one byte over must still be rejected, so the bound is a bound
+        // rather than an arbitrarily small number that happens to fit.
+        let over = vec![0x5au8; MAX_STATE_BYTES / 4 * 3];
+        let envelope = seal(
+            &over,
+            "correct horse battery staple",
+            b"ceiling-round-trip",
+            KdfParameters::TEST,
+        )
+        .expect("seal below MAX_ENVELOPE_BYTES");
+        assert!(
+            encode(&envelope).is_err(),
+            "the naive 4/3 ceiling must not encode - that was the original defect"
+        );
+    }
 
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
