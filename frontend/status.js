@@ -100,6 +100,13 @@ export function synchronizationPresentation(network, peers, synchronization) {
   };
 }
 
+/// `submitEnabled` is `true` in every branch, and that is the product
+/// decision, not an oversight: "Restore is always available. The wallet scans
+/// the chain in the background while the node synchronizes" (index.html).
+/// What this function gates is the *wording* - what the panel tells the user
+/// about the node while the scan runs. Anyone tempted to make one of these
+/// branches disable the button should read
+/// `regression_restore_submit_is_enabled_in_every_node_state` first.
 export function restoreReadinessPresentation(node) {
   const localHeight = Number.isSafeInteger(node?.canonical_tip_height)
     ? node.canonical_tip_height
@@ -189,6 +196,71 @@ export function restoreReadinessPresentation(node) {
     peerHeight: peerHeight || null,
     connectedPeers,
     progress,
+  };
+}
+
+/// The History used to print the backend's raw lifecycle identifier -
+/// `RESPONSE_PREPARED`, `ACCEPTED_NOT_RELAYED` - straight at the user. Every
+/// name `transaction_state_name` can produce is covered here; anything else
+/// falls back to the identifier with its underscores softened, so a new
+/// backend state degrades to something readable rather than to nothing.
+const TRANSACTION_STATE_LABELS = {
+  DRAFT: "Draft",
+  INPUTS_RESERVED: "Inputs reserved",
+  REQUEST_EXPORTED: "Request exported",
+  REQUEST_IMPORTED: "Request imported",
+  RESPONSE_PREPARED: "Response prepared",
+  RESPONSE_EXPORTED: "Response exported",
+  RESPONSE_IMPORTED: "Response imported",
+  FINALIZED: "Finalized",
+  SUBMITTING: "Submitting",
+  SUBMITTED: "Submitted",
+  ACCEPTED_NOT_RELAYED: "Accepted, not relayed",
+  IN_MEMPOOL: "In mempool",
+  CONFIRMED: "Confirmed",
+  REORGED: "Reorganized out",
+  RETRANSMIT_REQUIRED: "Retransmit required",
+  CANCELLED: "Cancelled",
+  FAILED: "Failed",
+  RECONCILIATION_REQUIRED: "Reconciliation required",
+};
+
+export function transactionStateLabel(state) {
+  if (typeof state !== "string" || state === "") return "Unknown";
+  if (Object.hasOwn(TRANSACTION_STATE_LABELS, state)) return TRANSACTION_STATE_LABELS[state];
+  const softened = state.replaceAll("_", " ").toLowerCase();
+  return softened.charAt(0).toUpperCase() + softened.slice(1);
+}
+
+/// The balance is only the whole balance once the cursor has reached the tip.
+/// `wallet_summary` returns `state.balance()` unconditionally, so a wallet
+/// scanned to 30% of the chain presented 30% of its funds as an authoritative
+/// figure, with nothing on the card to say so. This does not change the
+/// numbers - it says what they are worth.
+export function balanceCompletenessPresentation(synchronization) {
+  if (synchronization?.synchronized === true) return { partial: false, message: null };
+  const cursorHeight = Number.isSafeInteger(synchronization?.cursor_height)
+    ? synchronization.cursor_height
+    : null;
+  const tipHeight = Number.isSafeInteger(synchronization?.tip_height)
+    ? synchronization.tip_height
+    : null;
+  if (synchronization == null) {
+    return {
+      partial: true,
+      message: "Partial balance: synchronization status is unavailable, so these figures may be incomplete.",
+    };
+  }
+  if (cursorHeight != null && tipHeight != null && tipHeight > 0) {
+    const progress = Math.min(100, Math.floor((cursorHeight * 100) / tipHeight));
+    return {
+      partial: true,
+      message: `Partial balance: scanned to height ${cursorHeight} of ${tipHeight} (${progress}%). Funds above that height are not counted yet.`,
+    };
+  }
+  return {
+    partial: true,
+    message: "Partial balance: the wallet is still synchronizing, so these figures are incomplete.",
   };
 }
 

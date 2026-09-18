@@ -10,6 +10,8 @@ import {
   remoteTipAlertPresentation,
   restoreReadinessPresentation,
   restoreScanPresentation,
+  balanceCompletenessPresentation,
+  transactionStateLabel,
   synchronizationPresentation,
   reachabilityText,
 } from "../status.js";
@@ -625,4 +627,51 @@ test("regression_m13_restore_panel_does_not_fake_peer_discovery_while_node_is_do
   assert.equal(starting.badge, "STARTING");
   assert.doesNotMatch(starting.message, /Discovering/);
   assert.equal(starting.submitEnabled, true);
+});
+
+test("regression_m19_balance_card_says_when_the_figure_is_only_partial", () => {
+  // Synchronized: no caveat, the number is the whole number.
+  assert.deepEqual(
+    balanceCompletenessPresentation({ synchronized: true, cursor_height: 900, tip_height: 900 }),
+    { partial: false, message: null },
+  );
+
+  // Mid-scan: the card used to present 30% of the funds as authoritative.
+  const midScan = balanceCompletenessPresentation({
+    synchronized: false,
+    cursor_height: 300,
+    tip_height: 1_000,
+  });
+  assert.equal(midScan.partial, true);
+  assert.match(midScan.message, /scanned to height 300 of 1000 \(30%\)/);
+
+  // Heights unknown but not synchronized: still say it is partial.
+  const unknownHeights = balanceCompletenessPresentation({ synchronized: false });
+  assert.equal(unknownHeights.partial, true);
+  assert.match(unknownHeights.message, /still synchronizing/);
+
+  // The status call failed: unknown is not the same as complete.
+  const unavailable = balanceCompletenessPresentation(undefined);
+  assert.equal(unavailable.partial, true);
+  assert.match(unavailable.message, /unavailable/);
+});
+
+test("regression_b5_history_does_not_show_raw_backend_state_identifiers", () => {
+  // Every name `transaction_state_name` can emit must have a label.
+  const backendStates = [
+    "DRAFT", "INPUTS_RESERVED", "REQUEST_EXPORTED", "REQUEST_IMPORTED",
+    "RESPONSE_PREPARED", "RESPONSE_EXPORTED", "RESPONSE_IMPORTED", "FINALIZED",
+    "SUBMITTING", "SUBMITTED", "ACCEPTED_NOT_RELAYED", "IN_MEMPOOL",
+    "CONFIRMED", "REORGED", "RETRANSMIT_REQUIRED", "CANCELLED", "FAILED",
+    "RECONCILIATION_REQUIRED",
+  ];
+  for (const state of backendStates) {
+    const label = transactionStateLabel(state);
+    assert.notEqual(label, state, `${state} is still rendered raw`);
+    assert.doesNotMatch(label, /_/, `${state} label still contains an underscore`);
+  }
+  assert.equal(transactionStateLabel("ACCEPTED_NOT_RELAYED"), "Accepted, not relayed");
+  // An unknown future state degrades to something readable, not to nothing.
+  assert.equal(transactionStateLabel("SOME_NEW_STATE"), "Some new state");
+  assert.equal(transactionStateLabel(undefined), "Unknown");
 });

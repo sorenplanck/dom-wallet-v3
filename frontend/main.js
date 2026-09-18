@@ -11,6 +11,8 @@ import {
   nodeStatusText,
   reachabilityText,
   nomsFromDom,
+  balanceCompletenessPresentation,
+  transactionStateLabel,
   remoteTipAlertPresentation,
   restoreReadinessPresentation,
   restoreScanPresentation,
@@ -446,14 +448,27 @@ const refreshSummary = async () => {
     immature: "Immature",
     pending_incoming: "Pending incoming",
     pending_outgoing: "Pending outgoing",
-    locked: "Locked",
+    reserved: "Reserved",
     spendable: "Spendable",
   };
+  // `locked` is the protocol's `OutputState::Locked`, which this wallet never
+  // produces, so its card read "Locked: 0 DOM" permanently. Show it only if it
+  // ever carries value, and show "Reserved" - what really ties funds up -
+  // unconditionally in its place.
+  if (Number.isSafeInteger(summary.balance.locked) && summary.balance.locked > 0) {
+    balanceLabels.locked = "Locked";
+  }
   latestSpendableBalance = Number.isSafeInteger(summary.balance.spendable)
     && summary.balance.spendable >= 0
     ? summary.balance.spendable
     : null;
   byId("balance-total").firstChild.textContent = `${formatDomFromNoms(summary.balance.total ?? 0).replace(/ DOM$/, "")} `;
+  // `wallet_summary` always answers with whatever the cursor has reached so
+  // far, and the card used to present that as the balance, full stop.
+  const completeness = balanceCompletenessPresentation(synchronization);
+  const partialNotice = byId("balance-partial-notice");
+  partialNotice.hidden = !completeness.partial;
+  partialNotice.textContent = completeness.message ?? "";
   byId("balance-cards").replaceChildren(...Object.entries(balanceLabels).map(([key, label]) => {
     const value = summary.balance[key];
     const card = document.createElement("div");
@@ -1134,12 +1149,20 @@ tx("transaction-finalize", "transaction_finalize");
 tx("transaction-submit", "transaction_submit");
 tx("transaction-retry", "transaction_retry_submission");
 tx("transaction-reconcile", "transaction_reconcile_submission");
-tx("transaction-cancel", "slate_cancel", () => {
-  const confirmed = window.confirm("Cancel this payment manually? If a finalized transaction exists, the counterparty may still broadcast it; releasing the input can create a double-spend risk. Otherwise, the entire reserved input becomes available again.");
-  if (!confirmed) throw new Error("Cancellation was not confirmed.");
-  return { slateId: requiredId(), confirmExported: true };
+byId("transaction-cancel").addEventListener("click", async () => {
+  try {
+    const confirmed = window.confirm("Cancel this payment manually? If a finalized transaction exists, the counterparty may still broadcast it; releasing the input can create a double-spend risk. Otherwise, the entire reserved input becomes available again.");
+    if (!confirmed) throw new Error("Cancellation was not confirmed.");
+    renderTransaction(await run(() => invoke("slate_cancel", { slateId: requiredId(), confirmExported: true })));
+    show("slate cancel completed.");
+  } catch (error) {
+    // Same stale-record problem as the History button above.
+    if (error?.code === "TRANSACTION_RECONCILIATION_REQUIRED") {
+      await renderHistory().catch(() => {});
+    }
+    show(redactedError(error), true);
+  }
 });
-
 const receiveText = byId("receive-transaction-text");
 const receiveId = byId("receive-transaction-slate-id");
 const renderReceiver = (value) => {
@@ -1168,7 +1191,7 @@ const renderHistory = async () => {
     const node = document.createElement("article");
     node.className = "history-item";
     const title = document.createElement("strong");
-    title.textContent = `${transaction.state} · ${formatDomFromNoms(transaction.amount)}`;
+    title.textContent = `${transactionStateLabel(transaction.state)} · ${formatDomFromNoms(transaction.amount)}`;
     const identifier = document.createElement("code");
     identifier.textContent = transaction.slate_id ?? transaction.id;
     const details = document.createElement("p");
@@ -1216,6 +1239,13 @@ const renderHistory = async () => {
           await Promise.all([renderHistory(), refreshSummary()]);
           show("Payment cancelled. The reserved input is available again.");
         } catch (error) {
+          // A denied cancellation can still have changed the record: the
+          // backend commits `ReconciliationRequired` and only then refuses.
+          // Without this reload the History kept offering "Cancel and release
+          // input" for a transaction that is no longer cancellable at all.
+          if (error?.code === "TRANSACTION_RECONCILIATION_REQUIRED") {
+            await Promise.all([renderHistory(), refreshSummary()]).catch(() => {});
+          }
           show(redactedError(error), true);
         }
       });
