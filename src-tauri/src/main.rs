@@ -506,6 +506,14 @@ async fn check_wallet_update(
 
     state.set_wallet_download_state(WalletUpdaterState::Verifying, Some(100));
     let verifier = MinisignVerifier::from_base64(public_key)?;
+    // SECURITY INVARIANT: this call is the *only* barrier between a downloaded
+    // artifact and the native installer. `tauri-plugin-updater` verifies
+    // signatures inside its own `download()`, which this code deliberately does
+    // not use (the download is done here), so `Update::install` below performs
+    // no verification of its own. `bytes` must therefore always be the value
+    // returned by `verify_staged_artifact` — never re-read from disk, never
+    // sourced elsewhere. Switching to `download_and_install`, or passing any
+    // other buffer to `install`, silently removes signature checking.
     let bytes = verify_staged_artifact(&staging_directory, &staging_path, artifact, &verifier)?;
     let application = handle.state::<DesktopApplication>();
     let lease = application
@@ -516,6 +524,9 @@ async fn check_wallet_update(
         .prepare_for_update(&lease)
         .map_err(|_| UpdateError::WalletPersistFailed)?;
     let _ = fs::remove_file(&staging_path);
+    // `bytes` is exactly what `verify_staged_artifact` returned above: size,
+    // SHA-256 and minisign all checked, and held in memory since, so there is no
+    // window for the file on disk to be swapped underneath us.
     if update.install(bytes).is_err() {
         tracing::error!("Wallet installer failed; restarting the current signed version");
         handle.restart();

@@ -3488,11 +3488,19 @@ impl WalletService {
         let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
         let index = find_transaction_index(&state, slate_id, TransactionRole::Sender)?;
         let tx = &state.transactions[index];
+        // `ReconciliationRequired` and `Failed` used to be dead ends: neither
+        // could be cancelled (the exposure forbids it, correctly) nor retried,
+        // so the reserved inputs were stranded with no way forward at all.
+        // Resending the identical finalized bytes is idempotent and cannot
+        // double spend, so it is the safe escape from both.
         if tx.lifecycle != TransactionLifecycle::Finalized
             && !(retry
                 && matches!(
                     tx.lifecycle,
-                    TransactionLifecycle::Submitting | TransactionLifecycle::RetransmitRequired
+                    TransactionLifecycle::Submitting
+                        | TransactionLifecycle::RetransmitRequired
+                        | TransactionLifecycle::ReconciliationRequired
+                        | TransactionLifecycle::Failed
                 ))
         {
             return Err(CoreError::InvalidTransactionTransition);

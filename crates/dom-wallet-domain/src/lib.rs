@@ -811,8 +811,16 @@ impl LocalTransactionIntent {
                         E::RecipientResponse
                     )
                     | (L::ResponseImported, L::Finalized, E::Finalization)
+                    // Resubmitting the very same finalized bytes is idempotent:
+                    // a node that already holds them answers `AlreadyKnown`, so
+                    // this can never double spend. Allowing it out of
+                    // `ReconciliationRequired` and `Failed` is what keeps those
+                    // states from being dead ends that strand the inputs.
                     | (
-                        L::Finalized | L::RetransmitRequired,
+                        L::Finalized
+                            | L::RetransmitRequired
+                            | L::ReconciliationRequired
+                            | L::Failed,
                         L::Submitting,
                         E::SubmissionStarted
                     )
@@ -3027,6 +3035,30 @@ mod tests {
             recipient_output_id: None,
             change_output_id: None,
             expires_at_height: 0,
+        }
+    }
+
+    /// `ReconciliationRequired` and `Failed` could neither be cancelled (their
+    /// exposure forbids it, correctly) nor resubmitted, so a send that failed to
+    /// reach the node stranded its reserved inputs with no way forward at all.
+    /// Resending the identical finalized bytes is idempotent, so it is the safe
+    /// escape from both.
+    #[test]
+    fn reconciliation_required_and_failed_can_be_resubmitted() {
+        for lifecycle in [
+            TransactionLifecycle::ReconciliationRequired,
+            TransactionLifecycle::Failed,
+        ] {
+            let mut transaction = transaction_in(lifecycle);
+            transaction
+                .transition(
+                    TransactionLifecycle::Submitting,
+                    TransactionTransitionEvidence::SubmissionStarted,
+                )
+                .unwrap_or_else(|_| panic!("{lifecycle:?} must allow a resubmission"));
+            assert_eq!(transaction.lifecycle, TransactionLifecycle::Submitting);
+            // Exposure never regresses.
+            assert!(transaction.exposure >= BroadcastExposure::SubmissionStarted);
         }
     }
 
