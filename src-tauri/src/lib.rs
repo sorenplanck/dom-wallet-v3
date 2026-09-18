@@ -822,10 +822,21 @@ fn terminal_synchronization_error(error: &CommandError) -> bool {
         | CommandError::NoPeers
         | CommandError::WorkerPanicked
         | CommandError::ActivityBusy => false,
-        // Typed wallet errors carry their own decision.
+        // A locked wallet is not permanent for the *worker*. `retryable: false`
+        // is the right answer for a UI command — there is nothing to retry
+        // until the user acts — but the background scan must survive until the
+        // wallet is unlocked. An offline seed restore deliberately leaves the
+        // wallet locked and the UI promises "the chain scan continues in the
+        // background"; treating this as terminal killed the worker on its very
+        // first cycle and left the restore screen frozen at 0%.
+        CommandError::Wallet { code, .. } if *code == WALLET_LOCKED_CODE => false,
+        // Typed wallet errors otherwise carry their own decision.
         CommandError::Wallet { retryable, .. } => !retryable,
     }
 }
+
+/// Redacted code for a wallet that is open but still locked.
+const WALLET_LOCKED_CODE: &str = "WALLET_LOCKED";
 
 /// Consecutive failures after which a retriable synchronization error stops
 /// being silent.
@@ -6653,6 +6664,48 @@ mod tests {
         assert!(reported.len() < calls.get() as usize);
     }
 
+    /// An offline seed restore creates the wallet locked and the UI promises the
+    /// chain scan continues in the background. Classifying WALLET_LOCKED as
+    /// terminal killed the worker on its first cycle, so the restore screen sat
+    /// at 0% forever and the scan only began after a manual unlock restarted it.
+    #[test]
+    fn a_locked_wallet_keeps_the_sync_worker_alive_until_it_is_unlocked() {
+        let locked = CommandError::Wallet {
+            code: WALLET_LOCKED_CODE,
+            message: "locked",
+            retryable: false,
+        };
+        assert!(!terminal_synchronization_error(&locked));
+
+        let stop = AtomicBool::new(false);
+        let calls = std::cell::Cell::new(0_u32);
+        let unlocked_at = 4_u32;
+        let result = run_synchronization_follow_loop(
+            &stop,
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() >= unlocked_at {
+                    stop.store(true, Ordering::Release);
+                    return Ok(true);
+                }
+                Err(CommandError::Wallet {
+                    code: WALLET_LOCKED_CODE,
+                    message: "locked",
+                    retryable: false,
+                })
+            },
+            |_| {},
+            |_| {},
+        );
+
+        assert!(result.is_ok(), "the worker must survive a locked wallet");
+        assert_eq!(
+            calls.get(),
+            unlocked_at,
+            "the worker must keep polling until the wallet is unlocked"
+        );
+    }
+
     #[test]
     fn a_recovered_synchronization_clears_the_reported_stall() {
         let stop = AtomicBool::new(false);
@@ -6727,7 +6780,20 @@ mod tests {
         for error in variants {
             let terminal = terminal_synchronization_error(&error);
             let label = format!("{error:?}");
+            let locked =
+                matches!(&error, CommandError::Wallet { code, .. } if *code == WALLET_LOCKED_CODE);
             let dto = CommandErrorDto::from(error);
+            if locked {
+                // Deliberate divergence: a command has nothing to retry while
+                // the wallet is locked, but the background worker must stay
+                // alive until the user unlocks it.
+                assert!(!terminal, "{label} must not end the synchronization worker");
+                assert!(
+                    !dto.retryable,
+                    "{label} must stay non-retryable for commands"
+                );
+                continue;
+            }
             assert_eq!(
                 terminal, !dto.retryable,
                 "{label} is classified inconsistently: terminal={terminal}, retryable={}",

@@ -387,7 +387,8 @@ test("restore scan presentation reports block progress and partial balance", () 
     cursor_height: 1_200,
     tip_height: 8_000,
     scan_progress_percent: 15,
-    partial_balance: 250_000_000,
+    // The backend always sends a BalanceProjection object, never a scalar.
+    partial_balance: { confirmed: 100_000_000, immature: 150_000_000, total: 250_000_000 },
   });
   assert.equal(result.active, true);
   assert.equal(result.message, "Restored — scanning block 1200 of 8000 (15%)");
@@ -395,6 +396,19 @@ test("restore scan presentation reports block progress and partial balance", () 
   assert.equal(result.cursorHeight, 1_200);
   assert.equal(result.tipHeight, 8_000);
   assert.equal(result.partialBalanceText, "Partial balance: 2.50000000 DOM");
+});
+
+test("restore scan partial balance counts immature coinbases, not just confirmed", () => {
+  // A mining wallet being restored holds almost everything as immature
+  // coinbases. Reporting only `confirmed` showed ~0 while the scan was in fact
+  // finding money.
+  const result = restoreScanPresentation({
+    seed_restore_in_progress: true,
+    cursor_height: 10,
+    tip_height: 100,
+    partial_balance: { confirmed: 0, immature: 900_000_000, total: 900_000_000 },
+  });
+  assert.equal(result.partialBalanceText, "Partial balance: 9.00000000 DOM");
 });
 
 test("restore scan presentation derives progress when percent is missing", () => {

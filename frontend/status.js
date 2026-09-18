@@ -164,14 +164,17 @@ export function restoreScanPresentation(synchronization) {
     : tipHeight != null && tipHeight > 0
       ? Math.min(100, Math.floor((cursorHeight * 100) / tipHeight))
       : 0;
+  // `partial_balance` is always a BalanceProjection object; the old scalar
+  // branch was unreachable. Prefer `total`: reporting only `confirmed` hid
+  // every immature coinbase, which for a mining wallet being restored is
+  // essentially the whole balance, so the panel showed ~0 while the scan was
+  // in fact finding money.
   const partial = synchronization?.partial_balance;
-  const partialNoms = Number.isSafeInteger(partial)
-    ? partial
+  const partialNoms = Number.isSafeInteger(partial?.total)
+    ? partial.total
     : Number.isSafeInteger(partial?.confirmed)
       ? partial.confirmed
-      : Number.isSafeInteger(partial?.total)
-        ? partial.total
-        : null;
+      : null;
   if (!active) {
     return {
       active: false,

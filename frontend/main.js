@@ -64,8 +64,18 @@ const show = (message, failed = false) => {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => toast.classList.remove("show"), 5000);
 };
+export class OperationInProgressError extends Error {
+  constructor() {
+    super("Another wallet operation is still running.");
+    this.name = "OperationInProgressError";
+    this.code = "OPERATION_IN_PROGRESS";
+  }
+}
 const run = async (action) => {
-  if (pending) return undefined;
+  // Returning undefined here made every caller believe the command had
+  // succeeded: "transaction submit completed" / "Payment cancelled" were shown
+  // without anything being sent or cancelled. Fail loudly instead.
+  if (pending) throw new OperationInProgressError();
   pending = true;
   const buttons = [...document.querySelectorAll("button")];
   const disabledState = buttons.map((button) => button.disabled);
@@ -1089,11 +1099,6 @@ byId("response-export").addEventListener("click", async () => {
 
 const renderHistory = async () => {
   const [transactions, summary] = await Promise.all([invoke("transaction_list"), invoke("wallet_summary")]);
-  const pendingStates = new Set([
-    "INPUTS_RESERVED", "REQUEST_EXPORTED", "RESPONSE_IMPORTED", "FINALIZED",
-    "SUBMITTING", "SUBMITTED", "ACCEPTED_NOT_RELAYED", "IN_MEMPOOL",
-    "REORGED", "RETRANSMIT_REQUIRED", "RECONCILIATION_REQUIRED", "FAILED",
-  ]);
   const nodes = transactions.map((transaction) => {
     const node = document.createElement("article");
     node.className = "history-item";
@@ -1128,7 +1133,7 @@ const renderHistory = async () => {
         show("An expired, unfinalized payment was cancelled automatically and its input is available again.");
       }
     }
-    if (pendingStates.has(transaction.state) && transaction.manual_cancel_allowed) {
+    if (transaction.manual_cancel_allowed) {
       const cancel = document.createElement("button");
       cancel.className = "btn ghost transaction-cancel-pending";
       cancel.type = "button";
