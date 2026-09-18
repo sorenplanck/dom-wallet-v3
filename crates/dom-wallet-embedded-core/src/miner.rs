@@ -219,11 +219,35 @@ async fn mine_wallet_block_with_workers(
             .unwrap_or(0);
         let candidate_height = chain.tip_height.0.saturating_add(1);
         let seed_height = randomx_seed_height(candidate_height);
-        let seed_hash = chain
+        // CONSENSUS: the RandomX seed decides which dataset every hash is
+        // computed against. Falling back to an all-zero seed when the height
+        // index has no entry made the wallet mine against a dataset the
+        // validator never uses, so every solution found was rejected on
+        // `connect_block` and the whole round was wasted. Mirror the canonical
+        // node miner instead: only a committed header that really sits at the
+        // seed height is an acceptable seed, and only the genesis epoch may
+        // legitimately have none.
+        let seed_hash = match chain
             .store
             .get_hash_at_height(seed_height)
             .map_err(|_| WalletMiningError::Preparation("SEED_INDEX"))?
-            .unwrap_or([0; 32]);
+        {
+            Some(hash) => {
+                let header_bytes = chain
+                    .store
+                    .get_block_header(&hash)
+                    .map_err(|_| WalletMiningError::Preparation("SEED_INDEX"))?
+                    .ok_or(WalletMiningError::Preparation("SEED_HEADER_MISSING"))?;
+                let header = BlockHeader::from_bytes(&header_bytes)
+                    .map_err(|_| WalletMiningError::Preparation("SEED_HEADER_MALFORMED"))?;
+                if header.height.0 != seed_height {
+                    return Err(WalletMiningError::Preparation("SEED_HEIGHT_MISMATCH"));
+                }
+                hash
+            }
+            None if seed_height == 0 => [0u8; 32],
+            None => return Err(WalletMiningError::Preparation("SEED_BLOCK_MISSING")),
+        };
         (
             chain.tip_hash,
             chain.tip_height,
@@ -338,7 +362,14 @@ async fn mine_wallet_block_with_workers(
         } else if template_started.elapsed() >= TEMPLATE_REFRESH_INTERVAL {
             Ok(WalletMiningOutcome::TemplateExpired { height })
         } else {
-            Err(WalletMiningError::Worker)
+            // No worker reported a failure (that case returned above through
+            // `failed`), yet the round produced no header. The nonce loop
+            // re-reads the live node metrics on every iteration, so it can stop
+            // on a condition that has already recovered by the time this outer
+            // check runs. Treating that race as a worker failure ended mining
+            // permanently with `MINING_ERROR` after a round that simply found
+            // nothing; a template refresh is the correct, recoverable answer.
+            Ok(WalletMiningOutcome::TemplateExpired { height })
         };
     };
 
@@ -556,12 +587,25 @@ fn template_is_current(
             || authoritative_network_ready(current_height, peer_count, highest_known_peer_height))
 }
 
+/// Mining is paused only while the node is genuinely *behind* its peers.
+///
+/// This mirrors the canonical node miner, which pauses on
+/// `best_known_peer_height > local_height` (`dom-node`'s `MiningEligibility`).
+/// Requiring strict equality instead would stop mining whenever the local chain
+/// is *ahead* of the highest announced peer height — which happens
+/// deterministically right after this wallet mines a block, because the local
+/// height advances immediately while a peer height only rises when some peer
+/// announces it. That produced a permanent 0 H/s with no explanation.
 fn authoritative_network_ready(
     current_height: u64,
     peer_count: u64,
     highest_known_peer_height: u64,
 ) -> bool {
-    peer_count > 0 && highest_known_peer_height == current_height
+    // A peer height of zero above genesis means "no peer has announced a height
+    // yet", not "the network is at genesis". Without an IBD metric that is the
+    // only signal that the view is not authoritative, so it still blocks mining.
+    let authoritative = highest_known_peer_height > 0 || current_height == 0;
+    peer_count > 0 && authoritative && highest_known_peer_height <= current_height
 }
 
 fn now_seconds() -> u64 {
@@ -767,5 +811,22 @@ mod tests {
         assert!(!authoritative_network_ready(0, 0, 0));
         assert!(!authoritative_network_ready(9, 1, 10));
         assert!(!authoritative_network_ready(9, 1, 0));
+    }
+
+    #[test]
+    fn mining_continues_while_the_local_chain_is_ahead_of_its_peers() {
+        // Right after this wallet mines a block the local height advances while
+        // the highest announced peer height only rises once some peer announces
+        // it. Requiring strict equality stopped mining there, which showed up as
+        // a permanent 0 H/s. The canonical node miner only pauses while it is
+        // genuinely behind (`best_known_peer_height > local_height`).
+        assert!(authoritative_network_ready(10, 1, 9));
+        assert!(authoritative_network_ready(44_327, 5, 44_326));
+        assert!(template_is_current(10, 10, 1, 9, true, Duration::ZERO));
+
+        // Still behind: mining stays paused.
+        assert!(!authoritative_network_ready(9, 1, 10));
+        // Still unknown peer height above genesis: mining stays paused.
+        assert!(!authoritative_network_ready(10, 1, 0));
     }
 }
