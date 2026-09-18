@@ -692,6 +692,14 @@ pub struct WalletSyncStatusDto {
     pub remote_tip_alert: bool,
     pub synchronized: bool,
     pub paused: bool,
+    /// Whole-percent occupancy of the encrypted-state ceiling.
+    ///
+    /// A mining wallet grows by one unprunable record set per owned coinbase,
+    /// and crossing the ceiling freezes the scan cursor at `STORAGE_COMMIT`
+    /// with no warning (F-C7). Nothing stops the growth - the records are the
+    /// user's money - so the interface's job is to say how close the wall is
+    /// while there is still time to act.
+    pub state_utilization_percent: Option<u64>,
     pub last_result: String,
     pub last_error: Option<String>,
 }
@@ -4837,6 +4845,7 @@ fn sync_status_from_service(
         remote_tip_alert: context.remote_tip_alert,
         synchronized,
         paused: context.paused,
+        state_utilization_percent: service.state_storage_utilization_percent(),
         last_result: if synchronized {
             "SUCCESS"
         } else {
@@ -6941,6 +6950,7 @@ mod tests {
                 remote_tip_alert: false,
                 synchronized: false,
                 paused: false,
+                state_utilization_percent: None,
                 last_result: "NOT_SYNCHRONIZED".into(),
                 last_error: None,
             });

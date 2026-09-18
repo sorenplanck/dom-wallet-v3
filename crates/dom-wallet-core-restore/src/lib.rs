@@ -677,6 +677,13 @@ pub fn apply_recovery_batch(
     // Rebind any rediscovered Scriptless funding input and claim/refund payout
     // by canonical commitment before this batch is committed. This preserves
     // fail-closed input reservations and byte-identical local payout material.
+    // Ordinary payments need the same rebind the Scriptless reservations get:
+    // their reserved inputs are rows this rescan has just recreated under new
+    // local ids, and matching them back by commitment is what keeps a live
+    // payment's inputs reserved instead of silently available (F-C5).
+    state
+        .restore_transaction_reservations()
+        .map_err(|_| SeedRestoreError::MalformedRecovery)?;
     state
         .restore_scriptless_funding_reservations()
         .map_err(|_| SeedRestoreError::MalformedRecovery)?;

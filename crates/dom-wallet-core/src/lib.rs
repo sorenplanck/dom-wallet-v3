@@ -44,8 +44,8 @@ use dom_wallet_domain::{
     LocalTransactionIntent, MiningPreferences, Network, NetworkIdentity, NodeConfiguration,
     OutputRecord, OutputState, PrivateScriptlessFundingContext, PrivateScriptlessPayoutContext,
     PrivateTransactionContext, RecoveryMetadata, RecoveryOutputClass, RedactedNodeConfiguration,
-    ScriptlessFundingReservation, ScriptlessFundingReservationState, ScriptlessPayoutReservation,
-    ScriptlessPayoutReservationState, ScriptlessPayoutRoleV1,
+    ReservedRecoveryCoordinate, ScriptlessFundingReservation, ScriptlessFundingReservationState,
+    ScriptlessPayoutReservation, ScriptlessPayoutReservationState, ScriptlessPayoutRoleV1,
     ScriptlessTemplateParticipantBindingV1, SeedRestoreStatus, SwapAcceptedQuote,
     SwapSessionRecord, SwapSessionState, SwapSessionTransition, SyncStatus,
     TransactionCancellationReason, TransactionLifecycle, TransactionRole,
@@ -63,6 +63,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::{
+    collections::VecDeque,
     fmt,
     path::Path,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -437,6 +438,12 @@ pub struct WalletService {
     errors: ErrorDomainSnapshot,
     /// Last canonical tip height observed from a committed batch or Core identity.
     observed_tip_height: Option<u64>,
+    /// Coinbase coordinates already burned durably and not yet handed out.
+    ///
+    /// See `mining_coinbase_candidate`. Volatile on purpose: anything left
+    /// here when the process ends is simply never used, and the floor on disk
+    /// already covers it, so no index is ever handed out twice.
+    coinbase_coordinate_pool: VecDeque<ReservedRecoveryCoordinate>,
 }
 
 impl fmt::Debug for WalletService {
@@ -466,6 +473,7 @@ impl Default for WalletService {
             sender_secrets: None,
             errors: ErrorDomainSnapshot::default(),
             observed_tip_height: None,
+            coinbase_coordinate_pool: VecDeque::new(),
         }
     }
 }
@@ -985,6 +993,41 @@ impl WalletService {
 
     /// Reserve a Coinbase recovery coordinate before creating public mining
     /// material. Seed and blinding data never cross into the embedded node.
+    /// How many coinbase coordinates are burned per durable commit.
+    ///
+    /// Each candidate needs a coordinate that is durable *before* the public
+    /// material is built, or a crash could hand the same derivation index to
+    /// two outputs. That invariant used to cost one full state commit per
+    /// candidate - Argon2id over 64 MiB plus a rewrite of the entire encrypted
+    /// generation, on a wallet whose state grows with every coinbase it owns
+    /// (F-M25). Burning a batch keeps the invariant and pays for it once.
+    ///
+    /// Unused coordinates are never reused: the floor on disk already covers
+    /// the whole batch, so a crash skips them. Gaps are harmless because
+    /// restore rebuilds the floors from the capsules it actually finds rather
+    /// than enumerating indices.
+    const COINBASE_COORDINATE_BATCH: usize = 64;
+
+    /// Hand out the next burned coinbase coordinate, refilling durably when
+    /// the batch runs out.
+    fn next_coinbase_coordinate(&mut self) -> Result<ReservedRecoveryCoordinate, CoreError> {
+        if let Some(coordinate) = self.coinbase_coordinate_pool.pop_front() {
+            return Ok(coordinate);
+        }
+        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
+        let mut batch = VecDeque::with_capacity(Self::COINBASE_COORDINATE_BATCH);
+        for _ in 0..Self::COINBASE_COORDINATE_BATCH {
+            batch.push_back(state.reserve_recovery_coordinate(0, RecoveryOutputClass::Coinbase)?);
+        }
+        // Durable before any of them is used, exactly as before - the whole
+        // batch is covered by this single commit.
+        self.commit(state)?;
+        self.coinbase_coordinate_pool = batch;
+        self.coinbase_coordinate_pool
+            .pop_front()
+            .ok_or(CoreError::InvalidTransactionInput)
+    }
+
     pub fn mining_coinbase_candidate(
         &mut self,
         height: u64,
@@ -996,9 +1039,7 @@ impl WalletService {
         require_canonical_mainnet_when_applicable(
             &self.unlocked.as_ref().ok_or(CoreError::Locked)?.identity,
         )?;
-        let mut state = self.unlocked.as_ref().ok_or(CoreError::Locked)?.clone();
-        let coordinate = state.reserve_recovery_coordinate(0, RecoveryOutputClass::Coinbase)?;
-        self.commit(state)?;
+        let coordinate = self.next_coinbase_coordinate()?;
         let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
         let seed = CanonicalWalletSeed::from_entropy(&state.root_material)
             .map_err(|_| CoreError::RecoveryPhraseInvalid)?;
@@ -1265,6 +1306,10 @@ impl WalletService {
         self.sender_secrets = None;
         self.unlocked = None;
         self.password = None;
+        // Burned-but-unused coordinates are tied to the state that burned
+        // them. Dropping them wastes at most a handful of indices; keeping
+        // them across a lock could hand one out against a different state.
+        self.coinbase_coordinate_pool.clear();
         self.state = ApplicationState::Locked;
         Ok(())
     }
@@ -1280,6 +1325,27 @@ impl WalletService {
         self.metadata = None;
         self.state = ApplicationState::Closed;
         Ok(())
+    }
+
+    /// How much of the encrypted-state ceiling the active generation occupies,
+    /// as a whole percent.
+    ///
+    /// Every owned coinbase appends a record set that stays for as long as the
+    /// output is unspent - it is the user's money, so it cannot be pruned. A
+    /// mining wallet therefore walks toward the ceiling by design, and
+    /// crossing it freezes the scan cursor at `STORAGE_COMMIT` with no
+    /// warning at all (F-C7 - this is what happened to real wallets). There is
+    /// no fix that makes the growth stop; what there can be is warning far
+    /// enough ahead to act. Reads a file length, so it is cheap enough to
+    /// answer on every status poll and needs no password.
+    pub fn state_storage_utilization_percent(&self) -> Option<u64> {
+        let location = self.location.as_ref()?;
+        let used = location.active_generation_encoded_bytes().ok()?;
+        let ceiling = WalletDirectory::state_ceiling_bytes();
+        if ceiling == 0 {
+            return None;
+        }
+        Some(used.saturating_mul(100) / ceiling)
     }
 
     pub fn summary(&self) -> Result<WalletSummary, CoreError> {
@@ -1470,12 +1536,18 @@ impl WalletService {
 
     pub fn rescan_from_genesis(&mut self) -> Result<WalletSummary, CoreError> {
         // A genesis rescan removes every output discovered above height zero and
-        // recreates the rediscovered ones under fresh identifiers. A transaction
-        // intent stores only `reserved_output_ids`, never the input commitments,
-        // so its reservations cannot be rebound afterwards: the inputs would
-        // silently come back unreserved and spendable while a finalized
-        // transaction the counterparty can still broadcast keeps claiming them.
-        // Fail closed instead of creating a local double spend.
+        // recreates the rediscovered ones under fresh identifiers. A live
+        // reservation can only survive that if the intent recorded the
+        // canonical commitments of its inputs, because the commitment is the
+        // one identifier the chain itself carries -
+        // `restore_transaction_reservations` rebinds from it as each batch is
+        // applied.
+        //
+        // Without them there is nothing to rebind with: the inputs would come
+        // back unreserved and spendable while a finalized transaction the
+        // counterparty can still broadcast keeps claiming them. States written
+        // before the field existed are exactly that case, so they stay
+        // blocked - fail closed rather than create a local double spend.
         if self
             .unlocked
             .as_ref()
@@ -1484,10 +1556,9 @@ impl WalletService {
             .iter()
             .any(|transaction| {
                 !transaction.reserved_output_ids.is_empty()
-                    && !matches!(
-                        transaction.lifecycle,
-                        TransactionLifecycle::Cancelled | TransactionLifecycle::Confirmed { .. }
-                    )
+                    && transaction.lifecycle.retains_input_reservations()
+                    && transaction.reserved_input_commitments.len()
+                        != transaction.reserved_output_ids.len()
             })
         {
             return Err(CoreError::RescanBlockedByReservedInputs);
@@ -2889,6 +2960,20 @@ impl WalletService {
         let transaction_id = Uuid::new_v4();
         let coordinate = state.reserve_recovery_coordinate(0, RecoveryOutputClass::Change)?;
         let reserved_output_ids = selected.iter().map(|output| output.id).collect::<Vec<_>>();
+        // Recorded alongside the ids because a whole-history rescan replaces
+        // every local output row with a fresh UUID, and only the commitment
+        // survives that. `spendable_outputs` already requires a commitment on
+        // everything it selects, so this is never partial for a reservation
+        // this build creates.
+        let reserved_input_commitments = selected
+            .iter()
+            .map(|output| {
+                output
+                    .commitment
+                    .map(|commitment| commitment.to_vec())
+                    .ok_or(CoreError::UnsupportedSpendingEvidence)
+            })
+            .collect::<Result<Vec<_>, CoreError>>()?;
         for output in &mut state.outputs {
             if reserved_output_ids.contains(&output.id) {
                 if output.reserved_by.is_some() {
@@ -2922,6 +3007,7 @@ impl WalletService {
             amount,
             fee,
             reserved_output_ids,
+            reserved_input_commitments,
             request_bytes: Vec::new(),
             response_bytes: Vec::new(),
             finalized_transaction_bytes: Vec::new(),
@@ -3124,6 +3210,7 @@ impl WalletService {
             amount: slate.recovery_body()?.amount_noms(),
             fee: slate.fee_noms(),
             reserved_output_ids: Vec::new(),
+            reserved_input_commitments: Vec::new(),
             request_bytes: slate.canonical_bytes().to_vec(),
             response_bytes: Vec::new(),
             finalized_transaction_bytes: Vec::new(),
@@ -5455,6 +5542,7 @@ mod tests {
             amount: 1,
             fee: 1,
             reserved_output_ids: Vec::new(),
+            reserved_input_commitments: Vec::new(),
             request_bytes: Vec::new(),
             response_bytes: Vec::new(),
             finalized_transaction_bytes: Vec::new(),
@@ -5514,6 +5602,7 @@ mod tests {
             amount: 1_000_000_000,
             fee: 1,
             reserved_output_ids: vec![output_id],
+            reserved_input_commitments: Vec::new(),
             request_bytes: Vec::new(),
             response_bytes: Vec::new(),
             finalized_transaction_bytes: Vec::new(),
@@ -5608,6 +5697,7 @@ mod tests {
             amount: 1_000_000_000,
             fee: 1,
             reserved_output_ids: vec![output_id],
+            reserved_input_commitments: Vec::new(),
             request_bytes: vec![1],
             response_bytes: if finalized { vec![2] } else { Vec::new() },
             finalized_transaction_bytes: if finalized { vec![3] } else { Vec::new() },
@@ -5736,6 +5826,67 @@ mod tests {
         seed(&mut state, account_id);
         service.commit(state).unwrap();
         (service, transaction_id, slate_id, output_id)
+    }
+
+    #[test]
+    fn regression_m25_coinbase_coordinates_cost_one_commit_per_batch() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut service, _transaction_id, _slate_id, _output_id) =
+            unlocked_service_with(&temp, |_, _| {});
+
+        // Every generation is a full Argon2id derivation plus a rewrite of the
+        // whole encrypted state, so the generation counter is exactly the cost
+        // this test is about.
+        let start_generation = service.unlocked.as_ref().unwrap().generation;
+        let batch = WalletService::COINBASE_COORDINATE_BATCH;
+
+        let mut coordinates = Vec::with_capacity(batch);
+        for _ in 0..batch {
+            coordinates.push(service.next_coinbase_coordinate().unwrap());
+        }
+        assert_eq!(
+            service.unlocked.as_ref().unwrap().generation,
+            start_generation + 1,
+            "a full batch of coordinates must cost exactly one commit"
+        );
+
+        // The invariant that justified the per-candidate commit still holds:
+        // no derivation index is ever handed out twice ...
+        let unique = coordinates
+            .iter()
+            .map(|coordinate| coordinate.derivation_index())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            unique.len(),
+            batch,
+            "a derivation index was handed out twice"
+        );
+
+        // ... and every one of them was already durable before being returned,
+        // which is what a crash-safe coordinate means.
+        let floor = service
+            .unlocked
+            .as_ref()
+            .unwrap()
+            .recovery_allocation_floors
+            .coinbase;
+        assert!(
+            unique.iter().all(|index| *index <= floor),
+            "a coordinate was handed out above the durable floor"
+        );
+
+        // Exhausting the batch refills durably, and does so exactly once.
+        let next = service.next_coinbase_coordinate().unwrap();
+        assert_eq!(
+            service.unlocked.as_ref().unwrap().generation,
+            start_generation + 2
+        );
+        assert!(!unique.contains(&next.derivation_index()));
+
+        // Locking drops burned-but-unused coordinates rather than carrying
+        // them across to whatever state is unlocked next.
+        service.lock().unwrap();
+        assert!(service.coinbase_coordinate_pool.is_empty());
     }
 
     #[test]
@@ -6550,6 +6701,7 @@ mod tests {
                 amount: 1,
                 fee: 1,
                 reserved_output_ids: Vec::new(),
+                reserved_input_commitments: Vec::new(),
                 request_bytes: b"durable canonical bytes".to_vec(),
                 response_bytes: Vec::new(),
                 finalized_transaction_bytes: Vec::new(),

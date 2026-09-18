@@ -185,12 +185,29 @@ pub enum TransactionLifecycle {
     Submitted,
     AcceptedNotRelayed,
     InMempool,
-    Confirmed { height: u64, block_hash: [u8; 32] },
+    Confirmed {
+        height: u64,
+        #[serde(with = "serde_bytes_32")]
+        block_hash: [u8; 32],
+    },
     Reorged,
     RetransmitRequired,
     Cancelled,
     Failed,
     ReconciliationRequired,
+}
+
+impl TransactionLifecycle {
+    /// Whether a transaction in this state still owns its reserved inputs.
+    ///
+    /// `Cancelled` released them and `Confirmed` spent them; everything else
+    /// still holds them, including `Failed`, `Reorged` and
+    /// `ReconciliationRequired` - all three can be retried by resubmitting the
+    /// same finalized bytes, which is only sound while those exact inputs are
+    /// still reserved.
+    pub fn retains_input_reservations(&self) -> bool {
+        !matches!(self, Self::Cancelled | Self::Confirmed { .. })
+    }
 }
 
 /// Authoritative durable evidence of how far a transaction may have reached.
@@ -512,11 +529,11 @@ pub struct ScriptlessFundingReservation {
     pub change_output_id: Option<Uuid>,
     #[serde(default, with = "serde_option_bytes_33")]
     pub change_commitment: Option<[u8; 33]>,
-    #[serde(default)]
+    #[serde(default, with = "serde_compact_bytes")]
     pub change_output_bytes: Vec<u8>,
     #[serde(default, with = "serde_option_bytes_32")]
     pub offset_contribution: Option<[u8; 32]>,
-    #[serde(default)]
+    #[serde(default, with = "serde_compact_bytes")]
     pub wallet_excess_public_key: Vec<u8>,
     #[serde(default, with = "serde_option_bytes_32")]
     pub template_hash: Option<[u8; 32]>,
@@ -674,11 +691,11 @@ pub struct ScriptlessPayoutReservation {
     pub derivation_index: Option<u64>,
     #[serde(default, with = "serde_option_bytes_33")]
     pub output_commitment: Option<[u8; 33]>,
-    #[serde(default)]
+    #[serde(default, with = "serde_compact_bytes")]
     pub output_bytes: Vec<u8>,
     #[serde(default, with = "serde_option_bytes_32")]
     pub offset_contribution: Option<[u8; 32]>,
-    #[serde(default)]
+    #[serde(default, with = "serde_compact_bytes")]
     pub payout_excess_public_key: Vec<u8>,
     #[serde(default, with = "serde_option_bytes_32")]
     pub template_hash: Option<[u8; 32]>,
@@ -743,6 +760,7 @@ pub struct LocalTransactionIntent {
     pub cancelled_at_height: Option<u64>,
     /// Exactly 33 canonical commitment bytes. This is persisted before an
     /// external submission and is the only kernel-to-wallet association.
+    #[serde(with = "serde_compact_bytes")]
     pub kernel_excess: Vec<u8>,
     pub lifecycle: TransactionLifecycle,
     pub submitted: bool,
@@ -760,15 +778,30 @@ pub struct LocalTransactionIntent {
     pub fee: u64,
     #[serde(default)]
     pub reserved_output_ids: Vec<Uuid>,
+    /// Canonical commitments of the reserved inputs, positionally paired with
+    /// `reserved_output_ids`.
+    ///
+    /// A whole-history rescan rebuilds output records with fresh local UUIDs,
+    /// so a reservation recorded only by `reserved_output_ids` pointed at rows
+    /// that no longer existed: the inputs came back unreserved and the
+    /// transaction owning them was stranded (F-C5). A commitment is the one
+    /// identifier that survives a rescan, because it is what the chain itself
+    /// carries. `restore_transaction_reservations` uses it to rebind.
+    ///
+    /// `serde(default)` leaves it empty on states written before this field,
+    /// and an empty vector simply means "cannot rebind" rather than an error -
+    /// exactly the behaviour those wallets have today.
     #[serde(default)]
+    pub reserved_input_commitments: Vec<Vec<u8>>,
+    #[serde(default, with = "serde_compact_bytes")]
     pub request_bytes: Vec<u8>,
-    #[serde(default)]
+    #[serde(default, with = "serde_compact_bytes")]
     pub response_bytes: Vec<u8>,
     /// Durable canonical transaction bytes. Once populated, submission and
     /// recovery after restart do not depend on the disposable Slate envelope.
-    #[serde(default)]
+    #[serde(default, with = "serde_compact_bytes")]
     pub finalized_transaction_bytes: Vec<u8>,
-    #[serde(default)]
+    #[serde(default, with = "serde_option_bytes_32")]
     pub transaction_hash: Option<[u8; 32]>,
     #[serde(default)]
     pub attempt_count: u32,
@@ -1127,6 +1160,7 @@ pub struct RecoveredOutputMetadata {
     pub derivation_index: u64,
     pub domain: RecoveredOutputDomain,
     pub is_coinbase: bool,
+    #[serde(with = "serde_bytes_32")]
     pub block_hash: [u8; 32],
     pub output_position: u32,
 }
@@ -1144,7 +1178,9 @@ pub struct RecoveredAccountMapping {
 #[serde(deny_unknown_fields)]
 pub struct RecoveryCanonicalBlock {
     pub height: u64,
+    #[serde(with = "serde_bytes_32")]
     pub block_hash: [u8; 32],
+    #[serde(with = "serde_bytes_32")]
     pub previous_block_hash: [u8; 32],
     pub output_count: u32,
     pub legacy_proof_only_outputs: u32,
@@ -2626,6 +2662,100 @@ impl WalletState {
     /// Restore fail-closed common-wallet reservations after a reversible chain
     /// projection moves an input back to unspent. Exposed funding components
     /// are never forgotten or made selectable by a reorg.
+    /// Rebind ordinary transaction input reservations to the output rows a
+    /// rescan rebuilt, matching on canonical commitment.
+    ///
+    /// A whole-history rescan drops local output records and recreates them
+    /// with fresh UUIDs, so `reserved_output_ids` pointed at rows that no
+    /// longer existed: the inputs of a live payment came back unreserved and
+    /// could be selected by a second payment, while the first still owned them
+    /// (F-C5). The commitment is the only identifier that survives, because it
+    /// is what the chain carries. This is the same rebind the Scriptless
+    /// reservations below already relied on, applied to ordinary payments.
+    ///
+    /// Deliberately conservative: an intent whose commitments were never
+    /// recorded (written before the field existed) is left exactly as it is,
+    /// and an ambiguous or contradictory match is an error rather than a
+    /// guess - claiming the wrong input would be worse than claiming none.
+    pub fn restore_transaction_reservations(&mut self) -> Result<(), DomainError> {
+        let live = self
+            .transactions
+            .iter()
+            .enumerate()
+            .filter(|(_, transaction)| transaction.lifecycle.retains_input_reservations())
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        for transaction_index in live {
+            let transaction = &self.transactions[transaction_index];
+            let owner = transaction.id;
+            // Nothing to rebind with: leave the intent untouched rather than
+            // inventing a binding.
+            if transaction.reserved_input_commitments.len() != transaction.reserved_output_ids.len()
+            {
+                continue;
+            }
+            let pairs = transaction
+                .reserved_output_ids
+                .iter()
+                .copied()
+                .zip(transaction.reserved_input_commitments.clone())
+                .collect::<Vec<_>>();
+            for (input_index, (output_id, commitment)) in pairs.into_iter().enumerate() {
+                let exact = self
+                    .outputs
+                    .iter()
+                    .position(|output| output.id == output_id);
+                let output_index = match exact {
+                    Some(index)
+                        if self.outputs[index]
+                            .commitment
+                            .as_ref()
+                            .map(<[u8; 33]>::as_slice)
+                            == Some(commitment.as_slice()) =>
+                    {
+                        Some(index)
+                    }
+                    // The id still resolves but to a different commitment.
+                    // That is a corrupt binding, not a rescan artefact.
+                    Some(_) => return Err(DomainError::InvalidTransactionIntent),
+                    None => {
+                        let matches = self
+                            .outputs
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, output)| {
+                                output.commitment.as_ref().map(<[u8; 33]>::as_slice)
+                                    == Some(commitment.as_slice())
+                            })
+                            .map(|(index, _)| index)
+                            .collect::<Vec<_>>();
+                        if matches.len() > 1 {
+                            return Err(DomainError::InvalidTransactionIntent);
+                        }
+                        matches.first().copied()
+                    }
+                };
+                // The input was not rediscovered - it may be outside the
+                // scanned range. Leaving it unbound is the honest outcome.
+                let Some(output_index) = output_index else {
+                    continue;
+                };
+                let rebound_id = self.outputs[output_index].id;
+                self.transactions[transaction_index].reserved_output_ids[input_index] = rebound_id;
+                let output = &mut self.outputs[output_index];
+                if matches!(output.state, OutputState::Spent { .. }) {
+                    continue;
+                }
+                if output.reserved_by.is_some_and(|holder| holder != owner) {
+                    return Err(DomainError::InvalidTransactionIntent);
+                }
+                output.reserved_by = Some(owner);
+                output.state = OutputState::PendingOutgoing;
+            }
+        }
+        Ok(())
+    }
+
     pub fn restore_scriptless_funding_reservations(&mut self) -> Result<(), DomainError> {
         let reservation_indexes = self
             .scriptless_funding_reservations
@@ -2931,99 +3061,193 @@ impl WalletState {
     }
 }
 
+/// Shared representation for every persisted byte field: serialize as base64
+/// while the deserializer keeps accepting the legacy JSON integer-array form.
+///
+/// A JSON array of `u8` costs roughly 3.5 characters per byte; base64 costs
+/// 4/3. The per-record fields below (output commitments, blindings, recovered
+/// block hashes, retained transaction bytes) dominate a mining wallet's
+/// encrypted state, which grows by one record set per owned coinbase and has a
+/// hard storage ceiling - the difference is what decides how many coinbases
+/// fit before the scan cursor freezes at `STORAGE_COMMIT` (F-C7). The on-disk
+/// format migrates forward on the next commit without a version bump, and
+/// older generations keep loading. Same precedent as `compact_ciphertext` in
+/// `dom-wallet-crypto`.
+mod compact_bytes_repr {
+    use base64::Engine;
+    use serde::de::{Error, SeqAccess, Visitor};
+    use serde::{Deserializer, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct BytesVisitor;
+
+        impl<'de> Visitor<'de> for BytesVisitor {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a base64 string or a legacy byte array")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: Error,
+            {
+                base64::engine::general_purpose::STANDARD
+                    .decode(value)
+                    .map_err(|_| E::custom("invalid base64 bytes"))
+            }
+
+            fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+            where
+                E: Error,
+            {
+                Ok(value.to_vec())
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or_default());
+                while let Some(byte) = seq.next_element::<u8>()? {
+                    bytes.push(byte);
+                }
+                Ok(bytes)
+            }
+        }
+
+        deserializer.deserialize_any(BytesVisitor)
+    }
+}
+
+/// Variable-length persisted byte payloads (retained transaction and slate
+/// bytes). See `compact_bytes_repr` for the format contract.
+pub mod serde_compact_bytes {
+    pub use super::compact_bytes_repr::{deserialize, serialize};
+}
+
 pub mod serde_bytes_32 {
-    use serde::{Deserialize, Deserializer, Serializer};
+    use super::compact_bytes_repr;
+    use serde::{Deserializer, Serializer};
 
     pub fn serialize<S>(value: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        serializer.serialize_bytes(value)
+        compact_bytes_repr::serialize(value, serializer)
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
     where
         D: Deserializer<'de>,
     {
-        let bytes = Vec::<u8>::deserialize(deserializer)?;
-        bytes
+        compact_bytes_repr::deserialize(deserializer)?
             .try_into()
             .map_err(|_| serde::de::Error::custom("expected exactly 32 bytes"))
     }
 }
 
 pub mod serde_bytes_33 {
-    use serde::{Deserialize, Deserializer, Serializer};
+    use super::compact_bytes_repr;
+    use serde::{Deserializer, Serializer};
 
     pub fn serialize<S>(value: &[u8; 33], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        serializer.serialize_bytes(value)
+        compact_bytes_repr::serialize(value, serializer)
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 33], D::Error>
     where
         D: Deserializer<'de>,
     {
-        let bytes = Vec::<u8>::deserialize(deserializer)?;
-        bytes
+        compact_bytes_repr::deserialize(deserializer)?
             .try_into()
             .map_err(|_| serde::de::Error::custom("expected exactly 33 bytes"))
     }
 }
 
-pub mod serde_option_bytes_32 {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+macro_rules! compact_option_bytes_module {
+    ($name:ident, $len:literal) => {
+        pub mod $name {
+            use super::compact_bytes_repr;
+            use serde::de::{Deserializer, Error, Visitor};
+            use serde::Serializer;
+            use std::fmt;
 
-    pub fn serialize<S>(value: &Option<[u8; 32]>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        value
-            .as_ref()
-            .map(|bytes| bytes.as_slice())
-            .serialize(serializer)
-    }
+            pub fn serialize<S>(
+                value: &Option<[u8; $len]>,
+                serializer: S,
+            ) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                match value {
+                    Some(bytes) => compact_bytes_repr::serialize(bytes, serializer),
+                    None => serializer.serialize_none(),
+                }
+            }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<[u8; 32]>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Option::<Vec<u8>>::deserialize(deserializer)?.map_or(Ok(None), |bytes| {
-            bytes
-                .try_into()
-                .map(Some)
-                .map_err(|_| serde::de::Error::custom("expected exactly 32 bytes"))
-        })
-    }
+            pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<[u8; $len]>, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                struct OptionVisitor;
+
+                impl<'de> Visitor<'de> for OptionVisitor {
+                    type Value = Option<[u8; $len]>;
+
+                    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        formatter.write_str("null, a base64 string, or a legacy byte array")
+                    }
+
+                    fn visit_none<E>(self) -> Result<Self::Value, E>
+                    where
+                        E: Error,
+                    {
+                        Ok(None)
+                    }
+
+                    fn visit_unit<E>(self) -> Result<Self::Value, E>
+                    where
+                        E: Error,
+                    {
+                        Ok(None)
+                    }
+
+                    fn visit_some<D2>(self, deserializer: D2) -> Result<Self::Value, D2::Error>
+                    where
+                        D2: Deserializer<'de>,
+                    {
+                        compact_bytes_repr::deserialize(deserializer)?
+                            .try_into()
+                            .map(Some)
+                            .map_err(|_| {
+                                D2::Error::custom(concat!("expected exactly ", $len, " bytes"))
+                            })
+                    }
+                }
+
+                deserializer.deserialize_option(OptionVisitor)
+            }
+        }
+    };
 }
 
-pub mod serde_option_bytes_33 {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn serialize<S>(value: &Option<[u8; 33]>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        value
-            .as_ref()
-            .map(|bytes| bytes.as_slice())
-            .serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<[u8; 33]>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Option::<Vec<u8>>::deserialize(deserializer)?.map_or(Ok(None), |bytes| {
-            bytes
-                .try_into()
-                .map(Some)
-                .map_err(|_| serde::de::Error::custom("expected exactly 33 bytes"))
-        })
-    }
-}
+compact_option_bytes_module!(serde_option_bytes_32, 32);
+compact_option_bytes_module!(serde_option_bytes_33, 33);
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum DomainError {
@@ -3121,6 +3345,7 @@ mod tests {
             amount: 0,
             fee: 0,
             reserved_output_ids: Vec::new(),
+            reserved_input_commitments: Vec::new(),
             request_bytes: Vec::new(),
             response_bytes: Vec::new(),
             finalized_transaction_bytes: Vec::new(),
@@ -3395,6 +3620,7 @@ mod tests {
             amount: 0,
             fee: 0,
             reserved_output_ids: Vec::new(),
+            reserved_input_commitments: Vec::new(),
             request_bytes: Vec::new(),
             response_bytes: Vec::new(),
             finalized_transaction_bytes: Vec::new(),
@@ -3420,6 +3646,266 @@ mod tests {
         assert_eq!(
             state.transactions[0].lifecycle,
             TransactionLifecycle::ReconciliationRequired
+        );
+    }
+
+    fn sender_intent(id: Uuid) -> LocalTransactionIntent {
+        LocalTransactionIntent {
+            id,
+            created_at_height: 10,
+            created_at_unix_seconds: 0,
+            cancellation_reason: None,
+            cancelled_at_height: None,
+            kernel_excess: Vec::new(),
+            lifecycle: TransactionLifecycle::InputsReserved,
+            submitted: false,
+            exposure: BroadcastExposure::NeverBroadcast,
+            slate_id: Some(Uuid::new_v4()),
+            role: Some(TransactionRole::Sender),
+            amount: 1_000,
+            fee: 100,
+            reserved_output_ids: Vec::new(),
+            reserved_input_commitments: Vec::new(),
+            request_bytes: Vec::new(),
+            response_bytes: Vec::new(),
+            finalized_transaction_bytes: Vec::new(),
+            transaction_hash: None,
+            attempt_count: 0,
+            private_context: None,
+            recipient_output_id: None,
+            change_output_id: None,
+            expires_at_height: 0,
+        }
+    }
+
+    #[test]
+    fn regression_c5_rescan_rebinds_reservations_by_commitment() {
+        // A whole-history rescan recreates output rows under fresh UUIDs. The
+        // reservation used to point at ids that no longer existed, so the
+        // inputs of a live payment came back unreserved and a second payment
+        // could spend them underneath the first.
+        let mut state = WalletState::new(identity(), [7; 32], configuration());
+        let owner = Uuid::new_v4();
+        let stale_id = Uuid::new_v4();
+        let rebuilt_id = Uuid::new_v4();
+        let commitment = [0x33; 33];
+
+        // What the rescan rebuilt: same commitment, brand new local id.
+        state.outputs.push(OutputRecord {
+            id: rebuilt_id,
+            account_id: state.default_account.id,
+            commitment: Some(commitment),
+            value: 5_000,
+            state: OutputState::Confirmed,
+            discovered_height: 20,
+            reserved_by: None,
+        });
+
+        let mut intent = sender_intent(owner);
+        intent.reserved_output_ids = vec![stale_id];
+        intent.reserved_input_commitments = vec![commitment.to_vec()];
+        state.transactions.push(intent);
+
+        state.restore_transaction_reservations().unwrap();
+
+        assert_eq!(state.transactions[0].reserved_output_ids, vec![rebuilt_id]);
+        let output = &state.outputs[0];
+        assert_eq!(output.reserved_by, Some(owner));
+        assert_eq!(output.state, OutputState::PendingOutgoing);
+    }
+
+    #[test]
+    fn regression_c5_rebind_is_conservative_when_it_cannot_be_certain() {
+        let commitment = [0x44; 33];
+
+        // A state written before the field exists records no commitments, so
+        // there is nothing to rebind with. Leave it exactly as it was rather
+        // than guessing.
+        let mut legacy = WalletState::new(identity(), [7; 32], configuration());
+        let owner = Uuid::new_v4();
+        let stale_id = Uuid::new_v4();
+        legacy.outputs.push(OutputRecord {
+            id: Uuid::new_v4(),
+            account_id: legacy.default_account.id,
+            commitment: Some(commitment),
+            value: 5_000,
+            state: OutputState::Confirmed,
+            discovered_height: 20,
+            reserved_by: None,
+        });
+        let mut intent = sender_intent(owner);
+        intent.reserved_output_ids = vec![stale_id];
+        intent.reserved_input_commitments = Vec::new();
+        legacy.transactions.push(intent);
+        legacy.restore_transaction_reservations().unwrap();
+        assert_eq!(legacy.transactions[0].reserved_output_ids, vec![stale_id]);
+        assert_eq!(legacy.outputs[0].reserved_by, None);
+
+        // An input another transaction already holds is a hard error, never a
+        // silent takeover.
+        let mut contested = WalletState::new(identity(), [7; 32], configuration());
+        let other = Uuid::new_v4();
+        contested.outputs.push(OutputRecord {
+            id: Uuid::new_v4(),
+            account_id: contested.default_account.id,
+            commitment: Some(commitment),
+            value: 5_000,
+            state: OutputState::Confirmed,
+            discovered_height: 20,
+            reserved_by: Some(other),
+        });
+        let mut intent = sender_intent(owner);
+        intent.reserved_output_ids = vec![Uuid::new_v4()];
+        intent.reserved_input_commitments = vec![commitment.to_vec()];
+        contested.transactions.push(intent);
+        assert_eq!(
+            contested.restore_transaction_reservations(),
+            Err(DomainError::InvalidTransactionIntent)
+        );
+
+        // A cancelled transaction must not reclaim anything it released.
+        let mut cancelled = WalletState::new(identity(), [7; 32], configuration());
+        cancelled.outputs.push(OutputRecord {
+            id: Uuid::new_v4(),
+            account_id: cancelled.default_account.id,
+            commitment: Some(commitment),
+            value: 5_000,
+            state: OutputState::Confirmed,
+            discovered_height: 20,
+            reserved_by: None,
+        });
+        let mut intent = sender_intent(owner);
+        intent.lifecycle = TransactionLifecycle::Cancelled;
+        intent.reserved_output_ids = vec![Uuid::new_v4()];
+        intent.reserved_input_commitments = vec![commitment.to_vec()];
+        cancelled.transactions.push(intent);
+        cancelled.restore_transaction_reservations().unwrap();
+        assert_eq!(cancelled.outputs[0].reserved_by, None);
+    }
+
+    #[test]
+    fn regression_c7_persisted_byte_fields_stay_compact() {
+        // One record set is appended per owned coinbase and never pruned while
+        // the output is unspent, and the encrypted state has a hard ceiling -
+        // so bytes-per-record is the constant that decides how long a mining
+        // wallet lives before its cursor freezes at STORAGE_COMMIT. The bound
+        // below fails the build if someone reintroduces a JSON integer-array
+        // field (~3.5 bytes per byte) where base64 (4/3) is expected.
+        let mut state = WalletState::new(identity(), [7; 32], configuration());
+        let base = serde_json::to_vec(&state).unwrap().len();
+        let count = 1_000u64;
+        for index in 0..count {
+            let id = Uuid::new_v4();
+            state.outputs.push(OutputRecord {
+                id,
+                account_id: state.default_account.id,
+                commitment: Some([0xab; 33]),
+                value: 3_300_000_000,
+                state: OutputState::Confirmed,
+                discovered_height: 100_000 + index,
+                reserved_by: None,
+            });
+            state.remember_output_blinding(id, [0xcd; 32]);
+            state
+                .recovered_output_metadata
+                .push(RecoveredOutputMetadata {
+                    output_id: id,
+                    recovery_account: 0,
+                    derivation_index: index,
+                    domain: RecoveredOutputDomain::Coinbase,
+                    is_coinbase: true,
+                    block_hash: [0xef; 32],
+                    output_position: 0,
+                });
+        }
+        let grown = serde_json::to_vec(&state).unwrap().len();
+        let per_coinbase = (grown - base) / count as usize;
+        assert!(
+            per_coinbase <= 640,
+            "one owned coinbase now costs {per_coinbase} bytes of state; \
+             the compact ceiling budget assumes at most 640"
+        );
+
+        // And the compact form must round-trip exactly.
+        let encoded = serde_json::to_vec(&state).unwrap();
+        let decoded: WalletState = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, state);
+    }
+
+    #[test]
+    fn regression_c7_legacy_integer_array_state_still_loads() {
+        // Every byte field that moved to base64 must keep accepting the JSON
+        // integer-array form that main-v0.4 generations were written with.
+        let commitment_array: Vec<u8> = vec![0xab; 33];
+        let hash_array: Vec<u8> = vec![0xef; 32];
+        let output_id = Uuid::new_v4();
+
+        let legacy_output = serde_json::json!({
+            "id": output_id,
+            "account_id": Uuid::new_v4(),
+            "commitment": commitment_array,
+            "value": 42u64,
+            "state": "confirmed",
+            "discovered_height": 7u64,
+            "reserved_by": null,
+        });
+        let output: OutputRecord = serde_json::from_value(legacy_output).unwrap();
+        assert_eq!(output.commitment, Some([0xab; 33]));
+
+        let legacy_blinding = serde_json::json!({
+            "output_id": output_id,
+            "blinding": hash_array,
+        });
+        let blinding: PrivateOutputBlinding = serde_json::from_value(legacy_blinding).unwrap();
+        assert_eq!(blinding.blinding, [0xef; 32]);
+
+        let legacy_metadata = serde_json::json!({
+            "output_id": output_id,
+            "recovery_account": 0u32,
+            "derivation_index": 3u64,
+            "domain": "coinbase",
+            "is_coinbase": true,
+            "block_hash": hash_array,
+            "output_position": 0u32,
+        });
+        let metadata: RecoveredOutputMetadata = serde_json::from_value(legacy_metadata).unwrap();
+        assert_eq!(metadata.block_hash, [0xef; 32]);
+
+        let legacy_block = serde_json::json!({
+            "height": 9u64,
+            "block_hash": hash_array,
+            "previous_block_hash": hash_array,
+            "output_count": 1u32,
+            "legacy_proof_only_outputs": 0u32,
+        });
+        let block: RecoveryCanonicalBlock = serde_json::from_value(legacy_block).unwrap();
+        assert_eq!(block.block_hash, [0xef; 32]);
+
+        // A confirmed transaction carries three migrated fields at once: the
+        // lifecycle's embedded block hash, the kernel excess, and the
+        // transaction hash.
+        let kernel_array: Vec<u8> = vec![0x11; 33];
+        let legacy_transaction = serde_json::json!({
+            "id": Uuid::new_v4(),
+            "kernel_excess": kernel_array,
+            "lifecycle": { "CONFIRMED": { "height": 5u64, "block_hash": hash_array } },
+            "submitted": true,
+            "exposure": "CONFIRMED",
+            "amount": 1u64,
+            "fee": 1u64,
+            "transaction_hash": hash_array,
+            "finalized_transaction_bytes": kernel_array,
+        });
+        let transaction: LocalTransactionIntent =
+            serde_json::from_value(legacy_transaction).unwrap();
+        assert_eq!(transaction.kernel_excess, vec![0x11; 33]);
+        assert_eq!(transaction.transaction_hash, Some([0xef; 32]));
+        assert_eq!(
+            transaction.lifecycle,
+            TransactionLifecycle::Confirmed {
+                height: 5,
+                block_hash: [0xef; 32]
+            }
         );
     }
 
@@ -3500,6 +3986,7 @@ mod tests {
             amount: 600_000,
             fee: 50_000,
             reserved_output_ids: Vec::new(),
+            reserved_input_commitments: Vec::new(),
             request_bytes: Vec::new(),
             response_bytes: Vec::new(),
             finalized_transaction_bytes: Vec::new(),
@@ -3573,6 +4060,7 @@ mod tests {
             amount: 600_000,
             fee: 50_000,
             reserved_output_ids: Vec::new(),
+            reserved_input_commitments: Vec::new(),
             request_bytes: Vec::new(),
             response_bytes: Vec::new(),
             finalized_transaction_bytes: Vec::new(),

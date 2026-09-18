@@ -12,6 +12,7 @@ import {
   reachabilityText,
   nomsFromDom,
   balanceCompletenessPresentation,
+  stateCapacityPresentation,
   transactionStateLabel,
   remoteTipAlertPresentation,
   restoreReadinessPresentation,
@@ -175,6 +176,15 @@ const renderRemoteTipAlert = (presentation) => {
     node.hidden = remoteTipAlertMessage == null;
     node.textContent = remoteTipAlertMessage ?? "";
   }
+};
+
+// The storage ceiling is reached by mining successfully for long enough, and
+// crossing it stops synchronization for good. Say so while the remedies still
+// have time to confirm.
+const renderStateCapacityAlert = (presentation) => {
+  const node = byId("state-capacity-alert");
+  node.hidden = presentation.message == null;
+  node.textContent = presentation.message ?? "";
 };
 
 const stopRestoreScanPolling = () => { clearTimeout(restoreScanTimer); restoreScanTimer = undefined; };
@@ -490,6 +500,7 @@ const refreshSummary = async () => {
   const restoreScan = restoreScanPresentation(synchronization);
   if (restoreScan.active) byId("sync-status").textContent = restoreScan.message;
   renderRemoteTipAlert(remoteTipAlertPresentation(synchronization));
+  renderStateCapacityAlert(stateCapacityPresentation(synchronization));
   byId("settings-chain-id").textContent = liveStatus.chainId ?? "—";
   byId("settings-genesis").textContent = liveStatus.genesisHash ?? "—";
   if (liveStatus.dataDirectory) byId("settings-node-data").textContent = liveStatus.dataDirectory;

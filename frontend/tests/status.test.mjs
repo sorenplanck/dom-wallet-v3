@@ -11,6 +11,7 @@ import {
   restoreReadinessPresentation,
   restoreScanPresentation,
   balanceCompletenessPresentation,
+  stateCapacityPresentation,
   transactionStateLabel,
   synchronizationPresentation,
   reachabilityText,
@@ -674,4 +675,36 @@ test("regression_b5_history_does_not_show_raw_backend_state_identifiers", () => 
   // An unknown future state degrades to something readable, not to nothing.
   assert.equal(transactionStateLabel("SOME_NEW_STATE"), "Some new state");
   assert.equal(transactionStateLabel(undefined), "Unknown");
+});
+
+test("regression_c7_wallet_warns_before_the_storage_ceiling_stops_synchronization", () => {
+  // Below the thresholds the panel stays quiet: a healthy wallet must not be
+  // nagged about a wall that is years away.
+  assert.deepEqual(
+    stateCapacityPresentation({ state_utilization_percent: 40 }),
+    { level: "OK", message: null, percent: 40 },
+  );
+
+  const warning = stateCapacityPresentation({ state_utilization_percent: 78 });
+  assert.equal(warning.level, "WARNING");
+  assert.match(warning.message, /78% full/);
+
+  const critical = stateCapacityPresentation({ state_utilization_percent: 93 });
+  assert.equal(critical.level, "CRITICAL");
+  assert.match(critical.message, /Synchronization stops/);
+
+  // Exactly on each boundary counts as crossed.
+  assert.equal(stateCapacityPresentation({ state_utilization_percent: 75 }).level, "WARNING");
+  assert.equal(stateCapacityPresentation({ state_utilization_percent: 90 }).level, "CRITICAL");
+
+  // A backend that cannot measure (locked wallet, missing file) says nothing
+  // rather than inventing reassurance or alarm.
+  assert.deepEqual(
+    stateCapacityPresentation({ state_utilization_percent: null }),
+    { level: "OK", message: null, percent: null },
+  );
+  assert.deepEqual(
+    stateCapacityPresentation(undefined),
+    { level: "OK", message: null, percent: null },
+  );
 });

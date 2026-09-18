@@ -232,6 +232,35 @@ export function transactionStateLabel(state) {
   return softened.charAt(0).toUpperCase() + softened.slice(1);
 }
 
+/// How close the encrypted wallet state is to the ceiling that, once crossed,
+/// freezes the scan cursor at `STORAGE_COMMIT`.
+///
+/// A mining wallet appends one record set per owned coinbase, and those
+/// records are the user's money, so nothing prunes them: the wall is reached
+/// by mining successfully for long enough. It used to arrive with no warning
+/// at all - the wallet simply stopped synchronizing and never explained why.
+/// Thresholds are deliberately early, because the remedies (consolidating
+/// coinbases, moving funds) take time and confirmations.
+export function stateCapacityPresentation(synchronization) {
+  const percent = synchronization?.state_utilization_percent;
+  if (!Number.isSafeInteger(percent) || percent < 0) return { level: "OK", message: null, percent: null };
+  if (percent >= 90) {
+    return {
+      level: "CRITICAL",
+      percent,
+      message: `Wallet storage is ${percent}% full. Synchronization stops when it fills. Consolidate or move funds now.`,
+    };
+  }
+  if (percent >= 75) {
+    return {
+      level: "WARNING",
+      percent,
+      message: `Wallet storage is ${percent}% full. Plan to consolidate coinbase outputs before it fills.`,
+    };
+  }
+  return { level: "OK", message: null, percent };
+}
+
 /// The balance is only the whole balance once the cursor has reached the tip.
 /// `wallet_summary` returns `state.balance()` unconditionally, so a wallet
 /// scanned to 30% of the chain presented 30% of its funds as an authoritative

@@ -319,6 +319,31 @@ impl WalletDirectory {
         Ok(metadata)
     }
 
+    /// Size on disk of the active generation's encoded state file.
+    ///
+    /// One owned coinbase appends one record set to the state forever while it
+    /// is unspent, and the ceiling is hard: crossing it freezes the scan
+    /// cursor at `STORAGE_COMMIT` with no warning whatsoever (F-C7 - it
+    /// happened to real mining wallets). This is the cheap, always-available
+    /// measurement (a stat, no password and no decryption) that lets the
+    /// interface warn *before* the wall instead of explaining it after.
+    pub fn active_generation_encoded_bytes(&self) -> Result<u64, StorageError> {
+        let active = self.active_generation()?;
+        let path = self
+            .root
+            .join(GENERATIONS_DIR)
+            .join(generation_name(active))
+            .join(STATE_FILE);
+        fs::metadata(path)
+            .map(|metadata| metadata.len())
+            .map_err(StorageError::Io)
+    }
+
+    /// The hard ceiling `active_generation_encoded_bytes` is measured against.
+    pub const fn state_ceiling_bytes() -> u64 {
+        MAX_STATE_BYTES as u64
+    }
+
     pub fn load(&self, password: &str) -> Result<WalletState, StorageError> {
         let metadata = self.metadata()?;
         let password_authenticated = self.authenticate_password(password, &metadata)?;
@@ -1404,6 +1429,7 @@ mod tests {
             amount: 8,
             fee: 2,
             reserved_output_ids: vec![output_id],
+            reserved_input_commitments: Vec::new(),
             request_bytes: Vec::new(),
             response_bytes: Vec::new(),
             finalized_transaction_bytes: finalized_transaction_bytes.clone(),

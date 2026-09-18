@@ -77,6 +77,35 @@ struct PersistedUpdateState {
     last_check_unix_seconds: Option<u64>,
     next_check_unix_seconds: Option<u64>,
     last_error: Option<String>,
+    /// An install that was handed to the platform installer and has not been
+    /// accounted for yet. Written immediately before `Update::install`, read
+    /// and cleared on the next start.
+    #[serde(default)]
+    pending_install: Option<PendingInstall>,
+}
+
+/// What the wallet believed it was doing when it handed control to the
+/// platform installer and restarted.
+///
+/// There is no binary-level rollback here, and claiming one would be a lie:
+/// `Update::install` runs the platform's own installer (an .msi, a .app
+/// bundle replacement, a package manager), so "the previous version" is not a
+/// file this process can put back. The updater crate's `rollback_node`
+/// machinery has only ever had a test implementation, which is precisely the
+/// false assurance this replaces (F-A18).
+///
+/// What is achievable, and what this does, is make the failure *visible*: an
+/// install that did not take effect used to leave no trace at all - the
+/// application restarted on the old version and nothing ever explained why.
+/// Recording the intent before restarting turns that silence into a
+/// diagnosis, with the verified artifact still staged so a retry costs no
+/// second download.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PendingInstall {
+    previous_version: String,
+    target_version: String,
+    started_unix_seconds: u64,
 }
 
 fn update_state_path(handle: &tauri::AppHandle) -> Result<PathBuf, UpdateError> {
@@ -123,6 +152,67 @@ fn persist_update_state(path: &Path, state: &PersistedUpdateState) -> Result<(),
     result
 }
 
+/// Record that an install is about to be handed to the platform installer.
+///
+/// Written *before* `Update::install`, because after it this process may never
+/// run another line. Best effort: failing to record must not stop an install
+/// the user asked for and the signature checks already approved.
+fn mark_install_started(handle: &tauri::AppHandle, target_version: &str) {
+    let Ok(path) = update_state_path(handle) else {
+        return;
+    };
+    let mut state = load_update_state(&path).unwrap_or(PersistedUpdateState {
+        schema_version: 1,
+        ..Default::default()
+    });
+    state.schema_version = 1;
+    state.pending_install = Some(PendingInstall {
+        previous_version: get_build_info().wallet_version.to_string(),
+        target_version: target_version.to_string(),
+        started_unix_seconds: unix_seconds(),
+    });
+    if persist_update_state(&path, &state).is_err() {
+        tracing::warn!("Could not record the pending install before restarting");
+    }
+}
+
+/// Account for an install recorded before the last restart.
+///
+/// Three outcomes, and all three used to look identical from the interface:
+/// the new version is running (success), the old one is (the installer did
+/// not take effect), or something else entirely is (report what is actually
+/// running rather than guessing). Only the first is silent.
+fn reconcile_pending_install(handle: &tauri::AppHandle) {
+    let Ok(path) = update_state_path(handle) else {
+        return;
+    };
+    let Some(mut state) = load_update_state(&path) else {
+        return;
+    };
+    let Some(pending) = state.pending_install.take() else {
+        return;
+    };
+    let running = get_build_info().wallet_version;
+    if running == pending.target_version {
+        tracing::info!(version = running, "Update installed successfully");
+        state.last_error = None;
+    } else {
+        tracing::error!(
+            running,
+            target = %pending.target_version,
+            previous = %pending.previous_version,
+            "Update did not take effect; the previous version is still running"
+        );
+        handle
+            .state::<UpdateControl>()
+            .record_wallet_failure("UPDATE_INSTALL_DID_NOT_APPLY");
+        state.last_error = Some("UPDATE_INSTALL_DID_NOT_APPLY".into());
+    }
+    // Cleared either way: this install has now been accounted for, and
+    // leaving it would re-report the same outcome on every later start.
+    let _ = persist_update_state(&path, &state);
+}
+
 /// Write the durable part of the current status out, best effort.
 ///
 /// Called after every terminal step of an update cycle. A failure to persist
@@ -137,6 +227,8 @@ fn save_update_state(handle: &tauri::AppHandle) {
         last_check_unix_seconds: snapshot.wallet.last_check_unix_seconds,
         next_check_unix_seconds: snapshot.wallet.next_check_unix_seconds,
         last_error: snapshot.wallet.sanitized_error.clone(),
+        // Preserved: only the install path writes and clears it.
+        pending_install: load_update_state(&path).and_then(|state| state.pending_install),
     };
     if persist_update_state(&path, &state).is_err() {
         tracing::warn!("Could not persist updater state; it will reset on restart");
@@ -645,6 +737,10 @@ async fn check_wallet_update(
     application
         .prepare_for_update(&lease)
         .map_err(|_| UpdateError::WalletPersistFailed)?;
+    // Recorded before the installer runs, because after it this process may
+    // never execute another line. Without it, an install that silently failed
+    // to apply was indistinguishable from one that never happened.
+    mark_install_started(handle, &version.to_string());
     // `bytes` is exactly what `verify_staged_artifact` returned above: size,
     // SHA-256 and minisign all checked, and held in memory since, so there is no
     // window for the file on disk to be swapped underneath us.
@@ -1564,6 +1660,9 @@ fn application_builder() -> tauri::Builder<tauri::Wry> {
                     persisted.last_error,
                 );
             }
+            // An install recorded before the last restart has to be accounted
+            // for now, while the running version is the evidence.
+            reconcile_pending_install(app.handle());
             // Bind the persistent app-config directory before anything can read
             // the chain source, so a saved REMOTE selection (and the embedded
             // node map size) survives the restart instead of silently

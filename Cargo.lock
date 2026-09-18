@@ -1684,6 +1684,7 @@ dependencies = [
 name = "dom-wallet-domain"
 version = "0.3.6"
 dependencies = [
+ "base64 0.22.1",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
