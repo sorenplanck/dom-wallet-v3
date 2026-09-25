@@ -2,7 +2,13 @@
 
 //! Atomic generation storage for encrypted canonical wallet state.
 
-use dom_wallet_crypto::{decode, encode, open, seal, CryptoError, KdfParameters};
+#[cfg(feature = "legacy-writer")]
+use dom_wallet_crypto::seal_legacy_v1;
+use dom_wallet_crypto::{
+    decode, encode, encoded_len, max_encoded_bytes, max_plaintext_bytes, open,
+    peek_envelope_version, seal, CryptoError, KdfParameters, ENVELOPE_VERSION,
+    ENVELOPE_VERSION_LEGACY_V1, MAX_ENVELOPE_BYTES,
+};
 use dom_wallet_domain::{
     NetworkIdentity, NodeConfiguration, RescanPlan, WalletState, MODEL_VERSION,
     RECOVERY_SCHEME_BIP39_256_V1, SECRET_PROFILE_VERSION,
@@ -25,10 +31,71 @@ const AUTHENTICATION_FILE: &str = "authentication.envelope";
 const AUTHENTICATION_PLAINTEXT: &[u8] = b"DOM-WALLET-V3-PASSWORD-CHECK-V1";
 const RESCAN_PLAN_FILE: &str = "rescan-plan.envelope";
 const WRITER_LOCK_FILE: &str = ".wallet.lock";
-const MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
+/// Records the last legacy (v1) generation superseded by the first compact
+/// (v2) commit: `generation-N`, `none` (wallet never had a v1 generation) or
+/// `released` (the snapshot was explicitly discarded after validation).
+const PRE_MIGRATION_SNAPSHOT_FILE: &str = "pre-migration-snapshot";
+const PRE_MIGRATION_NONE: &str = "none";
+const PRE_MIGRATION_RELEASED: &str = "released";
+/// Bound for the small non-state files (metadata, active pointer, password
+/// authenticator). These never grow with wallet history.
+const MAX_AUXILIARY_FILE_BYTES: usize = 16 * 1024 * 1024;
+/// Hard bound for any encrypted state-bearing envelope file (generation state,
+/// rescan plan). It protects allocation against corrupted or hostile files;
+/// legacy v1 envelopes are additionally held to their original 16 MiB bound
+/// by the envelope decoder.
+pub const MAX_STATE_ENVELOPE_BYTES: usize = MAX_ENVELOPE_BYTES;
+/// Share of a limit at which a commit logs a capacity warning.
+const STATE_SIZE_WARNING_PERCENT: u64 = 75;
 pub const BACKUP_MAGIC: [u8; 8] = *b"DOMWBK01";
 pub const BACKUP_FORMAT_VERSION: u16 = 1;
-pub const MAX_BACKUP_BYTES: usize = 20 * 1024 * 1024;
+pub const MAX_BACKUP_BYTES: usize = MAX_ENVELOPE_BYTES + 1024 * 1024;
+
+/// On-disk encoding of one encrypted generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StateEncoding {
+    /// Current writer: envelope v2 with a base64 ciphertext.
+    CompactV2,
+    /// Pre-v2 format of released wallets up to v0.4.0, bounded by the
+    /// original 16 MiB limit. Always readable; writable only in builds with
+    /// the `legacy-writer` feature (fixtures and regression tests). It is
+    /// never chosen implicitly and there is no production downgrade path.
+    LegacyV1,
+}
+
+impl StateEncoding {
+    fn envelope_version(self) -> u16 {
+        match self {
+            Self::CompactV2 => ENVELOPE_VERSION,
+            Self::LegacyV1 => ENVELOPE_VERSION_LEGACY_V1,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::CompactV2 => "COMPACT_V2",
+            Self::LegacyV1 => "LEGACY_V1",
+        }
+    }
+
+    fn from_envelope_version(version: u16) -> Option<Self> {
+        match version {
+            ENVELOPE_VERSION => Some(Self::CompactV2),
+            ENVELOPE_VERSION_LEGACY_V1 => Some(Self::LegacyV1),
+            _ => None,
+        }
+    }
+}
+
+/// Non-secret size facts of one written generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StateSizeReport {
+    pub encoding: StateEncoding,
+    pub plaintext_bytes: u64,
+    pub envelope_bytes: u64,
+    pub plaintext_limit_bytes: u64,
+    pub envelope_limit_bytes: u64,
+}
 pub const RETAIN_SUPERSEDED_GENERATIONS: usize = 1;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -277,7 +344,7 @@ impl WalletDirectory {
         }
         let state_path = generation.join(STATE_FILE);
         require_regular_file(&state_path)?;
-        let state_encoded = read_bounded(&state_path)?;
+        let state_encoded = read_state_envelope(&state_path)?;
         decode(&state_encoded).map_err(|_| StorageError::AuthenticatedPayloadCorrupt)?;
         let authentication = root.join(AUTHENTICATION_FILE);
         if authentication.exists() {
@@ -319,6 +386,10 @@ impl WalletDirectory {
         Ok(state)
     }
 
+    /// Atomically publish `state` as the next generation in the current
+    /// compact format. A legacy active generation is migrated by this very
+    /// step: the new generation is fully written, synced and renamed into
+    /// place before the pointer moves, and the legacy generation is retained.
     pub fn commit(
         &self,
         expected_generation: u64,
@@ -326,9 +397,168 @@ impl WalletDirectory {
         password: &str,
         kdf: KdfParameters,
     ) -> Result<WalletState, StorageError> {
-        let state = self.stage_generation(expected_generation, state, password, kdf)?;
+        self.commit_with_encoding(
+            expected_generation,
+            state,
+            password,
+            kdf,
+            StateEncoding::CompactV2,
+        )
+    }
+
+    /// [`Self::commit`] with an explicit on-disk encoding. Only compatibility
+    /// tooling and tests choose [`StateEncoding::LegacyV1`].
+    pub fn commit_with_encoding(
+        &self,
+        expected_generation: u64,
+        state: WalletState,
+        password: &str,
+        kdf: KdfParameters,
+        encoding: StateEncoding,
+    ) -> Result<WalletState, StorageError> {
+        let state = self.stage_generation_with_encoding(
+            expected_generation,
+            state,
+            password,
+            kdf,
+            encoding,
+        )?;
         self.publish_staged_generation(expected_generation, &state)?;
         Ok(state)
+    }
+
+    /// On-disk encoding of the active generation, read from the envelope
+    /// header only (nothing is decrypted).
+    pub fn active_state_encoding(&self) -> Result<StateEncoding, StorageError> {
+        self.generation_encoding(self.active_generation()?)
+    }
+
+    /// On-disk encoding of one generation, from its header only.
+    pub fn generation_encoding(&self, generation: u64) -> Result<StateEncoding, StorageError> {
+        let encoded = read_state_envelope(
+            &self
+                .root
+                .join(GENERATIONS_DIR)
+                .join(generation_name(generation))
+                .join(STATE_FILE),
+        )?;
+        let version = peek_envelope_version(&encoded)
+            .map_err(|_| StorageError::AuthenticatedPayloadCorrupt)?;
+        StateEncoding::from_envelope_version(version).ok_or(StorageError::UnsupportedVersion)
+    }
+
+    /// The legacy (v1) generation that was active when this wallet was first
+    /// committed in the compact format. It stays protected from
+    /// [`Self::cleanup_superseded_generations`] until explicitly released, so
+    /// the exact pre-update state remains recoverable (read-only) through
+    /// [`Self::load_generation_for_recovery`] while an update is validated.
+    /// At most one generation is ever retained this way.
+    pub fn pre_migration_snapshot_generation(&self) -> Result<Option<u64>, StorageError> {
+        let path = self.root.join(PRE_MIGRATION_SNAPSHOT_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = read_bounded(&path)?;
+        let text = std::str::from_utf8(&bytes).map_err(|_| StorageError::InvalidMetadata)?;
+        if text == PRE_MIGRATION_NONE || text == PRE_MIGRATION_RELEASED {
+            return Ok(None);
+        }
+        let generation = parse_generation(text)?;
+        let directory = self
+            .root
+            .join(GENERATIONS_DIR)
+            .join(generation_name(generation));
+        Ok(directory.exists().then_some(generation))
+    }
+
+    /// Explicitly discard the pre-migration snapshot once the update has been
+    /// validated. Never removes the active generation.
+    pub fn release_pre_migration_snapshot(&self) -> Result<(), StorageError> {
+        let active = self.active_generation()?;
+        if let Some(generation) = self.pre_migration_snapshot_generation()? {
+            if generation == active {
+                return Err(StorageError::GenerationConflict);
+            }
+            atomic_write(
+                &self.root.join(PRE_MIGRATION_SNAPSHOT_FILE),
+                PRE_MIGRATION_RELEASED.as_bytes(),
+            )?;
+            let path = self
+                .root
+                .join(GENERATIONS_DIR)
+                .join(generation_name(generation));
+            fs::remove_dir_all(path).map_err(StorageError::Io)?;
+            sync_directory(&self.root.join(GENERATIONS_DIR))?;
+        }
+        Ok(())
+    }
+
+    /// Whenever a compact generation is about to supersede an active legacy
+    /// (v1) generation, durably record that legacy generation as the
+    /// pre-migration snapshot. Written before the pointer moves, so a crash in
+    /// between leaves a marker naming the still-active legacy generation.
+    /// Also covers a wallet that went back to a released (v1-writing) build
+    /// and was upgraded again: the most recent superseded v1 generation is the
+    /// one retained (bounded: one).
+    fn record_pre_migration_snapshot(&self, staged_generation: u64) -> Result<(), StorageError> {
+        let path = self.root.join(PRE_MIGRATION_SNAPSHOT_FILE);
+        if self.generation_encoding_hint(staged_generation)? != StateEncoding::CompactV2 {
+            return Ok(());
+        }
+        let active = self.active_generation()?;
+        if active == staged_generation
+            || self.generation_encoding_hint(active)? != StateEncoding::LegacyV1
+        {
+            if !path.exists() {
+                atomic_write(&path, PRE_MIGRATION_NONE.as_bytes())?;
+            }
+            return Ok(());
+        }
+        let marker = generation_name(active);
+        if read_bounded(&path).ok().as_deref() == Some(marker.as_bytes()) {
+            return Ok(());
+        }
+        atomic_write(&path, marker.as_bytes())?;
+        tracing::info!(
+            snapshot_generation = active,
+            "legacy wallet state is being migrated to the compact format; the pre-migration generation is retained"
+        );
+        Ok(())
+    }
+
+    /// Encoding of a generation from the first bytes of its envelope: every
+    /// writer serializes the header first with `envelope_version` right after
+    /// the eight magic numbers. Falls back to a full header parse when the
+    /// prefix is not conclusive.
+    fn generation_encoding_hint(&self, generation: u64) -> Result<StateEncoding, StorageError> {
+        let path = self
+            .root
+            .join(GENERATIONS_DIR)
+            .join(generation_name(generation))
+            .join(STATE_FILE);
+        let mut prefix = [0u8; 256];
+        let read = {
+            use std::io::Read;
+            let mut file = File::open(&path).map_err(StorageError::Io)?;
+            file.read(&mut prefix).map_err(StorageError::Io)?
+        };
+        let text = String::from_utf8_lossy(&prefix[..read]);
+        if let Some(position) = text.find("\"envelope_version\":") {
+            let digits: String = text[position + "\"envelope_version\":".len()..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            if let Some(encoding) = digits
+                .parse::<u16>()
+                .ok()
+                .and_then(StateEncoding::from_envelope_version)
+            {
+                if text[..position].starts_with("{\"header\":{\"magic\":[") {
+                    return Ok(encoding);
+                }
+            }
+        }
+        self.generation_encoding(generation)
     }
 
     pub fn root(&self) -> &Path {
@@ -340,9 +570,26 @@ impl WalletDirectory {
     pub fn stage_generation(
         &self,
         expected_generation: u64,
+        state: WalletState,
+        password: &str,
+        kdf: KdfParameters,
+    ) -> Result<WalletState, StorageError> {
+        self.stage_generation_with_encoding(
+            expected_generation,
+            state,
+            password,
+            kdf,
+            StateEncoding::CompactV2,
+        )
+    }
+
+    pub fn stage_generation_with_encoding(
+        &self,
+        expected_generation: u64,
         mut state: WalletState,
         password: &str,
         kdf: KdfParameters,
+        encoding: StateEncoding,
     ) -> Result<WalletState, StorageError> {
         let metadata = self.metadata()?;
         let active = self.active_generation()?;
@@ -357,7 +604,7 @@ impl WalletDirectory {
             .ok_or(StorageError::GenerationOverflow)?;
         state.validate().map_err(StorageError::Domain)?;
         self.remove_unpublished_generation(state.generation)?;
-        self.write_generation(&state, password, kdf)?;
+        self.write_generation(&state, password, kdf, encoding)?;
         Ok(state)
     }
 
@@ -380,6 +627,7 @@ impl WalletDirectory {
             return Err(StorageError::GenerationConflict);
         }
         state.validate().map_err(StorageError::Domain)?;
+        self.record_pre_migration_snapshot(state.generation)?;
         self.publish_pointer_and_metadata(state)
     }
 
@@ -416,7 +664,11 @@ impl WalletDirectory {
         let encoded =
             encode(&seal(&plaintext, password, &context, kdf).map_err(StorageError::Crypto)?)
                 .map_err(StorageError::Crypto)?;
-        atomic_write(&self.root.join(RESCAN_PLAN_FILE), &encoded)
+        atomic_write_private(
+            &self.root.join(RESCAN_PLAN_FILE),
+            &encoded,
+            MAX_STATE_ENVELOPE_BYTES,
+        )
     }
 
     pub fn load_rescan_plan(
@@ -428,7 +680,7 @@ impl WalletDirectory {
         if !path.exists() {
             return Ok(None);
         }
-        let envelope = decode(&read_bounded(&path)?).map_err(StorageError::Crypto)?;
+        let envelope = decode(&read_state_envelope(&path)?).map_err(StorageError::Crypto)?;
         let context = rescan_context(state.wallet_id, &state.identity);
         let plaintext = open(&envelope, password, &context).map_err(StorageError::Crypto)?;
         let plan =
@@ -472,7 +724,7 @@ impl WalletDirectory {
             rescan_plan: &plan,
         };
         let plaintext = serialize_secret(&payload)?;
-        if plaintext.is_empty() || plaintext.len() > MAX_STATE_BYTES {
+        if plaintext.is_empty() || plaintext.len() > max_plaintext_bytes(ENVELOPE_VERSION) {
             return Err(StorageError::FileSizeOutOfBounds);
         }
         let context = backup_context(created_unix_seconds, state.wallet_id, &state.identity);
@@ -591,6 +843,9 @@ impl WalletDirectory {
         }
         let mut retained = std::collections::BTreeSet::from([active]);
         retained.extend(protected.iter().copied());
+        // The pre-migration legacy snapshot survives routine cleanup until it
+        // is explicitly released (bounded: one generation).
+        retained.extend(self.pre_migration_snapshot_generation()?);
         retained.extend(
             generations
                 .iter()
@@ -620,7 +875,11 @@ impl WalletDirectory {
         password: &str,
         kdf: KdfParameters,
     ) -> Result<(), StorageError> {
-        self.write_generation(state, password, kdf)?;
+        self.write_generation(state, password, kdf, StateEncoding::CompactV2)?;
+        atomic_write(
+            &self.root.join(PRE_MIGRATION_SNAPSHOT_FILE),
+            PRE_MIGRATION_NONE.as_bytes(),
+        )?;
         self.write_authenticator(password, &WalletMetadata::from_state(state), kdf)?;
         self.publish_pointer_and_metadata(state)
     }
@@ -669,7 +928,7 @@ impl WalletDirectory {
         )
         .map_err(StorageError::Crypto)?;
         let encoded = encode(&envelope).map_err(StorageError::Crypto)?;
-        atomic_write_private(&path, &encoded, MAX_STATE_BYTES)
+        atomic_write_private(&path, &encoded, MAX_AUXILIARY_FILE_BYTES)
     }
 
     fn write_generation(
@@ -677,6 +936,7 @@ impl WalletDirectory {
         state: &WalletState,
         password: &str,
         kdf: KdfParameters,
+        encoding: StateEncoding,
     ) -> Result<(), StorageError> {
         let generation = generation_name(state.generation);
         let generations_dir = self.root.join(GENERATIONS_DIR);
@@ -690,11 +950,59 @@ impl WalletDirectory {
         create_private_directory(&temporary_dir)?;
         let result = (|| {
             let plaintext = serialize_secret(state)?;
+            let version = encoding.envelope_version();
+            let plaintext_limit = max_plaintext_bytes(version);
+            let envelope_limit = max_encoded_bytes(version);
+            // Reject before paying for the KDF when the plaintext alone cannot
+            // fit. The exact envelope size is reported below otherwise.
+            if plaintext.len() > plaintext_limit {
+                let error = StorageError::StateTooLarge {
+                    encoding,
+                    plaintext_bytes: plaintext.len() as u64,
+                    envelope_bytes: None,
+                    plaintext_limit_bytes: plaintext_limit as u64,
+                    envelope_limit_bytes: envelope_limit as u64,
+                };
+                log_state_too_large(state.generation, &error);
+                return Err(error);
+            }
             let context = state_context(state.wallet_id, &state.identity, state.generation);
-            let envelope =
-                seal(&plaintext, password, &context, kdf).map_err(StorageError::Crypto)?;
-            let encoded = encode(&envelope).map_err(StorageError::Crypto)?;
-            atomic_write(&temporary_dir.join(STATE_FILE), &encoded)?;
+            let envelope = match encoding {
+                StateEncoding::CompactV2 => seal(&plaintext, password, &context, kdf),
+                #[cfg(feature = "legacy-writer")]
+                StateEncoding::LegacyV1 => seal_legacy_v1(&plaintext, password, &context, kdf),
+                #[cfg(not(feature = "legacy-writer"))]
+                StateEncoding::LegacyV1 => return Err(StorageError::UnsupportedVersion),
+            }
+            .map_err(StorageError::Crypto)?;
+            let encoded = match encode(&envelope) {
+                Ok(encoded) => encoded,
+                Err(CryptoError::EnvelopeTooLarge) => {
+                    let error = StorageError::StateTooLarge {
+                        encoding,
+                        plaintext_bytes: plaintext.len() as u64,
+                        envelope_bytes: encoded_len(&envelope).ok().map(|len| len as u64),
+                        plaintext_limit_bytes: plaintext_limit as u64,
+                        envelope_limit_bytes: envelope_limit as u64,
+                    };
+                    log_state_too_large(state.generation, &error);
+                    return Err(error);
+                }
+                Err(error) => return Err(StorageError::Crypto(error)),
+            };
+            let report = StateSizeReport {
+                encoding,
+                plaintext_bytes: plaintext.len() as u64,
+                envelope_bytes: encoded.len() as u64,
+                plaintext_limit_bytes: plaintext_limit as u64,
+                envelope_limit_bytes: envelope_limit as u64,
+            };
+            log_state_size(state.generation, &report);
+            atomic_write_private(
+                &temporary_dir.join(STATE_FILE),
+                &encoded,
+                MAX_STATE_ENVELOPE_BYTES,
+            )?;
             sync_directory(&temporary_dir)?;
             fs::rename(&temporary_dir, &final_dir).map_err(StorageError::Io)?;
             sync_directory(&generations_dir)?;
@@ -720,7 +1028,7 @@ impl WalletDirectory {
         }
         let state_path = path.join(STATE_FILE);
         require_regular_file(&state_path)?;
-        let encoded = read_bounded(&state_path)?;
+        let encoded = read_state_envelope(&state_path)?;
         decode(&encoded).map_err(|_| StorageError::AuthenticatedPayloadCorrupt)?;
         fs::remove_dir_all(&path).map_err(StorageError::Io)?;
         sync_directory(&generations)
@@ -749,7 +1057,7 @@ impl WalletDirectory {
         metadata: &WalletMetadata,
         password_authenticated: bool,
     ) -> Result<WalletState, StorageError> {
-        let encoded = read_bounded(
+        let encoded = read_state_envelope(
             &self
                 .root
                 .join(GENERATIONS_DIR)
@@ -757,6 +1065,13 @@ impl WalletDirectory {
                 .join(STATE_FILE),
         )?;
         let envelope = decode(&encoded).map_err(|_| StorageError::AuthenticatedPayloadCorrupt)?;
+        if envelope.header.envelope_version == ENVELOPE_VERSION_LEGACY_V1 {
+            tracing::info!(
+                generation,
+                envelope_bytes = encoded.len() as u64,
+                "wallet state generation uses the legacy v1 envelope; the next commit writes the compact v2 format"
+            );
+        }
         let context = state_context(metadata.wallet_id, &metadata.identity, generation);
         let plaintext = open(&envelope, password, &context).map_err(|error| {
             if password_authenticated {
@@ -773,6 +1088,62 @@ impl WalletDirectory {
             .migrate_transaction_exposure()
             .map_err(StorageError::Domain)?;
         Ok(state)
+    }
+}
+
+fn percent_of(value: u64, limit: u64) -> u64 {
+    if limit == 0 {
+        return 100;
+    }
+    (u128::from(value) * 100 / u128::from(limit)) as u64
+}
+
+/// Sizes only: never wallet contents, keys or blindings.
+fn log_state_size(generation: u64, report: &StateSizeReport) {
+    let envelope_percent = percent_of(report.envelope_bytes, report.envelope_limit_bytes);
+    let plaintext_percent = percent_of(report.plaintext_bytes, report.plaintext_limit_bytes);
+    if envelope_percent.max(plaintext_percent) >= STATE_SIZE_WARNING_PERCENT {
+        tracing::warn!(
+            generation,
+            encoding = report.encoding.name(),
+            plaintext_bytes = report.plaintext_bytes,
+            envelope_bytes = report.envelope_bytes,
+            plaintext_limit_bytes = report.plaintext_limit_bytes,
+            envelope_limit_bytes = report.envelope_limit_bytes,
+            envelope_percent,
+            "wallet state generation is approaching the storage limit"
+        );
+    } else {
+        tracing::info!(
+            generation,
+            encoding = report.encoding.name(),
+            plaintext_bytes = report.plaintext_bytes,
+            envelope_bytes = report.envelope_bytes,
+            envelope_limit_bytes = report.envelope_limit_bytes,
+            "wallet state generation written"
+        );
+    }
+}
+
+fn log_state_too_large(generation: u64, error: &StorageError) {
+    if let StorageError::StateTooLarge {
+        encoding,
+        plaintext_bytes,
+        envelope_bytes,
+        plaintext_limit_bytes,
+        envelope_limit_bytes,
+    } = error
+    {
+        tracing::error!(
+            generation,
+            error_code = "WALLET_STATE_STORAGE_LIMIT_EXCEEDED",
+            encoding = encoding.name(),
+            plaintext_bytes,
+            envelope_bytes = envelope_bytes.unwrap_or(0),
+            plaintext_limit_bytes,
+            envelope_limit_bytes,
+            "wallet state generation exceeds the storage limit; nothing was published"
+        );
     }
 }
 
@@ -849,7 +1220,11 @@ fn backup_context(
 }
 
 fn read_bounded(path: &Path) -> Result<Vec<u8>, StorageError> {
-    read_bounded_with_limit(path, MAX_STATE_BYTES)
+    read_bounded_with_limit(path, MAX_AUXILIARY_FILE_BYTES)
+}
+
+fn read_state_envelope(path: &Path) -> Result<Vec<u8>, StorageError> {
+    read_bounded_with_limit(path, MAX_STATE_ENVELOPE_BYTES)
 }
 
 fn acquire_writer_lock(root: &Path) -> Result<Arc<File>, StorageError> {
@@ -926,7 +1301,7 @@ fn atomic_write_private(path: &Path, bytes: &[u8], max_bytes: usize) -> Result<(
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
-    atomic_write_private(path, bytes, MAX_STATE_BYTES)
+    atomic_write_private(path, bytes, MAX_AUXILIARY_FILE_BYTES)
 }
 
 fn validate_atomic_destination(path: &Path) -> Result<(), StorageError> {
@@ -1045,6 +1420,18 @@ pub enum StorageError {
     GenerationOverflow,
     #[error("bounded file size validation failed")]
     FileSizeOutOfBounds,
+    /// Deterministic: the same state can never fit, so retrying is useless.
+    #[error(
+        "wallet state storage limit exceeded ({plaintext_bytes} plaintext bytes; \
+         plaintext limit {plaintext_limit_bytes}, envelope limit {envelope_limit_bytes})"
+    )]
+    StateTooLarge {
+        encoding: StateEncoding,
+        plaintext_bytes: u64,
+        envelope_bytes: Option<u64>,
+        plaintext_limit_bytes: u64,
+        envelope_limit_bytes: u64,
+    },
     #[error("backup destination already exists")]
     BackupDestinationExists,
     #[error("backup data is invalid")]

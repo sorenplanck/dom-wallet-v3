@@ -654,6 +654,14 @@ pub struct WalletSyncStatusDto {
     pub paused: bool,
     pub last_result: String,
     pub last_error: Option<String>,
+    /// Background synchronization worker state (`IDLE`, `RUNNING`,
+    /// `STOPPING`, `ERROR`). Independent of the embedded node status.
+    #[serde(default)]
+    pub worker_state: String,
+    /// Code that stopped the background worker, when it stopped on a
+    /// terminal failure. A stopped worker never advances the cursor.
+    #[serde(default)]
+    pub worker_error: Option<String>,
 }
 
 const MINING_DISABLED: u64 = 0;
@@ -849,9 +857,16 @@ where
     Wait: FnMut(std::time::Duration),
 {
     let mut consecutive_failures = 0_u32;
+    tracing::info!("wallet synchronization worker started");
     while !stop.load(Ordering::Acquire) {
         let delay = match synchronize_once() {
             Ok(synchronized) => {
+                if consecutive_failures > 0 {
+                    tracing::info!(
+                        previous_consecutive_failures = consecutive_failures,
+                        "wallet synchronization recovered"
+                    );
+                }
                 consecutive_failures = 0;
                 std::time::Duration::from_millis(if synchronized {
                     SYNC_FOLLOW_POLL_MILLIS
@@ -859,10 +874,36 @@ where
                     SYNC_CATCH_UP_RETRY_MILLIS
                 })
             }
-            Err(error) if terminal_synchronization_error(&error) => return Err(error),
-            Err(_) => {
+            Err(error) if terminal_synchronization_error(&error) => {
+                tracing::error!(
+                    error_code = %command_error_log_code(&error),
+                    consecutive_failures,
+                    "wallet synchronization worker stopped on a terminal failure; it will not retry"
+                );
+                return Err(error);
+            }
+            Err(error) => {
                 let delay = synchronization_retry_backoff(consecutive_failures);
                 consecutive_failures = consecutive_failures.saturating_add(1);
+                // Transient waits (busy or starting Core) are routine; every
+                // other retryable failure is surfaced with its retry count.
+                if matches!(
+                    error,
+                    CommandError::NodeNotReady | CommandError::RestoreNodeSynchronizing
+                ) {
+                    tracing::debug!(
+                        error_code = %command_error_log_code(&error),
+                        retry = consecutive_failures,
+                        "wallet synchronization waiting for Core"
+                    );
+                } else {
+                    tracing::warn!(
+                        error_code = %command_error_log_code(&error),
+                        retry = consecutive_failures,
+                        backoff_millis = delay.as_millis() as u64,
+                        "wallet synchronization attempt failed; retrying"
+                    );
+                }
                 delay
             }
         };
@@ -870,7 +911,18 @@ where
             wait(delay);
         }
     }
+    tracing::info!("wallet synchronization worker stopped");
     Ok(())
+}
+
+/// Stable, non-sensitive identifier of a command error for logs.
+fn command_error_log_code(error: &CommandError) -> String {
+    match error {
+        CommandError::Wallet { code, .. } => (*code).to_owned(),
+        CommandError::InvalidInput(_) => "INVALID_INPUT".to_owned(),
+        CommandError::RecoveryPhrase(_) => "RECOVERY_PHRASE_INVALID".to_owned(),
+        other => format!("{other:?}"),
+    }
 }
 
 struct SynchronizationRuntime {
@@ -879,6 +931,28 @@ struct SynchronizationRuntime {
     error_code: Arc<Mutex<Option<String>>>,
     cached_status: Arc<Mutex<Option<WalletSyncStatusDto>>>,
     worker: Option<JoinHandle<()>>,
+    /// Set when the worker stopped on a deterministic persistence failure.
+    /// Automatic (re)starts — unlock, restore, chain-source changes — are
+    /// refused for the same wallet until an explicit user retry clears it.
+    terminal_latch: Arc<Mutex<Option<TerminalSyncLatch>>>,
+}
+
+#[derive(Clone, Debug)]
+struct TerminalSyncLatch {
+    wallet_id: Option<Uuid>,
+    code: String,
+}
+
+/// Terminal codes that no automatic restart can fix: the same batch would be
+/// scanned, the key re-derived and the commit refused again. Operational
+/// terminal codes such as a locked wallet are deliberately excluded so that
+/// unlocking keeps restarting synchronization.
+fn latches_automatic_restart(code: &str) -> bool {
+    code == "WALLET_STATE_STORAGE_LIMIT_EXCEEDED"
+        || code == "WALLET_STATE_VALIDATION_FAILED"
+        || code == "WALLET_STORAGE_FAILED"
+        || code == "RESTORE_VALIDATION_FAILED"
+        || code.starts_with("WALLET_STORAGE_IO_FAILED")
 }
 
 impl Default for SynchronizationRuntime {
@@ -889,6 +963,7 @@ impl Default for SynchronizationRuntime {
             error_code: Arc::new(Mutex::new(None)),
             cached_status: Arc::new(Mutex::new(None)),
             worker: None,
+            terminal_latch: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -2774,6 +2849,36 @@ impl DesktopApplication {
 
     pub fn wallet_sync_status(&self) -> Result<WalletSyncStatusDto, CommandError> {
         self.reap_finished_sync_worker()?;
+        self.wallet_sync_status_from_service()
+            .map(|status| self.with_worker_status(status))
+    }
+
+    /// Overlay the background worker state, which the service snapshot cannot
+    /// know: a worker stopped on a terminal failure must stay visible even
+    /// when the node itself is healthy.
+    fn with_worker_status(&self, mut status: WalletSyncStatusDto) -> WalletSyncStatusDto {
+        if let Ok(runtime) = self.synchronization.lock() {
+            status.worker_state =
+                sync_worker_state_name(runtime.state.load(Ordering::Acquire)).to_owned();
+            status.worker_error = runtime
+                .error_code
+                .lock()
+                .ok()
+                .and_then(|error| error.clone());
+            if let Some(latch) = runtime
+                .terminal_latch
+                .lock()
+                .ok()
+                .and_then(|latch| latch.clone())
+            {
+                status.worker_state = "ERROR".into();
+                status.worker_error = Some(latch.code);
+            }
+        }
+        status
+    }
+
+    fn wallet_sync_status_from_service(&self) -> Result<WalletSyncStatusDto, CommandError> {
         match self.service.try_lock() {
             Ok(service) => {
                 let status = sync_status_from_service(&service, self.sync_status_context());
@@ -3009,14 +3114,7 @@ impl DesktopApplication {
         }
         let sync = self.wallet_sync_status()?;
         let peers = self.node_peer_status()?;
-        require_mining_cursor_gate(
-            sync.cursor_height,
-            sync.cursor_hash.as_deref(),
-            sync.canonical_height,
-            sync.canonical_hash.as_deref(),
-            sync.last_error.as_deref(),
-            peers.total_connected_peers,
-        )?;
+        require_mining_sync_gate(&sync, peers.total_connected_peers)?;
         let node_status = self.embedded_node_status()?;
         if !matches!(
             node_status.lifecycle,
@@ -3344,6 +3442,23 @@ impl DesktopApplication {
     }
     pub fn synchronization_resume_live(&self) -> Result<WalletSyncStatusDto, CommandError> {
         self.synchronization_paused.store(false, Ordering::Release);
+        self.synchronization_start_explicit()
+    }
+
+    /// A user-initiated start (Synchronize / Retry / Resume): the only path
+    /// that clears a deterministic-failure latch, after the user has had the
+    /// chance to intervene (update, free disk space, fix permissions).
+    pub fn synchronization_start_explicit(&self) -> Result<WalletSyncStatusDto, CommandError> {
+        if let Ok(runtime) = self.synchronization.lock() {
+            if let Ok(mut latch) = runtime.terminal_latch.lock() {
+                if let Some(previous) = latch.take() {
+                    tracing::info!(
+                        error_code = %previous.code,
+                        "explicit synchronization retry after a deterministic failure"
+                    );
+                }
+            }
+        }
         self.synchronization_start_live()
     }
     pub fn synchronization_rescan(&self) -> Result<WalletSummary, CommandError> {
@@ -3362,10 +3477,38 @@ impl DesktopApplication {
         }
         self.reap_finished_sync_worker()?;
         let mut initial = self.wallet_sync_status()?;
+        let current_wallet = self
+            .service
+            .try_lock()
+            .ok()
+            .and_then(|service| service.summary().ok())
+            .map(|summary| summary.wallet_id);
         let mut runtime = self
             .synchronization
             .lock()
             .map_err(|_| CommandError::Unavailable)?;
+        if let Some(latch) = runtime
+            .terminal_latch
+            .lock()
+            .ok()
+            .and_then(|latch| latch.clone())
+        {
+            // Unknown current wallet (service busy) is treated as the same
+            // wallet: never auto-restart into a known deterministic failure.
+            if current_wallet.is_none()
+                || latch.wallet_id.is_none()
+                || latch.wallet_id == current_wallet
+            {
+                tracing::info!(
+                    error_code = %latch.code,
+                    "wallet synchronization stays stopped after a deterministic failure; an explicit retry is required"
+                );
+                return Ok(initial);
+            }
+            if let Ok(mut slot) = runtime.terminal_latch.lock() {
+                *slot = None;
+            }
+        }
         if runtime.worker.is_some() || runtime.state.load(Ordering::Acquire) == SYNC_RUNNING {
             initial.state = "SYNCHRONIZING".into();
             return Ok(initial);
@@ -3384,6 +3527,7 @@ impl DesktopApplication {
         let stop = Arc::clone(&runtime.stop);
         let state = Arc::clone(&runtime.state);
         let error_code = Arc::clone(&runtime.error_code);
+        let terminal_latch = Arc::clone(&runtime.terminal_latch);
         let cached = Arc::clone(&runtime.cached_status);
         let activities = Arc::clone(&self.activities);
         let chain_source = Arc::clone(&self.chain_source);
@@ -3452,11 +3596,26 @@ impl DesktopApplication {
                     }
                     Ok(Err(error)) => {
                         state.store(SYNC_ERROR, Ordering::Release);
+                        let code: String = match error {
+                            CommandError::RecoveryRequired => "SYNC_RECOVERY_REQUIRED".into(),
+                            CommandError::Wallet { code, .. } => code.into(),
+                            _ => "SYNC_WORK_FAILED".into(),
+                        };
+                        if latches_automatic_restart(&code) {
+                            let wallet_id = service
+                                .lock()
+                                .ok()
+                                .and_then(|wallet| wallet.summary().ok())
+                                .map(|summary| summary.wallet_id);
+                            if let Ok(mut slot) = terminal_latch.lock() {
+                                *slot = Some(TerminalSyncLatch {
+                                    wallet_id,
+                                    code: code.clone(),
+                                });
+                            }
+                        }
                         if let Ok(mut slot) = error_code.lock() {
-                            *slot = Some(match error {
-                                CommandError::RecoveryRequired => "SYNC_RECOVERY_REQUIRED".into(),
-                                _ => "SYNC_WORK_FAILED".into(),
-                            });
+                            *slot = Some(code);
                         }
                     }
                     Err(_) => {
@@ -4695,6 +4854,17 @@ fn sync_status_from_service(
         }
         .into(),
         last_error: diagnostic.last_error,
+        worker_state: String::new(),
+        worker_error: None,
+    }
+}
+
+fn sync_worker_state_name(state: u64) -> &'static str {
+    match state {
+        SYNC_RUNNING => "RUNNING",
+        SYNC_STOPPING => "STOPPING",
+        SYNC_ERROR => "ERROR",
+        _ => "IDLE",
     }
 }
 
@@ -5120,6 +5290,22 @@ fn mining_state_name(state: u64, enabled: bool) -> &'static str {
     }
 }
 
+/// The exact gate `mining_start` applies: mining only starts once the wallet
+/// cursor sits on the canonical tip with no synchronization error.
+fn require_mining_sync_gate(
+    sync: &WalletSyncStatusDto,
+    connected_peers: u64,
+) -> Result<(), CommandError> {
+    require_mining_cursor_gate(
+        sync.cursor_height,
+        sync.cursor_hash.as_deref(),
+        sync.canonical_height,
+        sync.canonical_hash.as_deref(),
+        sync.last_error.as_deref(),
+        connected_peers,
+    )
+}
+
 fn require_mining_cursor_gate(
     cursor_height: Option<u64>,
     cursor_hash: Option<&str>,
@@ -5416,7 +5602,9 @@ impl From<CommandError> for CommandErrorDto {
                     | "WALLET_WRITER_ACTIVE"
                     | "WALLET_STORAGE_GENERATION_CONFLICT"
                     | "WALLET_NOT_FOUND"
-                    | "WALLET_STORAGE_FAILED" => "STORAGE",
+                    | "WALLET_STORAGE_FAILED"
+                    | "WALLET_STORAGE_IO_FAILED"
+                    | "WALLET_STATE_STORAGE_LIMIT_EXCEEDED" => "STORAGE",
                     "INVALID_WALLET_STATE"
                     | "TRANSACTION_STATE_INVALID"
                     | "TRANSACTION_CANNOT_CANCEL" => "LIFECYCLE",
@@ -5701,6 +5889,11 @@ fn command_error_from_restore(error: SeedRestoreError) -> CommandError {
             code: "RESTORE_STORAGE_FAILED",
             message: "The encrypted restore state could not be resumed safely.",
             retryable: true,
+        },
+        SeedRestoreError::StateStorageLimitExceeded => CommandError::Wallet {
+            code: "WALLET_STATE_STORAGE_LIMIT_EXCEEDED",
+            message: "Wallet state storage limit exceeded. The restore stopped without publishing a partial wallet; update DOM Wallet to continue.",
+            retryable: false,
         },
         SeedRestoreError::CanonicalScan => CommandError::Wallet {
             code: "RESTORE_CANONICAL_SCAN_FAILED",
@@ -6184,6 +6377,167 @@ mod tests {
         ));
     }
 
+    fn mainnet_sync_status(
+        cursor_height: u64,
+        cursor_hash: &str,
+        last_error: Option<&str>,
+    ) -> WalletSyncStatusDto {
+        WalletSyncStatusDto {
+            state: "UNLOCKED".into(),
+            cursor_height: Some(cursor_height),
+            cursor_hash: Some(cursor_hash.into()),
+            canonical_height: Some(51_795),
+            canonical_hash: Some("aa".repeat(32)),
+            tip_height: Some(51_795),
+            scan_progress_percent: Some(cursor_height * 100 / 51_795),
+            seed_restore_in_progress: false,
+            partial_balance: None,
+            remote_tip_alert: false,
+            synchronized: cursor_height == 51_795 && last_error.is_none(),
+            paused: false,
+            last_result: "NOT_SYNCHRONIZED".into(),
+            last_error: last_error.map(Into::into),
+            worker_state: "RUNNING".into(),
+            worker_error: None,
+        }
+    }
+
+    /// The Mainnet report: node at 51795, wallet cursor frozen at 43264.
+    #[test]
+    fn mining_start_gate_rejects_a_lagging_wallet_and_accepts_a_synchronized_one() {
+        let behind = mainnet_sync_status(43_264, &"bb".repeat(32), None);
+        assert!(matches!(
+            require_mining_sync_gate(&behind, 2),
+            Err(CommandError::CursorInitializationFailed)
+        ));
+        let storage_limited = mainnet_sync_status(
+            43_264,
+            &"bb".repeat(32),
+            Some("WALLET_STATE_STORAGE_LIMIT_EXCEEDED"),
+        );
+        assert!(matches!(
+            require_mining_sync_gate(&storage_limited, 2),
+            Err(CommandError::CursorInitializationFailed)
+        ));
+        let synchronized = mainnet_sync_status(51_795, &"aa".repeat(32), None);
+        assert!(require_mining_sync_gate(&synchronized, 2).is_ok());
+        // Synchronized but isolated still refuses.
+        assert!(matches!(
+            require_mining_sync_gate(&synchronized, 0),
+            Err(CommandError::NoPeers)
+        ));
+    }
+
+    #[test]
+    fn storage_limit_is_a_terminal_non_retryable_synchronization_error() {
+        let limit = CommandError::from(CoreError::Storage(
+            dom_wallet_storage::StorageError::StateTooLarge {
+                encoding: dom_wallet_storage::StateEncoding::LegacyV1,
+                plaintext_bytes: 5_000_000,
+                envelope_bytes: Some(17_000_000),
+                plaintext_limit_bytes: 16_777_216,
+                envelope_limit_bytes: 16_777_216,
+            },
+        ));
+        assert!(terminal_synchronization_error(&limit));
+        let dto = CommandErrorDto::from(limit);
+        assert_eq!(dto.code, "WALLET_STATE_STORAGE_LIMIT_EXCEEDED");
+        assert!(!dto.retryable);
+        assert!(dto.message.contains("Wallet state storage limit exceeded"));
+        let restore = command_error_from_restore(SeedRestoreError::StateStorageLimitExceeded);
+        assert!(terminal_synchronization_error(&restore));
+        // Persistent I/O trouble is not transient by default: the worker stops
+        // with an actionable code and waits for an explicit retry.
+        let io = CommandError::from(CoreError::Storage(dom_wallet_storage::StorageError::Io(
+            std::io::Error::from(std::io::ErrorKind::StorageFull),
+        )));
+        assert!(terminal_synchronization_error(&io));
+        assert_eq!(CommandErrorDto::from(io).code, "WALLET_STORAGE_IO_FAILED");
+        assert!(latches_automatic_restart(
+            "WALLET_STORAGE_IO_FAILED:StorageFull"
+        ));
+        assert!(latches_automatic_restart(
+            "WALLET_STATE_STORAGE_LIMIT_EXCEEDED"
+        ));
+        // Operational terminal codes never latch: unlocking restarts sync.
+        assert!(!latches_automatic_restart("WALLET_LOCKED"));
+        assert!(!latches_automatic_restart("WALLET_NOT_OPEN"));
+    }
+
+    #[test]
+    fn deterministic_failure_latch_blocks_automatic_restarts_until_an_explicit_retry() {
+        let app = DesktopApplication::default();
+        {
+            let runtime = app.synchronization.lock().unwrap();
+            runtime.state.store(SYNC_ERROR, Ordering::Release);
+            *runtime.error_code.lock().unwrap() =
+                Some("WALLET_STATE_STORAGE_LIMIT_EXCEEDED".into());
+            *runtime.terminal_latch.lock().unwrap() = Some(TerminalSyncLatch {
+                wallet_id: None,
+                code: "WALLET_STATE_STORAGE_LIMIT_EXCEEDED".into(),
+            });
+        }
+        // Automatic paths (unlock, restore, chain-source change, UI refresh)
+        // go through synchronization_start_live: nothing is spawned.
+        for _ in 0..3 {
+            let _ = app.synchronization_start_live();
+            let runtime = app.synchronization.lock().unwrap();
+            assert!(runtime.worker.is_none(), "no automatic restart");
+            assert!(runtime.terminal_latch.lock().unwrap().is_some());
+        }
+        let status = app.wallet_sync_status().expect("status");
+        assert_eq!(status.worker_state, "ERROR");
+        assert_eq!(
+            status.worker_error.as_deref(),
+            Some("WALLET_STATE_STORAGE_LIMIT_EXCEEDED"),
+            "refreshing the status never erases the reason"
+        );
+        // An explicit user retry clears the latch (after intervention).
+        let _ = app.synchronization_start_explicit();
+        assert!(app
+            .synchronization
+            .lock()
+            .unwrap()
+            .terminal_latch
+            .lock()
+            .unwrap()
+            .is_none());
+        let _ = app.synchronization_pause();
+    }
+
+    #[test]
+    fn terminal_storage_limit_stops_the_follow_loop_after_one_attempt() {
+        let stop = AtomicBool::new(false);
+        let mut attempts = 0;
+        let mut waits = 0;
+        let result = run_synchronization_follow_loop(
+            &stop,
+            || {
+                attempts += 1;
+                Err(CommandError::from(CoreError::Storage(
+                    dom_wallet_storage::StorageError::StateTooLarge {
+                        encoding: dom_wallet_storage::StateEncoding::CompactV2,
+                        plaintext_bytes: 1,
+                        envelope_bytes: None,
+                        plaintext_limit_bytes: 0,
+                        envelope_limit_bytes: 0,
+                    },
+                )))
+            },
+            |_| waits += 1,
+        );
+        assert!(matches!(
+            result,
+            Err(CommandError::Wallet {
+                code: "WALLET_STATE_STORAGE_LIMIT_EXCEEDED",
+                retryable: false,
+                ..
+            })
+        ));
+        assert_eq!(attempts, 1, "no scan/KDF/commit replay loop");
+        assert_eq!(waits, 0);
+    }
+
     #[test]
     fn shutdown_is_idempotent_and_rejects_new_work() {
         let app = DesktopApplication::default();
@@ -6655,6 +7009,8 @@ mod tests {
                 paused: false,
                 last_result: "NOT_SYNCHRONIZED".into(),
                 last_error: None,
+                worker_state: String::new(),
+                worker_error: None,
             });
         }
         let entered = Arc::new(std::sync::Barrier::new(2));

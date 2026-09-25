@@ -1,0 +1,58 @@
+// Generates a legacy (pre-fix) wallet directory with the UNMODIFIED storage code.
+use dom_wallet_crypto::KdfParameters;
+use dom_wallet_domain::*;
+use dom_wallet_storage::{default_node_configuration, WalletDirectory};
+use uuid::Uuid;
+
+fn main() {
+    let out = std::path::PathBuf::from(std::env::args().nth(1).unwrap());
+    let pw = "legacy-fixture-password";
+    let identity = NetworkIdentity { network: Network::PrivateTestnet, chain_id: [4; 32], genesis_id: [5; 32] };
+    let mut state = WalletState::new(identity.clone(), [6; 32], default_node_configuration(identity));
+    let acct = state.default_account.id;
+    for i in 0..3u8 {
+        let id = Uuid::from_bytes([i + 1; 16]);
+        state.outputs.push(OutputRecord { id, account_id: acct, commitment: Some([0x10 + i; 33]),
+            value: 1_000 + u64::from(i), state: OutputState::Confirmed, discovered_height: 10 + u64::from(i), reserved_by: None });
+        state.private_output_blindings.push(PrivateOutputBlinding { output_id: id, blinding: [0x20 + i; 32] });
+        state.recovered_output_metadata.push(RecoveredOutputMetadata { output_id: id, recovery_account: 0,
+            derivation_index: u64::from(i) + 1, domain: RecoveredOutputDomain::Coinbase, is_coinbase: true,
+            block_hash: [0x30 + i; 32], output_position: 0 });
+    }
+    let mut prev = [0x40; 32];
+    for h in 10..13u64 {
+        let hash = [0x50 + h as u8; 32];
+        state.recovery_canonical_blocks.push(RecoveryCanonicalBlock { height: h, block_hash: hash, previous_block_hash: prev, output_count: 1, legacy_proof_only_outputs: 0 });
+        prev = hash;
+    }
+    state.recovery_scanned_blocks = 13;
+    state.core_scan_cursor = Some((0..86u8).collect());
+    let wallet = out.join("wallet");
+    let d = WalletDirectory::create(&wallet, &state, pw, KdfParameters::TEST).unwrap();
+    let s = d.load(pw).unwrap();
+    // one more generation so the fixture also carries a superseded generation
+    let s = d.commit(s.generation, s.clone(), pw, KdfParameters::TEST).unwrap();
+    d.export_backup(pw, "legacy-backup-password", KdfParameters::TEST, out.join("legacy.backup")).unwrap();
+    // Second backup carrying a durable rescan plan (legacy v1 rescan-plan envelope).
+    let mut planned = s.clone();
+    planned.prepare_rescan(ScanTarget {
+        target_height: 12,
+        target_block_hash: [0x5c; 32],
+        source_identity: "legacy-fixture-source".into(),
+        scan_bounds: ScanBounds { start_height: 10, end_height: 12, max_pages: 4, max_records_per_page: 64 },
+        evidence_version: 1,
+    }).unwrap();
+    let plan = planned.rescan_plan.clone().unwrap();
+    d.save_rescan_plan(&s, &plan, pw, KdfParameters::TEST).unwrap();
+    d.export_backup(pw, "legacy-backup-password", KdfParameters::TEST, out.join("legacy-with-rescan-plan.backup")).unwrap();
+    drop(d);
+    let _ = std::fs::remove_file(wallet.join(".wallet.lock"));
+    let expected = serde_json::json!({
+        "wallet_id": s.wallet_id.to_string(), "generation": s.generation,
+        "outputs": s.outputs.len(), "core_scan_cursor_len": 86,
+        "recovery_canonical_blocks": s.recovery_canonical_blocks.len(),
+        "password": pw, "backup_password": "legacy-backup-password",
+        "rescan_plan_id": plan.plan_id.to_string(),
+        "generated_by": "fixturegen (GENERATOR.rs.txt) against an unmodified worktree of commit 88e388ac241d00994b749e895a2cb5039ce1521e"});
+    std::fs::write(out.join("expected.json"), serde_json::to_vec_pretty(&expected).unwrap()).unwrap();
+}

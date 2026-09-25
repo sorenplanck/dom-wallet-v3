@@ -15,6 +15,7 @@ import {
   restoreReadinessPresentation,
   restoreScanPresentation,
   synchronizationPresentation,
+  walletSyncErrorPresentation,
 } from "./status.js";
 
 // Prefilled suggestion for the remote chain source URL. Deployment builds may
@@ -420,6 +421,7 @@ const refreshSummary = async () => {
   byId("canonical-height").textContent = liveStatus.canonicalHeight ?? "—";
   byId("cursor-height").textContent = liveStatus.cursorHeight ?? "Not initialized";
   byId("sync-status").textContent = liveStatus.message;
+  byId("wallet-sync-error").textContent = `Wallet sync error: ${walletSyncErrorPresentation(synchronization).message}`;
   const restoreScan = restoreScanPresentation(synchronization);
   if (restoreScan.active) byId("sync-status").textContent = restoreScan.message;
   renderRemoteTipAlert(remoteTipAlertPresentation(synchronization));

@@ -950,7 +950,7 @@ fn wallet_sync_status(
 fn wallet_sync_start(
     app: tauri::State<'_, DesktopApplication>,
 ) -> Result<dom_wallet_tauri_shell::WalletSyncStatusDto, dom_wallet_tauri_shell::CommandErrorDto> {
-    app.synchronization_start_live().map_err(Into::into)
+    app.synchronization_start_explicit().map_err(Into::into)
 }
 #[tauri::command]
 fn wallet_sync_pause(
@@ -1026,7 +1026,7 @@ fn synchronization_pause(
 fn synchronization_start(
     app: tauri::State<'_, DesktopApplication>,
 ) -> Result<dom_wallet_tauri_shell::WalletSyncStatusDto, dom_wallet_tauri_shell::CommandErrorDto> {
-    app.synchronization_start_live().map_err(Into::into)
+    app.synchronization_start_explicit().map_err(Into::into)
 }
 #[tauri::command]
 fn synchronization_resume(

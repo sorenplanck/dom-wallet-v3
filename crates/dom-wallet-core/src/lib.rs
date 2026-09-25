@@ -54,10 +54,12 @@ use dom_wallet_domain::{
     SCRIPTLESS_PAYOUT_RESERVATION_VERSION, SWAP_LEG_GAP_LIMIT,
 };
 use dom_wallet_embedded_core::{EmbeddedCoreConfiguration, EmbeddedPeerStatus, MiningEconomics};
-use dom_wallet_production_backend::{ProductionBackendError, PRODUCTION_BACKEND_KIND};
+use dom_wallet_production_backend::{
+    ProductionBackendError, DEFAULT_SCAN_BATCH_BLOCKS, PRODUCTION_BACKEND_KIND,
+};
 pub use dom_wallet_production_backend::{ProductionWalletBackend, REMOTE_BACKEND_KIND};
 use dom_wallet_storage::{
-    default_node_configuration, StorageError, WalletDirectory, WalletMetadata,
+    default_node_configuration, StateEncoding, StorageError, WalletDirectory, WalletMetadata,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -437,6 +439,10 @@ pub struct WalletService {
     errors: ErrorDomainSnapshot,
     /// Last canonical tip height observed from a committed batch or Core identity.
     observed_tip_height: Option<u64>,
+    /// On-disk encoding for every generation this service writes. Always the
+    /// compact format in production; regression tests select the legacy
+    /// writer to reproduce the pre-fix storage limit.
+    state_encoding: StateEncoding,
 }
 
 impl fmt::Debug for WalletService {
@@ -466,6 +472,7 @@ impl Default for WalletService {
             sender_secrets: None,
             errors: ErrorDomainSnapshot::default(),
             observed_tip_height: None,
+            state_encoding: StateEncoding::CompactV2,
         }
     }
 }
@@ -1338,60 +1345,9 @@ impl WalletService {
         self.commit(state)
     }
 
+    /// Reconcile to the canonical tip in one call (bounded pages internally).
     pub fn synchronize(&mut self) -> Result<WalletSummary, CoreError> {
-        let backend = self
-            .backend
-            .as_ref()
-            .ok_or(CoreError::EmbeddedCoreRequired)?;
-        if !backend.is_ready()? {
-            return Err(CoreError::NodeNotReady);
-        }
-        let state = self.unlocked.as_ref().ok_or(CoreError::Locked)?;
-        let seed = CanonicalWalletSeed::from_entropy(&state.root_material)
-            .map_err(|_| CoreError::RecoveryPhraseInvalid)?;
-        let identity = backend.current_identity()?;
-        require_domain_identity(&state.identity, &identity)?;
-        let location = self
-            .location
-            .as_ref()
-            .ok_or(CoreError::WalletNotOpen)?
-            .clone();
-        let password = self.password_text()?.to_owned();
-
-        let backend = self.backend.take().ok_or(CoreError::EmbeddedCoreRequired)?;
-        let state = self.unlocked.take().ok_or(CoreError::Locked)?;
-        let mut sink = WalletRecoverySink::new(location, state, password, self.kdf, seed, identity);
-        self.state = ApplicationState::Synchronizing;
-        let result = backend.reconcile_once(&mut sink);
-        let recovery_error = sink.last_recovery_error.take();
-        let generation_conflict = sink.last_generation_conflict.take();
-        self.backend = Some(backend);
-        self.observed_tip_height = sink
-            .observed_tip_height
-            .or(self.observed_tip_height)
-            .or(Some(sink.identity.current_tip.height));
-        self.unlocked = Some(sink.state);
-        match result {
-            Ok(_) => {
-                self.errors.synchronization = None;
-                self.metadata = Some(
-                    self.location
-                        .as_ref()
-                        .ok_or(CoreError::WalletNotOpen)?
-                        .metadata()?,
-                );
-                self.state = ApplicationState::Unlocked;
-                self.summary()
-            }
-            Err(error) => {
-                self.finish_sync_failure(&error);
-                if let Some(current) = generation_conflict {
-                    Err(StorageError::ExpectedGenerationConflict { current }.into())
-                } else {
-                    recovery_error.map_or_else(|| Err(error.into()), |error| Err(error.into()))
-                }
-            }
-        }
+        self.run_sync_pass(SyncPass::ToTip)
     }
 
     fn finish_sync_failure(&mut self, error: &ProductionBackendError) {
@@ -1412,7 +1368,12 @@ impl WalletService {
         self.state = ApplicationState::Unlocked;
     }
 
+    /// Reconcile at most one bounded canonical page (the desktop worker path).
     pub fn synchronize_live(&mut self) -> Result<WalletSummary, CoreError> {
+        self.run_sync_pass(SyncPass::OnePage)
+    }
+
+    fn run_sync_pass(&mut self, pass: SyncPass) -> Result<WalletSummary, CoreError> {
         let backend = self
             .backend
             .as_ref()
@@ -1431,14 +1392,47 @@ impl WalletService {
             .ok_or(CoreError::WalletNotOpen)?
             .clone();
         let password = self.password_text()?.to_owned();
+        let previous_cursor = committed_cursor_anchor(state);
+        let canonical_tip = identity.current_tip.height;
+        let range_start = previous_cursor.map_or(0, |anchor| anchor.saturating_add(1));
+        let range_end = match pass {
+            SyncPass::OnePage => canonical_tip
+                .min(range_start.saturating_add(DEFAULT_SCAN_BATCH_BLOCKS.saturating_sub(1))),
+            SyncPass::ToTip => canonical_tip,
+        };
+        // Follow-mode polls at the tip scan nothing; keep them out of the log.
+        let has_work = range_start <= canonical_tip;
+        if has_work {
+            tracing::info!(
+                pass = pass.name(),
+                previous_cursor = ?previous_cursor,
+                range_start,
+                range_end,
+                canonical_tip,
+                owned_outputs = state.outputs.len(),
+                "wallet synchronization batch started"
+            );
+        }
 
         let backend = self.backend.take().ok_or(CoreError::EmbeddedCoreRequired)?;
         let state = self.unlocked.take().ok_or(CoreError::Locked)?;
-        let mut sink = WalletRecoverySink::new(location, state, password, self.kdf, seed, identity);
+        let mut sink = WalletRecoverySink::new(
+            location,
+            state,
+            password,
+            self.kdf,
+            seed,
+            identity,
+            self.state_encoding,
+        );
         self.state = ApplicationState::Synchronizing;
-        let result = backend.reconcile_page(&mut sink);
+        let result = match pass {
+            SyncPass::OnePage => backend.reconcile_page(&mut sink),
+            SyncPass::ToTip => backend.reconcile_once(&mut sink),
+        };
         let recovery_error = sink.last_recovery_error.take();
         let generation_conflict = sink.last_generation_conflict.take();
+        let storage_failure = sink.last_storage_failure.take();
         self.backend = Some(backend);
         self.observed_tip_height = sink
             .observed_tip_height
@@ -1455,15 +1449,93 @@ impl WalletService {
                         .metadata()?,
                 );
                 self.state = ApplicationState::Unlocked;
+                let new_cursor = self.unlocked.as_ref().and_then(committed_cursor_anchor);
+                if has_work || new_cursor != previous_cursor {
+                    tracing::info!(
+                        pass = pass.name(),
+                        previous_cursor = ?previous_cursor,
+                        new_cursor = ?new_cursor,
+                        canonical_tip,
+                        owned_outputs =
+                            self.unlocked.as_ref().map_or(0, |state| state.outputs.len()),
+                        "wallet synchronization batch committed"
+                    );
+                }
                 self.summary()
+            }
+            // Deterministic or actionable storage failures: the same batch
+            // would fail identically, so they are reported as their own typed,
+            // non-retryable error instead of a generic node error that the
+            // worker would replay forever.
+            Err(_)
+                if storage_failure
+                    .and_then(StorageFailure::terminal_error)
+                    .is_some() =>
+            {
+                let failure = storage_failure.expect("checked above");
+                let (code, error) = failure.terminal_error().expect("checked above");
+                self.errors.synchronization = Some(code.clone());
+                self.state = ApplicationState::Unlocked;
+                if let StorageFailure::LimitExceeded(limit) = failure {
+                    tracing::error!(
+                        error_code = %code,
+                        previous_cursor = ?previous_cursor,
+                        range_start,
+                        range_end,
+                        canonical_tip,
+                        encoding = limit.encoding.name(),
+                        plaintext_bytes = limit.plaintext_bytes,
+                        envelope_bytes = limit.envelope_bytes.unwrap_or(0),
+                        plaintext_limit_bytes = limit.plaintext_limit_bytes,
+                        envelope_limit_bytes = limit.envelope_limit_bytes,
+                        "wallet synchronization stopped: the committed wallet state would exceed the storage limit; the cursor was not advanced"
+                    );
+                } else {
+                    tracing::error!(
+                        error_code = %code,
+                        previous_cursor = ?previous_cursor,
+                        range_start,
+                        range_end,
+                        canonical_tip,
+                        "wallet synchronization stopped: the wallet state could not be persisted; the cursor was not advanced"
+                    );
+                }
+                Err(error)
             }
             Err(error) => {
                 self.finish_sync_failure(&error);
-                if let Some(current) = generation_conflict {
-                    Err(StorageError::ExpectedGenerationConflict { current }.into())
+                let detail = match &error {
+                    ProductionBackendError::Scan(scan) => scan.to_string(),
+                    other => other.to_string(),
+                };
+                let result: Result<WalletSummary, CoreError> =
+                    if let Some(current) = generation_conflict {
+                        Err(StorageError::ExpectedGenerationConflict { current }.into())
+                    } else {
+                        recovery_error.map_or_else(|| Err(error.into()), |error| Err(error.into()))
+                    };
+                let code = result
+                    .as_ref()
+                    .err()
+                    .map_or("UNKNOWN", CoreError::redacted_code);
+                if self.errors.synchronization.is_some() {
+                    tracing::warn!(
+                        error_code = code,
+                        detail = %detail,
+                        previous_cursor = ?previous_cursor,
+                        range_start,
+                        range_end,
+                        canonical_tip,
+                        "wallet synchronization batch failed; the cursor was not advanced"
+                    );
                 } else {
-                    recovery_error.map_or_else(|| Err(error.into()), |error| Err(error.into()))
+                    tracing::debug!(
+                        error_code = code,
+                        previous_cursor = ?previous_cursor,
+                        "wallet synchronization deferred: Core is temporarily unavailable"
+                    );
                 }
+                result
             }
         }
     }
@@ -3671,7 +3743,13 @@ impl WalletService {
             .location
             .as_ref()
             .ok_or(CoreError::WalletNotOpen)?
-            .commit(expected, state, self.password_text()?, self.kdf)?;
+            .commit_with_encoding(
+                expected,
+                state,
+                self.password_text()?,
+                self.kdf,
+                self.state_encoding,
+            )?;
         self.metadata = Some(
             self.location
                 .as_ref()
@@ -3709,6 +3787,150 @@ struct WalletRecoverySink {
     observed_tip_height: Option<u64>,
     last_recovery_error: Option<SeedRestoreError>,
     last_generation_conflict: Option<u64>,
+    /// Typed class of the last refused commit of *this* sink (one sink per
+    /// synchronization pass, reset before every commit attempt), so the
+    /// storage cause survives the scan-layer error mapping.
+    last_storage_failure: Option<StorageFailure>,
+    encoding: StateEncoding,
+}
+
+/// Stable, operator-facing code for a wallet state that no longer fits.
+pub const WALLET_STATE_STORAGE_LIMIT_EXCEEDED: &str = "WALLET_STATE_STORAGE_LIMIT_EXCEEDED";
+
+#[derive(Clone, Copy, Debug)]
+struct StorageLimitExceeded {
+    encoding: StateEncoding,
+    plaintext_bytes: u64,
+    envelope_bytes: Option<u64>,
+    plaintext_limit_bytes: u64,
+    envelope_limit_bytes: u64,
+}
+
+impl StorageLimitExceeded {
+    fn from_error(error: &StorageError) -> Option<Self> {
+        match *error {
+            StorageError::StateTooLarge {
+                encoding,
+                plaintext_bytes,
+                envelope_bytes,
+                plaintext_limit_bytes,
+                envelope_limit_bytes,
+            } => Some(Self {
+                encoding,
+                plaintext_bytes,
+                envelope_bytes,
+                plaintext_limit_bytes,
+                envelope_limit_bytes,
+            }),
+            _ => None,
+        }
+    }
+
+    fn into_error(self) -> StorageError {
+        StorageError::StateTooLarge {
+            encoding: self.encoding,
+            plaintext_bytes: self.plaintext_bytes,
+            envelope_bytes: self.envelope_bytes,
+            plaintext_limit_bytes: self.plaintext_limit_bytes,
+            envelope_limit_bytes: self.envelope_limit_bytes,
+        }
+    }
+}
+
+/// Classification of a refused wallet-state commit during synchronization.
+///
+/// TRANSIENT (the worker retries with bounded backoff): an optimistic
+/// generation conflict (reloaded and reapplied in place), another writer
+/// holding the wallet lock, and I/O interrupted/timed out/would block.
+///
+/// TERMINAL / ACTIONABLE (the worker stops, the reason stays visible, and
+/// only an explicit user retry restarts it): the storage limit, any other
+/// I/O failure (disk full, read-only file system, permissions, missing
+/// path), wallet-state validation failures and every other storage error.
+/// Retrying these re-scans and re-derives the key for nothing until
+/// something outside the process changes.
+#[derive(Clone, Copy, Debug)]
+enum StorageFailure {
+    LimitExceeded(StorageLimitExceeded),
+    Transient,
+    Io(std::io::ErrorKind),
+    Domain(DomainError),
+    Other,
+}
+
+impl StorageFailure {
+    fn classify(error: &StorageError) -> Self {
+        if let Some(limit) = StorageLimitExceeded::from_error(error) {
+            return Self::LimitExceeded(limit);
+        }
+        match error {
+            StorageError::ExpectedGenerationConflict { .. } | StorageError::WriterActive => {
+                Self::Transient
+            }
+            StorageError::Io(io)
+                if matches!(
+                    io.kind(),
+                    std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                Self::Transient
+            }
+            StorageError::Io(io) => Self::Io(io.kind()),
+            StorageError::Domain(domain) => Self::Domain(*domain),
+            _ => Self::Other,
+        }
+    }
+
+    /// The typed, non-retryable error to surface, or `None` when transient.
+    fn terminal_error(self) -> Option<(String, CoreError)> {
+        match self {
+            Self::Transient => None,
+            Self::LimitExceeded(limit) => Some((
+                WALLET_STATE_STORAGE_LIMIT_EXCEEDED.into(),
+                CoreError::Storage(limit.into_error()),
+            )),
+            Self::Io(kind) => Some((
+                format!("{WALLET_STORAGE_IO_FAILED}:{kind:?}"),
+                CoreError::Storage(StorageError::Io(std::io::Error::from(kind))),
+            )),
+            Self::Domain(domain) => Some((
+                "WALLET_STATE_VALIDATION_FAILED".into(),
+                CoreError::Storage(StorageError::Domain(domain)),
+            )),
+            Self::Other => Some((
+                "WALLET_STORAGE_FAILED".into(),
+                CoreError::Storage(StorageError::CanonicalEncoding),
+            )),
+        }
+    }
+}
+
+/// Stable code for a non-transient I/O failure while persisting wallet state.
+pub const WALLET_STORAGE_IO_FAILED: &str = "WALLET_STORAGE_IO_FAILED";
+
+#[derive(Clone, Copy, Debug)]
+enum SyncPass {
+    OnePage,
+    ToTip,
+}
+
+impl SyncPass {
+    fn name(self) -> &'static str {
+        match self {
+            Self::OnePage => "page",
+            Self::ToTip => "to_tip",
+        }
+    }
+}
+
+fn committed_cursor_anchor(state: &WalletState) -> Option<u64> {
+    state
+        .core_scan_cursor
+        .as_deref()
+        .and_then(|bytes| WalletScanCursor::from_bytes(bytes).ok())
+        .map(|cursor| cursor.anchor_height)
 }
 
 #[derive(Debug)]
@@ -3734,6 +3956,7 @@ impl WalletRecoverySink {
         kdf: KdfParameters,
         seed: CanonicalWalletSeed,
         identity: CoreChainIdentity,
+        encoding: StateEncoding,
     ) -> Self {
         Self {
             directory,
@@ -3745,6 +3968,8 @@ impl WalletRecoverySink {
             observed_tip_height: None,
             last_recovery_error: None,
             last_generation_conflict: None,
+            last_storage_failure: None,
+            encoding,
         }
     }
 
@@ -3828,15 +4053,20 @@ impl WalletRecoverySink {
                 next.sync_status = SyncStatus::Synced;
             }
         }
+        self.last_storage_failure = None;
         self.state = self
             .directory
-            .commit(
+            .commit_with_encoding(
                 self.state.generation,
                 next,
                 self.password.as_str(),
                 self.kdf,
+                self.encoding,
             )
-            .map_err(|error| WalletScanSinkError::new(ScanCommitStage::StorageCommit, error))?;
+            .map_err(|error| {
+                self.last_storage_failure = Some(StorageFailure::classify(&error));
+                WalletScanSinkError::new(ScanCommitStage::StorageCommit, error)
+            })?;
         self.last_generation_conflict = None;
         self.observed_tip_height = Some(batch.observed_tip.height);
         Ok(())
@@ -5001,6 +5231,11 @@ impl CoreError {
             Self::Storage(StorageError::AuthenticatedPayloadCorrupt) => "WALLET_PAYLOAD_CORRUPT",
             Self::Storage(StorageError::InvalidMetadata) => "WALLET_METADATA_CORRUPT",
             Self::Storage(StorageError::NotFound) => "WALLET_NOT_FOUND",
+            Self::Storage(StorageError::StateTooLarge { .. }) => {
+                WALLET_STATE_STORAGE_LIMIT_EXCEEDED
+            }
+            Self::Storage(StorageError::Io(_)) => WALLET_STORAGE_IO_FAILED,
+            Self::Storage(StorageError::Domain(_)) => "WALLET_STATE_VALIDATION_FAILED",
             Self::Storage(_) => "WALLET_STORAGE_FAILED",
             Self::Domain(DomainError::SwapSessionNotFound) => "SWAP_SESSION_NOT_FOUND",
             Self::Domain(DomainError::InvalidSwapTransition) => "SWAP_TRANSITION_INVALID",
@@ -5160,6 +5395,12 @@ impl CoreError {
                 "The wallet metadata is corrupt and cannot be opened."
             }
             Self::Storage(StorageError::NotFound) => "The managed wallet was not found.",
+            Self::Storage(StorageError::StateTooLarge { .. }) => {
+                "Wallet state storage limit exceeded. Synchronization stopped before changing the wallet; update DOM Wallet to continue."
+            }
+            Self::Storage(StorageError::Io(_)) => {
+                "Wallet storage could not be written (for example disk full, read-only or permission denied). Fix the storage problem, then retry."
+            }
             Self::Storage(_) => "Wallet storage could not complete the operation.",
             Self::Domain(DomainError::SwapSessionNotFound) => {
                 "The requested swap session was not found."
@@ -6828,3 +7069,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod large_wallet_sync_tests;
