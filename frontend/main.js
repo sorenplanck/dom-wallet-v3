@@ -466,10 +466,10 @@ const refreshUpdates = async () => {
   byId("update-channel").textContent = updates.channel;
   byId("automatic-updates").checked = updates.automatic_updates;
   byId("update-mode").textContent = updates.automatic_updates && updates.signature_key_configured
-    ? "Enabled · Stable"
+    ? "Automatic · Stable"
     : updates.automatic_updates
       ? "Scheduled · signing unavailable"
-      : "Unavailable · fail closed";
+      : "Manual · Stable";
   byId("update-signing-state").textContent = updates.signature_key_configured ? "Configured" : "Unavailable — updates fail closed";
   const error = updates.wallet.sanitized_error;
   byId("update-error").textContent = error ?? "No updater error.";

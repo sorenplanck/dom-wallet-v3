@@ -11,9 +11,13 @@ The application checks three signed HTTPS feeds, in this order:
 2. Wallet `latest.json` updates the complete installed application.
 3. `node-latest.json` updates only a compatible managed `dom-node` sidecar.
 
-Checks occur after startup readiness, every 60 minutes while the application is
-running, after resume, and on explicit user request. A single-flight guard
-prevents concurrent checks. Network errors are non-fatal and retain the last
+Wallet checks occur after startup readiness, every 60 minutes while the
+application is running, after resume, and on explicit user request. When
+automatic updates are enabled, an available Wallet artifact is downloaded and
+verified immediately. Installation proceeds at the next safe point; a critical
+Slate or protected runtime activity leaves the verified artifact staged in
+`WAITING_FOR_SAFE_POINT` for a later retry. A single-flight guard prevents
+concurrent cycles. Network errors are non-fatal and retain the last
 authenticated cache and compiled emergency peers.
 
 Peer-only changes never install a binary. A node-only update never changes the

@@ -1482,7 +1482,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-chain"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "dom-wallet-domain",
  "hex",
@@ -1495,7 +1495,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-core"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "dom-adaptor",
  "dom-chain",
@@ -1514,7 +1514,7 @@ dependencies = [
  "dom-wallet-core-restore",
  "dom-wallet-core-submit",
  "dom-wallet-core-sync",
- "dom-wallet-crypto 0.3.6",
+ "dom-wallet-crypto 0.3.7",
  "dom-wallet-domain",
  "dom-wallet-embedded-core",
  "dom-wallet-keys",
@@ -1549,7 +1549,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-core-protocol"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "base64 0.22.1",
  "dom-consensus",
@@ -1566,7 +1566,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-core-recovery"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "bip39",
  "dom-adaptor",
@@ -1594,7 +1594,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-core-restore"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "dom-chain",
  "dom-consensus",
@@ -1606,7 +1606,7 @@ dependencies = [
  "dom-wallet-core-api",
  "dom-wallet-core-recovery",
  "dom-wallet-core-sync",
- "dom-wallet-crypto 0.3.6",
+ "dom-wallet-crypto 0.3.7",
  "dom-wallet-domain",
  "dom-wallet-embedded-core",
  "dom-wallet-recovery",
@@ -1620,7 +1620,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-core-submit"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "dom-consensus",
  "dom-core",
@@ -1634,7 +1634,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-core-sync"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "dom-chain",
  "dom-consensus",
@@ -1667,7 +1667,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-crypto"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -1683,7 +1683,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-domain"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "serde",
  "serde_json",
@@ -1693,7 +1693,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-embedded-core"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "dom-chain",
  "dom-config",
@@ -1727,7 +1727,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-multichain"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "bs58",
  "curve25519-dalek",
@@ -1743,7 +1743,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-node-manager"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "dom-sidecar",
  "dom-wallet-updater",
@@ -1761,7 +1761,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-production-backend"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "dom-node",
  "dom-wallet-core-api",
@@ -1770,7 +1770,7 @@ dependencies = [
  "dom-wallet-core-restore",
  "dom-wallet-core-submit",
  "dom-wallet-core-sync",
- "dom-wallet-crypto 0.3.6",
+ "dom-wallet-crypto 0.3.7",
  "dom-wallet-embedded-core",
  "dom-wallet-storage",
  "tempfile",
@@ -1779,7 +1779,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-protocol"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "base64 0.22.1",
  "dom-consensus",
@@ -1808,7 +1808,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-remote-source"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "dom-chain",
  "dom-consensus",
@@ -1827,9 +1827,9 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-storage"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
- "dom-wallet-crypto 0.3.6",
+ "dom-wallet-crypto 0.3.7",
  "dom-wallet-domain",
  "dom-wallet-storage",
  "fs2",
@@ -1845,7 +1845,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-swap-client"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "btc-crypto",
  "hex",
@@ -1863,14 +1863,14 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-tauri-shell"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "base64 0.22.1",
  "dom-wallet-core",
  "dom-wallet-core-api",
  "dom-wallet-core-restore",
  "dom-wallet-core-sync",
- "dom-wallet-crypto 0.3.6",
+ "dom-wallet-crypto 0.3.7",
  "dom-wallet-domain",
  "dom-wallet-embedded-core",
  "dom-wallet-multichain",
@@ -1900,7 +1900,7 @@ dependencies = [
 
 [[package]]
 name = "dom-wallet-updater"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "base64 0.22.1",
  "futures-util",

@@ -330,7 +330,13 @@ fn automatic_updates_set(
         }
     })?;
     updater.set_automatic_updates(enabled);
-    Ok(updater.snapshot())
+    let snapshot = updater.snapshot();
+    if enabled {
+        tauri::async_runtime::spawn(async move {
+            let _ = perform_update_cycle(handle, UpdateAction::Automatic).await;
+        });
+    }
+    Ok(snapshot)
 }
 
 #[tauri::command]
@@ -362,15 +368,16 @@ enum UpdateAction {
     Check,
     DownloadAndVerify,
     Apply,
+    Automatic,
 }
 
 impl UpdateAction {
     fn downloads(self) -> bool {
-        matches!(self, Self::DownloadAndVerify)
+        matches!(self, Self::DownloadAndVerify | Self::Automatic)
     }
 
     fn installs_or_restarts(self) -> bool {
-        matches!(self, Self::Apply)
+        matches!(self, Self::Apply | Self::Automatic)
     }
 }
 
@@ -486,12 +493,21 @@ async fn check_wallet_update(
     }
     let staging_path = staging_directory.join("wallet-update.stage");
     validate_artifact_staging_destination(&staging_directory, &staging_path)?;
-    if action.downloads() {
+    let verifier = MinisignVerifier::from_base64(public_key)?;
+    let mut verified_bytes = None;
+    if action == UpdateAction::Automatic && staging_path.exists() {
+        match verify_staged_artifact(&staging_directory, &staging_path, artifact, &verifier) {
+            Ok(bytes) => verified_bytes = Some(bytes),
+            Err(_) => {
+                fs::remove_file(&staging_path).map_err(|_| UpdateError::StateIo)?;
+            }
+        }
+    }
+    if action.downloads() && verified_bytes.is_none() {
         state.set_wallet_download_state(WalletUpdaterState::Downloading, Some(0));
         if staging_path.exists() {
             fs::remove_file(&staging_path).map_err(|_| UpdateError::StateIo)?;
         }
-        let verifier = MinisignVerifier::from_base64(public_key)?;
         download_verified_artifact_async(
             artifact,
             &verifier,
@@ -500,17 +516,32 @@ async fn check_wallet_update(
             ArtifactDownloadTimeouts::default(),
         )
         .await?;
+        verified_bytes = Some(verify_staged_artifact(
+            &staging_directory,
+            &staging_path,
+            artifact,
+            &verifier,
+        )?);
+    }
+    if action == UpdateAction::DownloadAndVerify {
         state.finish_verified_download(version.to_string());
         return Ok(());
     }
 
     state.set_wallet_download_state(WalletUpdaterState::Verifying, Some(100));
-    let verifier = MinisignVerifier::from_base64(public_key)?;
-    let bytes = verify_staged_artifact(&staging_directory, &staging_path, artifact, &verifier)?;
+    let bytes = match verified_bytes {
+        Some(bytes) => bytes,
+        None => verify_staged_artifact(&staging_directory, &staging_path, artifact, &verifier)?,
+    };
     let application = handle.state::<DesktopApplication>();
-    let lease = application
-        .acquire_update_apply_lease()
-        .map_err(|_| UpdateError::BusyCriticalOperation)?;
+    let lease = match application.acquire_update_apply_lease() {
+        Ok(lease) => lease,
+        Err(_) if action == UpdateAction::Automatic => {
+            state.defer_wallet_install(version.to_string());
+            return Ok(());
+        }
+        Err(_) => return Err(UpdateError::BusyCriticalOperation),
+    };
     state.set_wallet_download_state(WalletUpdaterState::Installing, Some(100));
     application
         .prepare_for_update(&lease)
@@ -1425,7 +1456,7 @@ fn application_builder() -> tauri::Builder<tauri::Wry> {
                 tokio::time::sleep(Duration::from_secs(jitter)).await;
                 loop {
                     if handle.state::<UpdateControl>().snapshot().automatic_updates {
-                        let _ = perform_update_cycle(handle.clone(), UpdateAction::Check).await;
+                        let _ = perform_update_cycle(handle.clone(), UpdateAction::Automatic).await;
                     }
                     tokio::time::sleep(Duration::from_secs(UPDATE_INTERVAL_SECONDS)).await;
                 }
@@ -1446,7 +1477,7 @@ fn main() {
             let handle = handle.clone();
             tauri::async_runtime::spawn(async move {
                 if handle.state::<UpdateControl>().snapshot().automatic_updates {
-                    let _ = perform_update_cycle(handle, UpdateAction::Check).await;
+                    let _ = perform_update_cycle(handle, UpdateAction::Automatic).await;
                 }
             });
         }
@@ -1472,7 +1503,7 @@ mod tests {
     }
 
     #[test]
-    fn regression_m5_check_download_apply_and_preference_are_distinct() {
+    fn regression_m5_manual_actions_remain_distinct_from_automatic_mode() {
         assert_ne!(UpdateAction::Check, UpdateAction::DownloadAndVerify);
         assert_ne!(UpdateAction::DownloadAndVerify, UpdateAction::Apply);
         assert!(!UpdateAction::Check.downloads());
@@ -1481,6 +1512,8 @@ mod tests {
         assert!(!UpdateAction::DownloadAndVerify.installs_or_restarts());
         assert!(!UpdateAction::Apply.downloads());
         assert!(UpdateAction::Apply.installs_or_restarts());
+        assert!(UpdateAction::Automatic.downloads());
+        assert!(UpdateAction::Automatic.installs_or_restarts());
         let directory = tempfile::tempdir().expect("preference directory");
         let path = directory.path().join("preference.json");
         persist_automatic_update_preference(&path, false).expect("persist preference");
