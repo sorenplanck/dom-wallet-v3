@@ -138,6 +138,10 @@ pub enum SeedRestoreError {
     CoordinateOverflow,
     #[error("encrypted restore state could not be committed")]
     Storage,
+    /// Deterministic: the restored state cannot fit the storage format, so a
+    /// retry would rescan and fail identically.
+    #[error("wallet state storage limit exceeded")]
+    StateStorageLimitExceeded,
     #[error("restore staging state is incompatible")]
     IncompatibleCheckpoint,
     #[error("restore is not complete")]
@@ -528,7 +532,12 @@ impl RestoreSink<'_> {
                 .map_err(|_| SeedRestoreError::MalformedRecovery)?;
             self.directory
                 .commit(expected_generation, state, self.password, self.kdf)
-                .map_err(|_| SeedRestoreError::Storage)
+                .map_err(|error| match error {
+                    StorageError::StateTooLarge { .. } => {
+                        SeedRestoreError::StateStorageLimitExceeded
+                    }
+                    _ => SeedRestoreError::Storage,
+                })
         })();
         match result {
             Ok(committed) => {

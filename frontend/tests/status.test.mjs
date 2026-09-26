@@ -12,6 +12,7 @@ import {
   restoreScanPresentation,
   synchronizationPresentation,
   reachabilityText,
+  walletSyncErrorPresentation,
 } from "../status.js";
 
 test("frontend source contains no durable browser storage access", async () => {
@@ -168,6 +169,59 @@ test("node status text exposes live heights and progress", () => {
   assert.match(text, /Highest peer height: 6684/);
   assert.match(text, /Synchronization: 15%/);
   assert.doesNotMatch(text, /CORE_NOT_READY/);
+  assert.match(text, /Node error: None/);
+  assert.doesNotMatch(text, /^Error:/m, "the node line never reads as a wallet verdict");
+});
+
+test("regression_43264_healthy_node_does_not_hide_a_stopped_wallet_scanner", () => {
+  // Node READY at 51795 with "Node error: None", wallet frozen at 43264.
+  const node = nodeStatusText({
+    status_message: "Ready",
+    lifecycle: "READY",
+    network: "MAINNET",
+    canonical_tip_height: 51_795,
+    highest_known_peer_height: 51_795,
+    synchronization_progress_percent: 100,
+    connected_peers: 2,
+    bootstrap_phase: "CONNECTED",
+    canonical_tip_hash: "abcd",
+    error_code: null,
+  });
+  assert.match(node, /Node error: None/);
+  const synchronization = {
+    synchronized: false,
+    cursor_height: 43_264,
+    last_error: "WALLET_STATE_STORAGE_LIMIT_EXCEEDED",
+    worker_state: "ERROR",
+    worker_error: "WALLET_STATE_STORAGE_LIMIT_EXCEEDED",
+  };
+  const walletError = walletSyncErrorPresentation(synchronization);
+  assert.equal(walletError.hasError, true);
+  assert.match(walletError.message, /^Wallet state storage limit exceeded/);
+  assert.match(walletError.message, /43264/);
+  const presentation = synchronizationPresentation(
+    { canonical_height: 51_795, lifecycle: "READY" },
+    { highest_known_peer_height: 51_795, total_connected_peers: 2 },
+    synchronization,
+  );
+  assert.equal(presentation.badgeState, "ATTENTION");
+  assert.match(presentation.message, /Wallet state storage limit exceeded/);
+});
+
+test("a stopped synchronization worker is visible even without a last_error", () => {
+  const presentation = walletSyncErrorPresentation({
+    synchronized: false,
+    cursor_height: 10,
+    last_error: null,
+    worker_state: "ERROR",
+    worker_error: null,
+  });
+  assert.equal(presentation.hasError, true);
+  assert.match(presentation.message, /stopped/);
+  assert.deepEqual(
+    walletSyncErrorPresentation({ last_error: null, worker_state: "RUNNING" }),
+    { hasError: false, code: null, message: "None" },
+  );
 });
 
 test("regression_restore_submit_is_enabled_in_every_node_state", () => {
@@ -555,4 +609,16 @@ test("mesh listener without inbound peers reports the portmap outcome", () => {
     "Your provider uses CGNAT \u00b7 outbound connections only");
   assert.equal(reachabilityText({ ...base, portmap_status: "none", advertised_port: 0 })[0],
     "Router did not open the port automatically");
+});
+
+test("persistent storage I/O failures ask for intervention instead of looking like a node problem", () => {
+  const presentation = walletSyncErrorPresentation({
+    cursor_height: 43_264,
+    last_error: "WALLET_STORAGE_IO_FAILED:StorageFull",
+    worker_state: "ERROR",
+    worker_error: "WALLET_STORAGE_IO_FAILED",
+  });
+  assert.equal(presentation.code, "WALLET_STORAGE_IO_FAILED");
+  assert.match(presentation.message, /StorageFull/);
+  assert.match(presentation.message, /Retry/);
 });

@@ -1498,6 +1498,7 @@ name = "dom-wallet-core"
 version = "0.3.6"
 dependencies = [
  "dom-adaptor",
+ "dom-chain",
  "dom-config",
  "dom-consensus",
  "dom-core",
@@ -1669,6 +1670,7 @@ name = "dom-wallet-crypto"
 version = "0.3.6"
 dependencies = [
  "argon2",
+ "base64 0.22.1",
  "chacha20poly1305",
  "hkdf",
  "rand 0.8.6",
@@ -1829,12 +1831,14 @@ version = "0.3.6"
 dependencies = [
  "dom-wallet-crypto 0.3.6",
  "dom-wallet-domain",
+ "dom-wallet-storage",
  "fs2",
  "libc",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "tracing",
  "uuid",
  "zeroize",
 ]

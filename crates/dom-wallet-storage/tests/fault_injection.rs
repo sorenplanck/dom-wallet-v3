@@ -325,3 +325,72 @@ fn read_only_wallet_fails_closed_and_recovers() {
         assert_eq!(committed.generation, original.generation + 1);
     }
 }
+
+fn copy_tree(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    fs::set_permissions(to, fs::Permissions::from_mode(0o700)).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+/// The first compact commit of a legacy wallet dies mid-write: the legacy
+/// generation stays active and byte-identical, no snapshot marker or
+/// pointer moves, and the migration completes once the fault clears.
+#[test]
+fn migration_interrupted_mid_write_keeps_the_legacy_generation_authoritative() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy-v1/wallet");
+    let password = "legacy-fixture-password";
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("legacy");
+    copy_tree(&fixture, &root);
+    let wallet = WalletDirectory::open(&root).unwrap();
+    let legacy = wallet.load(password).unwrap();
+    let pointer = active_generation_bytes(&root);
+    let active_state = root
+        .join("generations")
+        .join(String::from_utf8(pointer.clone()).unwrap())
+        .join("state.envelope");
+    let legacy_bytes = fs::read(&active_state).unwrap();
+
+    {
+        let _cap = FileSizeCap::install(1_024);
+        let error = wallet
+            .commit(
+                legacy.generation,
+                legacy.clone(),
+                password,
+                KdfParameters::TEST,
+            )
+            .expect_err("the compact generation cannot be written");
+        assert!(matches!(error, StorageError::Io(_)), "{error:?}");
+    }
+    assert_eq!(active_generation_bytes(&root), pointer);
+    assert_eq!(fs::read(&active_state).unwrap(), legacy_bytes);
+    assert!(staging_leftovers(&root).is_empty());
+    assert!(!root.join("pre-migration-snapshot").exists());
+    assert_eq!(wallet.load(password).unwrap(), legacy);
+
+    let migrated = wallet
+        .commit(
+            legacy.generation,
+            legacy.clone(),
+            password,
+            KdfParameters::TEST,
+        )
+        .expect("migration completes once the fault clears");
+    assert_eq!(migrated.generation, legacy.generation + 1);
+    assert_eq!(
+        wallet.pre_migration_snapshot_generation().unwrap(),
+        Some(legacy.generation)
+    );
+}

@@ -5,6 +5,12 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Enables StateEncoding::LegacyV1 writes (compatibility fixtures and regression
+# tests only). Release builds never enable it.
+legacy-writer = ["dom-wallet-crypto/legacy-writer"]
+
 [dependencies]
 dom-wallet-crypto = { path = "../dom-wallet-crypto" }
 dom-wallet-domain = { path = "../dom-wallet-domain" }
@@ -12,9 +18,12 @@ fs2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+# Self dev-dependency: the test build exercises the legacy writer.
+dom-wallet-storage = { path = ".", features = ["legacy-writer"] }
 libc = "0.2"
 tempfile.workspace = true

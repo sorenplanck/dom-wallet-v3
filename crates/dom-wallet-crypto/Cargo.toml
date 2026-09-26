@@ -5,8 +5,15 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Writes the pre-v2 envelope. Compatibility fixtures and regression tests only;
+# release builds never enable it.
+legacy-writer = []
+
 [dependencies]
 argon2.workspace = true
+base64.workspace = true
 chacha20poly1305.workspace = true
 hkdf.workspace = true
 rand.workspace = true

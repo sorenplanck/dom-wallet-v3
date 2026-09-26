@@ -2922,7 +2922,7 @@ pub mod serde_option_bytes_33 {
     }
 }
 
-#[derive(Debug, Error, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum DomainError {
     #[error("unsupported schema or profile version")]
     UnsupportedVersion,

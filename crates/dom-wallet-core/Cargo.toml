@@ -41,10 +41,13 @@ uuid.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+dom-chain.workspace = true
 dom-config.workspace = true
 dom-crypto.workspace = true
 dom-wallet.workspace = true
 dom-wallet-remote-source = { path = "../dom-wallet-remote-source" }
+# Regression tests reproduce the pre-fix storage format.
+dom-wallet-storage = { path = "../dom-wallet-storage", features = ["legacy-writer"] }
 reqwest.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

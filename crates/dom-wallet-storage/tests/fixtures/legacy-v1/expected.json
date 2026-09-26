@@ -1,0 +1,11 @@
+{
+  "backup_password": "legacy-backup-password",
+  "core_scan_cursor_len": 86,
+  "generated_by": "fixturegen (GENERATOR.rs.txt) against an unmodified worktree of commit 88e388ac241d00994b749e895a2cb5039ce1521e",
+  "generation": 1,
+  "outputs": 3,
+  "password": "legacy-fixture-password",
+  "recovery_canonical_blocks": 3,
+  "rescan_plan_id": "a4a7d356-d126-4c0a-a228-b8846304b0f8",
+  "wallet_id": "5783fd46-ad04-4c2d-b25c-501d5a5ca801"
+}

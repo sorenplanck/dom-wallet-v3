@@ -68,10 +68,11 @@ export function synchronizationPresentation(network, peers, synchronization) {
       progress: 100,
     };
   }
-  if (synchronization?.last_error) {
+  const walletError = walletSyncErrorPresentation(synchronization);
+  if (walletError.hasError) {
     return {
       badgeState: "ATTENTION",
-      message: synchronization.last_error,
+      message: walletError.message,
       localHeight,
       peerHeight,
       progress,
@@ -84,6 +85,45 @@ export function synchronizationPresentation(network, peers, synchronization) {
     peerHeight,
     progress,
   };
+}
+
+export const WALLET_STATE_STORAGE_LIMIT_EXCEEDED = "WALLET_STATE_STORAGE_LIMIT_EXCEEDED";
+
+// Wallet synchronization health, deliberately independent of the embedded
+// node: a healthy node ("Node error: None") says nothing about the wallet
+// scanner, which can be stopped while the node follows the tip.
+export function walletSyncErrorPresentation(synchronization) {
+  const code = synchronization?.last_error ?? synchronization?.worker_error ?? null;
+  const workerStopped = synchronization?.worker_state === "ERROR";
+  if (!code && !workerStopped) {
+    return { hasError: false, code: null, message: "None" };
+  }
+  const cursor = Number.isSafeInteger(synchronization?.cursor_height)
+    ? synchronization.cursor_height
+    : null;
+  if (code === WALLET_STATE_STORAGE_LIMIT_EXCEEDED
+    || synchronization?.worker_error === WALLET_STATE_STORAGE_LIMIT_EXCEEDED) {
+    return {
+      hasError: true,
+      code: WALLET_STATE_STORAGE_LIMIT_EXCEEDED,
+      message: `Wallet state storage limit exceeded. Wallet synchronization stopped${cursor == null ? "" : ` at height ${cursor}`}; the node itself is healthy. Update DOM Wallet to continue.`,
+    };
+  }
+  if (typeof code === "string" && code.startsWith("WALLET_STORAGE_IO_FAILED")) {
+    return {
+      hasError: true,
+      code: "WALLET_STORAGE_IO_FAILED",
+      message: `Wallet storage could not be written (${code.split(":")[1] ?? "I/O error"}). Wallet synchronization stopped${cursor == null ? "" : ` at height ${cursor}`}; free disk space or fix permissions, then press Retry.`,
+    };
+  }
+  if (!code) {
+    return {
+      hasError: true,
+      code: "SYNC_WORKER_STOPPED",
+      message: "Wallet synchronization stopped. Press Retry to restart it.",
+    };
+  }
+  return { hasError: true, code, message: code };
 }
 
 export function restoreReadinessPresentation(node) {
@@ -346,7 +386,7 @@ export function nodeStatusText(value) {
     `Connected peers: ${value.connected_peers}`,
     `Bootstrap: ${value.bootstrap_phase}`,
     `Canonical hash: ${value.canonical_tip_hash ?? "—"}`,
-    `Error: ${value.error_code ?? "None"}`,
+    `Node error: ${value.error_code ?? "None"}`,
   ].join("\n");
 }
 
